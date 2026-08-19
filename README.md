@@ -1,126 +1,44 @@
-The follwoing was written by Claude (also almost all of the code, so it goes), I will rewrite and fix it soon as it's only a pretty good generalization of what's going on here and I am uploading this late.
-
-Cheers. 
-
 # midiTracker
+##### MIDI player, recorder, and looper
 
-Alternate firmware for the picotracker v2 (RP2040/Pico, 240×320 ST7789
-TFT, PlatformIO + Arduino/earlephilhower core). It turns the device into
-a standalone MIDI workstation: an SD-card file player/recorder, a
-4-track live looper, an onboard synth for monitoring, and MIDI
-routing/clock/transport utilities — all driven by 9 buttons and the TFT.
+midiTracker is an alternate firmware for the picoTracker v2 PCB.
+You can order your own <a href=https://xiphonics.com/products/picotracker-pcb-kit>from xiphonics here</a>.
 
-MIDI moves over two transports simultaneously: hardware DIN/TRS (UART,
-31250 baud) and USB-MIDI, both always available regardless of mode.
+It turns the device into a MIDI/SysEx player, MIDI/SysEx recorder, and 4 track MIDI looper. 
 
-## What it does
+### Player
 
-At boot you land on a **mode-select** screen (UP/DOWN, ENTER/PLAY/RIGHT
-to choose) with three destinations:
+midiTracker plays standard '.mid' MIDI files, type 0 or 1, out over TRS or USB MIDI. It will also play standard '.syx' SysEx files (eg patch backups from a synth). File are streamed from the SD card and MIDI files can be paused/resumed, scrubbed through forwards and backwards and played at an adjustable tempo. A piano-style display lights up with the played back notes to provide visual feedback while playing.
 
-### Play / Record Files
+Additionally there is a simple onboard synth, supporting 24 melodic notes and 8 drum notes simultaneously, that you can use to listen to MIDI files without driving external gear. This is intended as a way to verify the contents of recordings and sounds very chiptune-y but it can be a lot of fun to play various MIDI files from the internet and enjoy the not-so-realistic sounds it makes.
 
-Browses `.mid` and `.syx` files on the SD card and:
+### Recorder
 
-- **Plays back** Standard MIDI Files (format 0/1, tempo-map changes,
-  running status, up to 24 tracks) straight off the card — no
-  whole-file RAM buffering. Pause/resume, restart when finished,
-  tempo-scale ±%, volume, and a live note-activity display.
-- **Records** incoming MIDI (from either transport) straight to a new
-  `.mid` file as it arrives, with live elapsed time and event count.
-- **Captures raw SysEx dumps** to `.syx` files (e.g. patch backups from a
-  synth), and sends a captured dump back out on demand.
-- Lets you rename/delete files and folders, create folders, and hand a
-  `.mid` file off to the Looper (**Load to Looper**, picks a destination
-  track).
-- MIDI output target (Hardware / USB / Both) and onboard-synth audio
-  monitoring are both adjustable from this screen and apply globally.
+midiTracker records both MIDI and SysEx straight to the SD card through a menu option that lets you pick whether you want to save MIDI data (will write to a type 0 .mid file) or SysEx dumps (will write to a standard .syx file).
 
-### MIDI Looper
+MIDI recording has no set limit and will record from either the 3.5mm TRS port or a connected USB host. Note data, CCs, inline SysEx commands (eg for patch changes) are all recorded as they are received.
 
-A live 4-track looper, each track independently:
+SysEx recording is similar and can be used to back up memory banks, individual patches, system configuration, etc.
 
-- Armed and recorded from incoming MIDI (filtered to one channel, or
-  any channel via OMNI), with mute, overdub, pause/resume, and
-  stop/restart.
-- Either **freeform** (records until you stop it) or **bar-quantized**
-  to one of several preset lengths against the shared BPM/time
-  signature.
-- Saved to and loaded from the SD card as its own small session folder.
+### Looper
 
-Shared session settings, all live-adjustable from the BPM row: **BPM**
-(20–300), **time signature** (a handful of common presets), **Sync**
-(all tracks locked to one shared clock) vs **Independent** (each track
-its own clock), a **metronome** (adjustable volume, its own wood-block
-synth voice, louder downbeat) with an optional **count-in**, and a
-header strip that visually blinks out the current beat.
+midiTracker has a 4 track MIDI looper. Each loop can be freeform in length or set to a certain number of bars. There is a hard limit of 4096 events per loop as loops are held in the Pico's limited RAM until you choose to save them. You can mute, overdub, pause/resume, and stop/restart each loop.
 
-A loop menu (ENTER) covers Save, Load Saved Loop, Erase Track, Erase All
-Tracks, and Delete Saved Loop.
+Loops can be saved as a group and loaded, again as a group. Each track can also be loaded with an individual MIDI file of your choice from the browser - not just prerecorded loops (you can loop your favourite Rick Astley song and play along).
 
-The Looper can also be driven externally: **Clock Source** can follow
-incoming MIDI Clock instead of the manually-set BPM, and **MIDI
-Transport** can let incoming Start/Stop/Continue start, freeze, and
-resume the tracks (see Settings, and MIDI Thru/Clock/Transport below).
+The looper supports variable BPM (set internally or driven by MIDI) as well as a number of common time signatures. Loops can run synced to each other, tied to BPM/bars (if using set bar limits), or run independantly. MIDI transport can be enabled and the looper with respond to START/STOP/CONTINUE messages to help automate loop recording and playback.
+
+A metronome, with optional count in, is included and features a visual indicator on the top of the screen to go along with the audio signal (the audio out is required for audio metronome, of course).
 
 ### Settings
 
-A scrollable list of device-wide defaults and behaviors, adjusted with
-EDIT+LEFT/RIGHT and persisted to `/settings.txt`:
+Various settings can be setchanged and will be saved to the SD card to be loaded on boot. Currently the following items can be set:
 
-| Setting | Default | Controls |
-|---|---|---|
-| Default BPM | 120 | Looper's starting tempo |
-| Time Sig | 4/4 | Looper's starting time signature |
-| Clock Source | Internal | Internal (manual BPM) vs External (follow incoming MIDI clock) |
-| Loop Length | Free | Looper's starting per-track bar length |
-| Sync Mode | Sync | Looper's starting Sync/Independent mode |
-| Metronome | Off | Metronome starting on/off |
-| Metro Volume | 80% | Metronome click volume |
-| Count In | On | Count-in starting on/off |
-| Count In Bars | 1 | Count-in length |
-| MIDI Transport | Off | React to incoming MIDI Start/Stop/Continue |
-| MIDI Thru | Off | Thru routing mode (see below) |
+BPM, time signature, clock source, loop length, sync mode, metronome, metronome volume, count in, count in bars, MIDI transport, MIDI thru
 
-Settings a Looper session has already picked up aren't yanked out from
-under it — a change here takes effect the next time you (re)enter the
-Looper with no track content yet, except MIDI Thru, which applies
-immediately since it isn't a Looper-specific concept.
+---
 
-## MIDI Thru, Clock, and Transport
-
-- **MIDI Thru**: `Off` / `On` (mirror every input to every output,
-  including a transport back to itself — the same self-echo a
-  dedicated hardware Thru port performs) / `TRS>USB` / `USB>TRS` /
-  `TRS>TRS` / `USB>USB` (each of the four directional modes enables
-  exactly one input→output pairing). Covers channel-voice messages,
-  SysEx, and realtime bytes (Clock/Start/Stop/Continue/Active
-  Sensing/System Reset) — all raw-forwarded, bypassing the onboard
-  synth and note-activity display entirely.
-- **Clock Source**: `Internal` uses the manually-set BPM as usual;
-  `External` derives a smoothed tempo estimate from incoming MIDI Clock
-  (24 pulses per quarter note) and drives the Looper's BPM live. This is
-  tempo-follow, not sample-accurate phase lock — loop position still
-  runs on the device's own timer at the currently-tracked tempo.
-- **MIDI Transport**: when on, incoming Start/Stop/Continue drive the
-  Looper directly — Start jumps every track with content to the
-  beginning and plays it, Stop freezes everything in place, Continue
-  resumes every paused track immediately.
-
-## Onboard synth
-
-A polyphonic synth (24 melodic + 8 drum voices) rendered on the RP2040's
-second core to the I2S DAC, purely so file/looper content is audible
-without external gear — not intended to sound realistic, just to make
-different parts distinguishable. One algorithmic preset per GM
-instrument family (16 families) on the melodic side, and a small set of
-archetypal drum voices (kick, snare, closed/open hat, tom, cymbal, wood
-block) on channel 10. Audio monitoring is opt-in and purely additive: it
-never affects what goes out over hardware/USB MIDI.
-
-## Controls
-
-9 momentary buttons, physical layout:
+#### Controls
 
 ```
       UP    PLAY  EDIT
@@ -128,16 +46,11 @@ LEFT  DOWN  RIGHT  ENTER
       ALT   NAV
 ```
 
-Every screen shows a two-line button hint in the footer for whatever's
-currently relevant. The general conventions held throughout the
-firmware: **ALT** and **EDIT** are modifiers held alongside another
-button to reach a secondary function (cycling a value, editing a
-number, etc.), **ENTER** opens a menu, and **NAV**/**LEFT** back out or
-stop.
+Every screen has a two line UI hint footer that explains what buttons (or combination) do what. The dpad buttons navigate through menus (generally right enters a menu and left backs out of it) and most modifications to settings are done while holding ALT or EDIT and changing the values with the direction arrows.
 
-## Hardware
+#### Hardware
 
-- RP2040 (Pico), 240×320 ST7789 TFT over hardware SPI1, up to 40MHz.
+- RP2040 (Pico), 240×320 ST7789 TFT over hardware SPI1
 - SD card over native SDIO (not SPI) via SdFat's RP2040 SDIO driver.
 - MIDI: hardware UART (TX/RX, 31250 baud) and USB-MIDI (composite USB
   device alongside a CDC debug console), both active simultaneously.
@@ -146,7 +59,7 @@ stop.
 
 See `include/pins.h` for the exact pin map.
 
-## Known limitations
+#### Known limitations
 
 - `MIDI_MAX_TRACKS` (24, in `config.h`) and `SdBrowser::MAX_DIR_ENTRIES`
   (96) are RAM-bounded caps — raise them if you hit real files/folders
@@ -154,9 +67,15 @@ See `include/pins.h` for the exact pin map.
 - Clock Source's "External" mode tracks tempo only; it does not
   phase-lock loop playback pulse-for-pulse to the incoming clock.
 
-## Building
+### Installation
 
-```
-pio run -e pico -t upload
-pio device monitor
-```
+Mount your picoTracker in firmware update mode (through the menu if you are on the picoTracker firmware - or by holding the boot pin on the bottom and then connecting the USB cable) and copy the .uf2 file from the latest release to your SD card.
+
+You can also pull the source and build it yourself - this was made mostly by Claude in platformio on VS Code.
+
+---
+
+While most of my intended functionality has been built in I need to do a lot more testing to make sure the UI and operation are rock solid and ready for use. Please submit issues you find here or find me on the picoTracker discord to tell me about them there.
+
+Cheers,
+rm
