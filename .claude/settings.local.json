@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 300 /home/dan/.platformio/penv/bin/platformio run)",
+      "Bash(diff -q \"/home/dan/sync/projects/platformio/midiTracker/.pio/libdeps/pico/Adafruit TinyUSB Library/src/arduino/Adafruit_USBD_Device.cpp\" \"/home/dan/.platformio/packages/framework-arduinopico/libraries/Adafruit_TinyUSB_Arduino/src/arduino/Adafruit_USBD_Device.cpp\")",
+      "Read(//home/dan/.platformio/packages/framework-arduinopico/libraries/Adafruit_TinyUSB_Arduino/src/arduino/**)",
+      "Bash(grep -rln \"setProductDescriptor\\\\|setManufacturerDescriptor\" /home/dan/.platformio/packages/framework-arduinopico/libraries/Adafruit_TinyUSB_Arduino/examples/ 2>/dev/null)",
+      "Read(//home/dan/.platformio/packages/framework-arduinopico/libraries/Adafruit_TinyUSB_Arduino/examples/**)"
+    ]
+  }
+}
