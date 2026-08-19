@@ -69,7 +69,7 @@ See `include/pins.h` for the exact pin map.
 
 ### Installation
 
-Mount your picoTracker in firmware update mode (through the menu if you are on the picoTracker firmware - or by holding the boot pin on the bottom and then connecting the USB cable) and copy the .uf2 file from the latest release to your SD card.
+Mount your picoTracker in firmware update mode (through the menu if you are on the picoTracker firmware - or by holding the boot pin on the bottom and then connecting the USB cable) and copy the .uf2 file from the latest release to your mounted device.
 
 You can also pull the source and build it yourself - this was made mostly by Claude in platformio on VS Code.
 
