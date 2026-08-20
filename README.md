@@ -32,7 +32,7 @@ A metronome, with optional count in, is included and features a visual indicator
 
 ### Settings
 
-Various settings can be setchanged and will be saved to the SD card to be loaded on boot. Currently the following items can be set:
+Various settings can be modified and will be saved to the SD card to be loaded on boot. Currently the following items can be set:
 
 BPM, time signature, clock source, loop length, sync mode, metronome, metronome volume, count in, count in bars, MIDI transport, MIDI thru
 
