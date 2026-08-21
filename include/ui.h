@@ -355,4 +355,11 @@ void updateSettingsSelection(const char* const* labels, const char* const* value
 // RIGHT adjusts it.
 void updateSettingsValue(const char* label, const char* value, int index, int scrollOffset);
 
+// Small vertical battery gauge, bottom-right corner, drawn over whatever
+// screen is currently up. See Battery (battery.h) for the underlying
+// percentage/charging read -- this just paints the current cached value.
+// Call on a slow independent timer (main.cpp does, ~1s); cheap enough
+// not to need its own dirty-tracking.
+void drawBatteryMeter();
+
 } // namespace Ui

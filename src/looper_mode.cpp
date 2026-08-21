@@ -2776,7 +2776,23 @@ bool updateMainScreen() {
             // to do once held, unlike EDIT/NAV's tap-vs-hold split above,
             // since a hold here wouldn't mean anything different from a
             // tap.
-            maybeStartCountIn();
+            //
+            // Only when nothing's already running, though (anyTrackAdvancing()
+            // -- Recording/Playing/Muted, same "is something actually
+            // happening" check updateMetronome() itself uses): pressing
+            // PLAY here while something's already going shouldn't
+            // re-trigger a fresh count-in over music that's already
+            // playing. Any newly-armed track still needs to actually
+            // start, though, so it joins in immediately instead --
+            // startArmedTracksTogether() is the same immediate, no-count-in
+            // start a MIDI note on an armed track's channel already
+            // triggers elsewhere (see handleIncomingMidi()), and is a
+            // no-op if nothing's armed.
+            if (anyTrackAdvancing()) {
+                startArmedTracksTogether();
+            } else {
+                maybeStartCountIn();
+            }
             // Also doubles as a "play everything" gesture: any track
             // that already has content but is just sitting stopped
             // starts playing immediately, same as EDIT-held "All Start"

@@ -5,6 +5,7 @@
 #include "synth.h"
 #include "input.h"
 #include "ui.h"
+#include "battery.h"
 #include "file_player_mode.h"
 #include "looper_mode.h"
 #include "settings_mode.h"
@@ -81,6 +82,7 @@ void setup() {
 
     Input::begin();
     Ui::begin();
+    Battery::begin();
     Ui::drawSplash();
     delay(1000);
 
@@ -141,5 +143,22 @@ void loop() {
     if (needsRedraw && topMode == MODE_SELECT) {
         needsRedraw = false;
         Ui::drawModeSelect(MODE_LABELS, MODE_COUNT, modeCursor);
+    }
+
+    // Battery gauge, bottom-right corner, drawn over whatever the mode
+    // above just did -- independent of any mode's own redraw cycle so it
+    // shows up everywhere without threading it through every screen.
+    // Battery::update() only actually re-samples the ADC every ~5s (see
+    // its own comment); this 1s redraw timer is deliberately faster
+    // than that so the icon reappears quickly after a screen transition
+    // wipes the footer, while still being far too infrequent to matter
+    // against the mixing-throughput budget (see S3mPlayer/XmPlayer's
+    // real-hardware-measured cost of *frequent* footer redraws).
+    Battery::update();
+    static uint32_t lastBatteryDrawMs = 0;
+    uint32_t nowMs = millis();
+    if (nowMs - lastBatteryDrawMs >= 1000) {
+        lastBatteryDrawMs = nowMs;
+        Ui::drawBatteryMeter();
     }
 }
