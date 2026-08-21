@@ -1,16 +1,18 @@
 # midiTracker
-##### MIDI player, recorder, and looper
+##### MIDI/tracker player, recorder, and looper
 
 midiTracker is an alternate firmware for the picoTracker v2 PCB.
 You can order your own <a href=https://xiphonics.com/products/picotracker-pcb-kit>from xiphonics here</a>.
 
-It turns the device into a MIDI/SysEx player, MIDI/SysEx recorder, and 4 track MIDI looper. 
+It turns the device into a MIDI/SysEx/tracker-file player, MIDI/SysEx recorder, and 4 track MIDI looper.
 
 ### Player
 
 midiTracker plays standard '.mid' MIDI files, type 0 or 1, out over TRS or USB MIDI. It will also play standard '.syx' SysEx files (eg patch backups from a synth). File are streamed from the SD card and MIDI files can be paused/resumed, scrubbed through forwards and backwards and played at an adjustable tempo. A piano-style display lights up with the played back notes to provide visual feedback while playing.
 
-Additionally there is a simple onboard synth, supporting 24 melodic notes and 8 drum notes simultaneously, that you can use to listen to MIDI files without driving external gear. This is intended as a way to verify the contents of recordings and sounds very chiptune-y but it can be a lot of fun to play various MIDI files from the internet and enjoy the not-so-realistic sounds it makes.
+It also plays .wav files, as well as a few tracker modules - .mod, .s3m, and .xm. These are experimental and not 100% tested, there may be slowdowns or audio glitches. Attempts have been made to make these sound as authentic as possible but of course there are hardware limitations that make this an interesting challenge.
+
+Additionally there is a simple onboard synth, supporting 24 melodic notes and 8 drum notes simultaneously, that you can use to listen to MIDI files without driving external gear (this is also what renders the tracker/WAV formats above). This is intended as a way to verify the contents of recordings and sounds very chiptune-y but it can be a lot of fun to play various MIDI files from the internet and enjoy the not-so-realistic sounds it makes.
 
 ### Recorder
 
@@ -56,6 +58,8 @@ Every screen has a two line UI hint footer that explains what buttons (or combin
   device alongside a CDC debug console), both active simultaneously.
 - I2S DAC for the onboard synth.
 - 9 buttons, active-low with internal pull-ups, software-debounced.
+- Battery voltage sense pin, read out as a small gauge in the bottom-right
+  corner of every screen (charge level and charging state).
 
 See `include/pins.h` for the exact pin map.
 
@@ -66,6 +70,10 @@ See `include/pins.h` for the exact pin map.
   that exceed them.
 - Clock Source's "External" mode tracks tempo only; it does not
   phase-lock loop playback pulse-for-pulse to the incoming clock.
+- Very rarely, a busy tracker-file passage can trigger a brief (a few
+  seconds, self-recovering) SD card read stall, heard as a momentary
+  slowdown/crackle. Believed to be intrinsic SD card behavior rather
+  than a firmware bug.
 
 ### Installation
 
