@@ -41,7 +41,7 @@ BPM, time signature, clock source, loop length, sync mode, metronome, metronome 
 #### Controls
 
 ```
-      UP    PLAY  EDIT
+      UP    PLAY   EDIT
 LEFT  DOWN  RIGHT  ENTER
       ALT   NAV
 ```

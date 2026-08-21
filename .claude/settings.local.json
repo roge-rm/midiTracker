@@ -5,7 +5,28 @@
       "Bash(diff -q \"/home/dan/sync/projects/platformio/midiTracker/.pio/libdeps/pico/Adafruit TinyUSB Library/src/arduino/Adafruit_USBD_Device.cpp\" \"/home/dan/.platformio/packages/framework-arduinopico/libraries/Adafruit_TinyUSB_Arduino/src/arduino/Adafruit_USBD_Device.cpp\")",
       "Read(//home/dan/.platformio/packages/framework-arduinopico/libraries/Adafruit_TinyUSB_Arduino/src/arduino/**)",
       "Bash(grep -rln \"setProductDescriptor\\\\|setManufacturerDescriptor\" /home/dan/.platformio/packages/framework-arduinopico/libraries/Adafruit_TinyUSB_Arduino/examples/ 2>/dev/null)",
-      "Read(//home/dan/.platformio/packages/framework-arduinopico/libraries/Adafruit_TinyUSB_Arduino/examples/**)"
+      "Read(//home/dan/.platformio/packages/framework-arduinopico/libraries/Adafruit_TinyUSB_Arduino/examples/**)",
+      "Bash(~/.platformio/penv/bin/platformio run *)",
+      "Read(//home/dan/Desktop/mods/artists/xtra spice mikey/**)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3)",
+      "Bash(timeout 300 pio run)",
+      "Bash(which platformio *)",
+      "Read(//home/dan/.platformio/penv/bin/**)",
+      "Bash(ldconfig -p)",
+      "Read(//home/dan/Desktop/mods/**)",
+      "Bash(nm -D /usr/lib/x86_64-linux-gnu/libopenmpt.so.0)",
+      "Bash(python3 -c \"import ctypes; print\\('ok'\\)\")",
+      "Bash(python3 verify_structure.py)",
+      "Bash(sed -i 's/files if len\\(files\\) <= 60 else random.sample\\(files, 60\\)/files/' verify_structure.py)",
+      "Bash(timeout 280 python3 verify_deltadecode.py)",
+      "Bash(python3 -c \"import numpy; print\\(numpy.__version__\\)\")",
+      "Bash(pip install *)",
+      "Bash(python3 -c \"import numpy; print\\('numpy', numpy.__version__\\)\")",
+      "Bash(python3 -m venv /tmp/claude-1000/-home-dan-sync-projects-platformio-midiTracker/72e45c72-efd0-400d-86ac-c21cb950ce61/scratchpad/venv)",
+      "Bash(/tmp/claude-1000/-home-dan-sync-projects-platformio-midiTracker/72e45c72-efd0-400d-86ac-c21cb950ce61/scratchpad/venv/bin/pip install *)",
+      "Bash(/tmp/claude-1000/-home-dan-sync-projects-platformio-midiTracker/72e45c72-efd0-400d-86ac-c21cb950ce61/scratchpad/venv/bin/python3 -c \"import numpy; print\\('numpy', numpy.__version__\\)\")",
+      "Bash(timeout 110 ./venv/bin/python3 verify_deltadecode.py)"
     ]
   }
 }

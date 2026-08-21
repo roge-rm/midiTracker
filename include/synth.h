@@ -65,4 +65,70 @@ void allNotesOff();
 // a given polyphony, just how loud the result comes out. Defaults to 80.
 void setVolume(uint8_t percent);
 
+// -- WAV playback stream --------------------------------------------------
+//
+// A second, independent audio source mixed into the same per-sample
+// pipeline described above (renderSample() -> softLimit() -> g_i2s), since
+// the RP2040 doesn't have PIO/DMA resources to spare for a second I2S
+// output. Unlike noteOn()/etc, this is bulk continuous audio, not discrete
+// events, so it's fed through a small ring buffer rather than the
+// inter-core FIFO: WavPlayer (running on core 0, alongside SD/UI work)
+// pushes already-converted 44.1kHz interleaved stereo frames in; loop1()
+// (core 1) pops one frame per sample and mixes it in, distinctly per
+// channel -- WavPlayer is responsible for all format conversion (bit
+// depth, channel count, sample-rate resampling) before anything reaches
+// here, so this stream is always exactly 44.1kHz/stereo/int16, and core 1
+// never branches on source format.
+//
+// This ring buffer is the only cushion between a core-0 SD stall and an
+// audible dropout in the WAV stream (much like the I2S DMA buffer already
+// cushions core 1 itself against those same stalls -- see setup1()'s
+// comment). WavPlayer deliberately keeps it topped up regardless of
+// play/pause state (see wavStreamSetActive() below) rather than only
+// filling it while actively playing -- that way there's no startup gap
+// the moment playback (re)starts, since audibility and buffer-filling are
+// two independent things.
+
+// Full reset: empties the ring buffer, clears the ended/underrun flags,
+// and silences output (same as wavStreamSetActive(false)). Call on a
+// fresh load(), on close()/stop(), and on seekTo() -- anywhere the
+// buffered content no longer corresponds to the current read position and
+// needs to be discarded rather than continued from.
+void wavStreamReset();
+
+// Toggles whether the consumer actually mixes buffered frames into the
+// output -- pause()/play() call this alone (not wavStreamReset()), so a
+// brief pause doesn't throw away whatever's already buffered ahead.
+void wavStreamSetActive(bool active);
+
+// Pushes up to `count` interleaved stereo frames (2 int16 per frame).
+// Returns how many were actually accepted (0..count) -- never blocks, so
+// core 0 is never stalled waiting on core 1; a caller that gets back
+// fewer than requested should carry the remainder over to its next call.
+size_t wavStreamWrite(const int16_t* frames, size_t count);
+
+// Free space in frames, so a producer can size its next read/resample
+// batch instead of guessing or attempting a write it knows will be
+// partially rejected.
+size_t wavStreamFree();
+
+// No more source data coming (EOF reached). Once the consumer drains
+// what's already buffered, it stops mixing WAV audio in on its own --
+// this is a normal, expected drain, not treated as an underrun.
+void wavStreamEnd();
+
+// True if the consumer wanted a frame (stream active, not yet
+// wavStreamEnd()'d) and found the buffer empty since the last call to
+// this function -- auto-clears on read. Meant for a small on-screen
+// indicator; an underrun here means a momentary audio dropout, not a
+// crash.
+bool wavStreamTookUnderrun();
+
+// Temporary real-hardware diagnostic -- total individual sample periods
+// the consumer has ever found the buffer empty (monotonically
+// increasing, never resets) -- a real duration/severity measure, unlike
+// wavStreamTookUnderrun()'s one-shot boolean. Callers diff two readings
+// to see how many samples were actually dropped in a given window.
+uint32_t wavStreamUnderrunSamples();
+
 } // namespace Synth

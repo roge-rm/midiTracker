@@ -118,6 +118,52 @@ uint32_t g_noiseState = 0xACE1u; // xorshift32 seed, any nonzero value
 // that is needed.
 uint8_t g_masterVolume = 80;
 
+// -- WAV playback ring buffer (see Synth::wavStream*() in synth.h) --------
+// Single-producer (core 0, via Synth::wavStreamWrite()) / single-consumer
+// (core 1, inside renderSample() via popWavFrame()) lock-free ring of
+// interleaved stereo int16 frames. head/tail are stored as ever-
+// increasing counts rather than pre-masked indices (mask only applied at
+// index time) so "empty" (head==tail) and "full" (head-tail==capacity)
+// are unambiguous -- the standard SPSC ring shape. Each is written by
+// exactly one core and only ever read by the other, same "plain volatile
+// is enough, no mutex needed" reasoning as g_readyForPioInit above (RP2040
+// shares plain SRAM between cores with no cache-coherency hazard, and
+// size_t is a single 32-bit word here, read/written atomically by the
+// hardware regardless of `volatile`).
+const size_t WAV_RING_FRAMES = 8192; // power of two -- ~186ms at 44.1kHz, see synth.h
+const size_t WAV_RING_MASK = WAV_RING_FRAMES - 1;
+int16_t g_wavRing[WAV_RING_FRAMES * 2]; // interleaved L,R
+volatile size_t g_wavHead = 0; // producer-owned
+volatile size_t g_wavTail = 0; // consumer-owned
+volatile bool g_wavActive = false; // stream is live -- renderSample() should try to pop
+volatile bool g_wavEnded = false;  // no more source data -- empty means "done", not "underrun"
+volatile bool g_wavUnderrun = false;
+// Temporary real-hardware diagnostic (see xm_file.cpp's own g_xmDiag*
+// block, and Synth::wavStreamUnderrunSamples() below) -- g_wavUnderrun
+// alone is a check-and-clear boolean, polled once per producer update()
+// call; a SUSTAINED drought spanning many consecutive renderSample()
+// calls (core 1 runs at a fixed 44.1kHz, hardware-paced by g_i2s.write16()
+// blocking) would still only ever read back as a single "yes" if the
+// producer isn't polling every single sample, completely hiding how long
+// the drought actually lasted. This counts every individual sample
+// renderSample() couldn't pop, a real duration/severity measure -- added
+// specifically to test whether a busy passage's audible "song slows down"
+// symptom is a long, sustained underrun (this counter climbing fast) as
+// opposed to something else entirely.
+volatile uint32_t g_wavUnderrunSamples = 0;
+
+// Consumer-side pop, called once per sample from renderSample() while
+// g_wavActive. Returns false on empty (caller decides whether that means
+// "done" or "underrun" via g_wavEnded).
+bool popWavFrame(int16_t& outL, int16_t& outR) {
+    if (g_wavHead == g_wavTail) return false;
+    size_t idx = g_wavTail & WAV_RING_MASK;
+    outL = g_wavRing[idx * 2 + 0];
+    outR = g_wavRing[idx * 2 + 1];
+    g_wavTail++;
+    return true;
+}
+
 int16_t nextNoise() {
     g_noiseState ^= g_noiseState << 13;
     g_noiseState ^= g_noiseState >> 17;
@@ -445,15 +491,41 @@ int32_t softLimit(int32_t mix) {
     return mag * sign;
 }
 
-int16_t renderSample() {
+// Fills outLeft/outRight with this sample's mixed output. Synth voices
+// contribute identically to both channels (they were never stereo to
+// begin with), so mixL/mixR only actually diverge once a WAV stream
+// (genuinely stereo -- see popWavFrame()) is active; softLimit()/volume
+// then apply per-channel, same cost shape as the old single-channel path
+// (still one divide per channel per sample, not per voice).
+void renderSample(int16_t& outLeft, int16_t& outRight) {
     int32_t mix = 0;
     for (int i = 0; i < NUM_MELODIC_VOICES; i++) mix += renderVoice(g_melodicVoices[i]);
     for (int i = 0; i < NUM_DRUM_VOICES; i++) mix += renderVoice(g_drumVoices[i]);
-    int32_t limited = softLimit(mix);
-    // A single divide per sample (not per voice) is cheap even without
-    // hardware integer divide, so this doesn't need the shift-friendly
-    // treatment renderVoice()'s per-voice envelope scaling gets.
-    return (int16_t)((limited * (int32_t)g_masterVolume) / 100);
+
+    int32_t mixL = mix;
+    int32_t mixR = mix;
+
+    if (g_wavActive) {
+        int16_t wl, wr;
+        if (popWavFrame(wl, wr)) {
+            mixL += wl;
+            mixR += wr;
+        } else if (g_wavEnded) {
+            g_wavActive = false; // fully drained after EOF -- stop checking every sample
+        } else {
+            g_wavUnderrun = true;
+            g_wavUnderrunSamples++;
+        }
+    }
+
+    int32_t limitedL = softLimit(mixL);
+    int32_t limitedR = softLimit(mixR);
+    // A single divide per channel per sample (not per voice) is cheap
+    // even without hardware integer divide, so this doesn't need the
+    // shift-friendly treatment renderVoice()'s per-voice envelope scaling
+    // gets.
+    outLeft = (int16_t)((limitedL * (int32_t)g_masterVolume) / 100);
+    outRight = (int16_t)((limitedR * (int32_t)g_masterVolume) / 100);
 }
 
 } // namespace
@@ -492,6 +564,52 @@ void Synth::allNotesOff() {
 void Synth::setVolume(uint8_t percent) {
     if (percent > 100) percent = 100;
     rp2040.fifo.push(packVolumeMsg(percent));
+}
+
+// -- WAV playback stream (see synth.h) -- called from core 0 (WavPlayer);
+// g_wav* are the same anonymous-namespace globals renderSample() reads on
+// core 1, both cores sharing one address space/binary as usual on RP2040.
+
+void Synth::wavStreamReset() {
+    g_wavActive = false; // set first -- consumer stops looking before the buffer moves under it
+    g_wavHead = 0;
+    g_wavTail = 0;
+    g_wavEnded = false;
+    g_wavUnderrun = false;
+}
+
+void Synth::wavStreamSetActive(bool active) {
+    g_wavActive = active;
+}
+
+size_t Synth::wavStreamWrite(const int16_t* frames, size_t count) {
+    size_t free = WAV_RING_FRAMES - (g_wavHead - g_wavTail);
+    size_t n = count < free ? count : free;
+    for (size_t i = 0; i < n; i++) {
+        size_t idx = (g_wavHead + i) & WAV_RING_MASK;
+        g_wavRing[idx * 2 + 0] = frames[i * 2 + 0];
+        g_wavRing[idx * 2 + 1] = frames[i * 2 + 1];
+    }
+    g_wavHead += n;
+    return n;
+}
+
+size_t Synth::wavStreamFree() {
+    return WAV_RING_FRAMES - (g_wavHead - g_wavTail);
+}
+
+void Synth::wavStreamEnd() {
+    g_wavEnded = true;
+}
+
+bool Synth::wavStreamTookUnderrun() {
+    bool v = g_wavUnderrun;
+    g_wavUnderrun = false;
+    return v;
+}
+
+uint32_t Synth::wavStreamUnderrunSamples() {
+    return g_wavUnderrunSamples;
 }
 
 // Dual-core Arduino entry points: the earlephilhower core calls these on
@@ -577,6 +695,7 @@ void loop1() {
         if (velocity > 0) handleNoteOn(channel, note, velocity);
         else handleNoteOff(note);
     }
-    int16_t sample = renderSample();
-    g_i2s.write16(sample, sample); // blocks until DMA buffer space is free, paces this loop
+    int16_t left, right;
+    renderSample(left, right);
+    g_i2s.write16(left, right); // blocks until DMA buffer space is free, paces this loop
 }
