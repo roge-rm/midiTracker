@@ -32,7 +32,7 @@ A metronome, with optional count in, is included and features a visual indicator
 
 ### Settings
 
-Various settings can be setchanged and will be saved to the SD card to be loaded on boot. Currently the following items can be set:
+Various settings can be modified and will be saved to the SD card to be loaded on boot. Currently the following items can be set:
 
 BPM, time signature, clock source, loop length, sync mode, metronome, metronome volume, count in, count in bars, MIDI transport, MIDI thru
 
@@ -69,7 +69,7 @@ See `include/pins.h` for the exact pin map.
 
 ### Installation
 
-Mount your picoTracker in firmware update mode (through the menu if you are on the picoTracker firmware - or by holding the boot pin on the bottom and then connecting the USB cable) and copy the .uf2 file from the latest release to your SD card.
+Mount your picoTracker in firmware update mode (through the menu if you are on the picoTracker firmware - or by holding the boot pin on the bottom and then connecting the USB cable) and copy the .uf2 file from the latest release to your mounted device.
 
 You can also pull the source and build it yourself - this was made mostly by Claude in platformio on VS Code.
 
