@@ -2,8 +2,6 @@
 #include "pins.h"
 #include <I2S.h>
 #include <math.h>
-#include <hardware/pio.h>
-#include <hardware/dma.h>
 
 namespace {
 
@@ -626,20 +624,6 @@ void setup1() {
         g_sineTable[i] = (int16_t)(32000.0f * sinf(2.0f * (float)M_PI * i / SINE_TABLE_SIZE));
     }
 
-    // Snapshot free PIO state machines/DMA channels right before I2S tries
-    // to claim its own -- diagnostic-only (see the print below), a cheap
-    // early warning if a future PIO/DMA consumer gets added elsewhere and
-    // starts crowding this claim out again (see platformio.ini's
-    // RP2040_PIO_SPI comment for the history here).
-    int freeSm0 = 0, freeSm1 = 0, freeDma = 0;
-    for (int i = 0; i < 4; i++) {
-        if (!pio_sm_is_claimed(pio0, i)) freeSm0++;
-        if (!pio_sm_is_claimed(pio1, i)) freeSm1++;
-    }
-    for (int i = 0; i < (int)NUM_DMA_CHANNELS; i++) {
-        if (!dma_channel_is_claimed(i)) freeDma++;
-    }
-
     // Larger than the library default (6 buffers x 64 words, ~9ms) to
     // absorb brief core 1 stalls without an audible underrun/pop -- most
     // notably, core 0 and core 1 share the same flash XIP bus, so core 0
@@ -649,24 +633,7 @@ void setup1() {
     // is the right call here.
     g_i2s.setBuffers(8, 256);
     g_i2s.setBitsPerSample(16);
-    bool ok = g_i2s.begin(SAMPLE_RATE);
-
-    // Diagnostic only, doesn't gate audio (I2S is already initialized
-    // above regardless): lets a USB-serial console confirm whether the
-    // I2S peripheral (PIO state machine + DMA) actually came up, to
-    // separate "firmware never started sending I2S data" from "data is
-    // going out but the DAC isn't producing sound" (e.g. PCM5102 boards
-    // commonly need XSMT tied high or they stay soft-muted). A one-shot
-    // print this early in boot would otherwise almost always be missed --
-    // USB CDC enumeration plus the time to open a monitor easily exceeds
-    // the ~1s it takes to get here -- so wait (bounded, so a boot with no
-    // monitor attached never stalls) for one to actually connect first.
-    uint32_t waitStart = millis();
-    while (!Serial && millis() - waitStart < 8000) { delay(10); }
-    Serial.printf("[synth] before claim: free SMs pio0=%d pio1=%d, free DMA=%d\n",
-                  freeSm0, freeSm1, freeDma);
-    Serial.printf("[synth] I2S begin(%d Hz, BCLK=%d, DATA=%d) -> %s\n",
-                  SAMPLE_RATE, AUDIO_BCLK, AUDIO_SDATA, ok ? "OK" : "FAILED");
+    g_i2s.begin(SAMPLE_RATE);
 }
 
 void loop1() {

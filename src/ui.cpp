@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "battery.h"
 #include "pins.h"
 #include "keyboard_layout.h"
 #include <TFT_eSPI.h>
@@ -518,6 +519,7 @@ void drawBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffset) 
     // as everywhere else redundant alternate triggers go unmentioned.
     tft.drawString("UD move/ALT page  EDIT menu", 4, fy + 1);
     tft.drawString("ENTER open  LEFT/NAV back  ALT output", 4, fy + 17);
+    drawBatteryMeter();
 }
 
 void updateBrowserSelection(const SdBrowser& browser, int prevIndex, int newIndex, int scrollOffset) {
@@ -644,6 +646,7 @@ void drawPlayer(const char* filename, const MidiPlayer& player, MidiOutTarget ta
     // similarly weaves in ENTER+LEFT/RIGHT (scrub).
     tft.drawString("UD tempo/EDIT+UD vol  PLAY tog  EDIT aud", 4, fy + 1);
     tft.drawString("LEFT back/ENT+LR seek  ALT midi  NAV stop", 4, fy + 17);
+    drawBatteryMeter();
 }
 
 // Repaints only the volume half of its row (right side of ROW4, next to
@@ -833,6 +836,7 @@ void drawWavPlayer(const char* filename, const WavPlayer& player, int volume, bo
     // here, same weaving convention drawPlayer()'s footer uses.
     tft.drawString("EDIT+UD vol  PLAY tog", 4, fy + 1);
     tft.drawString("LEFT back  ENT+LR seek  NAV stop", 4, fy + 17);
+    drawBatteryMeter();
 }
 
 void updateWavPlayerState(WavPlayer::State state, bool stopped) {
@@ -950,6 +954,7 @@ void drawModPlayer(const char* filename, const ModPlayer& player, int volume, bo
     // WAV screen's footer already documents.
     tft.drawString("EDIT+UD vol  PLAY tog", 4, fy + 1);
     tft.drawString("LEFT back  NAV stop", 4, fy + 17);
+    drawBatteryMeter();
 }
 
 void updateModPlayerState(ModPlayer::State state, bool stopped) {
@@ -1059,6 +1064,7 @@ void drawS3mPlayer(const char* filename, const S3mPlayer& player, int volume, bo
     // bare-EDIT-tap action.
     tft.drawString("EDIT+UD vol  PLAY tog", 4, fy + 1);
     tft.drawString("LEFT back  NAV stop", 4, fy + 17);
+    drawBatteryMeter();
 }
 
 void updateS3mPlayerState(S3mPlayer::State state, bool stopped) {
@@ -1171,6 +1177,7 @@ void drawXmPlayer(const char* filename, const XmPlayer& player, int volume, bool
     // bare-EDIT-tap action.
     tft.drawString("EDIT+UD vol  PLAY tog", 4, fy + 1);
     tft.drawString("LEFT back  NAV stop", 4, fy + 17);
+    drawBatteryMeter();
 }
 
 void updateXmPlayerState(XmPlayer::State state, bool stopped) {
@@ -1221,6 +1228,7 @@ void drawNameEntryFooterLine2(const char* error) {
     tft.fillRect(0, fy + 16, tft.width(), FOOTER_HEIGHT - 16, COLOR_BG);
     tft.setTextColor(error ? COLOR_ERROR : COLOR_DIM, COLOR_BG);
     tft.drawString(error ? error : "DEL/OK on keyboard  NAV cancel", 4, fy + 17);
+    drawBatteryMeter();
 }
 
 void drawNameEntry(const char* title, const char* name, const char* suffix,
@@ -1324,6 +1332,7 @@ void drawModeSelect(const char* const* labels, int count, int cursor) {
     tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
     tft.setTextColor(COLOR_DIM, COLOR_BG);
     tft.drawString("UP/DN move  ENTER select", 4, fy + 1);
+    drawBatteryMeter();
 }
 
 void updateModeSelectCursor(const char* const* labels, int count, int prevCursor, int newCursor) {
@@ -1353,6 +1362,7 @@ void drawEntryMenu(const char* subtitle, const char* const* labels, int count, i
     tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
     tft.setTextColor(COLOR_DIM, COLOR_BG);
     tft.drawString("UP/DN move  ENTER select  NAV cancel", 4, fy + 1);
+    drawBatteryMeter();
 }
 
 void updateEntryMenuSelection(const char* const* labels, int count, int prevCursor, int newCursor) {
@@ -1404,6 +1414,7 @@ void drawConfirmDelete(const char* name, bool isDir, bool failed) {
     tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
     tft.setTextColor(COLOR_DIM, COLOR_BG);
     tft.drawString(failed ? "NAV/ENTER back" : "ENTER delete  NAV cancel", 4, fy + 1);
+    drawBatteryMeter();
 }
 
 void drawRecording(const char* filename, const MidiRecorder& recorder) {
@@ -1461,6 +1472,7 @@ void drawRecording(const char* filename, const MidiRecorder& recorder) {
     tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
     tft.setTextColor(COLOR_DIM, COLOR_BG);
     tft.drawString("NAV/LEFT stop & save  EDIT discard", 4, fy + 1);
+    drawBatteryMeter();
 }
 
 void updateRecordingLive(const MidiRecorder& recorder) {
@@ -1534,6 +1546,7 @@ void drawSysExCapture(const char* filename, const SysExRecorder& recorder) {
     tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
     tft.setTextColor(COLOR_DIM, COLOR_BG);
     tft.drawString("NAV/LEFT stop & save  EDIT discard", 4, fy + 1);
+    drawBatteryMeter();
 }
 
 void updateSysExCaptureLive(const SysExRecorder& recorder) {
@@ -1606,6 +1619,7 @@ void drawSysExPlayer(const char* filename, const SysExPlayer& player) {
     tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
     tft.setTextColor(COLOR_DIM, COLOR_BG);
     tft.drawString("NAV/LEFT stop", 4, fy + 1);
+    drawBatteryMeter();
 }
 
 void updateSysExPlayerLive(const SysExPlayer& player) {
@@ -1999,6 +2013,7 @@ void drawLooper(const LoopTrackView tracksArg[4], int selectedTrack, bool onBpmR
     // things instead of one pair doing the same thing.
     tft.drawString("UD row/ALT chan  PLAY pause  EDIT rec/bpm", 4, fy + 1);
     tft.drawString("L back/R mute/ALT bar  ENT menu  NAV stop", 4, fy + 17);
+    drawBatteryMeter();
 }
 
 void updateLooperPositions(const LoopTrackView tracksArg[4], int selectedTrack) {
@@ -2101,6 +2116,7 @@ void drawLooperCountIn(int beatsRemaining) {
     tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
     tft.setTextColor(COLOR_DIM, COLOR_BG);
     tft.drawString("Recording starts after the count-in", 4, fy + 1);
+    drawBatteryMeter();
 }
 
 void updateLooperCountInBeat(int beatsRemaining) {
@@ -2178,6 +2194,7 @@ void drawSettings(const char* const* labels, const char* const* values, int coun
     // plus NAV, both rows below it.
     tft.drawString("UD move", 4, fy + 1);
     tft.drawString("EDIT+LR change  LEFT/NAV back", 4, fy + 17);
+    drawBatteryMeter();
 }
 
 void updateSettingsSelection(const char* const* labels, const char* const* values, int count,
@@ -2255,6 +2272,57 @@ void drawMessage(const char* line1, const char* line2) {
     tft.drawString(line1, cx, line2 ? cy - 10 : cy);
     if (line2) tft.drawString(line2, cx, cy + 10);
     tft.setTextDatum(TL_DATUM);
+    drawBatteryMeter();
+}
+
+// Small vertical battery gauge in the bottom-right corner. Footer
+// button-hint text is left-aligned starting at x=4 and, even at its
+// widest ("LEFT back/ENT+LR seek  ALT midi  NAV stop" in drawWavPlayer()),
+// stays well clear of this corner, so it's free across every screen.
+// Called on main.cpp's own ~1s timer (not tied to Battery::update()'s
+// much slower ~15s actual sample rate) so the icon reappears quickly
+// after any screen transition wipes the footer, without paying that
+// cost anywhere near once per loop() iteration -- see main.cpp.
+// Redrawn from scratch every call (clear + outline + fill) rather than
+// diffed against the previous state: at a ~1s cadence and this size,
+// there's no meaningful cost to just always repainting it outright.
+void drawBatteryMeter() {
+    const int bodyW = 10, bodyH = 16;
+    const int termW = 4, termH = 2;
+    const int marginRight = 6;
+
+    int bodyX = tft.width() - marginRight - bodyW;
+    int termX = bodyX + (bodyW - termW) / 2;
+    int fy = tft.height() - FOOTER_HEIGHT;
+    int topY = fy + (FOOTER_HEIGHT - (bodyH + termH)) / 2;
+    int termY = topY;
+    int bodyY = topY + termH;
+
+    uint8_t pct = Battery::percentage();
+    bool charging = Battery::isCharging();
+
+    tft.fillRect(bodyX - 1, topY - 1, bodyW + 2, bodyH + termH + 2, COLOR_BG);
+
+    uint16_t fillColor = COLOR_TEXT;
+    if (charging) {
+        fillColor = COLOR_ACCENT;
+    } else if (pct <= 15) {
+        fillColor = COLOR_ERROR;
+    } else if (pct <= 30) {
+        fillColor = COLOR_DIM;
+    }
+
+    tft.drawRect(bodyX, bodyY, bodyW, bodyH, COLOR_DIM);
+    tft.fillRect(termX, termY, termW, termH, COLOR_DIM);
+
+    // Fill grows from the bottom, matching a physical battery's usual
+    // orientation with the terminal on top.
+    const int interiorH = bodyH - 2;
+    int filledH = (interiorH * pct) / 100;
+    if (pct > 0 && filledH == 0) filledH = 1; // always show *something* above 0%
+    if (filledH > 0) {
+        tft.fillRect(bodyX + 1, bodyY + 1 + (interiorH - filledH), bodyW - 2, filledH, fillColor);
+    }
 }
 
 } // namespace Ui
