@@ -4,6 +4,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
+#include <new> // std::nothrow, see tracks' declaration below
 
 #include "sd_card.h"
 #include "midi_output.h"
@@ -97,7 +98,16 @@ struct LoopTrack {
     bool bufferFull = false; // events[] hit MAX_EVENTS_PER_TRACK and further events are being silently dropped
 };
 
-LoopTrack tracks[NUM_TRACKS];
+// Allocated lazily by enter() (see below), not a permanent static global
+// -- at 131KB+ this is by far the single largest RAM consumer in the
+// firmware, and stays resident through ordinary trips to Settings/Mode
+// Select rather than being freed on every exit. Only freed via
+// freeTracksIfAllocated() (see looper_mode.h), which main.cpp calls at
+// the one point that actually needs the RAM back: entering File Player
+// mode. All 37 existing tracks[i]/LoopTrack& call sites throughout this
+// file are untouched by this -- T* and T[N] support operator[] identically.
+LoopTrack* tracks = nullptr;
+bool tracksAllocFailed = false; // set by enter() if the lazy allocation fails; see update()'s first line
 int selectedTrack = 0;
 // The row cursor is really 5 positions (4 tracks + BPM), circular --
 // selectedTrack always holds a valid track index (0..3) regardless, and
@@ -2228,19 +2238,17 @@ void handleBpmRowFocus() {
     }
 }
 
-// A held press (>= HOLD_THRESHOLD_MS at release) is the "All" version of
-// what the button does tapped: EDIT tap arms/records the selected track
+// A held EDIT press (>= HOLD_THRESHOLD_MS at release) is the "All Start"
+// version of what a tap does: EDIT tap arms/records the selected track
 // (see toggleRecordOnSelected()), EDIT held resumes every stopped track
-// with content ("All Start" -- unchanged from before this button's tap
-// meaning moved here from PLAY); NAV tap stops the selected track, NAV
-// held stops every running track ("All Stop"). Deciding on release
-// (rather than acting immediately on press) delays the single-track
-// action slightly, which is fine here -- neither arming nor stopping is
-// actually time-critical: arming just waits for a note to truly start
-// recording (see toggleRecordOnSelected()'s own comment), and stopping a
-// track a few tens of ms later than the physical press is imperceptible.
-// Both are no-ops while the BPM row is selected -- there's no track to
-// act on.
+// with content (unchanged from before this button's tap meaning moved
+// here from PLAY). Deciding on release (rather than acting immediately
+// on press) delays the single-track action slightly, which is fine here
+// -- arming isn't time-critical, it just waits for a note to truly start
+// recording (see toggleRecordOnSelected()'s own comment). Both are
+// no-ops while the BPM row is selected -- there's no track to act on.
+// (NAV's own hold gesture, just below, works differently -- see
+// handleStopInput()'s comment.)
 const uint32_t HOLD_THRESHOLD_MS = 500;
 
 void handleRecordInput() {
@@ -2272,18 +2280,35 @@ void handleMuteInput() {
     }
 }
 
+// NAV's "All Stop" fires the instant a continuous hold reaches
+// STOP_ALL_HOLD_MS, rather than waiting for release like EDIT's own held
+// gesture above -- "press and hold to stop everything" reads more
+// immediately than "press, hold, then let go" for a panic-stop action,
+// and there's no single-track ambiguity here to justify the release-time
+// delay EDIT's version relies on. Also unlike EDIT's, this works from
+// the BPM row too: stopping everything doesn't depend on which track is
+// selected, so there's no reason to make it a no-op there. A short tap
+// still stops just the selected track (toggleStopOnSelected(), decided
+// on release as before) -- but only from a track row, and only if the
+// hold above didn't already fire.
+const uint32_t STOP_ALL_HOLD_MS = 1000;
+
 void handleStopInput() {
     static uint32_t pressStartMs = 0;
-    if (Input::justPressed(BTN_NAV)) pressStartMs = millis();
+    static bool firedAllStop = false;
+    if (Input::justPressed(BTN_NAV)) {
+        pressStartMs = millis();
+        firedAllStop = false;
+    }
+    if (Input::isDown(BTN_NAV) && !firedAllStop && millis() - pressStartMs >= STOP_ALL_HOLD_MS) {
+        firedAllStop = true;
+        stopAllActiveTracks();
+        redrawAllTrackRows();
+    }
     if (Input::justReleased(BTN_NAV)) {
-        if (onBpmRow) return;
-        if (millis() - pressStartMs >= HOLD_THRESHOLD_MS) {
-            stopAllActiveTracks();
-            redrawAllTrackRows();
-        } else {
-            toggleStopOnSelected();
-            redrawTrackRow(selectedTrack);
-        }
+        if (firedAllStop || onBpmRow) return;
+        toggleStopOnSelected();
+        redrawTrackRow(selectedTrack);
     }
 }
 
@@ -3056,16 +3081,17 @@ void buildTrackViews(Ui::LoopTrackView out[4]) {
 }
 
 // Applies SettingsMode's current defaults as this mode's own live state
-// -- called from both begin() (boot) and enter() (switching into the
-// mode), but only while nothing's actually going on yet
-// (!anyTrackHasContent()), so this is how a Settings change becomes
-// visible without a reboot (just leave Settings and re-enter the looper)
-// while never silently overwriting a session already in progress just
-// because the user happened to also tweak an unrelated default. Per-
-// track barLength is the one exception worth calling out: it's normally
-// sticky per track (the user's own ALT+LEFT/RIGHT choice survives erase/
-// re-record), but with no track holding content yet there's nothing of
-// the user's to protect, so resetting all 4 here is safe.
+// -- called from enter() (switching into the mode; tracks is guaranteed
+// allocated by the time this runs, see enter()'s own comment), but only
+// while nothing's actually going on yet (!anyTrackHasContent()), so this
+// is how a Settings change becomes visible without a reboot (just leave
+// Settings and re-enter the looper) while never silently overwriting a
+// session already in progress just because the user happened to also
+// tweak an unrelated default. Per-track barLength is the one exception
+// worth calling out: it's normally sticky per track (the user's own
+// ALT+LEFT/RIGHT choice survives erase/re-record), but with no track
+// holding content yet there's nothing of the user's to protect, so
+// resetting all 4 here is safe.
 void applySettingsIfFresh() {
     if (anyTrackHasContent()) return;
     manualBpm = SettingsMode::defaultBpm();
@@ -3079,15 +3105,78 @@ void applySettingsIfFresh() {
     for (int i = 0; i < NUM_TRACKS; i++) tracks[i].barLength = SettingsMode::defaultBarLength();
 }
 
+// -- Free-tracks-for-File-Player gate -------------------------------------
+//
+// Deliberately independent of `screen`/update()'s own state machine --
+// see updateFreeTracksForFilePlayer()'s header comment in looper_mode.h
+// for why: it runs while FilePlayerMode is active and about to open a
+// .mod/.s3m file specifically (see its APP_FREE_LOOPER_RAM), not while
+// MODE_LOOPER is the active top-level mode.
+const char* const FREE_GATE_LABELS[] = { "Save & Continue", "Discard & Continue", "Cancel" };
+const int FREE_GATE_COUNT = 3;
+int freeGateCursor = 0;
+
 } // namespace
+
+bool hasUnsavedTrackContent() {
+    return tracks != nullptr && anyTrackHasContent();
+}
+
+void freeTracksIfAllocated() {
+    delete[] tracks;
+    tracks = nullptr;
+}
+
+void beginFreeTracksForFilePlayer() {
+    freeGateCursor = 0;
+    Ui::drawEntryMenu("Free RAM for File Player", FREE_GATE_LABELS, FREE_GATE_COUNT, freeGateCursor);
+}
+
+FreeTracksResult updateFreeTracksForFilePlayer() {
+    if (Input::justPressed(BTN_UP) && freeGateCursor > 0) {
+        int prev = freeGateCursor--;
+        Ui::updateEntryMenuSelection(FREE_GATE_LABELS, FREE_GATE_COUNT, prev, freeGateCursor);
+    }
+    if (Input::justPressed(BTN_DOWN) && freeGateCursor < FREE_GATE_COUNT - 1) {
+        int prev = freeGateCursor++;
+        Ui::updateEntryMenuSelection(FREE_GATE_LABELS, FREE_GATE_COUNT, prev, freeGateCursor);
+    }
+    if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
+        return FREE_TRACKS_CANCELLED; // tracks left exactly as it was
+    }
+    if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
+        if (freeGateCursor == 0) saveSession(); // "Save & Continue" -- reuses existing SD-write machinery unmodified
+        freeTracksIfAllocated();                // "Discard & Continue": nothing to do first -- just free
+        return FREE_TRACKS_DONE;
+    }
+    return FREE_TRACKS_PENDING;
+}
 
 void begin() {
     // /loops is created lazily on first Save -- nothing to pre-create for
-    // that. See applySettingsIfFresh()'s comment for what this call does.
-    applySettingsIfFresh();
+    // that. tracks[] itself is allocated lazily too (see enter()), so
+    // there's genuinely nothing to do here at startup -- deliberately NOT
+    // calling applySettingsIfFresh() here anymore, since it touches
+    // tracks[i] and tracks is still null at this point (begin() runs once
+    // at firmware boot, before the user has necessarily even chosen to
+    // enter Looper mode). enter()'s own call covers this instead, always
+    // after the allocation below has already run.
 }
 
 void enter() {
+    tracksAllocFailed = false;
+    if (!tracks) {
+        tracks = new (std::nothrow) LoopTrack[NUM_TRACKS];
+        if (!tracks) {
+            // Extremely unlikely given the RAM budget this was sized
+            // against, but fail safe rather than let anything below
+            // dereference a null tracks -- bounce back to Mode Select
+            // instead of pretending the looper is usable.
+            tracksAllocFailed = true;
+            showFlashMessage("Not enough RAM", "for looper", 1500);
+            return;
+        }
+    }
     MidiOutput::setInputHandler(handleIncomingMidi);
     MidiOutput::setRealtimeHandler(handleMidiRealtime);
     // Always land on the main screen with a track (not the BPM row or a
@@ -3096,12 +3185,20 @@ void enter() {
     screen = SCREEN_MAIN;
     onBpmRow = false;
     needsRedraw = true;
-    // Picks up any Settings change made since begin() (or the last
-    // enter()) -- see applySettingsIfFresh()'s comment.
+    // Picks up any Settings change made since the last enter() -- see
+    // applySettingsIfFresh()'s comment. Safe now that tracks is
+    // guaranteed non-null above.
     applySettingsIfFresh();
 }
 
 bool update() {
+    if (tracksAllocFailed) {
+        // enter() already drew the message via showFlashMessage(); just
+        // let it sit on screen for its duration, then bail out to Mode
+        // Select -- don't fall through to anything below, all of which
+        // assumes tracks != nullptr.
+        return millis() >= flashUntilMs;
+    }
     updatePlayback(); // always runs, regardless of which screen is up, so loops never stall for a menu/prompt
     updateBarQuantizedRecording();
     updateMetronome(); // same reasoning -- shouldn't stall for a menu/prompt either

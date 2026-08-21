@@ -2,16 +2,21 @@
 #include <Arduino.h>
 #include "config.h"
 
+// Meaningless for directories. FILE_MID/FILE_SYX/FILE_WAV/FILE_MOD/
+// FILE_S3M/FILE_XM, see isMidiFilename()/isSysExFilename()/isWavFilename()/
+// isModFilename()/isS3mFilename()/isXmFilename().
+enum FileKind { FILE_MID, FILE_SYX, FILE_WAV, FILE_MOD, FILE_S3M, FILE_XM };
+
 struct BrowserEntry {
     char name[MAX_FILENAME_LEN];
     bool isDir;
-    bool isSysEx; // false (and meaningless) for directories -- a .syx dump vs. a .mid file, see isSysExFilename()
+    FileKind kind;
     uint32_t size;
 };
 
 // Lists and navigates directories on the SD card, filtering to
-// directories and *.mid/*.MID/*.syx/*.SYX files. Call begin() once after
-// sdCardBegin() succeeds.
+// directories and *.mid/*.MID/*.syx/*.SYX/*.wav/*.WAV/*.mod/*.MOD/*.s3m/
+// *.S3M/*.xm/*.XM files. Call begin() once after sdCardBegin() succeeds.
 class SdBrowser {
 public:
     bool begin(const char* rootPath = BROWSE_ROOT);
@@ -48,4 +53,8 @@ private:
     void loadEntries();
     static bool isMidiFilename(const char* name);
     static bool isSysExFilename(const char* name);
+    static bool isWavFilename(const char* name);
+    static bool isModFilename(const char* name);
+    static bool isS3mFilename(const char* name);
+    static bool isXmFilename(const char* name);
 };

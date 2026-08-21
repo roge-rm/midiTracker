@@ -95,16 +95,13 @@ void setup() {
     Synth::begin();
 
     if (!sdOk) {
-        Ui::drawMessage("SD card not found", "check card / wiring");
+        Ui::drawMessage("SD card not found", "check card");
         while (true) { delay(1000); }
     }
 
     FilePlayerMode::begin();
-    // Strictly before LooperMode::begin() -- that reads SettingsMode's
-    // defaults (BPM, sync mode, metronome, etc.) to initialize its own
-    // starting state.
     SettingsMode::begin();
-    LooperMode::begin();
+    LooperMode::begin(); // no ordering requirement on SettingsMode anymore -- see its own comment
 }
 
 void loop() {

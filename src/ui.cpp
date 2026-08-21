@@ -501,7 +501,7 @@ void drawBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffset) 
 
     if (count == 0) {
         tft.setTextColor(COLOR_DIM, COLOR_BG);
-        tft.drawString("(no .mid/.syx files here)", 8, HEADER_HEIGHT + 8);
+        tft.drawString("(no .mid/.syx/.wav/.mod/.s3m files here)", 8, HEADER_HEIGHT + 8);
     } else if (count > rows) {
         drawScrollbar(count, scrollOffset, rows, HEADER_HEIGHT);
     }
@@ -702,6 +702,492 @@ void updatePlayerLive(const MidiPlayer& player) {
                      buf, g_lastTempoStr, sizeof(g_lastTempoStr));
 
     drawNoteStrip(PLAYER_STRIP_Y);
+}
+
+// -- WAV player screen -------------------------------------------------
+//
+// Reuses drawPlayer()'s row Y constants (PLAYER_FILENAME_Y/ROW2_Y/ROW4_Y/
+// ROW5_Y) and Ui::updateVolume() unchanged -- Volume sits at ROW4_Y's
+// right column, the same position MIDI's Tracks | Volume occupies,
+// specifically so handleVolumeHold() (shared verbatim between both
+// screens, see file_player_mode.cpp) can redraw Volume through the exact
+// same call without a WAV-specific variant; ROW4_Y's left column is left
+// blank rather than sharing the row with format info, which would
+// otherwise run into Volume's column on a long format string ("44100 Hz
+// 16-bit Stereo" is wider than the left column leaves room for). ROW3_Y
+// (Tempo, for MIDI) is unused here -- WAV has no per-file tempo. A steady
+// elapsed/total progress bar occupies ROW5_Y downward in place of the
+// note-activity strip (meaningless for audio) and MIDI-target/Audio rows
+// (neither applies to WAV), with the format info line below the bar,
+// where it has the full row width to itself.
+
+char g_lastWavTimeStr[24] = {0};
+char g_lastWavStateStr[16] = {0};
+
+const int WAV_BAR_Y = PLAYER_ROW5_Y + 4;
+const int WAV_BAR_H = 24;
+const int WAV_FORMAT_Y = WAV_BAR_Y + WAV_BAR_H + 6;
+
+const char* wavStateLabel(WavPlayer::State s, bool stopped) {
+    switch (s) {
+        case WavPlayer::STATE_PLAYING: return "Playing";
+        case WavPlayer::STATE_PAUSED:  return stopped ? "Stopped" : "Paused";
+        case WavPlayer::STATE_DONE:    return "Finished";
+        case WavPlayer::STATE_ERROR:   return "Error";
+        default:                       return "Idle";
+    }
+}
+
+// Steady elapsed/total fill -- no activity flash the way
+// drawSysExProgress() has, since WAV streaming isn't message-bursty the
+// way SysEx sending is.
+void drawWavProgressBar(const WavPlayer& player) {
+    uint32_t total = player.totalMs();
+    uint32_t elapsed = player.elapsedMs();
+    if (elapsed > total) elapsed = total;
+
+    int barX = 8, barW = tft.width() - 16;
+    tft.fillRect(barX, WAV_BAR_Y, barW, WAV_BAR_H, COLOR_DIM);
+    int fillW = total > 0 ? (int)(((uint64_t)barW * elapsed) / total) : 0;
+    if (fillW > 0) tft.fillRect(barX, WAV_BAR_Y, fillW, WAV_BAR_H, TFT_GREEN);
+}
+
+void drawWavPlayer(const char* filename, const WavPlayer& player, int volume, bool stopped) {
+    tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
+    tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString("Now Playing", 4, 3);
+    drawHeaderBrand();
+
+    tft.fillRect(0, HEADER_HEIGHT, tft.width(), PLAYER_FILENAME_Y - HEADER_HEIGHT, COLOR_BG);
+    tft.fillRect(0, PLAYER_FILENAME_Y, tft.width(), PLAYER_ROW2_Y - PLAYER_FILENAME_Y, COLOR_BG);
+    tft.setTextColor(COLOR_TEXT, COLOR_BG);
+    tft.drawString(filename, 8, PLAYER_FILENAME_Y);
+
+    tft.fillRect(0, PLAYER_ROW2_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
+    tft.setTextColor(COLOR_DIM, COLOR_BG);
+    tft.drawString(STATE_LABEL, 8, PLAYER_ROW2_Y);
+
+    // A fresh file: force every field below to draw for real on the
+    // first tick rather than skipping a stale match -- see drawPlayer()'s
+    // identical reasoning for g_lastTimeStr/g_lastStateStr.
+    g_lastWavTimeStr[0] = '\0';
+    g_lastWavStateStr[0] = '\0';
+    updateStatValue(8 + tft.textWidth(STATE_LABEL), PLAYER_ROW2_Y,
+                     wavStateLabel(player.state(), stopped), g_lastWavStateStr, sizeof(g_lastWavStateStr));
+
+    bool isError = player.state() == WavPlayer::STATE_ERROR;
+    tft.fillRect(0, PLAYER_ROW3_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
+    if (isError) {
+        // Same "error replaces everything below State" convention as
+        // drawPlayer() -- there's no Time/Volume/format to show for a
+        // file that never loaded.
+        tft.setTextColor(COLOR_ERROR, COLOR_BG);
+        tft.drawString(player.errorMessage(), 8, PLAYER_ROW3_Y);
+    } else {
+        tft.setTextColor(COLOR_DIM, COLOR_BG);
+        tft.drawString(TIME_LABEL, STAT_COL2_X, PLAYER_ROW2_Y);
+        char timeStr[24];
+        char elapsedBuf[16], totalBuf[16];
+        formatDuration(player.elapsedMs(), elapsedBuf, sizeof(elapsedBuf));
+        formatDuration(player.totalMs(), totalBuf, sizeof(totalBuf));
+        snprintf(timeStr, sizeof(timeStr), "%s / %s", elapsedBuf, totalBuf);
+        updateStatValue(STAT_COL2_X + tft.textWidth(TIME_LABEL), PLAYER_ROW2_Y,
+                         timeStr, g_lastWavTimeStr, sizeof(g_lastWavTimeStr));
+
+        // Clears through to WAV_BAR_Y, not just ROW_HEIGHT -- the two are
+        // a few px apart (a small gap before the bar), so clearing only
+        // ROW_HEIGHT left that gap uncleared, showing leftover browser
+        // text there. Same "clear through to the next row's Y, not just
+        // this row's own height" fix drawPlayer() already uses for its
+        // filename-to-State gap.
+        tft.fillRect(0, PLAYER_ROW4_Y, tft.width(), WAV_BAR_Y - PLAYER_ROW4_Y, COLOR_BG);
+        char volBuf[16];
+        snprintf(volBuf, sizeof(volBuf), "Volume: %d%%", volume);
+        drawStatRow(PLAYER_ROW4_Y, "", volBuf);
+
+        drawWavProgressBar(player);
+
+        // Same reasoning as the fillRect above -- clears from right after
+        // the bar's own bottom edge (not just this row's own height), so
+        // the small gap between the bar and this text doesn't go uncleared.
+        tft.fillRect(0, WAV_BAR_Y + WAV_BAR_H, tft.width(), (WAV_FORMAT_Y + ROW_HEIGHT) - (WAV_BAR_Y + WAV_BAR_H), COLOR_BG);
+        tft.setTextColor(COLOR_DIM, COLOR_BG);
+        char formatBuf[32];
+        snprintf(formatBuf, sizeof(formatBuf), "%lu Hz  %u-bit  %s",
+                 (unsigned long)player.sampleRate(), player.bitsPerSample(),
+                 player.channels() == 2 ? "Stereo" : "Mono");
+        tft.drawString(formatBuf, 8, WAV_FORMAT_Y);
+    }
+
+    int contentBottom = isError ? (PLAYER_ROW3_Y + ROW_HEIGHT) : (WAV_FORMAT_Y + ROW_HEIGHT);
+    int fy = tft.height() - FOOTER_HEIGHT;
+    if (fy > contentBottom) {
+        tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
+    }
+    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
+    tft.setTextColor(COLOR_DIM, COLOR_BG);
+    // No ALT (no MIDI output target -- WAV never goes out a MIDI port)
+    // and no bare-EDIT-tap action (WAV playback is always audible, no
+    // separate on/off toggle) -- EDIT only ever acts as a hold-modifier
+    // here, same weaving convention drawPlayer()'s footer uses.
+    tft.drawString("EDIT+UD vol  PLAY tog", 4, fy + 1);
+    tft.drawString("LEFT back  ENT+LR seek  NAV stop", 4, fy + 17);
+}
+
+void updateWavPlayerState(WavPlayer::State state, bool stopped) {
+    updateStatValue(8 + tft.textWidth(STATE_LABEL), PLAYER_ROW2_Y,
+                     wavStateLabel(state, stopped), g_lastWavStateStr, sizeof(g_lastWavStateStr));
+}
+
+void updateWavPlayerLive(const WavPlayer& player) {
+    // Same STATE_ERROR caveat as updatePlayerLive() -- callers must not
+    // use this across a transition into/out of it.
+    char timeStr[24];
+    char elapsedBuf[16], totalBuf[16];
+    formatDuration(player.elapsedMs(), elapsedBuf, sizeof(elapsedBuf));
+    formatDuration(player.totalMs(), totalBuf, sizeof(totalBuf));
+    snprintf(timeStr, sizeof(timeStr), "%s / %s", elapsedBuf, totalBuf);
+    updateStatValue(STAT_COL2_X + tft.textWidth(TIME_LABEL), PLAYER_ROW2_Y,
+                     timeStr, g_lastWavTimeStr, sizeof(g_lastWavTimeStr));
+
+    drawWavProgressBar(player);
+}
+
+// -- MOD player screen ---------------------------------------------------
+//
+// Same row-reuse convention as the WAV screen (PLAYER_FILENAME_Y/ROW2_Y/
+// ROW4_Y), and Volume again sits at ROW4_Y's right column so
+// handleVolumeHold() redraws it through the unchanged Ui::updateVolume()
+// call. No progress bar -- a tracker has no fixed total duration (it can
+// loop indefinitely, see ModPlayer's header comment) -- so Time is
+// elapsed-only, and pattern/row position plus format info fill the space
+// the WAV screen's bar/format-line would otherwise occupy.
+
+char g_lastModTimeStr[16] = {0};
+char g_lastModStateStr[16] = {0};
+char g_lastModPosStr[24] = {0};
+
+const int MOD_POS_Y = PLAYER_ROW5_Y;                 // "Pattern: N/M  Row: R"
+const int MOD_FORMAT_Y = MOD_POS_Y + ROW_HEIGHT + 6; // format info line
+
+const char* modStateLabel(ModPlayer::State s, bool stopped) {
+    switch (s) {
+        case ModPlayer::STATE_PLAYING: return "Playing";
+        case ModPlayer::STATE_PAUSED:  return stopped ? "Stopped" : "Paused";
+        case ModPlayer::STATE_DONE:    return "Finished";
+        case ModPlayer::STATE_ERROR:   return "Error";
+        default:                       return "Idle";
+    }
+}
+
+void drawModPlayer(const char* filename, const ModPlayer& player, int volume, bool stopped) {
+    tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
+    tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString("Now Playing", 4, 3);
+    drawHeaderBrand();
+
+    tft.fillRect(0, HEADER_HEIGHT, tft.width(), PLAYER_FILENAME_Y - HEADER_HEIGHT, COLOR_BG);
+    tft.fillRect(0, PLAYER_FILENAME_Y, tft.width(), PLAYER_ROW2_Y - PLAYER_FILENAME_Y, COLOR_BG);
+    tft.setTextColor(COLOR_TEXT, COLOR_BG);
+    tft.drawString(filename, 8, PLAYER_FILENAME_Y);
+
+    tft.fillRect(0, PLAYER_ROW2_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
+    tft.setTextColor(COLOR_DIM, COLOR_BG);
+    tft.drawString(STATE_LABEL, 8, PLAYER_ROW2_Y);
+
+    // A fresh file: force every field below to draw for real on the
+    // first tick -- same reasoning as drawWavPlayer()'s identical resets.
+    g_lastModTimeStr[0] = '\0';
+    g_lastModStateStr[0] = '\0';
+    g_lastModPosStr[0] = '\0';
+    updateStatValue(8 + tft.textWidth(STATE_LABEL), PLAYER_ROW2_Y,
+                     modStateLabel(player.state(), stopped), g_lastModStateStr, sizeof(g_lastModStateStr));
+
+    bool isError = player.state() == ModPlayer::STATE_ERROR;
+    tft.fillRect(0, PLAYER_ROW3_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
+    if (isError) {
+        tft.setTextColor(COLOR_ERROR, COLOR_BG);
+        tft.drawString(player.errorMessage(), 8, PLAYER_ROW3_Y);
+    } else {
+        tft.setTextColor(COLOR_DIM, COLOR_BG);
+        tft.drawString(TIME_LABEL, STAT_COL2_X, PLAYER_ROW2_Y);
+        char timeStr[16];
+        formatDuration(player.elapsedMs(), timeStr, sizeof(timeStr));
+        updateStatValue(STAT_COL2_X + tft.textWidth(TIME_LABEL), PLAYER_ROW2_Y,
+                         timeStr, g_lastModTimeStr, sizeof(g_lastModTimeStr));
+
+        // Clears through to MOD_POS_Y, not just ROW_HEIGHT -- same "avoid
+        // an uncleared gap" fix drawWavPlayer() needed for its own
+        // Volume-row-to-bar gap.
+        tft.fillRect(0, PLAYER_ROW4_Y, tft.width(), MOD_POS_Y - PLAYER_ROW4_Y, COLOR_BG);
+        char volBuf[16];
+        snprintf(volBuf, sizeof(volBuf), "Volume: %d%%", volume);
+        drawStatRow(PLAYER_ROW4_Y, "", volBuf);
+
+        tft.fillRect(0, MOD_POS_Y, tft.width(), (MOD_FORMAT_Y + ROW_HEIGHT) - MOD_POS_Y, COLOR_BG);
+        char posBuf[24];
+        snprintf(posBuf, sizeof(posBuf), "Pattern: %d/%d  Row: %d",
+                 player.patternOrderPosition(), player.songLength(), player.currentRow());
+        updateStatValue(8, MOD_POS_Y, posBuf, g_lastModPosStr, sizeof(g_lastModPosStr));
+
+        char formatBuf[32];
+        snprintf(formatBuf, sizeof(formatBuf), "%dch  %d instruments", player.channelCount(), player.instrumentCount());
+        tft.setTextColor(COLOR_DIM, COLOR_BG);
+        tft.drawString(formatBuf, 8, MOD_FORMAT_Y);
+    }
+
+    int contentBottom = isError ? (PLAYER_ROW3_Y + ROW_HEIGHT) : (MOD_FORMAT_Y + ROW_HEIGHT);
+    int fy = tft.height() - FOOTER_HEIGHT;
+    if (fy > contentBottom) {
+        tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
+    }
+    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
+    tft.setTextColor(COLOR_DIM, COLOR_BG);
+    // No ALT (no MIDI target), no seek (ModPlayer doesn't support it, see
+    // its header comment), no bare-EDIT-tap action -- same reasoning the
+    // WAV screen's footer already documents.
+    tft.drawString("EDIT+UD vol  PLAY tog", 4, fy + 1);
+    tft.drawString("LEFT back  NAV stop", 4, fy + 17);
+}
+
+void updateModPlayerState(ModPlayer::State state, bool stopped) {
+    updateStatValue(8 + tft.textWidth(STATE_LABEL), PLAYER_ROW2_Y,
+                     modStateLabel(state, stopped), g_lastModStateStr, sizeof(g_lastModStateStr));
+}
+
+void updateModPlayerLive(const ModPlayer& player) {
+    char timeStr[16];
+    formatDuration(player.elapsedMs(), timeStr, sizeof(timeStr));
+    updateStatValue(STAT_COL2_X + tft.textWidth(TIME_LABEL), PLAYER_ROW2_Y,
+                     timeStr, g_lastModTimeStr, sizeof(g_lastModTimeStr));
+
+    char posBuf[24];
+    snprintf(posBuf, sizeof(posBuf), "Pattern: %d/%d  Row: %d",
+             player.patternOrderPosition(), player.songLength(), player.currentRow());
+    updateStatValue(8, MOD_POS_Y, posBuf, g_lastModPosStr, sizeof(g_lastModPosStr));
+}
+
+// -- S3M player screen ---------------------------------------------------
+//
+// Identical layout/row-reuse convention to the MOD screen above (S3M is
+// also a tracker format with no fixed total duration, see S3mPlayer's
+// header comment) -- only the format info line's contents differ.
+
+char g_lastS3mTimeStr[16] = {0};
+char g_lastS3mStateStr[16] = {0};
+char g_lastS3mPosStr[24] = {0};
+
+const int S3M_POS_Y = PLAYER_ROW5_Y;                 // "Pattern: N/M  Row: R"
+const int S3M_FORMAT_Y = S3M_POS_Y + ROW_HEIGHT + 6; // format info line
+
+const char* s3mStateLabel(S3mPlayer::State s, bool stopped) {
+    switch (s) {
+        case S3mPlayer::STATE_PLAYING: return "Playing";
+        case S3mPlayer::STATE_PAUSED:  return stopped ? "Stopped" : "Paused";
+        case S3mPlayer::STATE_DONE:    return "Finished";
+        case S3mPlayer::STATE_ERROR:   return "Error";
+        default:                       return "Idle";
+    }
+}
+
+void drawS3mPlayer(const char* filename, const S3mPlayer& player, int volume, bool stopped) {
+    tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
+    tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString("Now Playing", 4, 3);
+    drawHeaderBrand();
+
+    tft.fillRect(0, HEADER_HEIGHT, tft.width(), PLAYER_FILENAME_Y - HEADER_HEIGHT, COLOR_BG);
+    tft.fillRect(0, PLAYER_FILENAME_Y, tft.width(), PLAYER_ROW2_Y - PLAYER_FILENAME_Y, COLOR_BG);
+    tft.setTextColor(COLOR_TEXT, COLOR_BG);
+    tft.drawString(filename, 8, PLAYER_FILENAME_Y);
+
+    tft.fillRect(0, PLAYER_ROW2_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
+    tft.setTextColor(COLOR_DIM, COLOR_BG);
+    tft.drawString(STATE_LABEL, 8, PLAYER_ROW2_Y);
+
+    // A fresh file: force every field below to draw for real on the
+    // first tick -- same reasoning as drawModPlayer()'s identical resets.
+    g_lastS3mTimeStr[0] = '\0';
+    g_lastS3mStateStr[0] = '\0';
+    g_lastS3mPosStr[0] = '\0';
+    updateStatValue(8 + tft.textWidth(STATE_LABEL), PLAYER_ROW2_Y,
+                     s3mStateLabel(player.state(), stopped), g_lastS3mStateStr, sizeof(g_lastS3mStateStr));
+
+    bool isError = player.state() == S3mPlayer::STATE_ERROR;
+    tft.fillRect(0, PLAYER_ROW3_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
+    if (isError) {
+        tft.setTextColor(COLOR_ERROR, COLOR_BG);
+        tft.drawString(player.errorMessage(), 8, PLAYER_ROW3_Y);
+    } else {
+        tft.setTextColor(COLOR_DIM, COLOR_BG);
+        tft.drawString(TIME_LABEL, STAT_COL2_X, PLAYER_ROW2_Y);
+        char timeStr[16];
+        formatDuration(player.elapsedMs(), timeStr, sizeof(timeStr));
+        updateStatValue(STAT_COL2_X + tft.textWidth(TIME_LABEL), PLAYER_ROW2_Y,
+                         timeStr, g_lastS3mTimeStr, sizeof(g_lastS3mTimeStr));
+
+        // Same "clear through to the next content's Y" gap-fix as
+        // drawModPlayer()/drawWavPlayer().
+        tft.fillRect(0, PLAYER_ROW4_Y, tft.width(), S3M_POS_Y - PLAYER_ROW4_Y, COLOR_BG);
+        char volBuf[16];
+        snprintf(volBuf, sizeof(volBuf), "Volume: %d%%", volume);
+        drawStatRow(PLAYER_ROW4_Y, "", volBuf);
+
+        tft.fillRect(0, S3M_POS_Y, tft.width(), (S3M_FORMAT_Y + ROW_HEIGHT) - S3M_POS_Y, COLOR_BG);
+        char posBuf[24];
+        snprintf(posBuf, sizeof(posBuf), "Pattern: %d/%d  Row: %d",
+                 player.patternOrderPosition(), player.songLength(), player.currentRow());
+        updateStatValue(8, S3M_POS_Y, posBuf, g_lastS3mPosStr, sizeof(g_lastS3mPosStr));
+
+        char formatBuf[32];
+        snprintf(formatBuf, sizeof(formatBuf), "%dch  %d instruments", player.channelCount(), player.instrumentCount());
+        tft.setTextColor(COLOR_DIM, COLOR_BG);
+        tft.drawString(formatBuf, 8, S3M_FORMAT_Y);
+    }
+
+    int contentBottom = isError ? (PLAYER_ROW3_Y + ROW_HEIGHT) : (S3M_FORMAT_Y + ROW_HEIGHT);
+    int fy = tft.height() - FOOTER_HEIGHT;
+    if (fy > contentBottom) {
+        tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
+    }
+    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
+    tft.setTextColor(COLOR_DIM, COLOR_BG);
+    // Same footer reasoning as drawModPlayer() -- no ALT, no seek, no
+    // bare-EDIT-tap action.
+    tft.drawString("EDIT+UD vol  PLAY tog", 4, fy + 1);
+    tft.drawString("LEFT back  NAV stop", 4, fy + 17);
+}
+
+void updateS3mPlayerState(S3mPlayer::State state, bool stopped) {
+    updateStatValue(8 + tft.textWidth(STATE_LABEL), PLAYER_ROW2_Y,
+                     s3mStateLabel(state, stopped), g_lastS3mStateStr, sizeof(g_lastS3mStateStr));
+}
+
+void updateS3mPlayerLive(const S3mPlayer& player) {
+    char timeStr[16];
+    formatDuration(player.elapsedMs(), timeStr, sizeof(timeStr));
+    updateStatValue(STAT_COL2_X + tft.textWidth(TIME_LABEL), PLAYER_ROW2_Y,
+                     timeStr, g_lastS3mTimeStr, sizeof(g_lastS3mTimeStr));
+
+    char posBuf[24];
+    snprintf(posBuf, sizeof(posBuf), "Pattern: %d/%d  Row: %d",
+             player.patternOrderPosition(), player.songLength(), player.currentRow());
+    updateStatValue(8, S3M_POS_Y, posBuf, g_lastS3mPosStr, sizeof(g_lastS3mPosStr));
+}
+
+// -- XM player screen -----------------------------------------------------
+//
+// Identical layout/row-reuse convention to the S3M screen above (XM is
+// also a tracker format with no fixed total duration, see XmPlayer's
+// header comment) -- only the format info line's contents differ.
+
+char g_lastXmTimeStr[16] = {0};
+char g_lastXmStateStr[16] = {0};
+char g_lastXmPosStr[24] = {0};
+
+const int XM_POS_Y = PLAYER_ROW5_Y;                // "Pattern: N/M  Row: R"
+const int XM_FORMAT_Y = XM_POS_Y + ROW_HEIGHT + 6; // format info line
+
+const char* xmStateLabel(XmPlayer::State s, bool stopped) {
+    switch (s) {
+        case XmPlayer::STATE_PLAYING: return "Playing";
+        case XmPlayer::STATE_PAUSED:  return stopped ? "Stopped" : "Paused";
+        case XmPlayer::STATE_DONE:    return "Finished";
+        case XmPlayer::STATE_ERROR:   return "Error";
+        default:                      return "Idle";
+    }
+}
+
+void drawXmPlayer(const char* filename, const XmPlayer& player, int volume, bool stopped) {
+    tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
+    tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString("Now Playing", 4, 3);
+    drawHeaderBrand();
+
+    tft.fillRect(0, HEADER_HEIGHT, tft.width(), PLAYER_FILENAME_Y - HEADER_HEIGHT, COLOR_BG);
+    tft.fillRect(0, PLAYER_FILENAME_Y, tft.width(), PLAYER_ROW2_Y - PLAYER_FILENAME_Y, COLOR_BG);
+    tft.setTextColor(COLOR_TEXT, COLOR_BG);
+    tft.drawString(filename, 8, PLAYER_FILENAME_Y);
+
+    tft.fillRect(0, PLAYER_ROW2_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
+    tft.setTextColor(COLOR_DIM, COLOR_BG);
+    tft.drawString(STATE_LABEL, 8, PLAYER_ROW2_Y);
+
+    // A fresh file: force every field below to draw for real on the
+    // first tick -- same reasoning as drawS3mPlayer()'s identical resets.
+    g_lastXmTimeStr[0] = '\0';
+    g_lastXmStateStr[0] = '\0';
+    g_lastXmPosStr[0] = '\0';
+    updateStatValue(8 + tft.textWidth(STATE_LABEL), PLAYER_ROW2_Y,
+                     xmStateLabel(player.state(), stopped), g_lastXmStateStr, sizeof(g_lastXmStateStr));
+
+    bool isError = player.state() == XmPlayer::STATE_ERROR;
+    tft.fillRect(0, PLAYER_ROW3_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
+    if (isError) {
+        tft.setTextColor(COLOR_ERROR, COLOR_BG);
+        tft.drawString(player.errorMessage(), 8, PLAYER_ROW3_Y);
+    } else {
+        tft.setTextColor(COLOR_DIM, COLOR_BG);
+        tft.drawString(TIME_LABEL, STAT_COL2_X, PLAYER_ROW2_Y);
+        char timeStr[16];
+        formatDuration(player.elapsedMs(), timeStr, sizeof(timeStr));
+        updateStatValue(STAT_COL2_X + tft.textWidth(TIME_LABEL), PLAYER_ROW2_Y,
+                         timeStr, g_lastXmTimeStr, sizeof(g_lastXmTimeStr));
+
+        // Same "clear through to the next content's Y" gap-fix as
+        // drawS3mPlayer()/drawModPlayer().
+        tft.fillRect(0, PLAYER_ROW4_Y, tft.width(), XM_POS_Y - PLAYER_ROW4_Y, COLOR_BG);
+        char volBuf[16];
+        snprintf(volBuf, sizeof(volBuf), "Volume: %d%%", volume);
+        drawStatRow(PLAYER_ROW4_Y, "", volBuf);
+
+        tft.fillRect(0, XM_POS_Y, tft.width(), (XM_FORMAT_Y + ROW_HEIGHT) - XM_POS_Y, COLOR_BG);
+        char posBuf[24];
+        snprintf(posBuf, sizeof(posBuf), "Pattern: %d/%d  Row: %d",
+                 player.patternOrderPosition(), player.songLength(), player.currentRow());
+        updateStatValue(8, XM_POS_Y, posBuf, g_lastXmPosStr, sizeof(g_lastXmPosStr));
+
+        // XM channel counts legitimately run up to 32 (vs S3M's ~16 in
+        // practice) -- still just 2 digits, fits this row exactly like
+        // S3M's identical format line does.
+        char formatBuf[32];
+        snprintf(formatBuf, sizeof(formatBuf), "%dch  %d instruments", player.channelCount(), player.instrumentCount());
+        tft.setTextColor(COLOR_DIM, COLOR_BG);
+        tft.drawString(formatBuf, 8, XM_FORMAT_Y);
+    }
+
+    int contentBottom = isError ? (PLAYER_ROW3_Y + ROW_HEIGHT) : (XM_FORMAT_Y + ROW_HEIGHT);
+    int fy = tft.height() - FOOTER_HEIGHT;
+    if (fy > contentBottom) {
+        tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
+    }
+    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
+    tft.setTextColor(COLOR_DIM, COLOR_BG);
+    // Same footer reasoning as drawS3mPlayer() -- no ALT, no seek, no
+    // bare-EDIT-tap action.
+    tft.drawString("EDIT+UD vol  PLAY tog", 4, fy + 1);
+    tft.drawString("LEFT back  NAV stop", 4, fy + 17);
+}
+
+void updateXmPlayerState(XmPlayer::State state, bool stopped) {
+    updateStatValue(8 + tft.textWidth(STATE_LABEL), PLAYER_ROW2_Y,
+                     xmStateLabel(state, stopped), g_lastXmStateStr, sizeof(g_lastXmStateStr));
+}
+
+void updateXmPlayerLive(const XmPlayer& player) {
+    char timeStr[16];
+    formatDuration(player.elapsedMs(), timeStr, sizeof(timeStr));
+    updateStatValue(STAT_COL2_X + tft.textWidth(TIME_LABEL), PLAYER_ROW2_Y,
+                     timeStr, g_lastXmTimeStr, sizeof(g_lastXmTimeStr));
+
+    char posBuf[24];
+    snprintf(posBuf, sizeof(posBuf), "Pattern: %d/%d  Row: %d",
+             player.patternOrderPosition(), player.songLength(), player.currentRow());
+    updateStatValue(8, XM_POS_Y, posBuf, g_lastXmPosStr, sizeof(g_lastXmPosStr));
 }
 
 // Draws a single keyboard key at its grid position, highlighted or not.

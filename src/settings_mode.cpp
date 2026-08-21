@@ -565,13 +565,11 @@ namespace SettingsMode
 
             if (Input::justPressed(BTN_UP))
             {
-                if (cursor > 0)
-                    moveCursor(cursor - 1);
+                moveCursor(cursor > 0 ? cursor - 1 : SETTING_COUNT - 1);
             }
             if (Input::justPressed(BTN_DOWN))
             {
-                if (cursor < SETTING_COUNT - 1)
-                    moveCursor(cursor + 1);
+                moveCursor(cursor < SETTING_COUNT - 1 ? cursor + 1 : 0);
             }
             if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT))
             {

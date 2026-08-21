@@ -2,6 +2,10 @@
 #include <Arduino.h>
 #include "sd_browser.h"
 #include "midi_file.h"
+#include "wav_file.h"
+#include "mod_file.h"
+#include "s3m_file.h"
+#include "xm_file.h"
 #include "midi_output.h"
 #include "midi_recorder.h"
 #include "sysex_recorder.h"
@@ -77,6 +81,68 @@ void updatePlayerOutputTarget(MidiOutTarget target);
 // Cheap partial redraw of just the Audio on/off half of its row, e.g.
 // after EDIT toggles the onboard synth. Does not touch the MIDI field.
 void updatePlayerAudioState(bool audioOn);
+
+// Full redraw of the WAV "Now Playing" screen -- Filename/State/Time
+// (total known up front, unlike MidiPlayer)/Volume/format info (sample
+// rate, bit depth, channel count), no Tempo/Tracks/MIDI-target rows since
+// none apply to WAV playback. `stopped` is the same NAV-vs-PLAY-pause
+// distinction drawPlayer() uses, see updatePlayerState()'s comment.
+void drawWavPlayer(const char* filename, const WavPlayer& player, int volume, bool stopped);
+
+// Cheap partial redraw of just the State value -- same convention as
+// updatePlayerState(), including the same STATE_ERROR caveat: a
+// transition into or out of STATE_ERROR swaps the whole screen layout
+// (see drawWavPlayer()), so use that instead in that case.
+void updateWavPlayerState(WavPlayer::State state, bool stopped);
+
+// Cheap partial redraw of the WAV screen's elapsed-time row. Meant to be
+// called at a low fixed rate while STATE_PLAYING, and as a one-off after
+// a seek/NAV-stop (Time changed then too). Does not touch Filename/State/
+// Volume/format rows.
+void updateWavPlayerLive(const WavPlayer& player);
+
+// Full redraw of the MOD "Now Playing" screen -- Filename/State/Time
+// (elapsed only, no fixed total -- a tracker's song can loop
+// indefinitely, see ModPlayer's header comment)/Volume/`Pattern: N/M
+// Row: R` position/format info (channel and instrument counts). No
+// progress bar (no fixed total to show progress against), no seek
+// controls (ModPlayer doesn't support seeking).
+void drawModPlayer(const char* filename, const ModPlayer& player, int volume, bool stopped);
+
+// Cheap partial redraw of just the State value -- same convention as
+// updateWavPlayerState()/updatePlayerState().
+void updateModPlayerState(ModPlayer::State state, bool stopped);
+
+// Cheap partial redraw of the MOD screen's elapsed-time and pattern-
+// position rows. Meant to be called at a low fixed rate while
+// STATE_PLAYING. Does not touch Filename/State/Volume/format rows.
+void updateModPlayerLive(const ModPlayer& player);
+
+// Full redraw of the S3M "Now Playing" screen -- same layout as
+// drawModPlayer() (Filename/State/Time elapsed-only/Volume/`Pattern: N/M
+// Row: R`/format info), adapted for S3M's own channel/instrument counts.
+void drawS3mPlayer(const char* filename, const S3mPlayer& player, int volume, bool stopped);
+
+// Cheap partial redraw of just the State value -- same convention as
+// updateModPlayerState().
+void updateS3mPlayerState(S3mPlayer::State state, bool stopped);
+
+// Cheap partial redraw of the S3M screen's elapsed-time and pattern-
+// position rows -- same convention as updateModPlayerLive().
+void updateS3mPlayerLive(const S3mPlayer& player);
+
+// Full redraw of the XM "Now Playing" screen -- same layout as
+// drawS3mPlayer() (Filename/State/Time elapsed-only/Volume/`Pattern: N/M
+// Row: R`/format info), adapted for XM's own channel/instrument counts.
+void drawXmPlayer(const char* filename, const XmPlayer& player, int volume, bool stopped);
+
+// Cheap partial redraw of just the State value -- same convention as
+// updateS3mPlayerState().
+void updateXmPlayerState(XmPlayer::State state, bool stopped);
+
+// Cheap partial redraw of the XM screen's elapsed-time and pattern-
+// position rows -- same convention as updateS3mPlayerLive().
+void updateXmPlayerLive(const XmPlayer& player);
 
 // Full redraw of the on-screen QWERTY name entry screen shared by New
 // Recording, New Folder, and Rename. `title` labels what's being named,

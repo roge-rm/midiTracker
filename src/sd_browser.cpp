@@ -17,6 +17,34 @@ bool SdBrowser::isSysExFilename(const char* name) {
     return strcasecmp(ext, ".syx") == 0;
 }
 
+bool SdBrowser::isWavFilename(const char* name) {
+    size_t len = strlen(name);
+    if (len < 4) return false;
+    const char* ext = name + (len - 4);
+    return strcasecmp(ext, ".wav") == 0;
+}
+
+bool SdBrowser::isModFilename(const char* name) {
+    size_t len = strlen(name);
+    if (len < 4) return false;
+    const char* ext = name + (len - 4);
+    return strcasecmp(ext, ".mod") == 0;
+}
+
+bool SdBrowser::isS3mFilename(const char* name) {
+    size_t len = strlen(name);
+    if (len < 4) return false;
+    const char* ext = name + (len - 4);
+    return strcasecmp(ext, ".s3m") == 0;
+}
+
+bool SdBrowser::isXmFilename(const char* name) {
+    size_t len = strlen(name);
+    if (len < 3) return false;
+    const char* ext = name + (len - 3);
+    return strcasecmp(ext, ".xm") == 0;
+}
+
 bool SdBrowser::begin(const char* rootPath) {
     strncpy(_path, rootPath, sizeof(_path) - 1);
     _path[sizeof(_path) - 1] = '\0';
@@ -47,12 +75,16 @@ void SdBrowser::loadEntries() {
         if (nameBuf[0] != '.' && !file.isHidden()) {
             bool isDir = file.isDir();
             bool isSysEx = !isDir && isSysExFilename(nameBuf);
-            if (isDir || isMidiFilename(nameBuf) || isSysEx) {
+            bool isWav = !isDir && !isSysEx && isWavFilename(nameBuf);
+            bool isMod = !isDir && !isSysEx && !isWav && isModFilename(nameBuf);
+            bool isS3m = !isDir && !isSysEx && !isWav && !isMod && isS3mFilename(nameBuf);
+            bool isXm = !isDir && !isSysEx && !isWav && !isMod && !isS3m && isXmFilename(nameBuf);
+            if (isDir || isMidiFilename(nameBuf) || isSysEx || isWav || isMod || isS3m || isXm) {
                 BrowserEntry& e = _entries[_count];
                 strncpy(e.name, nameBuf, sizeof(e.name) - 1);
                 e.name[sizeof(e.name) - 1] = '\0';
                 e.isDir = isDir;
-                e.isSysEx = isSysEx;
+                e.kind = isSysEx ? FILE_SYX : (isWav ? FILE_WAV : (isMod ? FILE_MOD : (isS3m ? FILE_S3M : (isXm ? FILE_XM : FILE_MID))));
                 e.size = isDir ? 0 : (uint32_t)file.fileSize();
                 _count++;
             }
