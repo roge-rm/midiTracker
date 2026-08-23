@@ -13,6 +13,41 @@ namespace {
 // S3mPlayer's identical AMIGA_PAL_CLOCK comment on why (no hardware FPU).
 const float AMIGA_PAL_CLOCK = 7093789.2f;
 
+// _mixShift budgets headroom for this many simultaneous full-volume
+// channels, capped well below MAX_CHANNELS (32) -- see _mixShift's own
+// comment for why a literal all-channels-at-once budget was needlessly
+// quiet for real music, and softClampMix() below for what absorbs the
+// (rare) moments actual content exceeds this budget. Same cap, same
+// reasoning, duplicated in ModPlayer::load()/S3mPlayer::load().
+//
+// No longer actually used to compute _mixShift (see load()) -- capping at
+// 8 channels only ever reduced the shift for files with *more* than 8
+// channels, so an <=8-channel file got zero benefit and stayed shifted by
+// its full literal channel count. Real-hardware listening found tracker
+// playback still noticeably quieter than WAV/MIDI even after that fix.
+// Kept here only as a reminder of that dead end; _mixShift is
+// unconditionally 0 now, relying entirely on softClampMix() for safety.
+const int MIX_SHIFT_TYPICAL_CHANNELS = 8;
+
+// Soft knee above SOFT_KNEE_START, hard ceiling at HARD_LIMIT -- same
+// shape and same constants as Synth's own softLimit() in synth.cpp (kept
+// independent here rather than shared/exported, matching this file's
+// existing convention of parallel, cross-referenced per-engine mixing
+// code rather than a shared utility -- see e.g. readChannelSample()'s
+// comment). Replaces mixOneSample()'s previous bare +-32767 clamp, which
+// a real-hardware investigation had flagged as a suspect for audible pops
+// (see g_xmDiagClips/g_xmDiagMaxAbsPreClamp below) -- now that
+// MIX_SHIFT_TYPICAL_CHANNELS budgets less headroom than a literal
+// all-channels-at-once bound, that clamp is more likely to actually
+// trigger, so it needs to compress gracefully instead of cutting off flat.
+int32_t softClampMix(int32_t mix) {
+    int32_t sign = (mix < 0) ? -1 : 1;
+    int32_t mag = mix * sign;
+    if (mag > 24576) mag = 24576 + (mag - 24576) / 4;
+    if (mag > 32000) mag = 32000;
+    return mag * sign;
+}
+
 } // namespace
 
 // -- Temporary real-hardware diagnostics -------------------------------
@@ -21,6 +56,12 @@ const float AMIGA_PAL_CLOCK = 7093789.2f;
 // the hot paths, printed once a second, removed once no longer needed.
 // Not gated behind a build flag -- meant to be deleted outright once the
 // investigation this was added for is done.
+//
+// Silenced (not deleted) for now -- flip back to true to get the once/sec
+// Serial print back; the counters themselves keep accumulating either
+// way (cheap, harmless), only the print+reset is skipped while this is
+// false. Same flag/reasoning as S3mPlayer's own DIAG_PRINT_ENABLED.
+const bool DIAG_PRINT_ENABLED = false;
 uint32_t g_xmDiagCalls = 0, g_xmDiagProduced = 0, g_xmDiagPeakOut = 0;
 uint32_t g_xmDiagBusyUs = 0, g_xmDiagMaxUs = 0;
 uint32_t g_xmDiagMinFree = 0xFFFFFFFF;
@@ -145,8 +186,10 @@ bool XmPlayer::load(const char* path) {
     _linearFreqTable = (flags & 0x01) != 0;
     _fileNumChannels = numChannelsReal;
     _numChannels = (numChannelsReal < (uint16_t)MAX_CHANNELS) ? (int)numChannelsReal : MAX_CHANNELS;
+    // See _mixShift's declaration and MIX_SHIFT_TYPICAL_CHANNELS's comment --
+    // no channel-count-based headroom shift at all anymore, relying
+    // entirely on softClampMix() for safety.
     _mixShift = 0;
-    while ((1 << _mixShift) < _numChannels) _mixShift++;
 
     // Order table: always exactly 256 bytes regardless of songLen.
     if (_file.read(_orderTable, MAX_ORDERS) != MAX_ORDERS) {
@@ -730,12 +773,21 @@ void __not_in_flash_func(XmPlayer::mixOneSample)(int16_t& outL, int16_t& outR) {
     // same reasoning as readChannelSample()'s identical fix.
     mixL = ((mixL >> _mixShift) * (int32_t)_globalVolume) >> 6;
     mixR = ((mixR >> _mixShift) * (int32_t)_globalVolume) >> 6;
+    // Even with _mixShift's channel-count-based headroom removed entirely
+    // (see its declaration), real-hardware A/B listening against WAV/MIDI
+    // still found tracker playback a bit quiet, so a further +25% makeup
+    // gain here closes most of that remaining gap. Applied before the
+    // diagnostics below so they measure what actually reaches
+    // softClampMix(), not the pre-boost level.
+    mixL += mixL >> 2;
+    mixR += mixR >> 2;
     int32_t absL = mixL < 0 ? -mixL : mixL;
     int32_t absR = mixR < 0 ? -mixR : mixR;
     int32_t absMax = absL > absR ? absL : absR;
     if (absMax > g_xmDiagMaxAbsPreClamp) g_xmDiagMaxAbsPreClamp = absMax;
-    if (mixL > 32767) { mixL = 32767; g_xmDiagClips++; } else if (mixL < -32768) { mixL = -32768; g_xmDiagClips++; }
-    if (mixR > 32767) { mixR = 32767; g_xmDiagClips++; } else if (mixR < -32768) { mixR = -32768; g_xmDiagClips++; }
+    if (absMax > 24576) g_xmDiagClips++; // now counts soft-knee engagement, not hard clips -- see softClampMix()
+    mixL = softClampMix(mixL);
+    mixR = softClampMix(mixR);
     outL = (int16_t)mixL;
     outR = (int16_t)mixR;
     int32_t jump = (int32_t)outL - (int32_t)g_xmDiagLastOutL;
@@ -1467,7 +1519,7 @@ void __not_in_flash_func(XmPlayer::update)() { // see readRawSample()'s comment 
 
     static uint32_t lastPrintMs = 0;
     uint32_t nowMs = millis();
-    if (nowMs - lastPrintMs >= 1000) {
+    if (DIAG_PRINT_ENABLED && nowMs - lastPrintMs >= 1000) {
         lastPrintMs = nowMs;
         uint32_t avgActiveCh100 = g_xmDiagActiveChSamples ? (g_xmDiagActiveChSum * 100 / g_xmDiagActiveChSamples) : 0;
         uint32_t seqAvgNs = g_xmDiagSeqMisses ? (g_xmDiagSeqUs * 1000 / g_xmDiagSeqMisses) : 0;

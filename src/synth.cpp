@@ -12,6 +12,9 @@ namespace {
 const uint32_t MSG_TYPE_NOTE = 0x0u;
 const uint32_t MSG_TYPE_PROGRAM = 0x1u;
 const uint32_t MSG_TYPE_VOLUME = 0x2u;
+const uint32_t MSG_TYPE_OUTPUT_LEVEL = 0x3u;
+const uint32_t MSG_TYPE_REVERB_ENABLED = 0x4u;
+const uint32_t MSG_TYPE_REVERB_MIX = 0x5u;
 const uint32_t PANIC_MSG = 0xFFFFFFFFu;
 const uint32_t RESET_PROGRAMS_MSG = 0xFFFFFFFEu;
 
@@ -27,6 +30,15 @@ inline uint32_t packProgramMsg(uint8_t channel, uint8_t program) {
 inline uint32_t packVolumeMsg(uint8_t percent) {
     return (MSG_TYPE_VOLUME << 28) | percent;
 }
+inline uint32_t packOutputLevelMsg(uint8_t level) {
+    return (MSG_TYPE_OUTPUT_LEVEL << 28) | level;
+}
+inline uint32_t packReverbEnabledMsg(bool enabled) {
+    return (MSG_TYPE_REVERB_ENABLED << 28) | (enabled ? 1u : 0u);
+}
+inline uint32_t packReverbMixMsg(uint8_t percent) {
+    return (MSG_TYPE_REVERB_MIX << 28) | percent;
+}
 
 // Set by Synth::begin() on core 0, polled by setup1() on core 1 -- see
 // the long comment on Synth::begin() in synth.h for why this exists.
@@ -41,6 +53,34 @@ volatile bool g_readyForPioInit = false;
 
 const int SINE_TABLE_SIZE = 256;
 int16_t g_sineTable[SINE_TABLE_SIZE];
+
+// Filled once in setup1() from PRESETS[i].cutoffHz (see cutoffHzToAlphaQ16())
+// -- avoids repeating the expf() conversion on every single note-on. The
+// drum-kit equivalent (g_drumFilterAlpha) is declared further down, once
+// DRUM_TYPE_COUNT exists to size it.
+uint32_t g_presetFilterAlpha[16];
+
+// Filled once in setup1() from PRESETS[i].vibratoDepthPercent.
+uint32_t g_presetVibratoDepthQ16[16];
+
+// Filled once in setup1() from PRESETS[i].tremoloDepthPercent/
+// pwmDepthPercent -- same shared LFO as vibrato above, just modulating
+// amplitude (tremolo) or square-wave duty cycle (PWM) instead of pitch.
+uint32_t g_presetTremoloDepthQ16[16];
+uint32_t g_presetPwmDepthQ16[16];
+
+// Shared vibrato LFO: a single phase accumulator advanced once per sample
+// (in renderSample(), not per voice) and read by every melodic voice, each
+// scaled by its own preset depth (see Voice::vibratoRange and its use in
+// renderVoice()). Deliberate simplification: every voice's vibrato is
+// therefore in-phase with every other voice's, rather than each note
+// having its own independent LFO phase -- a true per-voice LFO would need
+// its own accumulator (and a sine lookup) per voice for a difference
+// unlikely to be audible at this fidelity level, whereas this is one
+// lookup total per sample no matter how many voices are active.
+const float LFO_RATE_HZ = 5.5f; // a natural vocal/instrumental vibrato rate
+uint32_t g_lfoPhaseInc = 0; // computed in setup1() from LFO_RATE_HZ
+uint32_t g_lfoPhase = 0;
 
 // Percussion gets its own dedicated pool rather than sharing one with
 // melodic voices: with a 14-25 track file, melodic content alone can
@@ -75,6 +115,50 @@ const int16_t VOICE_PEAK = 1 << VOICE_PEAK_SHIFT; // 2048
 const int32_t SOFT_KNEE_START = 24576; // 75% of full scale
 const int32_t HARD_LIMIT = 32000;
 
+// Attenuate-only auto-leveler: catches a *source* that runs consistently
+// hot for a whole file/passage (some tracker files vs. others, or a busy
+// MIDI passage) rather than the single-sample overs softLimit() already
+// handles below. Deliberately one-directional -- it can only ever reduce
+// gain below unity, never boost above it -- see the long comment on
+// Synth::setVolume() in synth.h for the real-hardware volume scare this
+// was built in response to: a wrong time constant here is a "sounds a bit
+// off" bug, never a "surprise loud" one, since the absolute ceiling is
+// still whatever the existing static taper already established.
+//
+// g_levelerEnvelope is a plain leaky-integrator follower of the combined
+// mix's magnitude, updated every sample (cheap, shift-only) with a
+// ~186ms attack and a ~3s release -- slow enough on both ends that it
+// tracks "how loud has this passage/file generally been" rather than
+// riding individual note transients (that's softLimit()'s job, not this
+// one's); a faster attack would make it react like a compressor and risk
+// audible pumping in time with the music. g_levelerGainQ16 (the actual
+// makeup gain applied) is only
+// recomputed every LEVELER_UPDATE_PERIOD samples, since a genuine integer
+// divide (no hardware divide on the Cortex-M0+) is unnecessary at full
+// 44.1kHz for something tracking loudness over hundreds of ms, not
+// individual samples.
+// Raised from an original 18000 (~55%) after real-hardware listening found
+// tracker files (.mod/.s3m/.xm) sounding noticeably quieter than MIDI --
+// not because anything was turned down for them, but because the tracker
+// headroom fix (MIX_SHIFT_TYPICAL_CHANNELS in mod_file.cpp/s3m_file.cpp/
+// xm_file.cpp) deliberately made a busy tracker mix's raw level hotter,
+// so it was sitting above the old 18000 target for long stretches and
+// getting constantly ducked back down by this leveler -- while sparser
+// MIDI polyphony tripped that threshold far less often. Net effect: the
+// leveler was fighting the very fix meant to bring tracker up to match
+// MIDI/WAV. 26000 sits just above SOFT_KNEE_START (24576, where softLimit()
+// below starts its own per-sample compression) on purpose: normal "loud"
+// content is now left to softLimit()'s graceful per-sample compression
+// instead of being pre-emptively ducked by this slower, sustained-level
+// leveler, which now only steps in for something genuinely, persistently
+// excessive -- a passage softLimit() alone is already compressing hard
+// and still isn't enough.
+const int32_t LEVELER_TARGET = 26000; // ~79% of full scale
+const int LEVELER_UPDATE_PERIOD = 256; // samples between gain recomputes (~5.8ms)
+int32_t g_levelerEnvelope = 0;
+uint32_t g_levelerGainQ16 = 65536; // unity; never set above this -- attenuate-only
+int g_levelerUpdateCounter = 0;
+
 enum Waveform : uint8_t { WAVE_SINE, WAVE_TRIANGLE, WAVE_SAW, WAVE_SQUARE, WAVE_NOISE };
 enum EnvStage : uint8_t { ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE };
 
@@ -98,6 +182,43 @@ struct Voice {
     // a kick/tom pitch-drop ("thump"). 0/0 for everything else.
     int32_t pitchDrop = 0;
     int32_t pitchDropStep = 0;
+
+    // One-pole low-pass filter state (see renderVoice()). filterState
+    // tracks the filter's own output history, so it lives per-voice just
+    // like phase/amplitude; filterAlpha (Q16, 1..65536) is copied in from
+    // the preset at voice-start and is otherwise constant for the voice's
+    // lifetime -- no filter envelope/LFO at this scope, just a fixed
+    // per-instrument brightness.
+    int32_t filterState = 0;
+    uint32_t filterAlpha = 65536;
+
+    // Max phase-inc deviation from the shared vibrato LFO (see g_lfoPhase
+    // above and renderVoice() below), computed once at note-on from the
+    // note's own phaseInc and the preset's vibratoDepthPercent -- 0 for
+    // any preset/voice with no vibrato (all percussion, and several
+    // melodic presets), which also skips the per-sample multiply in
+    // renderVoice() entirely.
+    uint32_t vibratoRange = 0;
+
+    // Tremolo (amplitude) and PWM (square-wave duty cycle) depth, Q16 --
+    // both driven by the same shared LFO as vibrato above, just copied
+    // straight from the preset's precomputed table at note-start (unlike
+    // vibratoRange, these don't scale with the note's own pitch, so no
+    // extra per-note-on math is needed). 0 skips the corresponding
+    // per-sample work entirely, same as vibratoRange == 0 does.
+    uint32_t tremoloDepthQ16 = 0;
+    uint32_t pwmDepthQ16 = 0;
+
+    // Stereo pan, 0-255 (0=full left, 128=center, 255=full right) -- same
+    // convention/split (L uses 255-pan, R uses pan, both >>8) the S3M/XM/
+    // MOD mixers already use for their own per-channel panning, reused
+    // here for consistency. Set once at note-start from the MIDI channel
+    // (melodic) or fixed center (percussion, see startPercussionVoice()) --
+    // not a live-updating CC10 response, just a per-part spread so
+    // simultaneous tracks/channels are spatially distinguishable, the same
+    // "make different parts distinguishable" goal the filter/vibrato
+    // presets already serve.
+    int32_t pan = 128;
 };
 
 Voice g_melodicVoices[NUM_MELODIC_VOICES];
@@ -111,10 +232,76 @@ uint8_t g_channelProgram[16] = {0};
 
 uint32_t g_noiseState = 0xACE1u; // xorshift32 seed, any nonzero value
 
-// Master volume, 0-100 (see Synth::setVolume()). Written only from loop1()
-// in response to a FIFO message, so no cross-core synchronization beyond
-// that is needed.
-uint8_t g_masterVolume = 80;
+// Converts a master-volume percent (0-100, linear on the UI's slider) to a
+// Q16 output gain (0..65536) using a cubic audio taper instead of a
+// straight linear multiply. Confirmed on real hardware (see the long
+// comment above Synth::setVolume() in synth.h): with a plain linear
+// percent/100 scale, 0% was correctly silent but 5% was already
+// uncomfortably loud -- and not just for the synth voices, for WAV and
+// .mod playback too, which share no mixing code with this or with each
+// other. The only thing all three share is this final volume-scaling
+// step, so a linear fader -- not any one engine's per-sample mixing --
+// was the actual cause: human loudness perception is roughly logarithmic,
+// so a linear 0-100 fader spends almost its entire *audible* range in the
+// first ~10%. A cubic taper (percent^3) is a cheap standard approximation
+// of a proper log/audio-taper pot without needing runtime log/pow calls
+// in the audio path -- this is only ever computed once per volume change
+// (from loop1()'s MSG_TYPE_VOLUME handler), not per sample.
+uint32_t volumePercentToGainQ16(uint8_t percent) {
+    if (percent == 0) return 0; // exact hard mute, no taper rounding involved
+    float frac = percent / 100.0f;
+    float gain = frac * frac * frac;
+    int32_t q16 = (int32_t)(gain * 65536.0f + 0.5f);
+    if (q16 < 1) q16 = 1; // any nonzero percent should be at least faintly audible
+    if (q16 > 65536) q16 = 65536;
+    return (uint32_t)q16;
+}
+
+// Master output gain, Q16 fixed point (0..65536, see volumePercentToGainQ16()
+// above). Written only from loop1() in response to a FIFO message (see
+// MSG_TYPE_VOLUME below) or setup1()'s initial default, so no cross-core
+// synchronization beyond volatile-free plain SRAM sharing is needed, same
+// as g_readyForPioInit above.
+uint32_t g_masterGainQ16 = 0; // set from the default percent in setup1()
+
+// Output Level: a final, coarse attenuation stage on top of the Volume
+// percent above, matching the picoTracker v2 hardware's own reference
+// firmware (xiphonics/picoTracker) which offers the same three-way
+// "Headphone Low" / "Headphone High" / "Line Level" choice for the exact
+// same reason this exists at all -- this board's PCM5102A DAC has no
+// gain/volume register of its own (it always outputs its full native
+// ~2.1 Vrms line level) and its TPA6139A2 headphone buffer is hardware-
+// strapped (a fixed resistor on its GAIN pin) to that chip's *lowest*
+// available gain step -- confirmed from the board's own published
+// schematic and the TPA6139A2 datasheet's gain table. So there is no
+// lower analog gain to reach for; digital attenuation is the only lever
+// that exists at all, on this firmware or the original.
+//
+// The reference firmware implements that attenuation by patching the raw
+// PIO instructions that shift the 16-bit sample into a 32-bit I2S frame,
+// inserting extra zero-padding bits after the sign bit (see its
+// audio_i2s.pio/picoTrackerAudioDriver.cpp) -- a bit-level trick specific
+// to its hand-rolled pico-sdk PIO/DMA driver. This firmware instead uses
+// the Arduino I2S library, which owns its own PIO program internally with
+// no hook for that kind of patch, so replicating it exactly isn't
+// practical here. The effect of N bits of that padding is mathematically
+// just an attenuation by 2^-N, though, so an equivalent plain right-shift
+// in this existing Q16 gain chain reproduces the same audible result
+// without touching I2S internals at all. Reverse-engineered from the
+// reference firmware's compiled PIO instructions (decoded 3 vs. 1 offset-
+// bit immediates between its "HP High"/"Line Level" presets, ~3 bits/
+// 18dB apart) rather than sourced from any published spec, so these are a
+// reasoned starting point, not a guaranteed match -- like every other
+// audio level in this file, verify by ear on real hardware.
+enum OutputLevel : uint8_t { OUTPUT_LEVEL_HP_LOW, OUTPUT_LEVEL_HP_HIGH, OUTPUT_LEVEL_LINE, OUTPUT_LEVEL_COUNT };
+const uint8_t OUTPUT_LEVEL_SHIFT[OUTPUT_LEVEL_COUNT] = {
+    3, // HP Low  (default): -18dB extra cut -- safest, matches the reference firmware's own default
+    1, // HP High: -6dB extra cut
+    0, // Line Level: no extra cut -- as loud as this firmware's existing (already headphone-safety-
+       // tuned) taper/leveler/limiter chain gets; intended for an external line-level input, not
+       // direct headphone/earbud listening
+};
+uint8_t g_outputLevelShift = OUTPUT_LEVEL_SHIFT[OUTPUT_LEVEL_HP_LOW]; // set from the default in setup1()
 
 // -- WAV playback ring buffer (see Synth::wavStream*() in synth.h) --------
 // Single-producer (core 0, via Synth::wavStreamWrite()) / single-consumer
@@ -172,7 +359,10 @@ int16_t nextNoise() {
 // phase represents one full waveform cycle over its entire 32-bit range;
 // the sine table is indexed by the top 8 bits (256 entries), and the
 // algorithmic waveforms below use the top 16 bits as a 0..65535 ramp.
-int16_t waveformSample(Waveform w, uint32_t phase) {
+// pulseWidth is only meaningful for WAVE_SQUARE (the duty-cycle threshold,
+// 32768 == fixed 50% -- see Voice::pwmDepthQ16 for who modulates it and
+// why); every other waveform ignores it.
+int16_t waveformSample(Waveform w, uint32_t phase, uint16_t pulseWidth) {
     uint16_t p16 = (uint16_t)(phase >> 16);
     switch (w) {
         case WAVE_TRIANGLE:
@@ -181,7 +371,7 @@ int16_t waveformSample(Waveform w, uint32_t phase) {
         case WAVE_SAW:
             return (int16_t)(p16 - 32768);
         case WAVE_SQUARE:
-            return (p16 < 32768) ? (int16_t)30000 : (int16_t)(-30000);
+            return (p16 < pulseWidth) ? (int16_t)30000 : (int16_t)(-30000);
         case WAVE_NOISE:
             return nextNoise();
         default: { // WAVE_SINE
@@ -189,6 +379,21 @@ int16_t waveformSample(Waveform w, uint32_t phase) {
             return g_sineTable[tableIdx];
         }
     }
+}
+
+// Converts a filter cutoff in Hz to a one-pole low-pass coefficient in
+// Q16 fixed point (1..65536, where 65536 == alpha 1.0 == no filtering).
+// Standard RC/exponential-smoother derivation: alpha = 1 - e^(-2*pi*fc/fs).
+// Only ever called at startup (once per preset, see g_presetFilterAlpha/
+// g_drumFilterAlpha below), so the float math and expf() call cost nothing
+// at runtime -- renderVoice()'s per-sample filter step is pure integer
+// multiply-shift.
+uint32_t cutoffHzToAlphaQ16(float cutoffHz) {
+    float alpha = 1.0f - expf(-2.0f * (float)M_PI * cutoffHz / SAMPLE_RATE);
+    int32_t q16 = (int32_t)(alpha * 65536.0f + 0.5f);
+    if (q16 < 1) q16 = 1;
+    if (q16 > 65536) q16 = 65536;
+    return (uint32_t)q16;
 }
 
 uint32_t hzToPhaseInc(float hz) {
@@ -214,25 +419,57 @@ struct InstrumentPreset {
     uint16_t decaySamples;
     uint8_t sustainPercent; // 0-100, fraction of peak held through sustain
     uint16_t releaseSamples;
+    float cutoffHz; // one-pole low-pass cutoff; ~18000+ is effectively "off"
+                     // (sine/triangle have little content up there anyway)
+    float vibratoDepthPercent; // max pitch deviation as % of note freq, via
+                                // the shared LFO (0 = no vibrato); ~1% is
+                                // roughly +-17 cents, a typical sung/played
+                                // vibrato depth
+    float tremoloDepthPercent; // max amplitude deviation, via the same
+                                // shared LFO (0 = no tremolo) -- e.g. a
+                                // rotary-speaker-style wobble for Organ
+    float pwmDepthPercent; // WAVE_SQUARE only: how far the duty cycle
+                            // swings from 50%, via the same shared LFO
+                            // (0 = fixed 50% duty, no PWM) -- ignored for
+                            // every other waveform
 };
 
+// Release times bumped well past their original 500-5000 (11-113ms) range
+// -- a real-hardware measurement (since removed, a temporary diagnostic)
+// found peak polyphony sitting at 9/24 melodic, 6/8 drum with zero voice
+// steals even on a busy file, so there's plenty of spare voice/CPU
+// headroom to let notes actually ring out instead of cutting off the
+// instant a note-off arrives -- which is exactly what a
+// release that short sounds like at normal note-to-note timing, and not
+// how any of these instruments actually behave. Tuned per family by real-
+// instrument intuition: mallets/pads (which are *defined* by a long
+// natural ring/tail) get the longest, organ/percussive (which realistically
+// have almost none) stay short, everything else lands in between.
+// tremoloDepthPercent/pwmDepthPercent (new trailing fields): Organ gets a
+// deliberately strong tremolo (rotary-speaker/Leslie character) and PWM
+// (square wave alone is a static buzz; a slowly sweeping duty cycle is
+// what actually makes it read as "alive"); Brass/Reed get a subtler PWM
+// for the same reason without the Leslie wobble; Pad/Strings/Ensemble get
+// a gentle tremolo alongside their existing vibrato for a bit of shimmer.
+// Everything else stays at 0/0 -- not every instrument needs movement on
+// top of what the filter/vibrato pass already gave it.
 const InstrumentPreset PRESETS[16] = {
-    /* 0 Piano             */ {WAVE_TRIANGLE, 50, 4000, 40, 3000},
-    /* 1 Chromatic Percus. */ {WAVE_SINE, 20, 3000, 15, 1500},
-    /* 2 Organ             */ {WAVE_SQUARE, 10, 0, 100, 500},
-    /* 3 Guitar            */ {WAVE_SAW, 30, 3500, 35, 2500},
-    /* 4 Bass              */ {WAVE_TRIANGLE, 20, 2000, 70, 2000},
-    /* 5 Strings           */ {WAVE_SAW, 800, 0, 90, 4000},
-    /* 6 Ensemble          */ {WAVE_SAW, 600, 0, 90, 4000},
-    /* 7 Brass             */ {WAVE_SQUARE, 150, 1500, 80, 2000},
-    /* 8 Reed              */ {WAVE_SQUARE, 200, 1500, 85, 2000},
-    /* 9 Pipe              */ {WAVE_SINE, 300, 1000, 90, 2000},
-    /*10 Synth Lead        */ {WAVE_SAW, 20, 1000, 90, 1000},
-    /*11 Synth Pad         */ {WAVE_TRIANGLE, 2000, 0, 95, 5000},
-    /*12 Synth Effects     */ {WAVE_SINE, 100, 2000, 60, 2000},
-    /*13 Ethnic            */ {WAVE_TRIANGLE, 50, 2500, 50, 2000},
-    /*14 Percussive        */ {WAVE_SQUARE, 10, 1500, 5, 500},
-    /*15 Sound Effects     */ {WAVE_SINE, 50, 2000, 30, 1000},
+    /* 0 Piano             */ {WAVE_TRIANGLE, 50, 4000, 40, 12000, 6500.0f, 0.0f, 0.0f, 0.0f},
+    /* 1 Chromatic Percus. */ {WAVE_SINE, 20, 3000, 15, 30000, 18000.0f, 0.0f, 0.0f, 0.0f},
+    /* 2 Organ             */ {WAVE_SQUARE, 10, 0, 100, 800, 9000.0f, 0.0f, 18.0f, 15.0f},
+    /* 3 Guitar            */ {WAVE_SAW, 30, 3500, 35, 10000, 5500.0f, 0.5f, 0.0f, 0.0f},
+    /* 4 Bass              */ {WAVE_TRIANGLE, 20, 2000, 70, 8000, 1600.0f, 0.0f, 0.0f, 0.0f},
+    /* 5 Strings           */ {WAVE_SAW, 800, 0, 90, 12000, 4200.0f, 1.2f, 5.0f, 0.0f},
+    /* 6 Ensemble          */ {WAVE_SAW, 600, 0, 90, 12000, 3800.0f, 1.0f, 5.0f, 0.0f},
+    /* 7 Brass             */ {WAVE_SQUARE, 150, 1500, 80, 6000, 6000.0f, 0.8f, 0.0f, 10.0f},
+    /* 8 Reed              */ {WAVE_SQUARE, 200, 1500, 85, 6000, 5000.0f, 1.0f, 0.0f, 10.0f},
+    /* 9 Pipe              */ {WAVE_SINE, 300, 1000, 90, 4500, 18000.0f, 0.6f, 0.0f, 0.0f},
+    /*10 Synth Lead        */ {WAVE_SAW, 20, 1000, 90, 5000, 9000.0f, 0.4f, 4.0f, 0.0f},
+    /*11 Synth Pad         */ {WAVE_TRIANGLE, 2000, 0, 95, 30000, 3000.0f, 0.3f, 6.0f, 0.0f},
+    /*12 Synth Effects     */ {WAVE_SINE, 100, 2000, 60, 6000, 18000.0f, 0.0f, 0.0f, 0.0f},
+    /*13 Ethnic            */ {WAVE_TRIANGLE, 50, 2500, 50, 6000, 4000.0f, 1.0f, 0.0f, 0.0f},
+    /*14 Percussive        */ {WAVE_SQUARE, 10, 1500, 5, 800, 7000.0f, 0.0f, 0.0f, 0.0f},
+    /*15 Sound Effects     */ {WAVE_SINE, 50, 2000, 30, 3000, 18000.0f, 0.0f, 0.0f, 0.0f},
 };
 
 // Basic synthesized drum kit: the GM percussion key map assigns specific
@@ -246,28 +483,45 @@ const InstrumentPreset PRESETS[16] = {
 // cymbal brightness at this fidelity level.
 enum DrumType { DRUM_KICK, DRUM_SNARE, DRUM_CLOSED_HAT, DRUM_OPEN_HAT, DRUM_TOM, DRUM_CYMBAL, DRUM_WOODBLOCK, DRUM_DEFAULT, DRUM_TYPE_COUNT };
 
+uint32_t g_drumFilterAlpha[DRUM_TYPE_COUNT];
+
 struct DrumPreset {
     Waveform waveform;
     float basePitchHz;
     uint16_t decaySamples;
     float pitchDropStartHz; // 0 = no pitch sweep
     uint16_t pitchDropSamples;
+    float cutoffHz; // one-pole low-pass cutoff -- the noise-based hits'
+                     // only source of spectral brightness (see comment
+                     // above DrumType), since decay time alone previously
+                     // had to carry closed-hat-vs-cymbal distinctiveness.
 };
 
 const DrumPreset DRUM_PRESETS[DRUM_TYPE_COUNT] = {
-    /*KICK       */ {WAVE_SINE, 60.0f, 7000, 120.0f, 1800},
-    /*SNARE      */ {WAVE_NOISE, 0.0f, 5000, 0.0f, 0},
-    /*CLOSED_HAT */ {WAVE_NOISE, 0.0f, 1200, 0.0f, 0},
-    /*OPEN_HAT   */ {WAVE_NOISE, 0.0f, 10000, 0.0f, 0},
-    /*TOM        */ {WAVE_SINE, 120.0f, 8000, 80.0f, 1200},
-    /*CYMBAL     */ {WAVE_NOISE, 0.0f, 16000, 0.0f, 0},
+    // decaySamples bumped up for Kick/Tom (7000->8500, 8000->9500, ~20%
+    // longer) for a fuller low-end body/tail -- see startPercussionVoice()'s
+    // comment for the accompanying extra level boost these two get. Pitch
+    // left untouched -- more low-end weight, not a different kick/tom tuning.
+    /*KICK       */ {WAVE_SINE, 60.0f, 8500, 120.0f, 1800, 2000.0f},
+    /*SNARE      */ {WAVE_NOISE, 0.0f, 5000, 0.0f, 0, 5500.0f},
+    // Cutoff brought down twice now (12000->7500->5000, 9000->6000->4200)
+    // after real-hardware listening still found hats too forward even
+    // after the first cut and losing the general drum boost -- raw white
+    // noise has equal energy at every frequency, so a high cutoff on it
+    // reads as harsh digital hiss rather than a real cymbal's resonant
+    // metallic character. Still brighter than Snare (5500), just not by
+    // as much as before.
+    /*CLOSED_HAT */ {WAVE_NOISE, 0.0f, 1200, 0.0f, 0, 5000.0f},
+    /*OPEN_HAT   */ {WAVE_NOISE, 0.0f, 10000, 0.0f, 0, 4200.0f},
+    /*TOM        */ {WAVE_SINE, 120.0f, 9500, 80.0f, 1200, 2500.0f},
+    /*CYMBAL     */ {WAVE_NOISE, 0.0f, 16000, 0.0f, 0, 15000.0f},
     // Only tonal, non-noise preset besides Kick/Tom -- a wood block is a
     // resonant knock, not a noise burst. Bright settle pitch, short decay
     // (shorter than even Closed Hat -- wood doesn't sustain), and a small,
     // fast pitch drop (150 samples vs. Tom's 1200) for the initial "crack"
     // transient rather than Tom's slower pitch-bend "thump".
-    /*WOODBLOCK  */ {WAVE_SINE, 900.0f, 900, 300.0f, 150},
-    /*DEFAULT    */ {WAVE_NOISE, 0.0f, 3000, 0.0f, 0},
+    /*WOODBLOCK  */ {WAVE_SINE, 900.0f, 900, 300.0f, 150, 18000.0f},
+    /*DEFAULT    */ {WAVE_NOISE, 0.0f, 3000, 0.0f, 0, 6000.0f},
 };
 
 DrumType classifyDrum(uint8_t note) {
@@ -295,15 +549,26 @@ void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity
     int32_t startAmplitude = v.amplitude;
     bool wasActive = v.active;
 
-    const InstrumentPreset& preset = PRESETS[(g_channelProgram[channel] >> 3) & 0x0F];
+    uint8_t family = (g_channelProgram[channel] >> 3) & 0x0F;
+    const InstrumentPreset& preset = PRESETS[family];
 
     v.active = true;
     v.note = note;
     v.waveform = preset.waveform;
-    if (!wasActive) v.phase = 0;
+    if (!wasActive) { v.phase = 0; v.filterState = 0; }
     v.phaseInc = noteToPhaseInc(note);
     v.pitchDrop = 0;
     v.pitchDropStep = 0;
+    v.filterAlpha = g_presetFilterAlpha[family];
+    v.vibratoRange = (uint32_t)(((uint64_t)v.phaseInc * g_presetVibratoDepthQ16[family]) >> 16);
+    v.tremoloDepthQ16 = g_presetTremoloDepthQ16[family];
+    v.pwmDepthQ16 = g_presetPwmDepthQ16[family];
+    // Spread channels 0-15 across the stereo field, but not hard to the
+    // extremes (32..224 of the 0..255 range) -- a channel fully isolated
+    // to one ear is fatiguing on headphones/earbuds, which is exactly
+    // what most listeners here will be using (see this file's whole
+    // Volume/Output Level history).
+    v.pan = 32 + ((int32_t)channel * 192) / 15;
 
     int32_t peak = ((int32_t)VOICE_PEAK * velocity) / 127;
     v.peakLevel = peak;
@@ -319,12 +584,16 @@ void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity
 }
 
 void startPercussionVoice(Voice& v, uint8_t note, uint8_t velocity) {
-    const DrumPreset& p = DRUM_PRESETS[classifyDrum(note)];
+    DrumType drumType = classifyDrum(note);
+    const DrumPreset& p = DRUM_PRESETS[drumType];
 
     v.active = true;
     v.note = note;
     v.waveform = p.waveform;
     v.phase = 0; // drum hits are one-shot triggers, always a fresh start
+    v.filterState = 0;
+    v.filterAlpha = g_drumFilterAlpha[drumType];
+    v.pan = 128; // drums stay centered, matching how real kits are usually mixed
     v.phaseInc = (p.basePitchHz > 0.0f) ? hzToPhaseInc(p.basePitchHz) : 0;
 
     v.pitchDrop = (p.pitchDropStartHz > 0.0f) ? (int32_t)hzToPhaseInc(p.pitchDropStartHz) : 0;
@@ -334,14 +603,41 @@ void startPercussionVoice(Voice& v, uint8_t note, uint8_t velocity) {
         if (v.pitchDropStep == 0) v.pitchDropStep = -1;
     }
 
-    // A modest prominence boost (x1.25, as a shift-friendly add-a-quarter
-    // rather than a real multiply): real drum mixes are usually pushed
-    // hot specifically so they cut through everything else, and now that
-    // percussion has its own guaranteed voices (no more losing the voice
-    // to melodic stealing), it's worth actually being audible over a
-    // dense 14-25 track arrangement.
+    // A modest prominence boost (x1.125, shift-friendly rather than a real
+    // multiply): real drum mixes are usually pushed hot specifically so
+    // they cut through everything else. Originally x1.25, cut back after
+    // real-hardware listening found drums sticking out too much once two
+    // other, later additions started stacking with this same amplitude
+    // boost to the same "make drums cut through" end: the per-drum-type
+    // brightness filter (closed hat/cymbal are now genuinely brighter on
+    // their own, not just louder -- see DRUM_PRESETS' cutoffHz) and
+    // stereo panning (drums stay centered while melodic voices spread out,
+    // and centered/mono-summed content reads as more forward than panned
+    // content even at equal amplitude). Reduce further (or drop this
+    // entirely) if it's still too hot.
     int32_t peak = ((int32_t)VOICE_PEAK * velocity) / 127;
-    peak += peak >> 2;
+    // Hats skip the general boost below entirely and then get two
+    // successive -25% cuts on top of that (~0.56x/-5dB combined): high-
+    // frequency noise is already perceptually piercing on its own (equal-
+    // loudness perception makes it read as more prominent per unit
+    // amplitude than low-frequency content), and real-hardware listening
+    // kept finding hats "too forward" through the general-boost removal,
+    // two rounds of cutoff cuts (see DRUM_PRESETS), and the first -25%.
+    if (drumType == DRUM_CLOSED_HAT || drumType == DRUM_OPEN_HAT) {
+        peak -= peak >> 2;
+        peak -= peak >> 2;
+    } else {
+        peak += peak >> 3;
+    }
+    // Extra low-end "oomph" for Kick/Tom specifically (on top of the
+    // general boost above): the only two tonal/bass-register drum types
+    // (a sine fundamental + pitch-drop "thump") -- everything else here is
+    // noise-based and doesn't have real low-end content to boost. +25% on
+    // top of the general +12.5% (~1.4x/+3dB total) rather than a pitch
+    // change, so this adds weight/punch without altering their tuning.
+    if (drumType == DRUM_KICK || drumType == DRUM_TOM) {
+        peak += peak >> 2;
+    }
     v.peakLevel = peak;
     v.sustainLevel = 0; // one-shot: decays fully to silence, ignores note-off
     v.decaySamples = p.decaySamples;
@@ -427,12 +723,59 @@ void handlePanic() {
 // Renders one voice's current sample and advances its phase/envelope by
 // one sample. Returns its contribution to the mix (0 if inactive). Shared
 // by both voice pools so the envelope state machine only exists once.
-int32_t renderVoice(Voice& v) {
-    if (!v.active) return 0;
+void renderVoice(Voice& v, int16_t lfoValue, int32_t& outL, int32_t& outR) {
+    if (!v.active) { outL = 0; outR = 0; return; }
 
-    uint32_t effectivePhaseInc = v.phaseInc + (v.pitchDrop > 0 ? (uint32_t)v.pitchDrop : 0);
-    int16_t raw = waveformSample(v.waveform, v.phase);
-    int32_t contribution = ((int32_t)raw * v.amplitude) >> VOICE_PEAK_SHIFT;
+    // Signed accumulate: pitchDrop (percussion pitch-sweep) and the shared
+    // vibrato LFO both nudge phaseInc, one always down (pitchDrop, never
+    // negative itself) and the other bidirectionally. int64_t keeps this
+    // safe regardless of sign without needing to reason about where
+    // v.phaseInc (uint32_t, can be a large fraction of its range for high
+    // notes) sits relative to either adjustment.
+    int64_t phaseIncAdj = (int64_t)v.phaseInc;
+    if (v.pitchDrop > 0) phaseIncAdj += v.pitchDrop;
+    if (v.vibratoRange != 0) {
+        // lfoValue is g_sineTable's output, ~-32000..32000 (not a true
+        // Q15 -32768..32767) -- close enough for a musical modulation
+        // depth that a >>15 shift stands in for a /32768 divide (the
+        // Cortex-M0+ has no hardware divide); the ~2% resulting shortfall
+        // in actual vs. nominal depth is inaudible.
+        phaseIncAdj += ((int64_t)v.vibratoRange * lfoValue) >> 15;
+    }
+    uint32_t effectivePhaseInc = (uint32_t)phaseIncAdj;
+
+    // PWM: the same shared LFO nudges the square wave's duty cycle around
+    // its fixed 50% (32768) center instead of pitch. Only WAVE_SQUARE
+    // voices ever have a nonzero pwmDepthQ16 (see PRESETS), so this is a
+    // no-op shift+add for every other waveform.
+    uint16_t pulseWidth = 32768;
+    if (v.pwmDepthQ16 != 0) {
+        int32_t swing = (int32_t)(((int64_t)v.pwmDepthQ16 * lfoValue) >> 15);
+        pulseWidth = (uint16_t)(int32_t)(32768 + swing);
+    }
+    int16_t raw = waveformSample(v.waveform, v.phase, pulseWidth);
+
+    // One-pole low-pass, applied to the raw oscillator before the envelope
+    // (VCF-before-VCA, the usual analog-synth order) so the filter's own
+    // brightness is independent of where the envelope happens to be. Q16
+    // fixed point; int64_t intermediate avoids the int32 overflow a full
+    // (diff up to 65535) * (alpha up to 65536) multiply would risk.
+    int32_t diff = (int32_t)raw - v.filterState;
+    v.filterState += (int32_t)(((int64_t)diff * (int64_t)v.filterAlpha) >> 16);
+
+    int32_t contribution = (v.filterState * v.amplitude) >> VOICE_PEAK_SHIFT;
+    // Tremolo: same shared LFO again, this time as a gain wobble around
+    // unity (65536 Q16) rather than a pitch or duty-cycle nudge. Applied
+    // post-envelope so it modulates the note's own current loudness
+    // rather than fighting the attack/decay/release shape.
+    if (v.tremoloDepthQ16 != 0) {
+        int32_t tremMod = (int32_t)(((int64_t)v.tremoloDepthQ16 * lfoValue) >> 15);
+        contribution = (int32_t)(((int64_t)contribution * (int64_t)(65536 + tremMod)) >> 16);
+    }
+    // Same pan split (255-pan for L, pan for R, both >>8) the S3M/XM/MOD
+    // mixers already use -- see Voice::pan's comment.
+    outL = (contribution * (255 - v.pan)) >> 8;
+    outR = (contribution * v.pan) >> 8;
     v.phase += effectivePhaseInc;
 
     if (v.pitchDropStep != 0) {
@@ -472,7 +815,6 @@ int32_t renderVoice(Voice& v) {
             if (v.amplitude <= 0) { v.amplitude = 0; v.active = false; }
             break;
     }
-    return contribution;
 }
 
 // Soft knee above SOFT_KNEE_START: an unusually loud/dense mix (many
@@ -489,19 +831,144 @@ int32_t softLimit(int32_t mix) {
     return mag * sign;
 }
 
-// Fills outLeft/outRight with this sample's mixed output. Synth voices
-// contribute identically to both channels (they were never stereo to
-// begin with), so mixL/mixR only actually diverge once a WAV stream
-// (genuinely stereo -- see popWavFrame()) is active; softLimit()/volume
-// then apply per-channel, same cost shape as the old single-channel path
-// (still one divide per channel per sample, not per voice).
-void renderSample(int16_t& outLeft, int16_t& outRight) {
-    int32_t mix = 0;
-    for (int i = 0; i < NUM_MELODIC_VOICES; i++) mix += renderVoice(g_melodicVoices[i]);
-    for (int i = 0; i < NUM_DRUM_VOICES; i++) mix += renderVoice(g_drumVoices[i]);
+// -- Lo-fi reverb -----------------------------------------------------------
+// A small mono Freeverb-style tank (4 parallel comb filters + 2 series
+// allpass filters) fed from the *entire* mix -- synth voices, WAV, and
+// tracker playback alike, whatever renderSample() is mixing this sample,
+// not just synth voices -- so it's one block here rather than something
+// threaded into each source. Comb/allpass delay lengths are Freeverb's own
+// well-known values, not arbitrary: they're chosen to be mutually non-
+// resonant so the tank doesn't ring at an audible pitch the way a naive
+// choice of lengths can.
+//
+// The wet signal is then deliberately degraded -- held for REVERB_DECIMATE
+// samples at a time (a crude sample-rate reduction, ~11kHz effective) and
+// bit-masked (a crude bitcrush) -- for an intentionally lo-fi, chiptune-
+// appropriate ambience rather than chasing a generic "nice concert hall"
+// plugin sound, which felt more true to what the rest of this synth
+// already is. Only the wet signal gets this treatment; the dry mix is
+// untouched, so it still reads as degraded *ambience*, not a degraded mix.
+//
+// The tank itself still runs at the full sample rate underneath the held/
+// decimated output -- only the read-out is stepped, not the delay lines'
+// own timing -- otherwise the decay/diffusion physics would run at the
+// decimated rate too and the whole thing would sound wrong, not just lo-fi.
+const int REVERB_COMB_COUNT = 4;
+const int REVERB_COMB_LEN0 = 1116, REVERB_COMB_LEN1 = 1188, REVERB_COMB_LEN2 = 1277, REVERB_COMB_LEN3 = 1356;
+const int REVERB_ALLPASS_LEN0 = 556, REVERB_ALLPASS_LEN1 = 441;
 
-    int32_t mixL = mix;
-    int32_t mixR = mix;
+int16_t g_reverbCombBuf0[REVERB_COMB_LEN0];
+int16_t g_reverbCombBuf1[REVERB_COMB_LEN1];
+int16_t g_reverbCombBuf2[REVERB_COMB_LEN2];
+int16_t g_reverbCombBuf3[REVERB_COMB_LEN3];
+int16_t g_reverbAllpassBuf0[REVERB_ALLPASS_LEN0];
+int16_t g_reverbAllpassBuf1[REVERB_ALLPASS_LEN1];
+size_t g_reverbCombPos0 = 0, g_reverbCombPos1 = 0, g_reverbCombPos2 = 0, g_reverbCombPos3 = 0;
+size_t g_reverbAllpassPos0 = 0, g_reverbAllpassPos1 = 0;
+int32_t g_reverbDampState0 = 0, g_reverbDampState1 = 0, g_reverbDampState2 = 0, g_reverbDampState3 = 0;
+
+// Q16 fixed point. FEEDBACK sets decay time (higher = longer tail);
+// DAMP_ALPHA is a one-pole lowpass *inside* each comb's feedback path,
+// same technique as the synth voices' own filterAlpha -- real rooms
+// absorb high frequencies fastest, so damping the feedback (not the
+// output) is what gives the tail a warm, closing-in-on-itself decay
+// instead of ringing brightly forever.
+const int32_t REVERB_COMB_FEEDBACK_Q16 = 53740;  // ~0.82
+const int32_t REVERB_DAMP_ALPHA_Q16 = 13107;      // ~0.2
+const int32_t REVERB_ALLPASS_FEEDBACK_Q16 = 32768; // 0.5, the standard Schroeder allpass value
+
+// Ceiling for the Settings "Reverb Mix" percent (see reverbMixPercentToQ16()
+// below) -- ~0.22 send level, the point this whole effect was actually
+// reasoned about and tuned within (see this block's header comment).
+// Reverb Mix's 0-100% maps *within* this ceiling rather than to a literal
+// 0-100% wet blend, since a stronger send than this hasn't been verified
+// not to get muddy/boomy given the comb feedback gain staging -- 100% on
+// the control means "as strong as this reverb was designed to go," not
+// "fully wet."
+const int32_t REVERB_WET_MAX_Q16 = 14417;
+
+// Runtime state for the two Settings controls (see Synth::setReverbEnabled()/
+// setReverbMix() in synth.h) -- written only from loop1() in response to a
+// FIFO message, same convention as g_masterGainQ16/g_outputLevelShift.
+// Reverb defaults on (this whole effect exists to be heard) at a mix
+// roughly matching what shipped before these became adjustable.
+bool g_reverbEnabled = true;
+uint32_t g_reverbMixQ16 = 0; // set from the default percent in setup1()
+
+uint32_t reverbMixPercentToQ16(uint8_t percent) {
+    if (percent > 100) percent = 100;
+    return (uint32_t)(((uint64_t)REVERB_WET_MAX_Q16 * percent) / 100);
+}
+
+int32_t reverbComb(int16_t* buf, size_t& pos, int len, int32_t input, int32_t& dampState) {
+    int32_t delayed = buf[pos];
+    dampState += (int32_t)(((int64_t)(delayed - dampState) * REVERB_DAMP_ALPHA_Q16) >> 16);
+    int32_t fedBack = input + (int32_t)(((int64_t)dampState * REVERB_COMB_FEEDBACK_Q16) >> 16);
+    if (fedBack > 32767) fedBack = 32767;
+    if (fedBack < -32768) fedBack = -32768;
+    buf[pos] = (int16_t)fedBack;
+    pos++;
+    if (pos >= (size_t)len) pos = 0;
+    return delayed;
+}
+
+int32_t reverbAllpass(int16_t* buf, size_t& pos, int len, int32_t input) {
+    int32_t bufOut = buf[pos];
+    int32_t output = bufOut - input;
+    int32_t fedBack = input + (int32_t)(((int64_t)bufOut * REVERB_ALLPASS_FEEDBACK_Q16) >> 16);
+    if (fedBack > 32767) fedBack = 32767;
+    if (fedBack < -32768) fedBack = -32768;
+    buf[pos] = (int16_t)fedBack;
+    pos++;
+    if (pos >= (size_t)len) pos = 0;
+    return output;
+}
+
+// Runs the tank every sample (see this block's header comment on why),
+// returns the full-rate wet signal -- reverbProcess()'s caller is what
+// applies the decimate/bitcrush lo-fi treatment to what it reads out.
+int32_t reverbProcess(int32_t input) {
+    int32_t combSum = 0;
+    combSum += reverbComb(g_reverbCombBuf0, g_reverbCombPos0, REVERB_COMB_LEN0, input, g_reverbDampState0);
+    combSum += reverbComb(g_reverbCombBuf1, g_reverbCombPos1, REVERB_COMB_LEN1, input, g_reverbDampState1);
+    combSum += reverbComb(g_reverbCombBuf2, g_reverbCombPos2, REVERB_COMB_LEN2, input, g_reverbDampState2);
+    combSum += reverbComb(g_reverbCombBuf3, g_reverbCombPos3, REVERB_COMB_LEN3, input, g_reverbDampState3);
+    combSum >>= 2; // 4 combs summed -- bring back down to roughly single-signal scale
+
+    int32_t out = reverbAllpass(g_reverbAllpassBuf0, g_reverbAllpassPos0, REVERB_ALLPASS_LEN0, combSum);
+    out = reverbAllpass(g_reverbAllpassBuf1, g_reverbAllpassPos1, REVERB_ALLPASS_LEN1, out);
+    return out;
+}
+
+const int REVERB_DECIMATE = 4; // hold the wet output for this many samples -- ~11kHz effective
+const int32_t REVERB_BIT_MASK = ~0x3F; // keep roughly the top 10 bits -- crude bitcrush grit
+int32_t g_reverbHeld = 0;
+int g_reverbDecimateCounter = 0;
+
+// Fills outLeft/outRight with this sample's mixed output. Each synth
+// voice contributes to mixL/mixR according to its own Voice::pan (melodic
+// voices spread across the stereo field by MIDI channel, drums centered --
+// see startMelodicVoice()/startPercussionVoice()), and a WAV stream
+// (genuinely stereo -- see popWavFrame()) adds in on top of that; softLimit()/
+// the leveler/volume then apply per-channel.
+void renderSample(int16_t& outLeft, int16_t& outRight) {
+    // One shared LFO lookup for this whole sample -- see g_lfoPhase's
+    // comment -- rather than each voice maintaining (and advancing) its
+    // own phase.
+    int16_t lfoValue = g_sineTable[(g_lfoPhase >> 24) & (SINE_TABLE_SIZE - 1)];
+    g_lfoPhase += g_lfoPhaseInc;
+
+    int32_t mixL = 0, mixR = 0;
+    for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
+        int32_t l, r;
+        renderVoice(g_melodicVoices[i], lfoValue, l, r);
+        mixL += l; mixR += r;
+    }
+    for (int i = 0; i < NUM_DRUM_VOICES; i++) {
+        int32_t l, r;
+        renderVoice(g_drumVoices[i], lfoValue, l, r);
+        mixL += l; mixR += r;
+    }
 
     if (g_wavActive) {
         int16_t wl, wr;
@@ -516,14 +983,57 @@ void renderSample(int16_t& outLeft, int16_t& outRight) {
         }
     }
 
+    // Lo-fi reverb send: mono sum of the dry mix so far feeds the tank
+    // (see reverbProcess()'s header comment), and the held/bitcrushed wet
+    // output gets added back identically to both channels -- placed here
+    // (before the leveler/limiter) so the wet signal is covered by the
+    // same headroom management as everything else, not an uncontrolled
+    // extra on top of it. Skipped entirely (tank included) when off --
+    // see Synth::setReverbEnabled() -- so a disabled reverb costs nothing,
+    // and re-enabling it starts from a cold (silent) tank rather than
+    // resuming a stale one, unnoticeable for an ambience effect like this.
+    if (g_reverbEnabled) {
+        int32_t reverbWetFull = reverbProcess((mixL + mixR) >> 1);
+        if (g_reverbDecimateCounter == 0) {
+            g_reverbHeld = reverbWetFull & REVERB_BIT_MASK;
+        }
+        g_reverbDecimateCounter++;
+        if (g_reverbDecimateCounter >= REVERB_DECIMATE) g_reverbDecimateCounter = 0;
+        int32_t reverbWetOut = (int32_t)(((int64_t)g_reverbHeld * g_reverbMixQ16) >> 16);
+        mixL += reverbWetOut;
+        mixR += reverbWetOut;
+    }
+
+    // Auto-leveler: track loudness, then (rarely) update the attenuation.
+    int32_t magL = mixL < 0 ? -mixL : mixL;
+    int32_t magR = mixR < 0 ? -mixR : mixR;
+    int32_t magnitude = magL > magR ? magL : magR;
+    if (magnitude > g_levelerEnvelope) {
+        g_levelerEnvelope += (magnitude - g_levelerEnvelope) >> 13; // ~186ms attack
+    } else {
+        g_levelerEnvelope += (magnitude - g_levelerEnvelope) >> 17; // ~3s release
+    }
+    if (++g_levelerUpdateCounter >= LEVELER_UPDATE_PERIOD) {
+        g_levelerUpdateCounter = 0;
+        if (g_levelerEnvelope > LEVELER_TARGET) {
+            g_levelerGainQ16 = (uint32_t)(((int64_t)LEVELER_TARGET << 16) / g_levelerEnvelope);
+        } else {
+            g_levelerGainQ16 = 65536; // unity -- never boosts past this
+        }
+    }
+    mixL = (int32_t)(((int64_t)mixL * g_levelerGainQ16) >> 16);
+    mixR = (int32_t)(((int64_t)mixR * g_levelerGainQ16) >> 16);
+
     int32_t limitedL = softLimit(mixL);
     int32_t limitedR = softLimit(mixR);
-    // A single divide per channel per sample (not per voice) is cheap
-    // even without hardware integer divide, so this doesn't need the
-    // shift-friendly treatment renderVoice()'s per-voice envelope scaling
-    // gets.
-    outLeft = (int16_t)((limitedL * (int32_t)g_masterVolume) / 100);
-    outRight = (int16_t)((limitedR * (int32_t)g_masterVolume) / 100);
+    // Q16 multiply-shift against the precomputed taper gain (see
+    // volumePercentToGainQ16()) rather than a runtime percent/100 divide --
+    // cheaper (no hardware divide on the Cortex-M0+) and, unlike the old
+    // divide, correct by construction for the audio taper. g_outputLevelShift
+    // (see its own comment) is a final plain right-shift on top -- the
+    // Headphone Low/High/Line Level coarse attenuation.
+    outLeft = (int16_t)((((int64_t)limitedL * g_masterGainQ16) >> 16) >> g_outputLevelShift);
+    outRight = (int16_t)((((int64_t)limitedR * g_masterGainQ16) >> 16) >> g_outputLevelShift);
 }
 
 } // namespace
@@ -562,6 +1072,20 @@ void Synth::allNotesOff() {
 void Synth::setVolume(uint8_t percent) {
     if (percent > 100) percent = 100;
     rp2040.fifo.push(packVolumeMsg(percent));
+}
+
+void Synth::setOutputLevel(uint8_t level) {
+    if (level >= OUTPUT_LEVEL_COUNT) level = OUTPUT_LEVEL_HP_LOW;
+    rp2040.fifo.push(packOutputLevelMsg(level));
+}
+
+void Synth::setReverbEnabled(bool enabled) {
+    rp2040.fifo.push(packReverbEnabledMsg(enabled));
+}
+
+void Synth::setReverbMix(uint8_t percent) {
+    if (percent > 100) percent = 100;
+    rp2040.fifo.push(packReverbMixMsg(percent));
 }
 
 // -- WAV playback stream (see synth.h) -- called from core 0 (WavPlayer);
@@ -624,6 +1148,17 @@ void setup1() {
         g_sineTable[i] = (int16_t)(32000.0f * sinf(2.0f * (float)M_PI * i / SINE_TABLE_SIZE));
     }
 
+    for (int i = 0; i < 16; i++) g_presetFilterAlpha[i] = cutoffHzToAlphaQ16(PRESETS[i].cutoffHz);
+    for (int i = 0; i < DRUM_TYPE_COUNT; i++) g_drumFilterAlpha[i] = cutoffHzToAlphaQ16(DRUM_PRESETS[i].cutoffHz);
+    for (int i = 0; i < 16; i++) {
+        g_presetVibratoDepthQ16[i] = (uint32_t)(PRESETS[i].vibratoDepthPercent / 100.0f * 65536.0f + 0.5f);
+        g_presetTremoloDepthQ16[i] = (uint32_t)(PRESETS[i].tremoloDepthPercent / 100.0f * 65536.0f + 0.5f);
+        g_presetPwmDepthQ16[i] = (uint32_t)(PRESETS[i].pwmDepthPercent / 100.0f * 65536.0f + 0.5f);
+    }
+    g_lfoPhaseInc = hzToPhaseInc(LFO_RATE_HZ);
+    g_masterGainQ16 = volumePercentToGainQ16(80); // matches the previous default percent
+    g_reverbMixQ16 = reverbMixPercentToQ16(70); // matches the level this effect first shipped at
+
     // Larger than the library default (6 buffers x 64 words, ~9ms) to
     // absorb brief core 1 stalls without an audible underrun/pop -- most
     // notably, core 0 and core 1 share the same flash XIP bus, so core 0
@@ -649,7 +1184,20 @@ void loop1() {
         }
         uint32_t type = msg >> 28;
         if (type == MSG_TYPE_VOLUME) {
-            g_masterVolume = (uint8_t)(msg & 0xFF);
+            g_masterGainQ16 = volumePercentToGainQ16((uint8_t)(msg & 0xFF));
+            continue;
+        }
+        if (type == MSG_TYPE_OUTPUT_LEVEL) {
+            uint8_t level = (uint8_t)(msg & 0xFF);
+            if (level < OUTPUT_LEVEL_COUNT) g_outputLevelShift = OUTPUT_LEVEL_SHIFT[level];
+            continue;
+        }
+        if (type == MSG_TYPE_REVERB_ENABLED) {
+            g_reverbEnabled = (msg & 0xFF) != 0;
+            continue;
+        }
+        if (type == MSG_TYPE_REVERB_MIX) {
+            g_reverbMixQ16 = reverbMixPercentToQ16((uint8_t)(msg & 0xFF));
             continue;
         }
         uint8_t channel = (msg >> 16) & 0x0F;

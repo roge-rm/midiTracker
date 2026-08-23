@@ -7,11 +7,16 @@
 // the other end of the MIDI cable/USB port.
 //
 // Scope: a small set of algorithmic waveforms (sine/triangle/saw/square)
-// and a per-GM-instrument-family envelope/waveform preset (16 families,
-// selected by Program Change), plus a basic synthesized drum kit on the
-// percussion channel (MIDI channel 10). This is meant to make different
-// parts/instruments in a file distinguishable from each other for
-// verification purposes -- not to sound like real instruments. See
+// run through a fixed one-pole low-pass filter and a shared LFO (vibrato,
+// tremolo, and square-wave PWM, all off the same LFO phase -- see
+// g_lfoPhase in synth.cpp), and a per-GM-instrument-family envelope/
+// waveform/cutoff/vibrato/tremolo/PWM preset (16 families, selected by
+// Program Change), plus a basic synthesized drum kit on the percussion
+// channel (MIDI channel 10). Melodic voices are spread across the stereo
+// field by MIDI channel (drums stay centered) -- see Voice::pan in
+// synth.cpp. This is meant to make different parts/instruments in a file
+// distinguishable from each other for verification purposes -- not to
+// sound like real instruments. See
 // MidiOutput::sendNoteOn/sendNoteOff/sendProgramChange in midi_output.cpp,
 // which is what actually drives this (every outgoing note/program change
 // from SMF playback reaches the synth the same way it reaches the HW/USB
@@ -63,7 +68,42 @@ void allNotesOff();
 // mix's soft limiter (see renderSample() in synth.cpp), so it's a pure
 // output level control -- it doesn't change limiting/clipping behavior at
 // a given polyphony, just how loud the result comes out. Defaults to 80.
+// `percent` is a UI-facing slider position, not a linear gain: internally
+// it's mapped through a cubic audio taper (see volumePercentToGainQ16() in
+// synth.cpp) so the perceived loudness scales roughly evenly across the
+// range, rather than a plain linear percent/100 multiply cramming nearly
+// all the audible range into the low end (confirmed on real hardware --
+// 0% was correctly silent, but 5% was already uncomfortably loud, and not
+// just for synth voices: WAV and .mod playback too, at the same 5%,
+// despite sharing no mixing code with each other or with the synth. Only
+// this final volume step is common to all three, which is what pointed at
+// a linear-taper fader rather than any one engine's mixing math).
 void setVolume(uint8_t percent);
+
+// Coarse output-level attenuation on top of setVolume() above, matching
+// the picoTracker v2 reference firmware's own Headphone Low / Headphone
+// High / Line Level choice (0/1/2) -- see g_outputLevelShift's long
+// comment in synth.cpp for why this exists at all: this board's DAC has
+// no gain control of its own and its headphone amp is already hardware-
+// strapped to its lowest gain step, so digital attenuation (this, plus
+// the Volume taper) is the only lever available, on this firmware or the
+// original. Defaults to Headphone Low (0, the safest/quietest) until
+// this is called.
+void setOutputLevel(uint8_t level);
+
+// On/off for the lo-fi reverb applied to the whole mix (synth + WAV +
+// tracker alike) -- see reverbProcess()'s long comment in synth.cpp for
+// what it actually is and why it's deliberately lo-fi/chiptune-flavored
+// rather than a generic "nice hall" sound. Defaults on. Off costs nothing
+// extra (the tank itself is skipped, not just muted), and re-enabling
+// starts from a cold/silent tank rather than resuming a stale one.
+void setReverbEnabled(bool enabled);
+
+// Reverb wet/dry mix, 0-100%. Not a literal 0-100% wet blend -- it scales
+// within the ceiling this effect was actually tuned/reasoned within (see
+// REVERB_WET_MAX_Q16 in synth.cpp), so 100% means "as strong as this
+// reverb was designed to go," not "fully wet." Defaults to 70.
+void setReverbMix(uint8_t percent);
 
 // -- WAV playback stream --------------------------------------------------
 //

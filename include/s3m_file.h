@@ -218,16 +218,14 @@ private:
     int _numInstruments = 0;
     int _numChannels = 0; // count of enabled channels -- UI display, and see _mixShift below
     bool _channelEnabled[MAX_CHANNELS] = {false}; // channels can be sparsely enabled, not just "first N"
-    // Headroom shift for mixOneSample(), computed once in load() as the
-    // smallest N with (1<<N) >= _numChannels -- the RP2040's Cortex-M0+
-    // has no hardware integer divide, so a genuine runtime `/ _numChannels`
-    // there (done every output sample) is a real, measurable cost that
-    // scales directly with channel count; S3M's usual 12-16 channels (vs
-    // MOD's usual 4) makes that cost far more significant here. Rounding
-    // the divisor up to a power of 2 turns it into a plain shift at the
-    // price of very slightly more headroom (quieter) than the exact
-    // channel count would need -- the same tradeoff ModPlayer's own fixed-
-    // headroom approach already accepts, just approximated further.
+    // Headroom shift for mixOneSample() -- unconditionally 0 now (see
+    // MIX_SHIFT_TYPICAL_CHANNELS's comment in s3m_file.cpp for why a
+    // channel-count-based shift was dropped entirely: even capping it
+    // undershot how quiet it made typical, non-worst-case tracker content,
+    // by a wide enough margin that real-hardware A/B listening against
+    // WAV/MIDI could still hear it). softClampMix() in mixOneSample() is
+    // the only headroom management left, applied unconditionally
+    // regardless of this value.
     uint8_t _mixShift = 0;
     uint8_t _globalVolume = 64;
     uint8_t _globalVolSlideParam = 0; // W's own slide memory -- global, not shared with any channel's D/volSlideParam
