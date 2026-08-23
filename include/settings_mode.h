@@ -27,6 +27,8 @@ int defaultOutputLevel();    // 0=HP Low, 1=HP High, 2=Line Level -- see Synth::
 int defaultVolume();         // percent, 0-100 -- see FilePlayerMode's `volume`/Synth::setVolume()
 bool reverbEnabled();        // see Synth::setReverbEnabled()
 int reverbMix();             // percent, 0-100 -- see Synth::setReverbMix()
+int reverbType();            // 0-2, see Synth::setReverbType()
+bool synthAudioEnabled();    // see Synth::setSynthAudioEnabled()
 float defaultBpm();
 int defaultTimeSigNum();     // beats/bar -- see LooperMode's TimeSig comment
 int defaultTimeSigDen();     // which note value is one beat (4 = quarter, 8 = eighth, ...)

@@ -2,6 +2,7 @@
 #include "pins.h"
 #include <I2S.h>
 #include <math.h>
+#include <stdlib.h>
 
 namespace {
 
@@ -15,6 +16,7 @@ const uint32_t MSG_TYPE_VOLUME = 0x2u;
 const uint32_t MSG_TYPE_OUTPUT_LEVEL = 0x3u;
 const uint32_t MSG_TYPE_REVERB_ENABLED = 0x4u;
 const uint32_t MSG_TYPE_REVERB_MIX = 0x5u;
+const uint32_t MSG_TYPE_REVERB_TYPE = 0x6u;
 const uint32_t PANIC_MSG = 0xFFFFFFFFu;
 const uint32_t RESET_PROGRAMS_MSG = 0xFFFFFFFEu;
 
@@ -39,6 +41,9 @@ inline uint32_t packReverbEnabledMsg(bool enabled) {
 inline uint32_t packReverbMixMsg(uint8_t percent) {
     return (MSG_TYPE_REVERB_MIX << 28) | percent;
 }
+inline uint32_t packReverbTypeMsg(uint8_t type) {
+    return (MSG_TYPE_REVERB_TYPE << 28) | type;
+}
 
 // Set by Synth::begin() on core 0, polled by setup1() on core 1 -- see
 // the long comment on Synth::begin() in synth.h for why this exists.
@@ -54,7 +59,7 @@ volatile bool g_readyForPioInit = false;
 const int SINE_TABLE_SIZE = 256;
 int16_t g_sineTable[SINE_TABLE_SIZE];
 
-// Filled once in setup1() from PRESETS[i].cutoffHz (see cutoffHzToAlphaQ16())
+// Filled once in setup1() from PRESETS[i].cutoffHz (see cutoffHzToAlphaQ14())
 // -- avoids repeating the expf() conversion on every single note-on. The
 // drum-kit equivalent (g_drumFilterAlpha) is declared further down, once
 // DRUM_TYPE_COUNT exists to size it.
@@ -185,12 +190,12 @@ struct Voice {
 
     // One-pole low-pass filter state (see renderVoice()). filterState
     // tracks the filter's own output history, so it lives per-voice just
-    // like phase/amplitude; filterAlpha (Q16, 1..65536) is copied in from
-    // the preset at voice-start and is otherwise constant for the voice's
-    // lifetime -- no filter envelope/LFO at this scope, just a fixed
-    // per-instrument brightness.
+    // like phase/amplitude; filterAlpha (Q14, 1..16384 -- see
+    // cutoffHzToAlphaQ14()) is copied in from the preset at voice-start
+    // and is otherwise constant for the voice's lifetime -- no filter
+    // envelope/LFO at this scope, just a fixed per-instrument brightness.
     int32_t filterState = 0;
-    uint32_t filterAlpha = 65536;
+    uint32_t filterAlpha = 16384;
 
     // Max phase-inc deviation from the shared vibrato LFO (see g_lfoPhase
     // above and renderVoice() below), computed once at note-on from the
@@ -382,18 +387,25 @@ int16_t waveformSample(Waveform w, uint32_t phase, uint16_t pulseWidth) {
 }
 
 // Converts a filter cutoff in Hz to a one-pole low-pass coefficient in
-// Q16 fixed point (1..65536, where 65536 == alpha 1.0 == no filtering).
+// Q14 fixed point (1..16384, where 16384 == alpha 1.0 == no filtering).
 // Standard RC/exponential-smoother derivation: alpha = 1 - e^(-2*pi*fc/fs).
 // Only ever called at startup (once per preset, see g_presetFilterAlpha/
 // g_drumFilterAlpha below), so the float math and expf() call cost nothing
 // at runtime -- renderVoice()'s per-sample filter step is pure integer
-// multiply-shift.
-uint32_t cutoffHzToAlphaQ16(float cutoffHz) {
+// multiply-shift. Q14, not Q16: real-hardware measurement found the
+// per-voice render cost blowing well past budget at just 10-11 active
+// voices, root-caused to Cortex-M0+ having no hardware 32x32->64 multiply
+// -- every "just use int64_t to be safe" in this file was silently
+// costing tens of cycles per voice per sample in software-emulated 64-bit
+// multiplication. Q14 keeps the worst case (diff up to 65535, alpha up to
+// 16384) at ~1.07e9, safely inside int32 range, so the filter step below
+// is a single-cycle 32-bit multiply instead.
+uint32_t cutoffHzToAlphaQ14(float cutoffHz) {
     float alpha = 1.0f - expf(-2.0f * (float)M_PI * cutoffHz / SAMPLE_RATE);
-    int32_t q16 = (int32_t)(alpha * 65536.0f + 0.5f);
-    if (q16 < 1) q16 = 1;
-    if (q16 > 65536) q16 = 65536;
-    return (uint32_t)q16;
+    int32_t q14 = (int32_t)(alpha * 16384.0f + 0.5f);
+    if (q14 < 1) q14 = 1;
+    if (q14 > 16384) q14 = 16384;
+    return (uint32_t)q14;
 }
 
 uint32_t hzToPhaseInc(float hz) {
@@ -560,7 +572,13 @@ void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity
     v.pitchDrop = 0;
     v.pitchDropStep = 0;
     v.filterAlpha = g_presetFilterAlpha[family];
-    v.vibratoRange = (uint32_t)(((uint64_t)v.phaseInc * g_presetVibratoDepthQ16[family]) >> 16);
+    // >>8 extra, on top of the usual >>16, pre-shrinks this for the
+    // per-sample runtime multiply in renderVoice() to stay a plain int32
+    // multiply instead of needing int64_t -- see that call site's comment.
+    // This is a one-time note-start computation (a 64-bit multiply here
+    // costs nothing, unlike doing it every sample), so precision is only
+    // sacrificed where it doesn't cost anything to keep.
+    v.vibratoRange = (uint32_t)(((uint64_t)v.phaseInc * g_presetVibratoDepthQ16[family]) >> 24);
     v.tremoloDepthQ16 = g_presetTremoloDepthQ16[family];
     v.pwmDepthQ16 = g_presetPwmDepthQ16[family];
     // Spread channels 0-15 across the stereo field, but not hard to the
@@ -737,10 +755,15 @@ void renderVoice(Voice& v, int16_t lfoValue, int32_t& outL, int32_t& outR) {
     if (v.vibratoRange != 0) {
         // lfoValue is g_sineTable's output, ~-32000..32000 (not a true
         // Q15 -32768..32767) -- close enough for a musical modulation
-        // depth that a >>15 shift stands in for a /32768 divide (the
+        // depth that a >>7 shift (instead of the "true" >>15 -- see
+        // vibratoRange's own >>24 note-start comment, 8 of the 15 bits
+        // already came off there) stands in for a /32768 divide (the
         // Cortex-M0+ has no hardware divide); the ~2% resulting shortfall
-        // in actual vs. nominal depth is inaudible.
-        phaseIncAdj += ((int64_t)v.vibratoRange * lfoValue) >> 15;
+        // in actual vs. nominal depth is inaudible. Plain int32 multiply,
+        // not int64_t -- vibratoRange was pre-shrunk at note-start
+        // specifically so this per-sample multiply doesn't need it (see
+        // cutoffHzToAlphaQ14()'s comment for why that matters here).
+        phaseIncAdj += ((int32_t)v.vibratoRange * lfoValue) >> 7;
     }
     uint32_t effectivePhaseInc = (uint32_t)phaseIncAdj;
 
@@ -748,29 +771,42 @@ void renderVoice(Voice& v, int16_t lfoValue, int32_t& outL, int32_t& outR) {
     // its fixed 50% (32768) center instead of pitch. Only WAVE_SQUARE
     // voices ever have a nonzero pwmDepthQ16 (see PRESETS), so this is a
     // no-op shift+add for every other waveform.
+    // Plain int32 multiply, not int64: pwmDepthQ16 is a preset-fixed
+    // percentage (max ~15%, see PRESETS), never phaseInc-scaled the way
+    // vibratoRange is, so (max ~9830) * (lfoValue up to ~32768) tops out
+    // around 3.2e8 -- nowhere near int32 overflow. See cutoffHzToAlphaQ14()'s
+    // comment for why this matters on a Cortex-M0+ (no hardware 64-bit
+    // multiply).
     uint16_t pulseWidth = 32768;
     if (v.pwmDepthQ16 != 0) {
-        int32_t swing = (int32_t)(((int64_t)v.pwmDepthQ16 * lfoValue) >> 15);
+        int32_t swing = ((int32_t)v.pwmDepthQ16 * lfoValue) >> 15;
         pulseWidth = (uint16_t)(int32_t)(32768 + swing);
     }
     int16_t raw = waveformSample(v.waveform, v.phase, pulseWidth);
 
     // One-pole low-pass, applied to the raw oscillator before the envelope
     // (VCF-before-VCA, the usual analog-synth order) so the filter's own
-    // brightness is independent of where the envelope happens to be. Q16
-    // fixed point; int64_t intermediate avoids the int32 overflow a full
-    // (diff up to 65535) * (alpha up to 65536) multiply would risk.
+    // brightness is independent of where the envelope happens to be. Q14
+    // fixed point (see cutoffHzToAlphaQ14()'s comment for why Q14, not
+    // Q16) -- plain int32 multiply, no int64_t needed: diff up to 65535 *
+    // alpha up to 16384 tops out around 1.07e9, safely inside int32 range.
     int32_t diff = (int32_t)raw - v.filterState;
-    v.filterState += (int32_t)(((int64_t)diff * (int64_t)v.filterAlpha) >> 16);
+    v.filterState += (diff * (int32_t)v.filterAlpha) >> 14;
 
     int32_t contribution = (v.filterState * v.amplitude) >> VOICE_PEAK_SHIFT;
     // Tremolo: same shared LFO again, this time as a gain wobble around
     // unity (65536 Q16) rather than a pitch or duty-cycle nudge. Applied
     // post-envelope so it modulates the note's own current loudness
-    // rather than fighting the attack/decay/release shape.
+    // rather than fighting the attack/decay/release shape. tremMod itself
+    // is a safe plain int32 multiply (same reasoning as PWM's swing
+    // above), but contribution (up to ~32767) times the Q16 gain (up to
+    // ~77332 at max depth) can exceed int32 -- contribution is shifted
+    // down 2 bits first (negligible precision loss for a modulation
+    // effect) to keep this a 32-bit multiply too; the final shift is
+    // adjusted from 16 to 14 to compensate.
     if (v.tremoloDepthQ16 != 0) {
-        int32_t tremMod = (int32_t)(((int64_t)v.tremoloDepthQ16 * lfoValue) >> 15);
-        contribution = (int32_t)(((int64_t)contribution * (int64_t)(65536 + tremMod)) >> 16);
+        int32_t tremMod = ((int32_t)v.tremoloDepthQ16 * lfoValue) >> 15;
+        contribution = ((contribution >> 2) * (65536 + tremMod)) >> 14;
     }
     // Same pan split (255-pan for L, pan for R, both >>8) the S3M/XM/MOD
     // mixers already use -- see Voice::pan's comment.
@@ -833,13 +869,15 @@ int32_t softLimit(int32_t mix) {
 
 // -- Lo-fi reverb -----------------------------------------------------------
 // A small mono Freeverb-style tank (4 parallel comb filters + 2 series
-// allpass filters) fed from the *entire* mix -- synth voices, WAV, and
-// tracker playback alike, whatever renderSample() is mixing this sample,
-// not just synth voices -- so it's one block here rather than something
-// threaded into each source. Comb/allpass delay lengths are Freeverb's own
-// well-known values, not arbitrary: they're chosen to be mutually non-
-// resonant so the tank doesn't ring at an audible pitch the way a naive
-// choice of lengths can.
+// allpass filters) fed from the onboard MIDI synth's own voices only --
+// see renderSample()'s synthMixL/R, captured before WAV/tracker content is
+// mixed in -- so a WAV or tracker file playing back never reaches the
+// tank, only actual synth notes do. The wet output still gets added into
+// the full (WAV-included) mix afterward, since there's nowhere else for
+// it to go once everything's combined into one output signal. Comb/
+// allpass delay lengths are Freeverb's own well-known values, not
+// arbitrary: they're chosen to be mutually non-resonant so the tank
+// doesn't ring at an audible pitch the way a naive choice of lengths can.
 //
 // The wet signal is then deliberately degraded -- held for REVERB_DECIMATE
 // samples at a time (a crude sample-rate reduction, ~11kHz effective) and
@@ -895,15 +933,37 @@ const int32_t REVERB_WET_MAX_Q16 = 14417;
 bool g_reverbEnabled = true;
 uint32_t g_reverbMixQ16 = 0; // set from the default percent in setup1()
 
+// Which reverb algorithm renderSample()'s reverb block runs, set from the
+// Settings "Reverb Type" control (see Synth::setReverbType()) -- same
+// write-only-from-loop1()-via-FIFO convention as g_reverbEnabled above.
+// All three share the same comb+allpass tank (reverbProcess() below);
+// Lush and Shimmer differ only in how they post-process its output (see
+// chorusProcess()/shimmerProcess()'s own header comments) rather than
+// being separate tanks, so switching types costs nothing extra in memory
+// and doesn't need its own enable/disable bookkeeping.
+const uint8_t REVERB_TYPE_LOFI = 0;
+const uint8_t REVERB_TYPE_LUSH = 1;
+const uint8_t REVERB_TYPE_SHIMMER = 2;
+uint8_t g_reverbType = REVERB_TYPE_LOFI;
+
 uint32_t reverbMixPercentToQ16(uint8_t percent) {
     if (percent > 100) percent = 100;
     return (uint32_t)(((uint64_t)REVERB_WET_MAX_Q16 * percent) / 100);
 }
 
+// Plain int32 multiplies throughout, not int64_t: delayed/dampState/bufOut
+// are all bounded to roughly +-32767 (they either come straight out of an
+// int16_t delay buffer or are a lowpass of one), and REVERB_*_Q16 are
+// small fixed constants (max 65536), so the worst case (~65535 * 65536)
+// still fits int32 -- no need for the software-emulated 64-bit multiply
+// this Cortex-M0+ doesn't have in hardware (see cutoffHzToAlphaQ14()'s
+// comment). `input` (the raw mix sum, not clamped to int16 range) is only
+// ever added, never multiplied, so its larger magnitude doesn't risk
+// overflow here either.
 int32_t reverbComb(int16_t* buf, size_t& pos, int len, int32_t input, int32_t& dampState) {
     int32_t delayed = buf[pos];
-    dampState += (int32_t)(((int64_t)(delayed - dampState) * REVERB_DAMP_ALPHA_Q16) >> 16);
-    int32_t fedBack = input + (int32_t)(((int64_t)dampState * REVERB_COMB_FEEDBACK_Q16) >> 16);
+    dampState += ((delayed - dampState) * REVERB_DAMP_ALPHA_Q16) >> 16;
+    int32_t fedBack = input + ((dampState * REVERB_COMB_FEEDBACK_Q16) >> 16);
     if (fedBack > 32767) fedBack = 32767;
     if (fedBack < -32768) fedBack = -32768;
     buf[pos] = (int16_t)fedBack;
@@ -915,7 +975,7 @@ int32_t reverbComb(int16_t* buf, size_t& pos, int len, int32_t input, int32_t& d
 int32_t reverbAllpass(int16_t* buf, size_t& pos, int len, int32_t input) {
     int32_t bufOut = buf[pos];
     int32_t output = bufOut - input;
-    int32_t fedBack = input + (int32_t)(((int64_t)bufOut * REVERB_ALLPASS_FEEDBACK_Q16) >> 16);
+    int32_t fedBack = input + ((bufOut * REVERB_ALLPASS_FEEDBACK_Q16) >> 16);
     if (fedBack > 32767) fedBack = 32767;
     if (fedBack < -32768) fedBack = -32768;
     buf[pos] = (int16_t)fedBack;
@@ -945,6 +1005,192 @@ const int32_t REVERB_BIT_MASK = ~0x3F; // keep roughly the top 10 bits -- crude 
 int32_t g_reverbHeld = 0;
 int g_reverbDecimateCounter = 0;
 
+// -- Lush/modulated reverb (Reverb Type: Lush) -------------------------------
+// Runs the same comb+allpass tank as Lo-fi (reverbProcess() above), but
+// instead of decimating/bitcrushing the wet output, reads it back through a
+// small delay line whose read position is slowly wobbled by its own LFO
+// (g_reverbChorusLfoPhase -- deliberately much slower than the ~5.5Hz voice
+// vibrato rate; a chorus wants a gentle drift, not a warble). This is a
+// post-process chorus on the tank's *output*, not a modulation of the comb
+// filters' own internal feedback taps: those delay lengths were tuned to be
+// mutually non-resonant (see reverbProcess()'s header comment), and wobbling
+// them directly risks reintroducing the metallic ringing that tuning was
+// meant to avoid. A wobbled reader gets the same "chorused, lively"
+// character without touching that tuning.
+const float REVERB_CHORUS_LFO_RATE_HZ = 0.3f; // slow drift, not a warble
+uint32_t g_reverbChorusLfoPhaseInc = 0; // computed in setup1()
+uint32_t g_reverbChorusLfoPhase = 0;
+
+const int REVERB_CHORUS_BUF_LEN = 512; // power of two, ample margin over the delay range below
+const int REVERB_CHORUS_BUF_MASK = REVERB_CHORUS_BUF_LEN - 1;
+// Allocated only while Reverb Type is actually Lush (see
+// reverbTypeChanged()), not a static array -- Lush and Shimmer are
+// mutually exclusive, so there's no reason to pay for both buffers'
+// worth of RAM at once when at most one is ever in use.
+int16_t* g_reverbChorusBuf = nullptr;
+size_t g_reverbChorusPos = 0;
+const int32_t REVERB_CHORUS_BASE_Q8 = 300 << 8;  // ~6.8ms center delay
+const int32_t REVERB_CHORUS_DEPTH_Q8 = 100 << 8; // +-~2.3ms sweep
+
+int32_t chorusProcess(int32_t tankWet) {
+    if (!g_reverbChorusBuf) return 0; // shouldn't happen -- see reverbTypeChanged()
+
+    // Clamp before storing -- tankWet is the tank's raw output, whose
+    // `input` isn't itself clamped to int16 range for a loud/many-voice
+    // send (see reverbProcess()'s comment), but this delay line is an
+    // int16_t buffer.
+    int32_t clamped = tankWet;
+    if (clamped > 32767) clamped = 32767;
+    if (clamped < -32768) clamped = -32768;
+    g_reverbChorusBuf[g_reverbChorusPos] = (int16_t)clamped;
+
+    // lfoValue in [-32767, 32767], scaled to +-REVERB_CHORUS_DEPTH_Q8 --
+    // safe int32 (32767 * 25600 =~ 8.4e8, nowhere near the ~2.1e9 int32
+    // ceiling).
+    int16_t lfoValue = g_sineTable[(g_reverbChorusLfoPhase >> 24) & (SINE_TABLE_SIZE - 1)];
+    g_reverbChorusLfoPhase += g_reverbChorusLfoPhaseInc;
+    int32_t depthQ8 = ((int32_t)lfoValue * REVERB_CHORUS_DEPTH_Q8) >> 15;
+    int32_t delayQ8 = REVERB_CHORUS_BASE_Q8 + depthQ8;
+    int32_t intDelay = delayQ8 >> 8;
+    int32_t frac = delayQ8 & 0xFF; // Q8 fraction, 0..255
+
+    // Adding a large multiple of the (power-of-two) buffer length before
+    // masking isn't strictly needed -- unsigned wraparound already makes
+    // this correct mod REVERB_CHORUS_BUF_LEN on its own -- but it keeps
+    // the intent obvious rather than relying on that wraparound silently.
+    size_t idx0 = (g_reverbChorusPos - (size_t)intDelay + REVERB_CHORUS_BUF_LEN * 4) & REVERB_CHORUS_BUF_MASK;
+    size_t idx1 = (idx0 - 1) & REVERB_CHORUS_BUF_MASK;
+    int32_t s0 = g_reverbChorusBuf[idx0];
+    int32_t s1 = g_reverbChorusBuf[idx1];
+    int32_t interpolated = s0 + (((s1 - s0) * frac) >> 8);
+
+    g_reverbChorusPos = (g_reverbChorusPos + 1) & REVERB_CHORUS_BUF_MASK;
+    return interpolated;
+}
+
+// -- Shimmer reverb (Reverb Type: Shimmer) -----------------------------------
+// Classic ambient/shoegaze effect (Valhalla Shimmer-style): the tank's own
+// wet output is pitch-shifted up an octave and fed back into the tank's
+// input, so successive passes climb another octave each time, decaying
+// naturally via the comb feedback coefficient (REVERB_COMB_FEEDBACK_Q16)
+// instead of spiraling forever -- an ascending, evolving wash rather than a
+// static one. The pitch shift itself is a standard two-tap granular
+// shifter: a circular delay line is written at the normal (1x) rate while
+// two read taps advance through it at 2x speed (an octave up); each tap
+// restarts (jumps back a full grain, to exactly as far behind the write
+// pointer as a 2x-speed read can go without ever overtaking it mid-grain)
+// when it finishes its grain, and a triangular crossfade between the two
+// taps (offset by half a grain from each other) hides that restart as a
+// smooth fade instead of a click.
+const int SHIMMER_GRAIN_LEN = 1024;  // ~23ms grain at 44.1kHz
+const int SHIMMER_BUF_LEN = 2048;    // power of two, 2x grain length for lookback margin
+const int SHIMMER_BUF_MASK = SHIMMER_BUF_LEN - 1;
+const int32_t SHIMMER_PITCH_RATIO_Q16 = 2 << 16; // +1 octave (2x read speed vs write)
+// Q16, ~0.4 -- keeps the regenerative feedback decaying rather than
+// runaway, and stays well clear of int32 overflow multiplied against a
+// worst-case +-32767 shimmerOut (32767 * 26214 =~ 8.6e8).
+const int32_t SHIMMER_FEEDBACK_Q16 = 26214;
+
+// Allocated only while Reverb Type is actually Shimmer -- see the same
+// reasoning on g_reverbChorusBuf above (Lush and Shimmer are mutually
+// exclusive, so only one of the two extra buffers is ever resident).
+int16_t* g_shimmerBuf = nullptr;
+size_t g_shimmerWritePos = 0;
+int32_t g_shimmerReadPosQ16[2] = {0, 0};
+int32_t g_shimmerGrainPos[2] = {0, SHIMMER_GRAIN_LEN / 2}; // half a grain apart, so their crossfades interleave
+int32_t g_shimmerFeedbackHeld = 0;
+
+int32_t shimmerReadTap(int tapIdx) {
+    int32_t posQ16 = g_shimmerReadPosQ16[tapIdx];
+    int32_t intPos = posQ16 >> 16;
+    int32_t frac = posQ16 & 0xFFFF; // Q16 fraction
+
+    size_t idx0 = ((size_t)intPos + SHIMMER_BUF_LEN * 4) & SHIMMER_BUF_MASK;
+    size_t idx1 = (idx0 + 1) & SHIMMER_BUF_MASK;
+    int32_t s0 = g_shimmerBuf[idx0];
+    int32_t s1 = g_shimmerBuf[idx1];
+    // s1-s0 maxes ~65535 and frac is Q16 (max 65535) -- their product
+    // wouldn't fit int32 (~4.3e9), so frac is pre-shrunk to Q8 first
+    // (same trick as chorusProcess()/cutoffHzToAlphaQ14()): worst case
+    // becomes 65535 * 255 =~ 1.7e7, safely inside int32.
+    int32_t interpolated = s0 + (((s1 - s0) * (frac >> 8)) >> 8);
+
+    // Triangular window over the grain, 0 at both ends, peaking (Q8,
+    // ~256) at the midpoint.
+    int32_t g = g_shimmerGrainPos[tapIdx];
+    int32_t window = (g < SHIMMER_GRAIN_LEN / 2)
+        ? (g * 256) / (SHIMMER_GRAIN_LEN / 2)
+        : ((SHIMMER_GRAIN_LEN - g) * 256) / (SHIMMER_GRAIN_LEN / 2);
+
+    return (interpolated * window) >> 8;
+}
+
+int32_t shimmerProcess(int32_t tankWet) {
+    if (!g_shimmerBuf) return 0; // shouldn't happen -- see reverbTypeChanged()
+
+    int32_t clamped = tankWet;
+    if (clamped > 32767) clamped = 32767;
+    if (clamped < -32768) clamped = -32768;
+    g_shimmerBuf[g_shimmerWritePos] = (int16_t)clamped;
+
+    int32_t sum = shimmerReadTap(0) + shimmerReadTap(1);
+
+    for (int t = 0; t < 2; t++) {
+        g_shimmerReadPosQ16[t] += SHIMMER_PITCH_RATIO_Q16;
+        g_shimmerGrainPos[t]++;
+        if (g_shimmerGrainPos[t] >= SHIMMER_GRAIN_LEN) {
+            g_shimmerGrainPos[t] = 0;
+            // Restart this tap's grain a full grain-length behind the
+            // *current* write pointer -- exactly far enough that a
+            // 2x-speed read can run the whole next grain without ever
+            // reading ahead of what's been written (see this block's
+            // header comment).
+            g_shimmerReadPosQ16[t] = ((int32_t)g_shimmerWritePos - SHIMMER_GRAIN_LEN) << 16;
+        }
+    }
+
+    g_shimmerWritePos = (g_shimmerWritePos + 1) & SHIMMER_BUF_MASK;
+    return sum;
+}
+
+// Frees whichever of g_reverbChorusBuf/g_shimmerBuf the *previous* type
+// owned (if any) and allocates+zeroes whichever the *new* type owns (if
+// not already allocated) -- called only from loop1()'s MSG_TYPE_REVERB_TYPE
+// handler, so this always runs on core 1, never racing renderSample()'s own
+// use of these pointers (both happen from the same core, and the FIFO-drain
+// loop that calls this always finishes before renderSample() runs for that
+// iteration). calloc, not malloc: a freshly allocated delay line must start
+// silent, not with whatever garbage happened to be in that RAM before --
+// stale content read back as audio would be an audible glitch, not just an
+// uninitialized-read footgun. Also resets that type's read/write cursors,
+// so switching back into a type later starts clean rather than referencing
+// positions from a since-freed, differently-sized allocation.
+void reverbTypeChanged(uint8_t newType) {
+    if (newType != REVERB_TYPE_LUSH && g_reverbChorusBuf) {
+        free(g_reverbChorusBuf);
+        g_reverbChorusBuf = nullptr;
+    }
+    if (newType != REVERB_TYPE_SHIMMER && g_shimmerBuf) {
+        free(g_shimmerBuf);
+        g_shimmerBuf = nullptr;
+    }
+    if (newType == REVERB_TYPE_LUSH && !g_reverbChorusBuf) {
+        g_reverbChorusBuf = (int16_t*)calloc(REVERB_CHORUS_BUF_LEN, sizeof(int16_t));
+        g_reverbChorusPos = 0;
+        g_reverbChorusLfoPhase = 0;
+    }
+    if (newType == REVERB_TYPE_SHIMMER && !g_shimmerBuf) {
+        g_shimmerBuf = (int16_t*)calloc(SHIMMER_BUF_LEN, sizeof(int16_t));
+        g_shimmerWritePos = 0;
+        g_shimmerReadPosQ16[0] = 0;
+        g_shimmerReadPosQ16[1] = 0;
+        g_shimmerGrainPos[0] = 0;
+        g_shimmerGrainPos[1] = SHIMMER_GRAIN_LEN / 2;
+        g_shimmerFeedbackHeld = 0;
+    }
+    g_reverbType = newType;
+}
+
 // Fills outLeft/outRight with this sample's mixed output. Each synth
 // voice contributes to mixL/mixR according to its own Voice::pan (melodic
 // voices spread across the stereo field by MIDI channel, drums centered --
@@ -970,6 +1216,12 @@ void renderSample(int16_t& outLeft, int16_t& outRight) {
         mixL += l; mixR += r;
     }
 
+    // Reverb sends from the synth voices only (see reverbProcess()'s
+    // header comment) -- captured before WAV/tracker content is mixed in
+    // below, so a WAV/tracker file playing back never feeds the tank, only
+    // the onboard MIDI synth's own voices do.
+    int32_t synthMixL = mixL, synthMixR = mixR;
+
     if (g_wavActive) {
         int16_t wl, wr;
         if (popWavFrame(wl, wr)) {
@@ -983,23 +1235,52 @@ void renderSample(int16_t& outLeft, int16_t& outRight) {
         }
     }
 
-    // Lo-fi reverb send: mono sum of the dry mix so far feeds the tank
-    // (see reverbProcess()'s header comment), and the held/bitcrushed wet
-    // output gets added back identically to both channels -- placed here
-    // (before the leveler/limiter) so the wet signal is covered by the
-    // same headroom management as everything else, not an uncontrolled
-    // extra on top of it. Skipped entirely (tank included) when off --
-    // see Synth::setReverbEnabled() -- so a disabled reverb costs nothing,
-    // and re-enabling it starts from a cold (silent) tank rather than
-    // resuming a stale one, unnoticeable for an ambience effect like this.
+    // Reverb send: mono sum of the synth-only mix (see synthMixL/R above)
+    // feeds the tank (see reverbProcess()'s header comment); which
+    // post-processing runs on the tank's output depends on Reverb Type
+    // (see g_reverbType's own comment for why all three share one tank).
+    // The wet signal gets added back identically to both (full,
+    // WAV-included) channels -- placed here (before the leveler/limiter)
+    // so it's covered by the same headroom management as everything else,
+    // not an uncontrolled extra on top of it. Skipped entirely (tank
+    // included) when off -- see Synth::setReverbEnabled() -- so a
+    // disabled reverb costs nothing, and re-enabling it starts from a
+    // cold (silent) tank rather than resuming a stale one, unnoticeable
+    // for an ambience effect like this.
     if (g_reverbEnabled) {
-        int32_t reverbWetFull = reverbProcess((mixL + mixR) >> 1);
-        if (g_reverbDecimateCounter == 0) {
-            g_reverbHeld = reverbWetFull & REVERB_BIT_MASK;
+        int32_t monoSend = (synthMixL + synthMixR) >> 1;
+        int32_t wetSignal;
+
+        if (g_reverbType == REVERB_TYPE_SHIMMER) {
+            // Regenerative: last sample's (already-decaying, see
+            // SHIMMER_FEEDBACK_Q16) pitch-shifted output feeds back into
+            // this sample's tank input, on top of the dry send.
+            int32_t tankWet = reverbProcess(monoSend + g_shimmerFeedbackHeld);
+            int32_t shimmerOut = shimmerProcess(tankWet);
+            g_shimmerFeedbackHeld = (shimmerOut * SHIMMER_FEEDBACK_Q16) >> 16;
+            // Tank halved so the pitched wash (the actual point of this
+            // mode) leads rather than just riding underneath a full-level
+            // plain reverb.
+            wetSignal = (tankWet >> 1) + shimmerOut;
+        } else {
+            int32_t tankWet = reverbProcess(monoSend);
+            if (g_reverbType == REVERB_TYPE_LUSH) {
+                wetSignal = chorusProcess(tankWet);
+            } else { // REVERB_TYPE_LOFI
+                if (g_reverbDecimateCounter == 0) {
+                    g_reverbHeld = tankWet & REVERB_BIT_MASK;
+                }
+                g_reverbDecimateCounter++;
+                if (g_reverbDecimateCounter >= REVERB_DECIMATE) g_reverbDecimateCounter = 0;
+                wetSignal = g_reverbHeld;
+            }
         }
-        g_reverbDecimateCounter++;
-        if (g_reverbDecimateCounter >= REVERB_DECIMATE) g_reverbDecimateCounter = 0;
-        int32_t reverbWetOut = (int32_t)(((int64_t)g_reverbHeld * g_reverbMixQ16) >> 16);
+
+        // Plain int32: wetSignal stays within a few x +-32767 across all
+        // three modes (see each mode's own overflow comments above),
+        // g_reverbMixQ16 maxes out at REVERB_WET_MAX_Q16 (14417) -- worst
+        // case product is nowhere near int32 overflow.
+        int32_t reverbWetOut = (wetSignal * (int32_t)g_reverbMixQ16) >> 16;
         mixL += reverbWetOut;
         mixR += reverbWetOut;
     }
@@ -1088,6 +1369,11 @@ void Synth::setReverbMix(uint8_t percent) {
     rp2040.fifo.push(packReverbMixMsg(percent));
 }
 
+void Synth::setReverbType(uint8_t type) {
+    if (type > 2) type = 0;
+    rp2040.fifo.push(packReverbTypeMsg(type));
+}
+
 // -- WAV playback stream (see synth.h) -- called from core 0 (WavPlayer);
 // g_wav* are the same anonymous-namespace globals renderSample() reads on
 // core 1, both cores sharing one address space/binary as usual on RP2040.
@@ -1148,14 +1434,15 @@ void setup1() {
         g_sineTable[i] = (int16_t)(32000.0f * sinf(2.0f * (float)M_PI * i / SINE_TABLE_SIZE));
     }
 
-    for (int i = 0; i < 16; i++) g_presetFilterAlpha[i] = cutoffHzToAlphaQ16(PRESETS[i].cutoffHz);
-    for (int i = 0; i < DRUM_TYPE_COUNT; i++) g_drumFilterAlpha[i] = cutoffHzToAlphaQ16(DRUM_PRESETS[i].cutoffHz);
+    for (int i = 0; i < 16; i++) g_presetFilterAlpha[i] = cutoffHzToAlphaQ14(PRESETS[i].cutoffHz);
+    for (int i = 0; i < DRUM_TYPE_COUNT; i++) g_drumFilterAlpha[i] = cutoffHzToAlphaQ14(DRUM_PRESETS[i].cutoffHz);
     for (int i = 0; i < 16; i++) {
         g_presetVibratoDepthQ16[i] = (uint32_t)(PRESETS[i].vibratoDepthPercent / 100.0f * 65536.0f + 0.5f);
         g_presetTremoloDepthQ16[i] = (uint32_t)(PRESETS[i].tremoloDepthPercent / 100.0f * 65536.0f + 0.5f);
         g_presetPwmDepthQ16[i] = (uint32_t)(PRESETS[i].pwmDepthPercent / 100.0f * 65536.0f + 0.5f);
     }
     g_lfoPhaseInc = hzToPhaseInc(LFO_RATE_HZ);
+    g_reverbChorusLfoPhaseInc = hzToPhaseInc(REVERB_CHORUS_LFO_RATE_HZ);
     g_masterGainQ16 = volumePercentToGainQ16(80); // matches the previous default percent
     g_reverbMixQ16 = reverbMixPercentToQ16(70); // matches the level this effect first shipped at
 
@@ -1163,10 +1450,15 @@ void setup1() {
     // absorb brief core 1 stalls without an audible underrun/pop -- most
     // notably, core 0 and core 1 share the same flash XIP bus, so core 0
     // reading MIDI track data off the SD card during playback can briefly
-    // starve core 1's code fetches. ~46ms of buffering is still plenty
-    // responsive for note timing; trading a bit of latency for resilience
-    // is the right call here.
-    g_i2s.setBuffers(8, 256);
+    // starve core 1's code fetches. Bumped from 8 buffers (~46ms) to 12
+    // (~70ms) after round-2 popping diagnostics on busy multi-track MIDI
+    // files showed availableForWrite() repeatedly dropping to ~19% of
+    // capacity during passages with heavy track-switching (more open
+    // tracks == more SD reads interleaved == more XIP contention) -- never
+    // a confirmed full drain in that data, but not much margin left
+    // either. Still plenty responsive for note timing; trading a bit more
+    // latency for resilience is the right call here.
+    g_i2s.setBuffers(12, 256);
     g_i2s.setBitsPerSample(16);
     g_i2s.begin(SAMPLE_RATE);
 }
@@ -1200,6 +1492,11 @@ void loop1() {
             g_reverbMixQ16 = reverbMixPercentToQ16((uint8_t)(msg & 0xFF));
             continue;
         }
+        if (type == MSG_TYPE_REVERB_TYPE) {
+            uint8_t t = (uint8_t)(msg & 0xFF);
+            if (t <= REVERB_TYPE_SHIMMER && t != g_reverbType) reverbTypeChanged(t);
+            continue;
+        }
         uint8_t channel = (msg >> 16) & 0x0F;
         if (type == MSG_TYPE_PROGRAM) {
             g_channelProgram[channel] = (uint8_t)(msg & 0xFF);
@@ -1212,5 +1509,6 @@ void loop1() {
     }
     int16_t left, right;
     renderSample(left, right);
+
     g_i2s.write16(left, right); // blocks until DMA buffer space is free, paces this loop
 }
