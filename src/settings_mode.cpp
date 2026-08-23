@@ -10,6 +10,7 @@
 #include "ui.h"
 #include "sd_card.h"
 #include "midi_output.h"
+#include "keyboard_layout.h" // Theme page's "Save Theme" name entry -- see handleThemeSaveNameInput()
 
 namespace SettingsMode
 {
@@ -37,7 +38,9 @@ namespace SettingsMode
             SETTING_COUNT_IN_BARS,
             SETTING_MIDI_TRANSPORT,
             SETTING_MIDI_THRU,
+            SETTING_BRIGHTNESS,
             SETTING_REBOOT_BOOTLOADER,
+            SETTING_THEME_EDITOR, // ENTER opens the Theme editor (see beginThemeEditor()) -- not adjusted with EDIT+LEFT/RIGHT like every other row here
             SETTING_COUNT,
         };
 
@@ -63,12 +66,57 @@ namespace SettingsMode
         const SettingIndex PAGE_AUDIO_ITEMS[] = {SETTING_OUTPUT_LEVEL, SETTING_DEFAULT_VOLUME, SETTING_REVERB, SETTING_REVERB_MIX, SETTING_REVERB_TYPE, SETTING_SYNTH_AUDIO};
         const SettingIndex PAGE_LOOPER_ITEMS[] = {SETTING_BPM, SETTING_TIME_SIGNATURE, SETTING_BAR_LENGTH, SETTING_SYNC};
         const SettingIndex PAGE_METRONOME_ITEMS[] = {SETTING_METRONOME, SETTING_METRONOME_VOLUME, SETTING_COUNT_IN, SETTING_COUNT_IN_BARS};
-        const SettingIndex PAGE_MIDI_SYSTEM_ITEMS[] = {SETTING_CLOCK_SOURCE, SETTING_MIDI_TRANSPORT, SETTING_MIDI_THRU, SETTING_REBOOT_BOOTLOADER};
+        const SettingIndex PAGE_MIDI_SYSTEM_ITEMS[] = {SETTING_CLOCK_SOURCE, SETTING_MIDI_TRANSPORT, SETTING_MIDI_THRU, SETTING_BRIGHTNESS, SETTING_THEME_EDITOR, SETTING_REBOOT_BOOTLOADER};
 
         const SettingIndex *PAGE_ITEMS[PAGE_COUNT] = {PAGE_AUDIO_ITEMS, PAGE_LOOPER_ITEMS, PAGE_METRONOME_ITEMS, PAGE_MIDI_SYSTEM_ITEMS};
-        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {6, 4, 4, 4};
+        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {6, 4, 4, 6};
 
         int currentPage = 0;
+
+        // -- Theme editor state --------------------------------------------------
+        // Entirely separate from `cursor`/`scrollOffset` below (the generic
+        // settings list's own state) -- opened via ENTER on the "Theme" row in
+        // PAGE_MIDI_SYSTEM (see SETTING_THEME_EDITOR/beginThemeEditor()), not a
+        // page of its own: it needs a row cursor *and* a focused R/G/B field
+        // within that row, plus a small save/load/reset sub-flow, none of which
+        // fits the single-value-per-row model every other page uses. `inThemeEditor`
+        // gates handleInput()/update() into handleThemeInput()/the Theme draw
+        // dispatch instead of the generic per-page logic while it's open.
+        bool inThemeEditor = false;
+        enum ThemeScreen
+        {
+            THEME_LIST,           // the R/G/B color list itself
+            THEME_MENU,           // Save Theme / Load Theme / Reset to Default
+            THEME_SAVE_NAME,      // on-screen keyboard, naming a theme to save
+            THEME_SAVE_OVERWRITE, // "overwrite theme X?" (see FilePlayerMode's own analog)
+            THEME_LOAD_PICK,      // list of saved .thm files to load
+            THEME_FLASH,          // brief result message, then back to THEME_LIST
+        };
+        ThemeScreen themeScreen = THEME_LIST;
+
+        int themeColorCursor = 0;   // which color row (0..Ui::themeColorCount()-1)
+        int themeChannelCursor = 0; // which field within that row: 0=R, 1=G, 2=B
+        int themeScrollOffset = 0;
+
+        const char *THEMES_ROOT = "/themes";
+        const int THEME_NAME_MAX_LEN = 16;
+        char themeNameBuf[THEME_NAME_MAX_LEN + 1] = {0};
+        int themeNameLen = 0;
+        int themeKeyRow = 1, themeKeyCol = 0; // on-screen keyboard cursor, see keyboard_layout.h
+        char themeNameError[40] = {0};
+        char themePendingOverwritePath[64] = {0}; // THEME_SAVE_OVERWRITE only
+
+        const char *const THEME_MENU_LABELS[] = {"Save Theme", "Load Theme", "Reset to Default"};
+        const int THEME_MENU_COUNT = 3;
+        int themeMenuCursor = 0;
+
+        const int MAX_SAVED_THEMES = 20; // generous headroom -- see LooperMode's own MAX_SAVED_SESSIONS precedent
+        char themeLoadNames[MAX_SAVED_THEMES][THEME_NAME_MAX_LEN + 1];
+        int themeLoadCount = 0;
+        int themeLoadCursor = 0;
+
+        char themeFlashMsg[32] = {0};
+        uint32_t themeFlashUntilMs = 0;
 
         // `cursor` (declared further below) is a position *within the current
         // page* (0..currentPageItemCount()-1), not a raw SettingIndex anymore --
@@ -123,6 +171,15 @@ namespace SettingsMode
         MidiThruMode g_defaultThruMode = MIDI_THRU_OFF;
         bool g_clockSourceSlave = false;     // false = Internal (preset BPM), true = Slave (follow MIDI clock)
         bool g_midiTransportEnabled = false; // react to incoming Start/Stop/Continue
+        int g_displayBrightness = 100; // percent -- see Ui::setBacklightBrightness()
+        // Empty = the hardcoded default palette (Ui's own THEME_COLORS defaults,
+        // never touched unless a theme's explicitly loaded). Set whenever a
+        // theme is saved or loaded (see finishThemeSaveName()/
+        // handleThemeSaveOverwriteInput()/handleThemeLoadPickInput()), cleared
+        // by "Reset to Default" -- begin() re-applies whichever one this names
+        // on every boot, so the picked theme survives a power cycle without
+        // having to reload it by hand every time.
+        char g_activeThemeName[THEME_NAME_MAX_LEN + 1] = {0};
 
         const char *outputLevelLabel(int level)
         {
@@ -227,8 +284,12 @@ namespace SettingsMode
                 return "Clock Source";
             case SETTING_MIDI_TRANSPORT:
                 return "MIDI Transport";
+            case SETTING_BRIGHTNESS:
+                return "Brightness";
             case SETTING_REBOOT_BOOTLOADER:
                 return "USB Bootloader";
+            case SETTING_THEME_EDITOR:
+                return "Theme";
             default:
                 return "";
             }
@@ -295,10 +356,18 @@ namespace SettingsMode
             case SETTING_MIDI_TRANSPORT:
                 snprintf(out, outSize, "%s", g_midiTransportEnabled ? "On" : "Off");
                 break;
+            case SETTING_BRIGHTNESS:
+                snprintf(out, outSize, "%d%%", g_displayBrightness);
+                break;
             case SETTING_REBOOT_BOOTLOADER:
                 // Not a stored value -- see handleBootloaderHold() for the
                 // actual trigger. Static instructional text instead.
                 snprintf(out, outSize, "Hold ENTER");
+                break;
+            case SETTING_THEME_EDITOR:
+                // Not a stored value either -- see beginThemeEditor(), triggered
+                // by a tap of ENTER on this row (handleInput()'s own comment).
+                snprintf(out, outSize, "ENTER to edit");
                 break;
             default:
                 out[0] = '\0';
@@ -438,6 +507,16 @@ namespace SettingsMode
             case SETTING_MIDI_TRANSPORT:
                 g_midiTransportEnabled = (direction > 0);
                 break;
+            case SETTING_BRIGHTNESS:
+                g_displayBrightness += direction * 5;
+                // Floor of 10, not 0 -- 0% would black out the screen with
+                // no visual feedback left to see the value climb back up.
+                if (g_displayBrightness < 10)
+                    g_displayBrightness = 10;
+                if (g_displayBrightness > 100)
+                    g_displayBrightness = 100;
+                Ui::setBacklightBrightness(g_displayBrightness); // live-applied immediately, same as MIDI Thru above
+                break;
             }
         }
 
@@ -506,6 +585,10 @@ namespace SettingsMode
             n = snprintf(line, sizeof(line), "clockSlave=%d\n", g_clockSourceSlave ? 1 : 0);
             file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "midiTransport=%d\n", g_midiTransportEnabled ? 1 : 0);
+            file.write((const uint8_t *)line, n);
+            n = snprintf(line, sizeof(line), "brightness=%d\n", g_displayBrightness);
+            file.write((const uint8_t *)line, n);
+            n = snprintf(line, sizeof(line), "activeTheme=%s\n", g_activeThemeName);
             file.write((const uint8_t *)line, n);
 
             file.sync();
@@ -619,6 +702,21 @@ namespace SettingsMode
             if (strncmp(line, "midiTransport=", 14) == 0)
             {
                 g_midiTransportEnabled = atoi(line + 14) != 0;
+                return;
+            }
+            if (strncmp(line, "brightness=", 11) == 0)
+            {
+                g_displayBrightness = atoi(line + 11);
+                if (g_displayBrightness < 10)
+                    g_displayBrightness = 10;
+                if (g_displayBrightness > 100)
+                    g_displayBrightness = 100;
+                return;
+            }
+            if (strncmp(line, "activeTheme=", 12) == 0)
+            {
+                strncpy(g_activeThemeName, line + 12, THEME_NAME_MAX_LEN);
+                g_activeThemeName[THEME_NAME_MAX_LEN] = '\0';
                 return;
             }
         }
@@ -814,10 +912,602 @@ namespace SettingsMode
             needsRedraw = true;
         }
 
+        // Opens the Theme editor from a tap of ENTER on its row (see
+        // handleInput()) -- always starts at the top of the color list, never
+        // mid-save/load from a previous visit.
+        void beginThemeEditor()
+        {
+            inThemeEditor = true;
+            themeScreen = THEME_LIST;
+            themeColorCursor = 0;
+            themeChannelCursor = 0;
+            themeScrollOffset = 0;
+            needsRedraw = true;
+        }
+
+        // -- Theme editor --------------------------------------------------------
+
+        void ensureThemeVisible()
+        {
+            int rows = Ui::visibleRows();
+            if (rows <= 0)
+                return;
+            if (themeColorCursor < themeScrollOffset || themeColorCursor >= themeScrollOffset + rows)
+            {
+                themeScrollOffset = (themeColorCursor / rows) * rows;
+            }
+            if (themeScrollOffset < 0)
+                themeScrollOffset = 0;
+        }
+
+        void moveThemeCursor(int newCursor)
+        {
+            int prevCursor = themeColorCursor;
+            int prevScroll = themeScrollOffset;
+            themeColorCursor = newCursor;
+            ensureThemeVisible();
+            if (themeScrollOffset == prevScroll)
+            {
+                Ui::updateThemeSelection(prevCursor, themeColorCursor, themeChannelCursor, themeScrollOffset);
+            }
+            else
+            {
+                needsRedraw = true;
+            }
+        }
+
+        void adjustThemeChannel(int delta)
+        {
+            uint8_t r, g, b;
+            Ui::getThemeColorRGB(themeColorCursor, r, g, b);
+            uint8_t *chan = (themeChannelCursor == 0) ? &r : (themeChannelCursor == 1) ? &g
+                                                                                        : &b;
+            int v = (int)*chan + delta;
+            if (v < 0)
+                v = 0;
+            if (v > 255)
+                v = 255;
+            *chan = (uint8_t)v;
+            Ui::setThemeColorRGB(themeColorCursor, r, g, b);
+            Ui::updateThemeRow(themeColorCursor, themeChannelCursor, true, themeScrollOffset);
+        }
+
+        // EDIT held + UP/DOWN/LEFT/RIGHT: adjusts the focused channel
+        // (themeChannelCursor) of the selected color row -- UP/DOWN by 10 (coarse),
+        // LEFT/RIGHT by 1 (fine), each repeating while held with its own
+        // hold-to-accelerate timing, same shape as LooperMode's BPM value
+        // (handleBpmValueAdjust()). Bare UP/DOWN/LEFT/RIGHT (EDIT not held) mean
+        // row/field navigation instead (see handleThemeInput()), so this only
+        // ever runs while EDIT is down.
+        void handleThemeValueHold()
+        {
+            if (!Input::isDown(BTN_EDIT))
+                return;
+
+            const uint32_t NORMAL_INTERVAL_MS = 120;
+            const uint32_t FAST_INTERVAL_MS = 40;
+            const uint32_t ACCEL_AFTER_MS = 1500;
+            uint32_t now = millis();
+
+            static uint32_t upPressedAtMs = 0, downPressedAtMs = 0;
+            static uint32_t rightPressedAtMs = 0, leftPressedAtMs = 0;
+            static uint32_t lastUpStep = 0, lastDownStep = 0;
+            static uint32_t lastRightStep = 0, lastLeftStep = 0;
+
+            if (Input::justPressed(BTN_UP))
+                upPressedAtMs = now;
+            if (Input::justPressed(BTN_DOWN))
+                downPressedAtMs = now;
+            if (Input::justPressed(BTN_RIGHT))
+                rightPressedAtMs = now;
+            if (Input::justPressed(BTN_LEFT))
+                leftPressedAtMs = now;
+
+            if (Input::isDown(BTN_UP))
+            {
+                uint32_t interval = (now - upPressedAtMs >= ACCEL_AFTER_MS) ? FAST_INTERVAL_MS : NORMAL_INTERVAL_MS;
+                if (Input::justPressed(BTN_UP) || now - lastUpStep >= interval)
+                {
+                    adjustThemeChannel(10);
+                    lastUpStep = now;
+                }
+            }
+            if (Input::isDown(BTN_DOWN))
+            {
+                uint32_t interval = (now - downPressedAtMs >= ACCEL_AFTER_MS) ? FAST_INTERVAL_MS : NORMAL_INTERVAL_MS;
+                if (Input::justPressed(BTN_DOWN) || now - lastDownStep >= interval)
+                {
+                    adjustThemeChannel(-10);
+                    lastDownStep = now;
+                }
+            }
+            if (Input::isDown(BTN_RIGHT))
+            {
+                uint32_t interval = (now - rightPressedAtMs >= ACCEL_AFTER_MS) ? FAST_INTERVAL_MS : NORMAL_INTERVAL_MS;
+                if (Input::justPressed(BTN_RIGHT) || now - lastRightStep >= interval)
+                {
+                    adjustThemeChannel(1);
+                    lastRightStep = now;
+                }
+            }
+            if (Input::isDown(BTN_LEFT))
+            {
+                uint32_t interval = (now - leftPressedAtMs >= ACCEL_AFTER_MS) ? FAST_INTERVAL_MS : NORMAL_INTERVAL_MS;
+                if (Input::justPressed(BTN_LEFT) || now - lastLeftStep >= interval)
+                {
+                    adjustThemeChannel(-1);
+                    lastLeftStep = now;
+                }
+            }
+        }
+
+        // Shows `msg` for a bit, then returns to THEME_LIST -- same idea as
+        // LooperMode's showFlashMessage(), just local to this page since
+        // nothing else in SettingsMode currently needs transient messages.
+        void showThemeFlash(const char *msg)
+        {
+            strncpy(themeFlashMsg, msg, sizeof(themeFlashMsg) - 1);
+            themeFlashMsg[sizeof(themeFlashMsg) - 1] = '\0';
+            themeFlashUntilMs = millis() + 1200;
+            themeScreen = THEME_FLASH;
+            needsRedraw = true;
+        }
+
+        void beginThemeMenu()
+        {
+            themeMenuCursor = 0;
+            themeScreen = THEME_MENU;
+            Ui::drawEntryMenu("Theme", THEME_MENU_LABELS, THEME_MENU_COUNT, themeMenuCursor);
+        }
+
+        // Writes every themeable color as "Label=R,G,B\n" -- plain text (hence
+        // the user-facing ".thm" extension is cosmetic, same spirit as
+        // LooperMode's own .mid session files), one line per Ui::themeColorLabel()
+        // entry so the file stays readable/hand-editable and immune to
+        // THEME_COLORS being reordered later (see loadThemeFromFile()'s
+        // matching-by-label, not position).
+        bool saveThemeToFile(const char *path)
+        {
+            FsFile file;
+            if (!file.open(path, O_RDWR | O_CREAT | O_TRUNC))
+                return false;
+            char line[48];
+            for (int i = 0; i < Ui::themeColorCount(); i++)
+            {
+                uint8_t r, g, b;
+                Ui::getThemeColorRGB(i, r, g, b);
+                int n = snprintf(line, sizeof(line), "%s=%d,%d,%d\n", Ui::themeColorLabel(i), r, g, b);
+                file.write((const uint8_t *)line, n);
+            }
+            file.sync();
+            file.close();
+            return true;
+        }
+
+        // Reverses saveThemeToFile() -- unrecognized labels (an older/newer
+        // firmware's theme file, or a hand-edited typo) are silently skipped
+        // rather than failing the whole load, same graceful-fallback approach
+        // SettingsMode's own loadSettings()/LooperMode's readSessionMeta() use
+        // for their own text files.
+        bool loadThemeFromFile(const char *path)
+        {
+            FsFile file;
+            if (!file.open(path, O_RDONLY))
+                return false;
+
+            char line[48];
+            int lineLen = 0;
+            int c;
+            bool any = false;
+            while ((c = file.read()) >= 0)
+            {
+                if (c == '\n')
+                {
+                    line[lineLen] = '\0';
+                    char *eq = strchr(line, '=');
+                    if (eq)
+                    {
+                        *eq = '\0';
+                        int r, g, b;
+                        if (sscanf(eq + 1, "%d,%d,%d", &r, &g, &b) == 3)
+                        {
+                            for (int i = 0; i < Ui::themeColorCount(); i++)
+                            {
+                                if (strcmp(line, Ui::themeColorLabel(i)) == 0)
+                                {
+                                    Ui::setThemeColorRGB(i, (uint8_t)r, (uint8_t)g, (uint8_t)b);
+                                    any = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    lineLen = 0;
+                }
+                else if (c != '\r' && lineLen < (int)sizeof(line) - 1)
+                {
+                    line[lineLen++] = (char)c;
+                }
+            }
+            file.close();
+            return any;
+        }
+
+        // Populates themeLoadNames[]/themeLoadCount from THEMES_ROOT's *.thm
+        // files, sorted alphabetically -- same insertion-sort-while-scanning
+        // approach LooperMode's buildSavedSessionList() uses (MAX_SAVED_THEMES
+        // is small enough that an O(n^2) insertion sort is cheap either way).
+        void scanThemesFolder()
+        {
+            themeLoadCount = 0;
+            FsFile dir = sd.open(THEMES_ROOT);
+            if (!dir || !dir.isDir())
+                return;
+
+            FsFile entry;
+            char name[32];
+            while (entry.openNext(&dir, O_RDONLY) && themeLoadCount < MAX_SAVED_THEMES)
+            {
+                if (!entry.isDir())
+                {
+                    entry.getName(name, sizeof(name));
+                    size_t len = strlen(name);
+                    if (len > 4 && strcasecmp(name + len - 4, ".thm") == 0)
+                    {
+                        name[len - 4] = '\0';
+                        int insertAt = themeLoadCount;
+                        while (insertAt > 0 && strcasecmp(themeLoadNames[insertAt - 1], name) > 0)
+                        {
+                            strncpy(themeLoadNames[insertAt], themeLoadNames[insertAt - 1], THEME_NAME_MAX_LEN);
+                            insertAt--;
+                        }
+                        strncpy(themeLoadNames[insertAt], name, THEME_NAME_MAX_LEN);
+                        themeLoadNames[insertAt][THEME_NAME_MAX_LEN] = '\0';
+                        themeLoadCount++;
+                    }
+                }
+                entry.close();
+            }
+            if (dir)
+                dir.close();
+        }
+
+        void beginThemeLoadPick()
+        {
+            scanThemesFolder();
+            themeLoadCursor = 0;
+            themeScreen = THEME_LOAD_PICK;
+            needsRedraw = true;
+        }
+
+        void beginThemeSaveName()
+        {
+            themeNameBuf[0] = '\0';
+            themeNameLen = 0;
+            themeNameError[0] = '\0';
+            themeKeyRow = 1; // top-left letter key ('Q') -- no auto-generated
+            themeKeyCol = 0; // default to accept here, unlike recordings/captures
+            themeScreen = THEME_SAVE_NAME;
+            needsRedraw = true;
+        }
+
+        // Trims trailing spaces, then either saves directly or -- if the name
+        // collides with an existing .thm -- detours through THEME_SAVE_OVERWRITE
+        // first, same "already exists" handling FilePlayerMode's own
+        // finishNameEntry() uses for recordings/captures/renames.
+        void finishThemeSaveName()
+        {
+            char trimmed[THEME_NAME_MAX_LEN + 1];
+            strncpy(trimmed, themeNameBuf, sizeof(trimmed));
+            trimmed[THEME_NAME_MAX_LEN] = '\0';
+            int len = (int)strlen(trimmed);
+            while (len > 0 && trimmed[len - 1] == ' ')
+                trimmed[--len] = '\0';
+            if (len == 0)
+                return; // nothing typed -- stay on the naming screen
+
+            if (!sd.exists(THEMES_ROOT))
+                sd.mkdir(THEMES_ROOT);
+
+            char path[64];
+            snprintf(path, sizeof(path), "%s/%s.thm", THEMES_ROOT, trimmed);
+
+            if (sd.exists(path))
+            {
+                strncpy(themePendingOverwritePath, path, sizeof(themePendingOverwritePath) - 1);
+                themePendingOverwritePath[sizeof(themePendingOverwritePath) - 1] = '\0';
+                themeScreen = THEME_SAVE_OVERWRITE;
+                needsRedraw = true;
+                return;
+            }
+
+            if (saveThemeToFile(path))
+            {
+                strncpy(g_activeThemeName, trimmed, THEME_NAME_MAX_LEN);
+                g_activeThemeName[THEME_NAME_MAX_LEN] = '\0';
+                showThemeFlash("Theme saved");
+            }
+            else
+            {
+                strncpy(themeNameError, "save failed", sizeof(themeNameError) - 1);
+                Ui::updateNameEntryError(themeNameError);
+            }
+        }
+
+        void handleThemeSaveNameInput()
+        {
+            int dRow = 0, dCol = 0;
+            if (Input::justPressed(BTN_UP))
+                dRow = -1;
+            if (Input::justPressed(BTN_DOWN))
+                dRow = 1;
+            if (Input::justPressed(BTN_LEFT))
+                dCol = -1;
+            if (Input::justPressed(BTN_RIGHT))
+                dCol = 1;
+            if (dRow != 0 || dCol != 0)
+            {
+                int newRow = themeKeyRow + dRow;
+                if (newRow < 0)
+                    newRow = 0;
+                if (newRow >= KEYBOARD_ROW_COUNT)
+                    newRow = KEYBOARD_ROW_COUNT - 1;
+                int newCol = (dRow != 0) ? themeKeyCol : themeKeyCol + dCol;
+                if (newCol < 0)
+                    newCol = 0;
+                if (newCol >= KEYBOARD_ROW_LENS[newRow])
+                    newCol = KEYBOARD_ROW_LENS[newRow] - 1;
+                if (newRow != themeKeyRow || newCol != themeKeyCol)
+                {
+                    int prevRow = themeKeyRow, prevCol = themeKeyCol;
+                    themeKeyRow = newRow;
+                    themeKeyCol = newCol;
+                    Ui::updateNameEntryKey(prevRow, prevCol, themeKeyRow, themeKeyCol);
+                }
+            }
+
+            if (Input::justPressed(BTN_NAV))
+            {
+                themeScreen = THEME_LIST;
+                needsRedraw = true;
+                return;
+            }
+
+            if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY))
+            {
+                const KeyDef &key = KEYBOARD_ROWS[themeKeyRow][themeKeyCol];
+                bool hadError = (themeNameError[0] != '\0');
+                themeNameError[0] = '\0';
+                switch (key.kind)
+                {
+                case KEY_CHAR:
+                    if (themeNameLen < THEME_NAME_MAX_LEN)
+                    {
+                        themeNameBuf[themeNameLen++] = key.ch;
+                        themeNameBuf[themeNameLen] = '\0';
+                        Ui::updateNameEntryPreview(themeNameBuf, "");
+                        if (hadError)
+                            Ui::updateNameEntryError(nullptr);
+                    }
+                    break;
+                case KEY_DEL:
+                    if (themeNameLen > 0)
+                    {
+                        themeNameBuf[--themeNameLen] = '\0';
+                        Ui::updateNameEntryPreview(themeNameBuf, "");
+                        if (hadError)
+                            Ui::updateNameEntryError(nullptr);
+                    }
+                    break;
+                case KEY_OK:
+                    finishThemeSaveName();
+                    break;
+                }
+            }
+        }
+
+        void handleThemeSaveOverwriteInput()
+        {
+            if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT))
+            {
+                themeScreen = THEME_SAVE_NAME;
+                needsRedraw = true;
+                return;
+            }
+            if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY))
+            {
+                sd.remove(themePendingOverwritePath);
+                if (saveThemeToFile(themePendingOverwritePath))
+                {
+                    strncpy(g_activeThemeName, themeNameBuf, THEME_NAME_MAX_LEN);
+                    g_activeThemeName[THEME_NAME_MAX_LEN] = '\0';
+                    showThemeFlash("Theme saved");
+                }
+                else
+                {
+                    strncpy(themeNameError, "save failed", sizeof(themeNameError) - 1);
+                    themeScreen = THEME_SAVE_NAME;
+                    needsRedraw = true;
+                }
+            }
+        }
+
+        void handleThemeMenuInput()
+        {
+            if (Input::justPressed(BTN_UP))
+            {
+                int prev = themeMenuCursor;
+                themeMenuCursor = (themeMenuCursor > 0) ? themeMenuCursor - 1 : THEME_MENU_COUNT - 1;
+                Ui::updateEntryMenuSelection(THEME_MENU_LABELS, THEME_MENU_COUNT, prev, themeMenuCursor);
+            }
+            if (Input::justPressed(BTN_DOWN))
+            {
+                int prev = themeMenuCursor;
+                themeMenuCursor = (themeMenuCursor < THEME_MENU_COUNT - 1) ? themeMenuCursor + 1 : 0;
+                Ui::updateEntryMenuSelection(THEME_MENU_LABELS, THEME_MENU_COUNT, prev, themeMenuCursor);
+            }
+            if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT))
+            {
+                themeScreen = THEME_LIST;
+                needsRedraw = true;
+                return;
+            }
+            if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY))
+            {
+                if (themeMenuCursor == 0)
+                    beginThemeSaveName();
+                else if (themeMenuCursor == 1)
+                    beginThemeLoadPick();
+                else
+                {
+                    Ui::resetThemeColorsToDefault();
+                    g_activeThemeName[0] = '\0';
+                    showThemeFlash("Reset to default");
+                }
+            }
+        }
+
+        void handleThemeLoadPickInput()
+        {
+            if (Input::justPressed(BTN_UP) && themeLoadCount > 0)
+            {
+                themeLoadCursor = (themeLoadCursor > 0) ? themeLoadCursor - 1 : themeLoadCount - 1;
+                needsRedraw = true;
+            }
+            if (Input::justPressed(BTN_DOWN) && themeLoadCount > 0)
+            {
+                themeLoadCursor = (themeLoadCursor < themeLoadCount - 1) ? themeLoadCursor + 1 : 0;
+                needsRedraw = true;
+            }
+            if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT))
+            {
+                themeScreen = THEME_MENU;
+                Ui::drawEntryMenu("Theme", THEME_MENU_LABELS, THEME_MENU_COUNT, themeMenuCursor);
+                return;
+            }
+            if ((Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) && themeLoadCount > 0)
+            {
+                char path[64];
+                snprintf(path, sizeof(path), "%s/%s.thm", THEMES_ROOT, themeLoadNames[themeLoadCursor]);
+                if (loadThemeFromFile(path))
+                {
+                    strncpy(g_activeThemeName, themeLoadNames[themeLoadCursor], THEME_NAME_MAX_LEN);
+                    g_activeThemeName[THEME_NAME_MAX_LEN] = '\0';
+                    showThemeFlash("Theme loaded");
+                }
+                else
+                    showThemeFlash("Load failed");
+            }
+        }
+
+        // Top-level entry while inThemeEditor is true, called from handleInput()
+        // before any of the generic (SettingIndex-based) page logic runs -- the
+        // editor's row model (a color list with a focused R/G/B field, plus its
+        // own save/load/reset sub-screens) doesn't fit that shape, so it's
+        // entirely self-contained here instead.
+        bool handleThemeInput()
+        {
+            if (themeScreen == THEME_FLASH)
+            {
+                if (millis() >= themeFlashUntilMs)
+                {
+                    themeScreen = THEME_LIST;
+                    needsRedraw = true;
+                }
+                return false;
+            }
+            if (themeScreen == THEME_MENU)
+            {
+                handleThemeMenuInput();
+                return false;
+            }
+            if (themeScreen == THEME_SAVE_NAME)
+            {
+                handleThemeSaveNameInput();
+                return false;
+            }
+            if (themeScreen == THEME_SAVE_OVERWRITE)
+            {
+                handleThemeSaveOverwriteInput();
+                return false;
+            }
+            if (themeScreen == THEME_LOAD_PICK)
+            {
+                handleThemeLoadPickInput();
+                return false;
+            }
+
+            // THEME_LIST. No handleBootloaderHold() call here -- it indexes
+            // currentPageItem(cursor), which is only valid for the generic
+            // (SettingIndex-based) pages this editor isn't one of.
+            //
+            // EDIT held repurposes all four arrow keys into value-adjust (see
+            // handleThemeValueHold()) instead of their bare navigation meaning
+            // below -- same "EDIT is a pure modifier, never a standalone action"
+            // convention used everywhere else in this app (e.g. LooperMode's
+            // ALT). Checked first so navigation never fires alongside it.
+            if (Input::isDown(BTN_EDIT))
+            {
+                handleThemeValueHold();
+                return false;
+            }
+
+            // Bare arrow keys freely navigate: UP/DOWN moves between colors,
+            // LEFT/RIGHT moves between that color's R/G/B fields -- both wrap.
+            // Nothing here claims LEFT for "back"/page-nav the way the generic
+            // pages' LEFT does; NAV is this editor's only exit, precisely so
+            // these four keys stay free to just be a 2D cursor.
+            if (Input::justPressed(BTN_UP))
+            {
+                moveThemeCursor(themeColorCursor > 0 ? themeColorCursor - 1 : Ui::themeColorCount() - 1);
+            }
+            if (Input::justPressed(BTN_DOWN))
+            {
+                moveThemeCursor(themeColorCursor < Ui::themeColorCount() - 1 ? themeColorCursor + 1 : 0);
+            }
+            if (Input::justPressed(BTN_RIGHT))
+            {
+                themeChannelCursor = (themeChannelCursor + 1) % 3;
+                Ui::updateThemeRow(themeColorCursor, themeChannelCursor, true, themeScrollOffset);
+            }
+            if (Input::justPressed(BTN_LEFT))
+            {
+                themeChannelCursor = (themeChannelCursor + 2) % 3; // -1 mod 3
+                Ui::updateThemeRow(themeColorCursor, themeChannelCursor, true, themeScrollOffset);
+            }
+            if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY))
+            {
+                beginThemeMenu();
+            }
+            if (Input::justPressed(BTN_NAV))
+            {
+                inThemeEditor = false; // back to the MIDI/System row list, not out of Settings entirely
+                needsRedraw = true;
+                return false;
+            }
+            return false;
+        }
+
         // Returns true if this tick requested backing out to mode select.
         bool handleInput()
         {
+            if (inThemeEditor)
+            {
+                return handleThemeInput();
+            }
+
             handleBootloaderHold();
+
+            // A tap (not hold -- that's handleBootloaderHold()'s own row,
+            // mutually exclusive since they're different SettingIndex values)
+            // of ENTER on the Theme row opens the editor, same "ENTER acts on
+            // the selected row" idea as everywhere else this app uses ENTER
+            // for a non-adjustable action.
+            if (Input::justPressed(BTN_ENTER) && currentPageItem(cursor) == SETTING_THEME_EDITOR)
+            {
+                beginThemeEditor();
+                return false;
+            }
 
             if (Input::isDown(BTN_EDIT))
             {
@@ -875,6 +1565,22 @@ namespace SettingsMode
         // routing behavior with nowhere else to be adjusted, so it's applied
         // live immediately rather than waiting on some other mode to pull it.
         MidiOutput::setThruMode(g_defaultThruMode);
+        // Same reasoning for Brightness -- Ui::begin() already set the
+        // backlight to a hardcoded 100% before settings had even loaded
+        // (it runs first, for the splash screen), so this is what actually
+        // brings it to the saved value.
+        Ui::setBacklightBrightness(g_displayBrightness);
+        // And again for whichever theme was last active (empty = the
+        // hardcoded default palette Ui's own THEME_COLORS already start
+        // at, so there's nothing to do then) -- a silent no-op if the file
+        // was since deleted from the SD card by hand, same graceful-
+        // fallback reasoning loadThemeFromFile() itself already documents.
+        if (g_activeThemeName[0] != '\0')
+        {
+            char path[64];
+            snprintf(path, sizeof(path), "%s/%s.thm", THEMES_ROOT, g_activeThemeName);
+            loadThemeFromFile(path);
+        }
     }
 
     void enter()
@@ -893,11 +1599,56 @@ namespace SettingsMode
         if (needsRedraw)
         {
             needsRedraw = false;
-            const char *labelPtrs[SETTING_COUNT];
-            char values[SETTING_COUNT][16];
-            const char *valuePtrs[SETTING_COUNT];
-            buildLists(labelPtrs, values, valuePtrs);
-            Ui::drawSettings(labelPtrs, valuePtrs, currentPageItemCount(), cursor, scrollOffset, PAGE_TITLES[currentPage]);
+            if (inThemeEditor)
+            {
+                switch (themeScreen)
+                {
+                case THEME_LIST:
+                    Ui::drawThemePage(themeColorCursor, themeChannelCursor, themeScrollOffset);
+                    break;
+                case THEME_MENU:
+                    Ui::drawEntryMenu("Theme", THEME_MENU_LABELS, THEME_MENU_COUNT, themeMenuCursor);
+                    break;
+                case THEME_SAVE_NAME:
+                    Ui::drawNameEntry("Save Theme", themeNameBuf, "",
+                                       themeNameError[0] ? themeNameError : nullptr,
+                                       themeKeyRow, themeKeyCol);
+                    break;
+                case THEME_SAVE_OVERWRITE:
+                {
+                    const char *slash = strrchr(themePendingOverwritePath, '/');
+                    const char *name = slash ? slash + 1 : themePendingOverwritePath;
+                    Ui::drawConfirmOverwrite(name, false);
+                    break;
+                }
+                case THEME_LOAD_PICK:
+                {
+                    if (themeLoadCount > 0)
+                    {
+                        const char *labels[MAX_SAVED_THEMES];
+                        for (int i = 0; i < themeLoadCount; i++)
+                            labels[i] = themeLoadNames[i];
+                        Ui::drawEntryMenu("Load Theme", labels, themeLoadCount, themeLoadCursor);
+                    }
+                    else
+                    {
+                        Ui::drawMessage("No saved themes", "NAV back");
+                    }
+                    break;
+                }
+                case THEME_FLASH:
+                    Ui::drawMessage(themeFlashMsg, nullptr);
+                    break;
+                }
+            }
+            else
+            {
+                const char *labelPtrs[SETTING_COUNT];
+                char values[SETTING_COUNT][16];
+                const char *valuePtrs[SETTING_COUNT];
+                buildLists(labelPtrs, values, valuePtrs);
+                Ui::drawSettings(labelPtrs, valuePtrs, currentPageItemCount(), cursor, scrollOffset, PAGE_TITLES[currentPage]);
+            }
         }
         return false;
     }

@@ -36,6 +36,7 @@ enum AppState {
     APP_PLAY_XM,      // playing back a .xm file (see openSelected())
     APP_ENTRY_MENU,   // Open/Rename/Delete/Load to Looper/New Recording/Capture SysEx Dump/New Folder
     APP_NAME_ENTRY,   // shared on-screen-keyboard editor for the actions above
+    APP_CONFIRM_OVERWRITE, // "overwrite X?" -- the name just entered collides with an existing file/folder, see finishNameEntry()
     APP_CONFIRM_DELETE,
     APP_RECORDING,
     APP_CONFIRM_CANCEL_RECORDING, // "cancel recording? unsaved progress will be lost"
@@ -143,6 +144,14 @@ char nameEntryError[40] = {0};
 char renameOldPath[224] = {0}; // NAME_RENAME only: absolute path being renamed
 bool renameIsDir = false;      // NAME_RENAME only
 FileKind renameKind = FILE_MID; // NAME_RENAME only, meaningless if renameIsDir -- which extension to re-append
+
+// -- APP_CONFIRM_OVERWRITE state -- see finishNameEntry()/
+// handleConfirmOverwriteInput(). NAME_NEW_FOLDER never reaches this (see
+// finishNameEntry()'s own comment on why), so these are only ever
+// meaningful for NAME_NEW_RECORDING/NAME_NEW_SYSEX_CAPTURE/NAME_RENAME.
+char pendingName[NAME_ENTRY_MAX_LEN + 1] = {0}; // trimmed name to actually act on once the collision's resolved
+char pendingOverwritePath[224] = {0}; // the colliding path that would be removed on confirm
+bool pendingOverwriteIsDir = false;   // whether pendingOverwritePath is a directory (only reachable via NAME_RENAME)
 
 // -- entry action menu state --
 MenuEntry menuEntries[7];
@@ -518,10 +527,19 @@ void generateDefaultSysExName(char* out, size_t outSize) {
 }
 
 // Loads `initial` (truncated to NAME_ENTRY_MAX_LEN) into the shared
-// editor buffer. The on-screen keyboard cursor resets to a fixed start
-// point ('Q') for each new session, but -- per the whole point of this
-// screen -- is left wherever the user leaves it between keystrokes
-// within a session, so picking several nearby letters stays quick.
+// editor buffer. The on-screen keyboard cursor resets for each new
+// session, but -- per the whole point of this screen -- is left wherever
+// the user leaves it between keystrokes within a session, so picking
+// several nearby letters stays quick. Where it resets *to* depends on
+// purpose: New Recording/SysEx Capture start pre-filled with an
+// auto-generated name (see generateDefaultRecordingName()/
+// generateDefaultSysExName()) that's good enough to just accept most of
+// the time, so the cursor starts right on OK -- a bare ENTER saves it
+// immediately, no detour up to 'Q' first needed just to reach OK. New
+// Folder (always empty) and Rename (the existing name, which -- unlike
+// the other two -- you've very deliberately opened this screen to
+// *change*) still start at the top-left letter key, since there's real
+// typing to do either way.
 void beginNameEntry(NamePurpose purpose, const char* initial) {
     namePurpose = purpose;
     nameEntryError[0] = '\0';
@@ -532,8 +550,13 @@ void beginNameEntry(NamePurpose purpose, const char* initial) {
     nameEntryBuf[len] = '\0';
     nameEntryLen = len;
 
-    nameEntryKeyRow = 1; // top-left letter key ('Q')
-    nameEntryKeyCol = 0;
+    if (purpose == NAME_NEW_RECORDING || purpose == NAME_NEW_SYSEX_CAPTURE) {
+        nameEntryKeyRow = KEYBOARD_ROW_COUNT - 1;
+        nameEntryKeyCol = KEYBOARD_ROW_LENS[KEYBOARD_ROW_COUNT - 1] - 1; // OK is always the last key of the last row
+    } else {
+        nameEntryKeyRow = 1; // top-left letter key ('Q')
+        nameEntryKeyCol = 0;
+    }
 
     appState = APP_NAME_ENTRY;
     needsRedraw = true;
@@ -619,19 +642,16 @@ const char* currentNameSuffix() {
     return "";
 }
 
-// Trims any trailing spaces the user typed via the SPACE key off
-// nameEntryBuf and performs whatever namePurpose calls for. Failures
-// (name collision, filesystem error) stay on the editor screen with
+// Actually performs whatever namePurpose calls for -- called once any
+// name collision has already been resolved, either because there wasn't
+// one or because the user just confirmed overwriting it (see
+// finishNameEntry()/handleConfirmOverwriteInput()). `trimmed` is the
+// already-validated, trailing-space-trimmed name to act on. Failures
+// (only filesystem errors at this point -- the collision case is handled
+// before this is ever called) stay on the editor screen with
 // `nameEntryError` set rather than navigating away, so the user can just
 // change the name and retry.
-void finishNameEntry() {
-    char trimmed[NAME_ENTRY_MAX_LEN + 1];
-    strncpy(trimmed, nameEntryBuf, sizeof(trimmed));
-    trimmed[NAME_ENTRY_MAX_LEN] = '\0';
-    int len = (int)strlen(trimmed);
-    while (len > 0 && trimmed[len - 1] == ' ') trimmed[--len] = '\0';
-    if (len == 0) return; // nothing typed -- stay on the naming screen
-
+void performNameEntryAction(const char* trimmed) {
     if (namePurpose == NAME_NEW_RECORDING) {
         char filename[NAME_ENTRY_MAX_LEN + 5];
         snprintf(filename, sizeof(filename), "%s.mid", trimmed);
@@ -641,7 +661,7 @@ void finishNameEntry() {
         strncpy(nowRecordingName, trimmed, sizeof(nowRecordingName) - 1);
         nowRecordingName[sizeof(nowRecordingName) - 1] = '\0';
 
-        recorder.arm(path); // failure surfaces via recorder.state() on the recording screen
+        recorder.arm(path); // failure (e.g. the collision we already cleared reappearing from a race) surfaces via recorder.state() on the recording screen
         appState = APP_RECORDING;
         needsRedraw = true;
         return;
@@ -665,9 +685,7 @@ void finishNameEntry() {
     if (namePurpose == NAME_NEW_FOLDER) {
         char path[224];
         browser.buildPath(trimmed, path, sizeof(path));
-        if (sd.exists(path)) {
-            strncpy(nameEntryError, "already exists", sizeof(nameEntryError) - 1);
-        } else if (!sd.mkdir(path)) {
+        if (!sd.mkdir(path)) {
             strncpy(nameEntryError, "could not create folder", sizeof(nameEntryError) - 1);
         } else {
             browser.refresh();
@@ -692,8 +710,6 @@ void finishNameEntry() {
     }
     if (strcmp(newPath, renameOldPath) == 0) {
         appState = APP_BROWSE; // unchanged -- nothing to do
-    } else if (sd.exists(newPath)) {
-        strncpy(nameEntryError, "already exists", sizeof(nameEntryError) - 1);
     } else if (!sd.rename(renameOldPath, newPath)) {
         strncpy(nameEntryError, "rename failed", sizeof(nameEntryError) - 1);
     } else {
@@ -702,6 +718,91 @@ void finishNameEntry() {
     }
     if (appState == APP_BROWSE) needsRedraw = true;
     else Ui::updateNameEntryError(nameEntryError);
+}
+
+// Trims any trailing spaces the user typed via the SPACE key off
+// nameEntryBuf, then either performs whatever namePurpose calls for
+// directly (performNameEntryAction()) or, if that would collide with an
+// existing file/folder, detours through APP_CONFIRM_OVERWRITE first (see
+// handleConfirmOverwriteInput()) -- same "already exists" collision every
+// one of these actions can hit, now resolved with an explicit overwrite
+// choice instead of an outright reject. NAME_NEW_FOLDER is the one
+// exception: creating a folder that already exists as a folder isn't a
+// meaningful "overwrite" (there's no content to replace, just a name to
+// reuse), and treating it as one would mean recursively deleting whatever
+// that folder already contains just to recreate it empty -- a much bigger
+// destructive surprise than replacing a single file, so it keeps the
+// plain reject-and-retry behavior it already had.
+void finishNameEntry() {
+    char trimmed[NAME_ENTRY_MAX_LEN + 1];
+    strncpy(trimmed, nameEntryBuf, sizeof(trimmed));
+    trimmed[NAME_ENTRY_MAX_LEN] = '\0';
+    int len = (int)strlen(trimmed);
+    while (len > 0 && trimmed[len - 1] == ' ') trimmed[--len] = '\0';
+    if (len == 0) return; // nothing typed -- stay on the naming screen
+
+    if (namePurpose == NAME_NEW_FOLDER) {
+        performNameEntryAction(trimmed);
+        return;
+    }
+
+    // Compute the same target path performNameEntryAction() itself would,
+    // just to check for a collision before doing anything.
+    char path[224];
+    bool isDir = false;
+    if (namePurpose == NAME_RENAME) {
+        if (renameIsDir) {
+            browser.buildPath(trimmed, path, sizeof(path));
+            isDir = true; // describes whatever's already AT this path, not the thing being renamed
+        } else {
+            char filename[NAME_ENTRY_MAX_LEN + 5];
+            snprintf(filename, sizeof(filename), "%s%s", trimmed, extensionForKind(renameKind));
+            browser.buildPath(filename, path, sizeof(path));
+        }
+        if (strcmp(path, renameOldPath) == 0) {
+            performNameEntryAction(trimmed); // unchanged name -- its own no-op path handles this
+            return;
+        }
+    } else {
+        char filename[NAME_ENTRY_MAX_LEN + 5];
+        snprintf(filename, sizeof(filename), "%s%s", trimmed, currentNameSuffix());
+        browser.buildPath(filename, path, sizeof(path));
+    }
+
+    if (sd.exists(path)) {
+        strncpy(pendingName, trimmed, sizeof(pendingName) - 1);
+        pendingName[sizeof(pendingName) - 1] = '\0';
+        strncpy(pendingOverwritePath, path, sizeof(pendingOverwritePath) - 1);
+        pendingOverwritePath[sizeof(pendingOverwritePath) - 1] = '\0';
+        pendingOverwriteIsDir = isDir;
+        appState = APP_CONFIRM_OVERWRITE;
+        needsRedraw = true;
+    } else {
+        performNameEntryAction(trimmed);
+    }
+}
+
+// ENTER removes whatever's at pendingOverwritePath and then proceeds with
+// the original action, same as if there'd been no collision at all; NAV
+// goes back to APP_NAME_ENTRY (not all the way to APP_BROWSE) so a
+// change-my-mind cancel lands back on editing the name, same place every
+// other name-entry error already leaves you.
+void handleConfirmOverwriteInput() {
+    if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
+        appState = APP_NAME_ENTRY;
+        needsRedraw = true;
+        return;
+    }
+    if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
+        bool ok = pendingOverwriteIsDir ? sd.rmdir(pendingOverwritePath) : sd.remove(pendingOverwritePath);
+        if (!ok) {
+            strncpy(nameEntryError, "overwrite failed", sizeof(nameEntryError) - 1);
+            appState = APP_NAME_ENTRY;
+            needsRedraw = true;
+            return;
+        }
+        performNameEntryAction(pendingName);
+    }
 }
 
 // Builds the contextual action list for whatever's currently selected in
@@ -716,26 +817,31 @@ void beginEntryMenu() {
     // selection is always one of those five. "Load to Looper" only makes
     // sense for .mid -- the looper is a MIDI-event looper, not an audio
     // one, same reason .syx/.wav/.mod/.s3m never offer it.
-    bool isFile = hasSelection && !browser.entry(selectedIndex).isDir;
-    bool isMidFile = isFile && browser.entry(selectedIndex).kind == FILE_MID;
+    // Fetched once into a local reference (rather than three separate
+    // browser.entry(selectedIndex) calls) since entry() now materializes
+    // on demand -- see SdBrowser's own comment.
+    static const BrowserEntry emptySelection = {};
+    const BrowserEntry& selected = hasSelection ? browser.entry(selectedIndex) : emptySelection;
+    bool isFile = hasSelection && !selected.isDir;
+    bool isMidFile = isFile && selected.kind == FILE_MID;
 
     menuEntryCount = 0;
-    if (hasSelection) {
-        menuEntries[menuEntryCount++] = {MENU_OPEN, "Open"};
-        menuEntries[menuEntryCount++] = {MENU_RENAME, "Rename"};
-        menuEntries[menuEntryCount++] = {MENU_DELETE, "Delete"};
-    }
+    menuEntries[menuEntryCount++] = {MENU_NEW_RECORDING, "New Recording"};
+    menuEntries[menuEntryCount++] = {MENU_CAPTURE_SYSEX, "Capture SysEx Dump"};
     if (isMidFile) {
         // Not offered for a .syx selection -- the looper works in terms of
         // MIDI events/tracks, which a raw SysEx dump doesn't have.
         menuEntries[menuEntryCount++] = {MENU_LOAD_TO_LOOPER, "Load to Looper"};
     }
-    menuEntries[menuEntryCount++] = {MENU_NEW_RECORDING, "New Recording"};
-    menuEntries[menuEntryCount++] = {MENU_CAPTURE_SYSEX, "Capture SysEx Dump"};
+    if (hasSelection) {
+        menuEntries[menuEntryCount++] = {MENU_OPEN, "Open"};
+        menuEntries[menuEntryCount++] = {MENU_RENAME, "Rename"};
+        menuEntries[menuEntryCount++] = {MENU_DELETE, "Delete"};
+    }
     menuEntries[menuEntryCount++] = {MENU_NEW_FOLDER, "New Folder"};
 
     if (hasSelection) {
-        strncpy(menuSubtitle, browser.entry(selectedIndex).name, sizeof(menuSubtitle) - 1);
+        strncpy(menuSubtitle, selected.name, sizeof(menuSubtitle) - 1);
         menuSubtitle[sizeof(menuSubtitle) - 1] = '\0';
     } else {
         strncpy(menuSubtitle, "Menu", sizeof(menuSubtitle) - 1);
@@ -1342,10 +1448,10 @@ void moveMenuCursor(int newCursor) {
 
 void handleEntryMenuInput() {
     if (Input::justPressed(BTN_UP)) {
-        if (menuCursor > 0) moveMenuCursor(menuCursor - 1);
+        moveMenuCursor(menuCursor > 0 ? menuCursor - 1 : menuEntryCount - 1); // wraps to the bottom
     }
     if (Input::justPressed(BTN_DOWN)) {
-        if (menuCursor < menuEntryCount - 1) moveMenuCursor(menuCursor + 1);
+        moveMenuCursor(menuCursor < menuEntryCount - 1 ? menuCursor + 1 : 0); // wraps to the top
     }
     if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
         appState = APP_BROWSE;
@@ -1622,6 +1728,14 @@ void enter() {
     }
     Synth::setVolume((uint8_t)volume);
 
+    // Normally the browser's list just stays valid across a mode switch
+    // (nothing else touches the SD card while we're away) -- but
+    // freeBrowserBuffers() may have silently dropped it in the meantime
+    // (see its own comment), so rebuild here if that happened rather than
+    // showing an incorrectly-empty browser. A no-op the vast majority of
+    // the time (needsRebuild() only true right after that reclaim).
+    if (browser.needsRebuild()) browser.refresh();
+
     appState = APP_BROWSE;
     needsRedraw = true;
 }
@@ -1769,6 +1883,10 @@ bool update() {
             handleNameEntryInput();
             break;
 
+        case APP_CONFIRM_OVERWRITE:
+            handleConfirmOverwriteInput();
+            break;
+
         case APP_CONFIRM_DELETE:
             handleConfirmDeleteInput();
             break;
@@ -1894,6 +2012,16 @@ bool update() {
                 break;
             }
 
+            case APP_CONFIRM_OVERWRITE: {
+                // pendingOverwritePath is a full absolute path -- just the
+                // filename/folder-name portion after the last '/' is what
+                // drawConfirmDelete()'s own `name` convention expects too.
+                const char* slash = strrchr(pendingOverwritePath, '/');
+                const char* name = slash ? slash + 1 : pendingOverwritePath;
+                Ui::drawConfirmOverwrite(name, pendingOverwriteIsDir);
+                break;
+            }
+
             case APP_CONFIRM_DELETE: {
                 bool valid = (selectedIndex >= 0 && selectedIndex < browser.entryCount());
                 const BrowserEntry& e = browser.entry(valid ? selectedIndex : 0);
@@ -1949,6 +2077,10 @@ void consumeLooperImport(char* pathOut, size_t pathOutSize, int& trackIndexOut) 
     pathOut[pathOutSize - 1] = '\0';
     trackIndexOut = pendingLooperImportTrack;
     pendingLooperImport = false;
+}
+
+void freeBrowserBuffers() {
+    browser.freeBuffers();
 }
 
 } // namespace FilePlayerMode

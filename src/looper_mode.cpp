@@ -7,6 +7,8 @@
 #include <new> // std::nothrow, see tracks' declaration below
 
 #include "sd_card.h"
+#include "sd_browser.h"
+#include "keyboard_layout.h"
 #include "midi_output.h"
 #include "input.h"
 #include "ui.h"
@@ -38,7 +40,14 @@ const int NUM_TRACKS = 4;
 // revisited rather than assumed to still fit.
 const int MAX_EVENTS_PER_TRACK = 4096;
 const char* LOOPS_ROOT = "/loops";
-const uint8_t OMNI_CHANNEL = 16; // sentinel channel value: matches any incoming channel
+// Bundle (whole-session) saves live one level down from individual loop
+// saves -- LOOPS_ROOT itself holds loose single-track .mid files (see
+// saveSelectedLoop()), while BUNDLES_ROOT holds the LOOPnnn folders
+// saveSession() has always written (just relocated a level deeper, same
+// naming convention).
+const char* BUNDLES_ROOT = "/loops/bundles";
+const uint8_t OMNI_CHANNEL = 16; // sentinel input-channel value: matches any incoming channel
+const uint8_t CHANNEL_AS_RECORDED = 16; // sentinel output-channel value: send each event on whatever channel it was captured on, unremapped
 
 enum TrackState { TRACK_EMPTY, TRACK_ARMED, TRACK_RECORDING, TRACK_PLAYING, TRACK_MUTED, TRACK_STOPPED, TRACK_PAUSED };
 
@@ -48,7 +57,13 @@ struct LoopEvent {
 };
 
 struct LoopTrack {
-    uint8_t channel = OMNI_CHANNEL; // 0-15, or OMNI_CHANNEL (default: record from any incoming channel)
+    uint8_t channelIn = OMNI_CHANNEL; // 0-15, or OMNI_CHANNEL (default: record from any incoming channel)
+    // 0-15, or CHANNEL_AS_RECORDED (send each event on whatever channel it
+    // was captured on -- see updatePlayback()). Set to a real per-track
+    // default (not CHANNEL_AS_RECORDED) right after tracks[] is allocated,
+    // see enter() -- a default member initializer here can't vary by this
+    // track's own index.
+    uint8_t channelOut = 0;
     TrackState state = TRACK_EMPTY;
 
     // 0 = freeform (current recording pass, or all prior passes, just ran
@@ -132,7 +147,7 @@ float manualBpm = 120.0f;
 // what the metronome/count-in/bar-quantized recording actually need
 // (a click grid and a bar length), without the added complexity compound
 // meter's alternate beat-grouping would bring for little payoff on a
-// tracker. See barsToMs(), updateMetronome(), updateCountIn().
+// tracker. See barsToMs(), updateMasterClock(), updateCountIn().
 struct TimeSig { int num, den; };
 const int TIME_SIG_PRESET_COUNT = 6;
 const TimeSig TIME_SIG_PRESETS[TIME_SIG_PRESET_COUNT] = {
@@ -154,18 +169,26 @@ int timeSigPresetIndex() {
 
 // -- metronome ------------------------------------------------------------
 // Off by default; ticks over the onboard synth's audio-out only (never
-// HW/USB MIDI -- see updateMetronome()), on the same bar grid
+// HW/USB MIDI -- see updateMasterClock()), on the same bar grid
 // sessionEpochMs already anchors bar-quantized recording to, so it stays
 // musically locked to whatever's being recorded/played regardless of
 // Sync vs Independent (a metronome is inherently one shared clock, not a
 // per-track thing).
 bool metronomeOn = false;
-// The metronome's own beat clock -- see updateMetronome()'s header
-// comment for why this runs continuously (advancing every beat, whether
-// or not a click is actually audible right now) instead of being
-// recomputed from scratch on every call.
-uint32_t metronomeNextDueMs = 0; // wall-clock deadline for the next beat; 0 = clock not running (metronomeOn just turned on, or hasn't yet)
-int metronomeBeatInBar = 0;      // which beat of the bar metronomeNextDueMs is (0 = downbeat)
+// The "master clock" -- this session's one shared beat/bar position,
+// independent of whether the audible click (metronomeOn) is switched on:
+// it's what actually drives the header's beat-indicator squares and the
+// BPM row's beat-flash for a running loop even with Metro off (see
+// updateMasterClock()'s header comment), so "the metronome" isn't quite
+// the right name for it even though updateMasterClock() is also what
+// sounds the click when Metro is on. masterClockNextDueMs runs
+// continuously (advancing every beat while something's running) instead
+// of being recomputed from scratch on every call; 0 means the clock isn't
+// running at all right now (nothing to restart in place -- see
+// restartMasterClockFromStart() for how a fresh start is told apart from
+// resuming something already in progress).
+uint32_t masterClockNextDueMs = 0; // wall-clock deadline for the next beat; 0 = not running
+int masterClockBeatInBar = 0;      // which beat of the bar masterClockNextDueMs is (0 = downbeat)
 int metronomeVolumePercent = 80; // scales METRONOME_VELOCITY(_DOWNBEAT) below -- see SettingsMode::metronomeVolume()
 const uint8_t METRONOME_CHANNEL = 9;   // GM percussion (MIDI channel 10) -- see PERCUSSION_CHANNEL in synth.cpp
 const uint8_t METRONOME_NOTE = 76;     // GM Hi Wood Block -- a resonant "knock" (synth.cpp's classifyDrum()), trying this in place of the previous Closed Hi-Hat tick
@@ -175,15 +198,50 @@ const uint8_t METRONOME_VELOCITY = 90;
 // them holds regardless of the overall metronome volume setting).
 const uint8_t METRONOME_VELOCITY_DOWNBEAT = (uint8_t)(METRONOME_VELOCITY * 1.40f + 0.5f);
 
+// Forces the master clock to the downbeat, right now -- the "restart from
+// the beginning" half of this app's one rule for it: a *fresh* start
+// (arming a track and triggering it with nothing else already
+// running/counting-in, starting a click-only pre-roll, or resuming a
+// Stopped -- not Paused -- track with nothing else running) always begins
+// at bar 1 beat 1, never wherever stale elapsed session time would
+// otherwise put it. Every call site below gates this behind
+// `masterClockNextDueMs == 0` first (checked *before* anything that
+// call site might do could change what's advancing) -- that's what tells
+// a genuine fresh start apart from joining/continuing something already
+// running, which must never get yanked out of phase by this. A resumed
+// Pause is the one case that deliberately does NOT call this at all (see
+// togglePauseOnSelected()/finishResumeFromPause()): that path leaves the
+// master clock to resync itself from real elapsed time instead, which is
+// what makes it resume in place, in phase with wherever the track it's
+// unfreezing actually left off.
+void restartMasterClockFromStart(uint32_t now) {
+    masterClockBeatInBar = 0;
+    masterClockNextDueMs = now;
+}
+
 // -- count-in -------------------------------------------------------------
 // Only ever triggers when metronomeOn && countInEnabled; when the
 // metronome is on but count-in is off, arming a track still just waits
-// for its first note the way it always has (see handleIncomingMidi()).
+// for its first note the way it always has (see handleIncomingMidi()) --
+// PLAY can still start the click running early, though, see
+// startMetronomeClickOnly() just below.
 bool countInEnabled = true;   // see SettingsMode::defaultCountInEnabled()
 int countInBars = 1;          // see SettingsMode::defaultCountInBars()
 bool countInActive = false;
 uint32_t countInStartMs = 0;
 int countInBeatShown = -1;    // -1 = count-in not currently showing anything yet
+
+// True while a "click-only" pre-roll is running -- Metro's click ticking
+// (and the shared epoch/clock established) with nothing actually armed
+// yet or already recording, so the user can start hearing/feeling the
+// tempo before committing to anything. Only reachable when Metro is on
+// but Count In is off (see startMetronomeClickOnly(), PLAY's own handler
+// in updateMainScreen()) -- with Count In on, that overlay already serves
+// this same "hear the tempo before you play" purpose. Keeps
+// updateMasterClock()'s clock running the same way countInActive/
+// anyTrackAdvancing() do; cleared the moment real recording actually
+// starts (see startArmedTracksTogether()) or Metro turns back off.
+bool metronomeClickOnlyActive = false;
 
 // The BPM row packs five independently-adjustable things into one row --
 // this is which of them ALT+UP/DOWN/LEFT/RIGHT currently targets.
@@ -200,9 +258,25 @@ int countInBeatShown = -1;    // -1 = count-in not currently showing anything ye
 enum BpmRowFocus { BPM_FOCUS_VALUE, BPM_FOCUS_TIME_SIG, BPM_FOCUS_METRONOME, BPM_FOCUS_COUNT_IN, BPM_FOCUS_SYNC };
 BpmRowFocus bpmRowFocus = BPM_FOCUS_VALUE;
 
+// Header beat-indicator row's own visibility -- independent of metronomeOn
+// (see updateMetronomeBeatIndicator()), so the squares stay available as a
+// static time-signature reference even with the metronome's click off. On
+// by default; toggled with an EDIT tap while BPM value has focus (see
+// handleBpmRowEditToggle()).
+bool showBeatIndicator = true;
+
+// How long the BPM row's beat-flash outline stays lit (see
+// updateBpmRowBeatFlash()) -- brief enough to read as a pulse rather than
+// a steady state even at the fastest supported tempo (300 BPM = 200ms/beat),
+// short of the header beat-square flash's own 250ms ACTIVITY_FLASH_MS
+// precedent since that one isn't competing with the next beat's timing.
+const uint32_t BPM_ROW_BEAT_FLASH_MS = 100;
+uint32_t bpmRowFlashUntilMs = 0; // 0 = not currently flashing
+
 bool needsRedraw = true;
 
 bool enterUsedAsModifier = false; // disambiguates ENTER-tap (open menu) from ENTER-held+PLAY (erase), see updateMainScreen()
+bool editUsedForBarLength = false; // disambiguates EDIT-tap (arm/record) from EDIT-held+LEFT/RIGHT (cycle bar length), see handleBarLengthAdjust()/handleRecordInput()
 
 // How long a track's MIDI-activity indicator stays lit after it actually
 // captures an incoming event -- see recordEvent() and buildTrackViews().
@@ -215,14 +289,20 @@ const uint32_t ACTIVITY_FLASH_MS = 250;
 enum Screen {
     SCREEN_MAIN,
     SCREEN_EXIT_CONFIRM,   // "loops are playing, exit anyway?"
-    SCREEN_MENU,           // ENTER-tap: Save / Load Saved Loop / Erase Track N / Erase All Tracks / Delete Saved Loop
-    SCREEN_SAVE_CONFIRM,   // "save loops?"
+    SCREEN_MENU,           // ENTER-tap: Save / Load / Erase Track N / Erase All Tracks / Delete Loop Bundle
+    SCREEN_SAVE_MENU,      // Save Selected Loop / Save All Loops
+    SCREEN_SAVE_LOOP_NAME, // on-screen keyboard: name the individual loop file (Save Selected Loop)
+    SCREEN_SAVE_LOOP_OVERWRITE, // "overwrite X.mid?" -- the typed name collides with an existing loop file
+    SCREEN_SAVE_CONFIRM,   // "save all loops?" (Save All Loops -- the bundle, same behavior as the old plain Save)
     SCREEN_ERASE_CONFIRM,  // "erase Track N?" -- the track selected when the menu was opened
     SCREEN_ERASE_ALL_CONFIRM, // "erase all 4 tracks?"
-    SCREEN_DELETE_BROWSE,  // pick a saved session to delete
+    SCREEN_DELETE_BROWSE,  // pick a saved bundle to delete (Delete Loop Bundle)
     SCREEN_DELETE_CONFIRM, // "delete LOOPnnn?"
-    SCREEN_LOAD_BROWSE,    // pick a saved session to load from
-    SCREEN_LOAD_PICK,      // pick "Load All" or one track within that session
+    SCREEN_LOAD_MENU,      // Load Selected Loop / Load All Loops
+    SCREEN_LOAD_LOOP_BROWSE, // restricted /loops browser (Load Selected Loop): tap selects/enters, hold ENTER deletes
+    SCREEN_LOAD_LOOP_DELETE_CONFIRM, // "delete X.mid?" -- reached by holding ENTER in the browser above
+    SCREEN_LOAD_BROWSE,    // pick a saved bundle to load from (Load All Loops)
+    SCREEN_LOAD_PICK,      // pick "Load All" or one track within that bundle
     SCREEN_LOAD_CONFIRM,   // "load all from LOOPnnn?" / "load Track X into Track Y?"
     SCREEN_IMPORT_CONFIRM, // "import FILE.mid into Track N?" -- requestImport()'s landing screen
     SCREEN_FLASH_MESSAGE,  // brief result message ("Saved as...", "Deleted...", etc), then back to SCREEN_MAIN
@@ -235,13 +315,13 @@ uint32_t flashUntilMs = 0; // valid while screen == SCREEN_FLASH_MESSAGE
 // was selected at that moment. BPM lives directly on the main screen (see
 // onBpmRow) rather than in this menu, since it's a shared/global setting,
 // not a per-track one -- same reasoning is why bar length lives on each
-// track row (ALT+LEFT/RIGHT, see handleBarLengthAdjust()) instead of here.
+// track row (EDIT+LEFT/RIGHT, see handleBarLengthAdjust()) instead of here.
 const int MENU_COUNT = 5;
 char menuEraseLabel[20];   // "Erase Track N"
 const char* menuLabels[MENU_COUNT];
 int menuCursor = 0;
 
-// Bar-length presets, cycled by ALT+LEFT/RIGHT on the selected track (see
+// Bar-length presets, cycled by EDIT+LEFT/RIGHT on the selected track (see
 // handleBarLengthAdjust()) -- index 0 (0 bars) means Freeform, matching
 // LoopTrack::barLength's convention.
 const int BAR_PRESET_COUNT = 9;
@@ -269,6 +349,45 @@ const char* loadPickLabels[NUM_TRACKS + 1];
 int loadPickLabelCount = 0;
 int loadPickCursor = 0;
 
+// -- SCREEN_SAVE_MENU / SCREEN_LOAD_MENU state ---------------------------
+// Two-item submenus opened from SCREEN_MENU's Save/Load rows -- see
+// updateMenu(). Neither wraps at the ends, same convention as SCREEN_MENU
+// itself.
+const int SAVE_MENU_COUNT = 2;
+const char* const saveMenuLabels[SAVE_MENU_COUNT] = { "Save Selected Loop", "Save All Loops" };
+int saveMenuCursor = 0;
+
+const int LOAD_MENU_COUNT = 2;
+const char* const loadMenuLabels[LOAD_MENU_COUNT] = { "Load Selected Loop", "Load All Loops" };
+int loadMenuCursor = 0;
+
+// -- SCREEN_SAVE_LOOP_NAME / SCREEN_SAVE_LOOP_OVERWRITE state ------------
+// A local re-implementation of FilePlayerMode's shared on-screen-keyboard
+// name entry (same Ui::drawNameEntry()/KEYBOARD_ROWS grid), rather than a
+// shared helper -- FilePlayerMode's version is tangled up with its own
+// NamePurpose/browser-relative-path machinery that doesn't apply here
+// (this only ever names one thing: an individual loop file at LOOPS_ROOT).
+const int LOOP_NAME_MAX_LEN = 16;
+char loopSaveNameBuf[LOOP_NAME_MAX_LEN + 1] = {0};
+int loopSaveNameLen = 0;
+int loopSaveKeyRow = 0;
+int loopSaveKeyCol = 0;
+char loopSaveError[40] = {0};
+char pendingLoopSaveName[LOOP_NAME_MAX_LEN + 1] = {0}; // trimmed name pending SCREEN_SAVE_LOOP_OVERWRITE's confirm
+
+// -- SCREEN_LOAD_LOOP_BROWSE / SCREEN_LOAD_LOOP_DELETE_CONFIRM state -----
+// An independent SdBrowser instance rooted at LOOPS_ROOT (SdBrowser
+// supports being instantiated more than once -- FilePlayerMode's own
+// `browser` is a separate instance already). NOT the same object as
+// FilePlayerMode's browser, and NOT reused for the bundle
+// save/load/delete flows above (those still just list session-folder
+// names by hand, same as before). Only .mid files and folders ever
+// appear here (see selectHighlightedLoopEntry()).
+SdBrowser loopBrowser;
+int loopBrowseSelectedIndex = 0;
+int loopBrowseScrollOffset = 0;
+bool loopDeleteFailed = false; // valid while screen == SCREEN_LOAD_LOOP_DELETE_CONFIRM
+
 // -- SCREEN_IMPORT_CONFIRM state -----------------------------------------
 // Set by requestImport(), the entry point main.cpp calls in response to
 // FilePlayerMode's "Load to Looper" browser action -- see looper_mode.h.
@@ -288,6 +407,8 @@ void rescaleBarQuantizedTracks(); // defined below
 void startArmedTracksTogether(); // defined below
 void handleBpmValueAdjust(); // defined below
 void handleTimeSigAdjust(); // defined below
+void beginSaveLoopName(); // defined below
+void beginLoadLoopBrowse(); // defined below
 
 // Cheap partial redraw of just track idx's row -- used throughout instead
 // of a full needsRedraw pass whenever only that one track's state
@@ -417,7 +538,16 @@ void resyncCursor(LoopTrack& t) {
 // stopAccumMs is per-track either way. Shared by NAV and EDIT-held ("All
 // Start") on a stopped track -- both should restart it the same way.
 void resumeFromStop(LoopTrack& t) {
-    t.stopAccumMs = millis() - epochFor(t);
+    uint32_t now = millis();
+    // The track itself always restarts from position 0 here, never resumes
+    // in place -- if the master clock was genuinely idle (nothing else
+    // already running/counting-in), restart it from the downbeat too, same
+    // "fresh start" rule restartMasterClockFromStart() documents. A track
+    // being Stopped (not Paused) is deliberately NOT the resume-in-place
+    // exception to that rule -- only a resumed Pause is (see
+    // finishResumeFromPause(), which this is not).
+    if (masterClockNextDueMs == 0) restartMasterClockFromStart(now);
+    t.stopAccumMs = now - epochFor(t);
     t.state = TRACK_PLAYING;
     t.playCursor = 0;
     t.prevPos = 0;
@@ -450,7 +580,16 @@ void updatePlayback() {
         while (t.playCursor < t.eventCount && t.events[t.playCursor].offsetMs <= pos) {
             const LoopEvent& e = t.events[t.playCursor];
             if (t.state != TRACK_MUTED) {
-                MidiOutput::sendRaw(e.status, e.data1, e.data2, dataBytesForStatus(e.status));
+                // channelOut == CHANNEL_AS_RECORDED sends the event exactly
+                // as captured (its status byte's own channel nibble,
+                // whatever that was -- see recordEvent()); otherwise every
+                // event is forced onto one fixed output channel regardless
+                // of what it was recorded on, so e.g. a single input device
+                // can drive several pieces of outboard gear on different
+                // channels without ever touching that device's own channel.
+                uint8_t outStatus = (t.channelOut == CHANNEL_AS_RECORDED)
+                    ? e.status : (uint8_t)((e.status & 0xF0) | t.channelOut);
+                MidiOutput::sendRaw(outStatus, e.data1, e.data2, dataBytesForStatus(e.status));
                 // Separate from recordEvent()'s lastRecordActivityMs: a
                 // track mid-overdub is simultaneously capturing new events
                 // AND playing back its existing content, so these need
@@ -460,6 +599,25 @@ void updatePlayback() {
             }
             t.playCursor++;
         }
+    }
+}
+
+// Silences whatever channel(s) this track has actually been sounding
+// notes on -- shared by every state transition that needs to avoid a
+// stuck note (Mute, Stop, Pause, MIDI Stop, Erase). A remapped output
+// channel (channelOut != CHANNEL_AS_RECORDED) only ever sends on that one
+// channel, so silencing just it is enough; in AS_RECORDED mode played-back
+// events keep whatever channel they were captured on, which can vary
+// per-event under OMNI input, so there's no single channel guaranteed to
+// catch every stuck note -- broadcast All Notes Off across all 16 real
+// channels instead. Deliberately just CC 123 (not also All Sound Off, the
+// way MidiOutput::allNotesOffAllChannels() does for a global panic) --
+// same narrow scope the single-channel call this replaces already had.
+void allNotesOffForTrack(const LoopTrack& t) {
+    if (t.channelOut != CHANNEL_AS_RECORDED) {
+        MidiOutput::sendControlChange(t.channelOut, 123, 0);
+    } else {
+        for (uint8_t ch = 0; ch < 16; ch++) MidiOutput::sendControlChange(ch, 123, 0);
     }
 }
 
@@ -491,7 +649,7 @@ bool anyTrackMuted() {
 // internally, just silently -- same three states updatePlayback() itself
 // treats as "actively advancing", as opposed to EMPTY/STOPPED/PAUSED/
 // ARMED, which it skips). Used to hold the metronome's beat clock paused
-// until something actually starts (see updateMetronome()) -- deliberately
+// until something actually starts (see updateMasterClock()) -- deliberately
 // excludes ARMED: a track waiting for its first note hasn't started
 // playing or recording yet, so it shouldn't release the clock on its own.
 bool anyTrackAdvancing() {
@@ -502,42 +660,80 @@ bool anyTrackAdvancing() {
     return false;
 }
 
-// Advances the metronome's own beat clock and, when a beat comes due,
-// fires a click -- audibly only while something's actually recording, a
-// count-in is leading into one (see maybeStartCountIn()), or a track is
-// Muted (standing in as a reference click for whatever got silenced);
-// otherwise the beat is still tracked, just silently. Talks to Synth directly rather
-// than through MidiOutput::sendNoteOn() -- unlike track playback, this
-// must never reach HW/USB MIDI out, only the onboard synth's own
-// audio-out. No explicit note-off needed: percussion voices are one-shot
-// and decay on their own (see synth.cpp's startPercussionVoice()).
+// Advances the master clock (this session's shared beat/bar position --
+// see its own declaration comment above) and, when a beat comes due,
+// fires an audible click -- but only while Metro is actually on
+// (metronomeOn) and something's actually recording, a count-in is leading
+// into one (see maybeStartCountIn()), a track is Muted (standing in as a
+// reference click for whatever got silenced), or a click-only pre-roll is
+// running (see startMetronomeClickOnly()). The clock itself keeps
+// advancing regardless of metronomeOn, though, silently -- it's what
+// drives the header's beat-indicator squares (see masterClockCurrentBeat()/
+// Ui::updateLooperBeatIndicator()), which stay a useful "where are we in
+// the bar" reference for a running loop even with the audible click
+// switched off; the BPM row's own beat-flash (updateBpmRowBeatFlash()) is
+// the separate on-screen indicator for the click itself, and stays
+// metronomeOn-gated. Talks to Synth directly rather than through
+// MidiOutput::sendNoteOn() -- unlike track playback, this must never reach
+// HW/USB MIDI out, only the onboard synth's own audio-out. No explicit
+// note-off needed: percussion voices are one-shot and decay on their own
+// (see synth.cpp's startPercussionVoice()).
 //
 // The clock only actually runs while something is genuinely happening --
-// a count-in, or at least one track Recording/Playing/Muted (see
-// anyTrackAdvancing()) -- rather than the moment Metro is merely toggled
-// on: otherwise it'd sit there ticking (and the header's beat-indicator
-// squares advancing) with nothing playing or recording at all, which
-// reads as "running by default" rather than "waiting to be used". While
-// something IS running, though, the clock deliberately keeps advancing
-// every beat regardless of finer-grained changes in *what* exactly is
-// running or how audible it is (e.g. muting one of several playing
-// tracks), rather than being reset on every such toggle -- otherwise a
-// recording toggle mid-session would resync to "whichever beat we're in
-// right now" and click immediately, instead of landing on the next beat a
-// listener would actually expect. It's re-synced from sessionEpochMs's
-// true bar grid exactly once, only when the clock (re)starts from
-// nothing running (metronomeNextDueMs == 0) -- not on every call --
-// because recomputing an absolute beat count from the *entire* elapsed
-// session time on every call broke down as soon as beatMs changed
-// (manualBpm/timeSigDen adjustment): a tiny tempo tweak, multiplied
-// across a long elapsed time, could shift that computed integer by many
-// beats at once, firing a spurious click on almost every adjustment step.
-// Advancing by exactly one beatMs interval per click instead means a
-// tempo change only ever affects the *next* interval, never retroactively
-// recounts history.
-void updateMetronome() {
-    if (!metronomeOn || !(countInActive || anyTrackAdvancing())) {
-        metronomeNextDueMs = 0; // clock not running -- next start re-syncs fresh and clicks right away
+// a count-in, at least one track Recording/Playing/Muted (see
+// anyTrackAdvancing()), or a click-only pre-roll -- rather than
+// continuously: otherwise it'd sit there advancing (and the header's
+// beat-indicator squares moving) with nothing playing, recording, or even
+// pre-rolling, which reads as "running by default" rather than "waiting
+// to be used". While something IS running,
+// though, the clock deliberately keeps advancing every beat regardless of
+// finer-grained changes in *what* exactly is running, whether it's
+// audible, or whether Metro itself gets toggled mid-session (e.g. muting
+// one of several playing tracks, or flipping Metro on/off) -- rather than
+// being reset on every such change, since that would resync to "whichever
+// beat we're in right now" instead of landing on the next beat a listener
+// (or the header display) would actually expect.
+//
+// A restart from nothing running (masterClockNextDueMs == 0) is the one
+// case that DOES resync -- exactly once, right here, never on every call
+// (recomputing an absolute beat count from the *entire* elapsed session
+// time on every call broke down as soon as beatMs changed: manualBpm/
+// timeSigDen adjustment, a tiny tempo tweak, multiplied across a long
+// elapsed time, could shift that computed integer by many beats at once,
+// firing a spurious click on almost every adjustment step -- advancing by
+// exactly one beatMs interval per click instead means a tempo change only
+// ever affects the *next* interval, never retroactively recounts history).
+// This generic resync -- picking up wherever elapsed real time since
+// sessionEpochMs says the clock should be -- is deliberately what a
+// resumed Pause relies on for resuming in place (see
+// finishResumeFromPause()'s own comment). Every *other* restart path
+// (arming a track and triggering it, a click-only pre-roll, resuming a
+// Stopped track) instead calls restartMasterClockFromStart() first, which
+// forces masterClockBeatInBar/masterClockNextDueMs to the downbeat before
+// this generic resync would otherwise run -- since by the time this
+// function sees masterClockNextDueMs == 0 again, it can no longer tell a
+// "start fresh at bar 1" restart apart from a "resume in place" one on its
+// own.
+void updateMasterClock() {
+    // A click-only pre-roll (see startMetronomeClickOnly()) only makes
+    // sense while Metro itself is on -- cancel it the same way
+    // updateCountIn() cancels an in-progress count-in when Metro turns off
+    // mid-count-in, rather than leaving the clock silently advancing with
+    // no audible click and nothing armed/recording to justify it.
+    if (metronomeClickOnlyActive && !metronomeOn) metronomeClickOnlyActive = false;
+
+    if (!(countInActive || anyTrackAdvancing() || metronomeClickOnlyActive)) {
+        // Not just "not running" -- reset all the way back to the start,
+        // every tick nothing's advancing, so the master clock never sits
+        // idle holding some stale mid-bar position (e.g. left over from a
+        // track that was Paused and then erased instead of resumed). A
+        // fresh start's own restartMasterClockFromStart() call would
+        // override this anyway, but resetting proactively here means
+        // *any* idle stretch, from *any* cause, always leaves the clock
+        // parked at the beginning -- never relies on every possible path
+        // back to idle remembering to clean up after itself.
+        masterClockNextDueMs = 0;
+        masterClockBeatInBar = 0;
         return;
     }
 
@@ -547,52 +743,55 @@ void updateMetronome() {
     float beatMs = 60000.0f / manualBpm * (4.0f / timeSigDen);
     if (beatMs <= 0.0f) return;
 
-    if (metronomeNextDueMs == 0) {
+    if (masterClockNextDueMs == 0) {
         uint32_t elapsed = now - sessionEpochMs;
         int beatIndex = (int)(elapsed / beatMs);
-        metronomeBeatInBar = beatIndex % timeSigNum;
-        metronomeNextDueMs = now; // treat the beat we're already in as due right away
+        masterClockBeatInBar = beatIndex % timeSigNum;
+        masterClockNextDueMs = now; // treat the beat we're already in as due right away
     }
-    if ((int32_t)(now - metronomeNextDueMs) < 0) return; // not due yet
+    if ((int32_t)(now - masterClockNextDueMs) < 0) return; // not due yet
 
-    if (countInActive || anyTrackRecording() || anyTrackMuted()) {
-        bool downbeat = (metronomeBeatInBar == 0);
+    if (metronomeOn && (countInActive || anyTrackRecording() || anyTrackMuted() || metronomeClickOnlyActive)) {
+        bool downbeat = (masterClockBeatInBar == 0);
         uint8_t baseVelocity = downbeat ? METRONOME_VELOCITY_DOWNBEAT : METRONOME_VELOCITY;
         uint8_t velocity = (uint8_t)(((int)baseVelocity * metronomeVolumePercent) / 100);
         Synth::noteOn(METRONOME_CHANNEL, METRONOME_NOTE, velocity);
     }
 
-    metronomeBeatInBar = (metronomeBeatInBar + 1) % timeSigNum;
-    metronomeNextDueMs += (uint32_t)beatMs;
+    masterClockBeatInBar = (masterClockBeatInBar + 1) % timeSigNum;
+    masterClockNextDueMs += (uint32_t)beatMs;
 }
 
-// Derives which beat the metronome is currently sounding (0 = downbeat),
-// for the header's beat-indicator squares (see updateMetronomeBeatIndicator()
-// and Ui::updateLooperBeatIndicator()). Returns -1 (no beat lit -- the row
-// still shows, just with nothing highlighted) while the clock itself isn't
-// actually running (metronomeNextDueMs == 0, see updateMetronome()'s own
-// "held until something starts" gate) -- otherwise, right after Metro
-// turns on but before anything's playing/recording, this would show
-// whatever stale beat metronomeBeatInBar was last left at as if it were
-// live. When the clock IS running: metronomeBeatInBar always holds the
-// *next* due beat by the time updateMetronome() returns (see its own big
+// Derives which beat is current (0 = downbeat) -- despite the name, this
+// tracks the loop's beat *position*, not specifically the audible click:
+// it's driven by the same silently-still-advancing clock regardless of
+// metronomeOn (see updateMasterClock()'s own comment), so it stays valid for
+// the header's beat-indicator squares (updateMetronomeBeatIndicator()/
+// Ui::updateLooperBeatIndicator()) whenever a track is actually running,
+// even with the audible click switched off. Returns -1 (no beat lit -- the
+// row still shows, just with nothing highlighted) while the clock itself
+// isn't actually running (masterClockNextDueMs == 0, see updateMasterClock()'s
+// own "held until something starts" gate) -- otherwise, right after
+// something starts running but before its first beat, this would show
+// whatever stale beat masterClockBeatInBar was last left at as if it were
+// live. When the clock IS running: masterClockBeatInBar always holds the
+// *next* due beat by the time updateMasterClock() returns (see its own big
 // comment above) -- never "the beat that just fired" -- so the beat
-// actually sounding right now is one step behind it, wrapping backward
-// through 0. Meaningless while metronomeOn is false -- callers only use
-// this guarded by that.
-int metronomeCurrentBeat() {
-    if (metronomeNextDueMs == 0) return -1; // clock held, waiting for something to start
-    return (metronomeBeatInBar - 1 + timeSigNum) % timeSigNum;
+// actually current right now is one step behind it, wrapping backward
+// through 0.
+int masterClockCurrentBeat() {
+    if (masterClockNextDueMs == 0) return -1; // clock held, waiting for something to start
+    return (masterClockBeatInBar - 1 + timeSigNum) % timeSigNum;
 }
 
-// Called when a track is armed (see toggleRecordOnSelected()'s
-// TRACK_EMPTY case) -- if the metronome and count-in are both enabled
-// and a count-in isn't already running, starts one instead of leaving
-// the track to wait for its first note. No-op (armed tracks wait for a
-// note as usual) otherwise. Safe to call while a count-in is already
-// active -- e.g. arming a second track partway through one -- since it
-// just no-ops and lets that track join whatever's already counting down
-// (see startArmedTracksTogether(), called once the count-in ends).
+// Called from PLAY on the BPM row while nothing's already advancing (see
+// its handler in updateMainScreen()) -- if the metronome and count-in are
+// both enabled and a count-in isn't already running, starts one. No-op
+// otherwise (see startMetronomeClickOnly() for the Metro-on-but-
+// Count-In-off alternative that handler falls back to). Safe to call
+// while a count-in is already active -- e.g. PLAY pressed again partway
+// through one -- since it just no-ops and leaves the existing count-in
+// running.
 void maybeStartCountIn() {
     if (!metronomeOn || !countInEnabled || countInActive) return;
 
@@ -610,16 +809,36 @@ void maybeStartCountIn() {
 
     // Force the metronome's own click clock to restart exactly here, on
     // this same downbeat, instead of leaving it wherever its ongoing
-    // background phase happened to be (see updateMetronome()'s comment on
+    // background phase happened to be (see updateMasterClock()'s comment on
     // why that clock normally *doesn't* reset on every audibility change
     // -- a count-in is the one deliberate exception, since the whole
     // point of pressing it is a clean, predictable "4, 3, 2, 1" where the
     // beats you hear actually match the beats the overlay is counting
     // down, not whatever click happened to already be mid-cycle).
-    metronomeNextDueMs = countInStartMs;
-    metronomeBeatInBar = 0;
+    masterClockNextDueMs = countInStartMs;
+    masterClockBeatInBar = 0;
 
     needsRedraw = true; // switches the main-screen redraw into count-in mode -- see update()
+}
+
+// Called from PLAY on the BPM row (see its handler in updateMainScreen())
+// when maybeStartCountIn() wouldn't do anything -- Metro's on but Count In
+// isn't, so there's no overlay to lead into a start; this just starts the
+// click running immediately instead; lets the user get a feel for the
+// tempo, or simply get the session's shared clock/epoch established,
+// before arming or playing anything. Its only call site's own
+// anyTrackAdvancing()/countInEnabled guards mean this only ever runs while
+// the master clock was genuinely idle, so restartMasterClockFromStart()
+// unconditionally applies -- no need to check masterClockNextDueMs == 0
+// first the way its other two call sites do. metronomeClickOnlyActive is
+// what actually keeps the clock running (see updateMasterClock()) until
+// real recording/playing takes over that job (see
+// startArmedTracksTogether()).
+void startMetronomeClickOnly() {
+    uint32_t now = millis();
+    if (!sessionEpochSet) { sessionEpochMs = now; sessionEpochSet = true; }
+    restartMasterClockFromStart(now);
+    metronomeClickOnlyActive = true;
 }
 
 // Advances the count-in and, once it's run for countInBars bars, starts
@@ -673,8 +892,17 @@ void updateMetronomeBeatIndicator() {
     static int shownBeat = -1;
     static int shownNum = -1;
 
-    bool visible = metronomeOn;
-    int beat = visible ? metronomeCurrentBeat() : -1;
+    // Visibility is its own toggle (see showBeatIndicator), independent of
+    // metronomeOn; the highlighted square tracks a running track's beat
+    // *position*, also independent of metronomeOn (masterClockCurrentBeat()
+    // advances off the same silent clock regardless -- see
+    // updateMasterClock()'s own comment), so this advances for a running
+    // loop even with the audible click switched off -- there's a separate
+    // on-screen indicator for the click itself (the BPM row's own
+    // beat-flash, see updateBpmRowBeatFlash()). Squares still show static
+    // (nothing lit) while nothing's actually running, same as before.
+    bool visible = showBeatIndicator;
+    int beat = visible ? masterClockCurrentBeat() : -1;
 
     if (visible == shownVisible && beat == shownBeat && timeSigNum == shownNum) return;
     shownVisible = visible;
@@ -682,6 +910,38 @@ void updateMetronomeBeatIndicator() {
     shownNum = timeSigNum;
 
     Ui::updateLooperBeatIndicator(visible, beat, timeSigNum);
+}
+
+// Flashes the BPM row's outline briefly on each metronome beat -- a
+// bigger, more peripheral-vision-friendly companion to the small header
+// beat squares above, meant to be noticed without staring at the header
+// but not distracting if you already are. Independent of showBeatIndicator
+// (the header squares' own on/off toggle): this only cares whether the
+// metronome is actually sounding, not whether that separate row is shown.
+// The downbeat (beat 0) flashes orange instead of yellow, same idea as the
+// metronome's own louder downbeat click, so bar boundaries stand out from
+// the beats in between at a glance.
+// Detects "a new beat just fired" the same way updateMetronomeBeatIndicator()
+// does (comparing masterClockCurrentBeat() against what it was last tick) --
+// lastBeat starts at -2 rather than -1 so the clock's initial "-1 = held,
+// nothing sounding yet" reading is never itself mistaken for a beat.
+void updateBpmRowBeatFlash() {
+    static int lastBeat = -2;
+    uint32_t now = millis();
+
+    int beat = metronomeOn ? masterClockCurrentBeat() : -1;
+    if (beat != lastBeat) {
+        lastBeat = beat;
+        if (beat >= 0) { // an actual beat fired, not the clock going idle/held
+            bpmRowFlashUntilMs = now + BPM_ROW_BEAT_FLASH_MS;
+            Ui::updateLooperBpmRowBeatFlash(true, beat == 0, onBpmRow);
+        }
+    }
+
+    if (bpmRowFlashUntilMs != 0 && now >= bpmRowFlashUntilMs) {
+        bpmRowFlashUntilMs = 0;
+        Ui::updateLooperBpmRowBeatFlash(false, false, onBpmRow);
+    }
 }
 
 // For a bar-quantized track (barLength > 0) on its open-ended first
@@ -753,6 +1013,20 @@ void recordEvent(LoopTrack& t, uint8_t status, uint8_t data1, uint8_t data2) {
 void startArmedTracksTogether() {
     uint32_t now = millis();
     if (!sessionEpochSet) { sessionEpochMs = now; sessionEpochSet = true; }
+    // A fresh start while the master clock was genuinely idle always
+    // begins right on the downbeat (see restartMasterClockFromStart()) --
+    // checked *before* anything below can change what's advancing, so it
+    // only ever fires for a truly fresh start: not mid-count-in or while
+    // joining tracks already playing (masterClockNextDueMs is already
+    // nonzero by the time this runs, in both cases).
+    if (masterClockNextDueMs == 0) restartMasterClockFromStart(now);
+    // Whatever's about to start recording/playing takes over keeping the
+    // master clock running (anyTrackAdvancing() covers it from
+    // here on) -- a pre-roll click-only session (see
+    // startMetronomeClickOnly()) has served its purpose the moment real
+    // recording begins, regardless of which of the three call paths
+    // (incoming note, PLAY, count-in finishing) got here.
+    metronomeClickOnlyActive = false;
     for (int i = 0; i < NUM_TRACKS; i++) {
         LoopTrack& t = tracks[i];
         if (t.state == TRACK_ARMED) {
@@ -767,18 +1041,31 @@ void startArmedTracksTogether() {
                 // whole time it was actually frozen.
                 t.stopAccumMs += now - t.stopStartMs;
                 resyncCursor(t);
+            } else if (t.barLength > 0) {
+                // Bar-quantized tracks start counting from the nearest bar
+                // line instead of the raw trigger moment -- this becomes
+                // both the reference event offsets are captured against
+                // (recordEvent()) and, once committed, epochMs, so the
+                // whole take is bar-grid-aligned with no separate
+                // after-the-fact adjustment needed.
+                t.recordStartMs = snapToBarBoundary(now, sessionEpochMs, barsToMs(1));
+            } else if (metronomeOn) {
+                // Freeform (barLength == 0) with Metro actually running a
+                // click the user could realistically have been playing
+                // along to (e.g. a pre-roll from startMetronomeClickOnly())
+                // -- snap to the nearest *beat* instead of the raw trigger
+                // moment, same floor-not-true-nearest reasoning
+                // snapToBarBoundary()'s own comment gives (the next beat
+                // hasn't happened yet at the moment this fires, so there's
+                // nothing to round forward to). snapToBarBoundary() is
+                // grid-size-agnostic despite its name -- one beat's worth
+                // of ms is just a finer grid than one bar's.
+                float beatMs = 60000.0f / manualBpm * (4.0f / timeSigDen);
+                t.recordStartMs = snapToBarBoundary(now, sessionEpochMs, (uint32_t)beatMs);
             } else {
-                // Bar-quantized tracks (barLength > 0) start counting from
-                // the nearest bar line instead of the raw trigger moment --
-                // this becomes both the reference event offsets are
-                // captured against (recordEvent()) and, once committed,
-                // epochMs, so the whole take is bar-grid-aligned with no
-                // separate after-the-fact adjustment needed. Freeform
-                // tracks (barLength == 0) keep the raw moment -- that's
-                // the "unquantized" option.
-                t.recordStartMs = (t.barLength > 0)
-                    ? snapToBarBoundary(now, sessionEpochMs, barsToMs(1))
-                    : now;
+                // No beat reference to snap to (Metro off) -- keep the raw
+                // trigger moment, the "unquantized" option.
+                t.recordStartMs = now;
             }
             t.state = TRACK_RECORDING;
             // This runs from the MIDI input callback or updateCountIn(),
@@ -813,7 +1100,7 @@ void handleIncomingMidi(uint8_t status, uint8_t data1, uint8_t data2, uint8_t le
         bool matchesArmed = false;
         for (int i = 0; i < NUM_TRACKS; i++) {
             const LoopTrack& t = tracks[i];
-            if (t.state == TRACK_ARMED && (t.channel == channel || t.channel == OMNI_CHANNEL)) {
+            if (t.state == TRACK_ARMED && (t.channelIn == channel || t.channelIn == OMNI_CHANNEL)) {
                 matchesArmed = true;
                 break;
             }
@@ -823,7 +1110,7 @@ void handleIncomingMidi(uint8_t status, uint8_t data1, uint8_t data2, uint8_t le
 
     for (int i = 0; i < NUM_TRACKS; i++) {
         LoopTrack& t = tracks[i];
-        if (t.state == TRACK_RECORDING && (t.channel == channel || t.channel == OMNI_CHANNEL)) {
+        if (t.state == TRACK_RECORDING && (t.channelIn == channel || t.channelIn == OMNI_CHANNEL)) {
             recordEvent(t, status, data1, data2);
         }
     }
@@ -914,7 +1201,7 @@ void toggleRecordOnSelected() {
 void toggleMuteOnSelected() {
     LoopTrack& t = tracks[selectedTrack];
     if (t.state == TRACK_PLAYING) {
-        MidiOutput::sendControlChange(t.channel, 123, 0); // All Notes Off -- avoid a stuck note
+        allNotesOffForTrack(t); // avoid a stuck note
         t.state = TRACK_MUTED;
     } else if (t.state == TRACK_MUTED) {
         t.state = TRACK_PLAYING;
@@ -949,7 +1236,7 @@ void commitAndStop(LoopTrack& t) {
         t.state = TRACK_PLAYING;
     }
     if (t.state == TRACK_PLAYING || t.state == TRACK_MUTED) {
-        MidiOutput::sendControlChange(t.channel, 123, 0); // avoid a stuck note
+        allNotesOffForTrack(t); // avoid a stuck note
         t.stopStartMs = millis();
         t.state = TRACK_STOPPED;
     } else if (t.state == TRACK_PAUSED) {
@@ -1046,7 +1333,7 @@ uint32_t nextBarBoundaryAfter(uint32_t now) {
 void togglePauseOnSelected() {
     LoopTrack& t = tracks[selectedTrack];
     if (t.state == TRACK_PLAYING || t.state == TRACK_MUTED) {
-        MidiOutput::sendControlChange(t.channel, 123, 0); // avoid a stuck note, same as Stop/Mute
+        allNotesOffForTrack(t); // avoid a stuck note, same as Stop/Mute
         t.stopStartMs = millis();
         t.state = TRACK_PAUSED;
     } else if (t.state == TRACK_PAUSED) {
@@ -1077,7 +1364,7 @@ void togglePauseOnSelected() {
 // togglePauseOnSelected()) actually arrives -- a Paused track resumes in
 // place at the next beat, a Stopped one restarts from the top at the next
 // bar. Runs every tick regardless of screen, same reasoning as
-// updatePlayback()/updateMetronome().
+// updatePlayback()/updateMasterClock().
 void updatePendingResumes() {
     uint32_t now = millis();
     for (int i = 0; i < NUM_TRACKS; i++) {
@@ -1129,11 +1416,18 @@ bool anyTrackHasContent() {
     return false;
 }
 
-// Called once the user confirms leaving the looper while loops are
-// running: freezes every active track (committing any in-progress
-// recording first) rather than erasing anything, so coming back into
-// Looper mode later finds everything intact, just stopped.
+// "All Stop" -- called both from NAV's held panic-stop gesture (see
+// handleStopInput()) and once the user confirms leaving the looper while
+// loops are running (updateExitConfirm()): freezes every active track
+// (committing any in-progress recording first) rather than erasing
+// anything, so coming back into Looper mode later finds everything
+// intact, just stopped. Also cancels a click-only pre-roll (see
+// startMetronomeClickOnly()) if one's running with nothing armed/recording
+// yet to actually stop -- "stop everything" should silence that too,
+// rather than leaving it clicking on its own with no way back to it short
+// of toggling Metro off.
 void stopAllActiveTracks() {
+    metronomeClickOnlyActive = false;
     for (int i = 0; i < NUM_TRACKS; i++) commitAndStop(tracks[i]);
 }
 
@@ -1198,7 +1492,7 @@ void midiTransportStop() {
         LoopTrack& t = tracks[i];
         t.resumePending = false;
         if (t.state == TRACK_PLAYING || t.state == TRACK_MUTED) {
-            MidiOutput::sendControlChange(t.channel, 123, 0); // avoid a stuck note, same as Pause/Stop
+            allNotesOffForTrack(t); // avoid a stuck note, same as Pause/Stop
             t.stopStartMs = now;
             t.state = TRACK_PAUSED;
             any = true;
@@ -1303,11 +1597,12 @@ void handleMidiRealtime(MidiRealtimeEvent event) {
 // Reset fields individually rather than `t = LoopTrack()` -- each track
 // holds a MAX_EVENTS_PER_TRACK-sized buffer (~16KB), so constructing a
 // whole temporary LoopTrack on the stack here would be a large, avoidable
-// stack spike. channel and barLength are deliberately untouched -- both
-// are per-track setup that callers either want preserved (erase-and-
-// re-record) or overwrite themselves right after (loading saved content).
+// stack spike. channelIn/channelOut and barLength are deliberately
+// untouched -- all are per-track setup that callers either want preserved
+// (erase-and-re-record) or overwrite themselves right after (loading saved
+// content).
 void resetTrack(LoopTrack& t) {
-    if (t.state != TRACK_EMPTY) MidiOutput::sendControlChange(t.channel, 123, 0);
+    if (t.state != TRACK_EMPTY) allNotesOffForTrack(t);
     t.state = TRACK_EMPTY;
     t.lengthMs = 0;
     t.epochMs = 0;
@@ -1336,15 +1631,26 @@ void eraseAllTracks() {
 }
 
 // delta is +1/-1. Wraps through all 16 real channels plus OMNI_CHANNEL.
-void adjustChannelOnSelected(int delta) {
+void adjustChannelInOnSelected(int delta) {
     LoopTrack& t = tracks[selectedTrack];
-    int ch = (int)t.channel + delta;
+    int ch = (int)t.channelIn + delta;
     if (ch < 0) ch = OMNI_CHANNEL;
     if (ch > OMNI_CHANNEL) ch = 0;
-    t.channel = (uint8_t)ch;
+    t.channelIn = (uint8_t)ch;
     // Already-recorded events keep whatever channel they were captured
     // with (it's baked into their stored status byte) -- this only
     // changes what future recording on this track listens for.
+}
+
+// delta is +1/-1. Wraps through all 16 real channels plus
+// CHANNEL_AS_RECORDED. Unlike channelIn, this affects already-recorded
+// content too -- see updatePlayback()'s remap.
+void adjustChannelOutOnSelected(int delta) {
+    LoopTrack& t = tracks[selectedTrack];
+    int ch = (int)t.channelOut + delta;
+    if (ch < 0) ch = CHANNEL_AS_RECORDED;
+    if (ch > CHANNEL_AS_RECORDED) ch = 0;
+    t.channelOut = (uint8_t)ch;
 }
 
 // delta is +1/-1. Cycles through BAR_PRESETS (Freeform, 1/2/4/8/16/32/64/128).
@@ -1462,11 +1768,11 @@ bool saveTrackToFile(const LoopTrack& t, const char* path) {
     return true;
 }
 
-// Picks "LOOP001", "LOOP002", etc. under LOOPS_ROOT -- same pattern as
+// Picks "LOOP001", "LOOP002", etc. under BUNDLES_ROOT -- same pattern as
 // FilePlayerMode's REC00N auto-naming.
 void generateSessionName(char* out, size_t outSize) {
     int nextNum = 1;
-    FsFile dir = sd.open(LOOPS_ROOT);
+    FsFile dir = sd.open(BUNDLES_ROOT);
     if (dir && dir.isDir()) {
         FsFile entry;
         char name[32];
@@ -1485,13 +1791,54 @@ void generateSessionName(char* out, size_t outSize) {
     snprintf(out, outSize, "LOOP%03d", nextNum);
 }
 
+// Picks "Loop001", "Loop002", etc. directly under LOOPS_ROOT (not
+// BUNDLES_ROOT) -- individual loop saves are loose files at the loops
+// root, one level up from where the bundle folders live, and this scans
+// past those folders (isDir() is skipped) so a same-numbered bundle never
+// collides with an individual file's suggested name.
+void generateLoopFileName(char* out, size_t outSize) {
+    int nextNum = 1;
+    FsFile dir = sd.open(LOOPS_ROOT);
+    if (dir && dir.isDir()) {
+        FsFile entry;
+        char name[32];
+        while (entry.openNext(&dir, O_RDONLY)) {
+            if (!entry.isDir()) {
+                entry.getName(name, sizeof(name));
+                if (strncasecmp(name, "Loop", 4) == 0) {
+                    int num = atoi(name + 4);
+                    if (num >= nextNum) nextNum = num + 1;
+                }
+            }
+            entry.close();
+        }
+    }
+    if (dir) dir.close();
+    snprintf(out, outSize, "Loop%03d", nextNum);
+}
+
+// Saves just the selected track as a standalone .mid directly under
+// LOOPS_ROOT -- no session.txt, no channelIn/channelOut/barLength
+// metadata (same "no metadata" contract importFileIntoTrack() already
+// uses to load one of these back in, see its own comment). `path` is
+// opened O_TRUNC, so this doubles as the overwrite path -- no separate
+// remove needed when the name already exists (see
+// updateSaveLoopOverwrite()).
+bool saveSelectedLoop(const char* name) {
+    if (!sd.exists(LOOPS_ROOT)) sd.mkdir(LOOPS_ROOT);
+    char path[96];
+    snprintf(path, sizeof(path), "%s/%s.mid", LOOPS_ROOT, name);
+    return saveTrackToFile(tracks[selectedTrack], path);
+}
+
 void saveSession() {
     if (!sd.exists(LOOPS_ROOT)) sd.mkdir(LOOPS_ROOT);
+    if (!sd.exists(BUNDLES_ROOT)) sd.mkdir(BUNDLES_ROOT);
 
     char sessionName[16];
     generateSessionName(sessionName, sizeof(sessionName));
     char sessionPath[64];
-    snprintf(sessionPath, sizeof(sessionPath), "%s/%s", LOOPS_ROOT, sessionName);
+    snprintf(sessionPath, sizeof(sessionPath), "%s/%s", BUNDLES_ROOT, sessionName);
 
     if (!sd.mkdir(sessionPath)) {
         showFlashMessage("Save failed", "could not create folder", 1500);
@@ -1519,17 +1866,21 @@ void saveSession() {
         if (saveTrackToFile(t, trackPath)) anySaved = true;
 
         if (metaOk) {
-            char chStr[8];
-            if (t.channel == OMNI_CHANNEL) snprintf(chStr, sizeof(chStr), "OMNI");
-            else snprintf(chStr, sizeof(chStr), "%d", t.channel + 1);
+            char inStr[8];
+            if (t.channelIn == OMNI_CHANNEL) snprintf(inStr, sizeof(inStr), "OMNI");
+            else snprintf(inStr, sizeof(inStr), "%d", t.channelIn + 1);
+            char outStr[8];
+            if (t.channelOut == CHANNEL_AS_RECORDED) snprintf(outStr, sizeof(outStr), "REC");
+            else snprintf(outStr, sizeof(outStr), "%d", t.channelOut + 1);
             // barLength isn't recoverable from the .mid file itself (a
             // freeform take and a bar-quantized one can produce identical
             // event/length data) -- lengthMs is written too, but only for
             // reference: loadTrackFromFile() recovers the exact value from
             // the file's own End-of-Track event instead.
-            char line[96];
-            int n = snprintf(line, sizeof(line), "track%d.channel=%s\ntrack%d.barLength=%d\ntrack%d.lengthMs=%lu\n",
-                              i + 1, chStr, i + 1, t.barLength, i + 1, (unsigned long)t.lengthMs);
+            char line[128];
+            int n = snprintf(line, sizeof(line),
+                              "track%d.channelIn=%s\ntrack%d.channelOut=%s\ntrack%d.barLength=%d\ntrack%d.lengthMs=%lu\n",
+                              i + 1, inStr, i + 1, outStr, i + 1, t.barLength, i + 1, (unsigned long)t.lengthMs);
             meta.write((const uint8_t*)line, n);
         }
     }
@@ -1540,12 +1891,12 @@ void saveSession() {
     showFlashMessage(msg, anySaved ? nullptr : "(no tracks had content)", 1200);
 }
 
-// Scans LOOPS_ROOT for saved session folders into savedSessionNames[],
+// Scans BUNDLES_ROOT for saved session folders into savedSessionNames[],
 // sorted alphabetically (a plain insertion sort -- MAX_SAVED_SESSIONS is
 // small enough that O(n^2) doesn't matter). Used by SCREEN_DELETE_BROWSE.
 void loadSavedSessions() {
     savedSessionCount = 0;
-    FsFile dir = sd.open(LOOPS_ROOT);
+    FsFile dir = sd.open(BUNDLES_ROOT);
     if (dir && dir.isDir()) {
         FsFile entry;
         while (savedSessionCount < MAX_SAVED_SESSIONS && entry.openNext(&dir, O_RDONLY)) {
@@ -1578,7 +1929,7 @@ void loadSavedSessions() {
 // there rather than guessing which of track1-4.mid/session.txt exist.
 bool deleteSavedSession(const char* name) {
     char sessionPath[64];
-    snprintf(sessionPath, sizeof(sessionPath), "%s/%s", LOOPS_ROOT, name);
+    snprintf(sessionPath, sizeof(sessionPath), "%s/%s", BUNDLES_ROOT, name);
 
     FsFile dir = sd.open(sessionPath);
     if (dir && dir.isDir()) {
@@ -1625,9 +1976,9 @@ bool readVarLen(FsFile& f, uint32_t& value) {
 // division/tempo, so this only needs to reverse exactly that, not handle
 // arbitrary files. lengthMs comes from the End-of-Track event's own tick,
 // not the last note event -- see saveTrackToFile()'s comment on why that
-// was written that way. Leaves t.channel/barLength untouched -- neither
-// is recoverable from the file itself, callers fill them in from the
-// session's metadata (see readSessionMeta()) afterward.
+// was written that way. Leaves t.channelIn/channelOut/barLength untouched
+// -- none is recoverable from the file itself, callers fill them in from
+// the session's metadata (see readSessionMeta()) afterward.
 bool loadTrackFromFile(LoopTrack& t, const char* path) {
     FsFile file;
     if (!file.open(path, O_RDONLY)) return false;
@@ -1985,28 +2336,36 @@ bool importMidiEvents(LoopTrack& t, const char* path) {
 
 // Imports an arbitrary Standard MIDI File into t -- unlike
 // loadTrackIntoSlot() (which loads this firmware's own saved sessions and
-// gets channel/barLength from their metadata), there's no metadata for an
-// arbitrary file, so this resets to the same sensible defaults a brand
-// new track would have (OMNI, Freeform); the user can dial either in
-// afterward same as any other track.
-bool importFileIntoTrack(LoopTrack& t, const char* path) {
+// gets channelIn/channelOut/barLength from their metadata), there's no
+// metadata for an arbitrary file, so this resets to the same sensible
+// defaults a brand new track in this slot would have (OMNI in, this slot's
+// own channel out, Freeform); the user can dial any of them in afterward
+// same as any other track. `trackIndex` (0-3) is only needed for that
+// channelOut default -- see enter()'s comment on why it can't just be a
+// LoopTrack member initializer.
+bool importFileIntoTrack(LoopTrack& t, const char* path, int trackIndex) {
     if (!importMidiEvents(t, path)) return false;
-    t.channel = OMNI_CHANNEL;
+    t.channelIn = OMNI_CHANNEL;
+    t.channelOut = (uint8_t)trackIndex;
     t.barLength = 0;
     parkLoadedTrack(t);
     return true;
 }
 
 // Per-track fields saveSession()'s session.txt carries but a .mid file
-// can't (see loadTrackFromFile()'s comment) -- channel and barLength.
-// Defaults match a fresh LoopTrack's, so a key missing from an older or
-// hand-edited session.txt just falls back sanely rather than failing.
+// can't (see loadTrackFromFile()'s comment) -- channelIn, channelOut, and
+// barLength. Defaults match a fresh LoopTrack's, so a key missing from an
+// older or hand-edited session.txt just falls back sanely rather than
+// failing.
 struct SessionMeta {
     bool sync = true;
     float bpm = 120.0f;
     int timeSigNum = 4;
     int timeSigDen = 4;
-    uint8_t channel[NUM_TRACKS] = {OMNI_CHANNEL, OMNI_CHANNEL, OMNI_CHANNEL, OMNI_CHANNEL};
+    uint8_t channelIn[NUM_TRACKS] = {OMNI_CHANNEL, OMNI_CHANNEL, OMNI_CHANNEL, OMNI_CHANNEL};
+    // Matches a fresh looper's own out-channel default (see enter()):
+    // track N -> channel N.
+    uint8_t channelOut[NUM_TRACKS] = {0, 1, 2, 3};
     int barLength[NUM_TRACKS] = {0, 0, 0, 0};
 };
 
@@ -2031,11 +2390,19 @@ void parseSessionMetaLine(const char* line, SessionMeta& meta) {
         char prefix[20];
         size_t plen;
 
-        snprintf(prefix, sizeof(prefix), "track%d.channel=", i + 1);
+        snprintf(prefix, sizeof(prefix), "track%d.channelIn=", i + 1);
         plen = strlen(prefix);
         if (strncmp(line, prefix, plen) == 0) {
             const char* v = line + plen;
-            meta.channel[i] = (strcasecmp(v, "OMNI") == 0) ? OMNI_CHANNEL : (uint8_t)(atoi(v) - 1);
+            meta.channelIn[i] = (strcasecmp(v, "OMNI") == 0) ? OMNI_CHANNEL : (uint8_t)(atoi(v) - 1);
+            return;
+        }
+
+        snprintf(prefix, sizeof(prefix), "track%d.channelOut=", i + 1);
+        plen = strlen(prefix);
+        if (strncmp(line, prefix, plen) == 0) {
+            const char* v = line + plen;
+            meta.channelOut[i] = (strcasecmp(v, "REC") == 0) ? CHANNEL_AS_RECORDED : (uint8_t)(atoi(v) - 1);
             return;
         }
 
@@ -2076,16 +2443,18 @@ void readSessionMeta(const char* sessionPath, SessionMeta& meta) {
 }
 
 // Wipes any existing content from t (see resetTrack()), loads new
-// events/length from path, and applies channel/barLength from the saved
-// session's metadata. Parked TRACK_STOPPED with its own position-zero
-// pinned to right now, so it starts at the top of its loop the first time
-// it's played rather than wherever elapsedRunMs() would otherwise land it
-// -- same trick resumeFromStop() uses, just landing in STOPPED instead of
-// PLAYING since loaded content shouldn't start making sound on its own.
-bool loadTrackIntoSlot(LoopTrack& t, const char* path, uint8_t channel, int barLength) {
+// events/length from path, and applies channelIn/channelOut/barLength from
+// the saved session's metadata. Parked TRACK_STOPPED with its own
+// position-zero pinned to right now, so it starts at the top of its loop
+// the first time it's played rather than wherever elapsedRunMs() would
+// otherwise land it -- same trick resumeFromStop() uses, just landing in
+// STOPPED instead of PLAYING since loaded content shouldn't start making
+// sound on its own.
+bool loadTrackIntoSlot(LoopTrack& t, const char* path, uint8_t channelIn, uint8_t channelOut, int barLength) {
     resetTrack(t);
     if (!loadTrackFromFile(t, path)) return false;
-    t.channel = channel;
+    t.channelIn = channelIn;
+    t.channelOut = channelOut;
     t.barLength = barLength;
     parkLoadedTrack(t);
     return true;
@@ -2097,7 +2466,7 @@ bool loadTrackIntoSlot(LoopTrack& t, const char* path, uint8_t channel, int barL
 // saveSession()).
 void buildLoadPickList(const char* sessionName) {
     char sessionPath[64];
-    snprintf(sessionPath, sizeof(sessionPath), "%s/%s", LOOPS_ROOT, sessionName);
+    snprintf(sessionPath, sizeof(sessionPath), "%s/%s", BUNDLES_ROOT, sessionName);
 
     loadPickLabels[0] = "Load All";
     int found = 0;
@@ -2119,7 +2488,7 @@ void buildLoadPickList(const char* sessionName) {
 // same "acts on the selected track" convention as Erase Track N.
 void loadSingleTrackIntoSelected(const char* sessionName, int savedTrackNum) {
     char sessionPath[64];
-    snprintf(sessionPath, sizeof(sessionPath), "%s/%s", LOOPS_ROOT, sessionName);
+    snprintf(sessionPath, sizeof(sessionPath), "%s/%s", BUNDLES_ROOT, sessionName);
     SessionMeta meta;
     readSessionMeta(sessionPath, meta);
 
@@ -2127,7 +2496,7 @@ void loadSingleTrackIntoSelected(const char* sessionName, int savedTrackNum) {
     snprintf(trackPath, sizeof(trackPath), "%s/track%d.mid", sessionPath, savedTrackNum);
 
     int idx = savedTrackNum - 1;
-    bool ok = loadTrackIntoSlot(tracks[selectedTrack], trackPath, meta.channel[idx], meta.barLength[idx]);
+    bool ok = loadTrackIntoSlot(tracks[selectedTrack], trackPath, meta.channelIn[idx], meta.channelOut[idx], meta.barLength[idx]);
     // The saved track may have been recorded at a different BPM than the
     // live session is currently running at -- bring a bar-quantized
     // track's actual length back in line with its declared bar count at
@@ -2148,7 +2517,7 @@ void loadSingleTrackIntoSelected(const char* sessionName, int savedTrackNum) {
 // whatever was live.
 void loadEntireSession(const char* sessionName) {
     char sessionPath[64];
-    snprintf(sessionPath, sizeof(sessionPath), "%s/%s", LOOPS_ROOT, sessionName);
+    snprintf(sessionPath, sizeof(sessionPath), "%s/%s", BUNDLES_ROOT, sessionName);
     SessionMeta meta;
     readSessionMeta(sessionPath, meta);
 
@@ -2162,7 +2531,7 @@ void loadEntireSession(const char* sessionName) {
         char trackPath[112];
         snprintf(trackPath, sizeof(trackPath), "%s/track%d.mid", sessionPath, i + 1);
         if (sd.exists(trackPath)) {
-            if (loadTrackIntoSlot(tracks[i], trackPath, meta.channel[i], meta.barLength[i])) anyLoaded = true;
+            if (loadTrackIntoSlot(tracks[i], trackPath, meta.channelIn[i], meta.channelOut[i], meta.barLength[i])) anyLoaded = true;
         } else {
             resetTrack(tracks[i]);
         }
@@ -2179,12 +2548,14 @@ void loadEntireSession(const char* sessionName) {
 // UP/DOWN move a single circular cursor across 5 positions: the 4 tracks,
 // then the BPM row, then back to track 1 -- e.g. DOWN from track 4 lands
 // on BPM, DOWN again wraps to track 1; UP from track 1 wraps back to BPM.
-// ALT held repurposes UP/DOWN for channel-adjust instead
-// (handleChannelHold()); EDIT held repurposes it for BPM value/Time Sig
-// adjust instead when focus is on one of those (handleBpmValueAdjust()/
+// ALT held repurposes UP/DOWN for out-channel-adjust instead
+// (handleChannelOutHold()); EDIT held has no UP/DOWN meaning on a track
+// row for now (see handleBarLengthAdjust()'s comment), but still adjusts
+// BPM value/Time Sig on the BPM row (handleBpmValueAdjust()/
 // handleTimeSigAdjust()) -- both have to be excluded here the same way,
 // otherwise holding either while pressing UP/DOWN would also move the row
-// cursor out from under whatever it was trying to adjust.
+// cursor out from under whatever it was trying to adjust (or, for EDIT on
+// a track row, just move the cursor when it should stay put).
 void handleRowCursor() {
     if (Input::isDown(BTN_ALT) || Input::isDown(BTN_EDIT)) return;
 
@@ -2253,9 +2624,19 @@ const uint32_t HOLD_THRESHOLD_MS = 500;
 
 void handleRecordInput() {
     static uint32_t pressStartMs = 0;
-    if (Input::justPressed(BTN_EDIT)) pressStartMs = millis();
+    if (Input::justPressed(BTN_EDIT)) {
+        pressStartMs = millis();
+        editUsedForBarLength = false;
+    }
     if (Input::justReleased(BTN_EDIT)) {
-        if (onBpmRow) return;
+        // Also skip both the tap and the held ("All Start") action below
+        // if this press was actually spent cycling bar length instead
+        // (handleBarLengthAdjust()) -- otherwise a quick EDIT+RIGHT tap to
+        // bump the bar-length preset would also arm/record the track, and
+        // releasing EDIT after cycling through a few presets over a
+        // longer hold would also fire "All Start", since this handler's
+        // own hold-length check has no way to tell the two apart.
+        if (onBpmRow || editUsedForBarLength) return;
         if (millis() - pressStartMs >= HOLD_THRESHOLD_MS) {
             startAllStoppedTracks();
             redrawAllTrackRows();
@@ -2269,11 +2650,12 @@ void handleRecordInput() {
 // RIGHT: mutes/unmutes the selected track (moved here from EDIT's old tap
 // meaning). Tap-only, fires immediately on press -- unlike EDIT/NAV above,
 // nothing else is attached to a held RIGHT press to disambiguate against.
-// Guards against ALT the same way handleBarLengthAdjust() requires it:
-// bare RIGHT means Mute, ALT+RIGHT means bar length instead, and the two
+// Guards against ALT and EDIT the same way handleChannelInHold() and
+// handleBarLengthAdjust() require: bare RIGHT means Mute, ALT+RIGHT means
+// in-channel adjust, EDIT+RIGHT means bar length instead, and all three
 // need to stay mutually exclusive.
 void handleMuteInput() {
-    if (onBpmRow || Input::isDown(BTN_ALT)) return;
+    if (onBpmRow || Input::isDown(BTN_ALT) || Input::isDown(BTN_EDIT)) return;
     if (Input::justPressed(BTN_RIGHT)) {
         toggleMuteOnSelected();
         redrawTrackRow(selectedTrack);
@@ -2288,9 +2670,11 @@ void handleMuteInput() {
 // delay EDIT's version relies on. Also unlike EDIT's, this works from
 // the BPM row too: stopping everything doesn't depend on which track is
 // selected, so there's no reason to make it a no-op there. A short tap
-// still stops just the selected track (toggleStopOnSelected(), decided
-// on release as before) -- but only from a track row, and only if the
-// hold above didn't already fire.
+// (decided on release, same as before) stops just the selected track from
+// a track row (toggleStopOnSelected()), or cancels a click-only pre-roll
+// from the BPM row if one's running (see the BPM row branch below) -- a
+// no-op on the BPM row otherwise, and always a no-op if the hold above
+// already fired.
 const uint32_t STOP_ALL_HOLD_MS = 1000;
 
 void handleStopInput() {
@@ -2306,7 +2690,19 @@ void handleStopInput() {
         redrawAllTrackRows();
     }
     if (Input::justReleased(BTN_NAV)) {
-        if (firedAllStop || onBpmRow) return;
+        if (firedAllStop) return;
+        if (onBpmRow) {
+            // No track to stop from here, but a click-only pre-roll (see
+            // startMetronomeClickOnly()) is still something worth a plain
+            // NAV tap being able to cancel -- the metronome's audibly
+            // running with nothing armed/recording/playing yet, so "stop"
+            // means stop *that* instead. Clearing the flag alone is enough:
+            // updateMasterClock() sees nothing left keeping its clock running
+            // and zeroes it on its own very next tick, same as it already
+            // does when Metro itself gets turned off mid-pre-roll.
+            if (metronomeClickOnlyActive) metronomeClickOnlyActive = false;
+            return;
+        }
         toggleStopOnSelected();
         redrawTrackRow(selectedTrack);
     }
@@ -2382,12 +2778,30 @@ void setBpmRowBoolField(bool* field) {
     Ui::updateLooperBpm(manualBpm, timeSigNum, timeSigDen, syncMode, metronomeOn, metronomeVolumePercent, false, countInEnabled, countInBars, false, (int)bpmRowFocus, true);
 }
 
-// EDIT toggles whichever of Metro/Count In/Sync currently has focus on
-// the BPM row -- a quicker, no-ALT-needed alternative to ALT+UP/DOWN (see
-// handleBpmAdjust()) for these three on/off-style fields specifically.
-// No-op off the BPM row (EDIT means arm/record there instead, see
-// handleRecordInput()) or while focus is on BPM value/Time Sig, neither
-// of which is a plain on/off toggle.
+// Forces the header beat-indicator row visible whenever the metronome
+// turns on -- if you're turning the click on, you almost certainly want to
+// see the visual beat reference too, regardless of whether it had been
+// manually hidden (see showBeatIndicator / handleBpmRowEditToggle()'s
+// BPM_FOCUS_VALUE branch). One-directional: turning Metro back off does
+// NOT hide the indicator, since it's still useful as a static
+// time-signature reference on its own. Called right after every place
+// metronomeOn can flip on during normal interaction (handleBpmAdjust()'s
+// ALT+UP/DOWN and handleBpmRowEditToggle()'s EDIT-tap); a no-op (and no
+// redraw) if it's already on or the indicator's already showing.
+void showBeatIndicatorIfMetronomeOn() {
+    if (!metronomeOn || showBeatIndicator) return;
+    showBeatIndicator = true;
+    Ui::updateLooperBeatIndicator(true, masterClockCurrentBeat(), timeSigNum);
+}
+
+// EDIT toggles whichever of BPM value/Metro/Count In/Sync currently has
+// focus on the BPM row: for Metro/Count In/Sync, a quicker, no-ALT-needed
+// alternative to ALT+UP/DOWN (see handleBpmAdjust()); for BPM value, the
+// header beat-indicator row's own on/off toggle (see showBeatIndicator) --
+// that field has no ALT+UP/DOWN meaning of its own on the BPM row for this
+// to be an alternative to, so EDIT-tap is its only toggle. No-op off the
+// BPM row (EDIT means arm/record there instead, see handleRecordInput())
+// or while focus is on Time Sig, which has nothing of its own to toggle.
 // Metro's own on/off toggle is decided on EDIT's *release*, not press --
 // unlike Sync below, EDIT-held+LEFT/RIGHT on Metro/Count In means
 // something else entirely (adjust Metro's volume or Count In's bar count,
@@ -2400,10 +2814,31 @@ void setBpmRowBoolField(bool* field) {
 // something, which suppresses the toggle here.
 bool metronomeEditUsedForVolume = false;
 bool countInEditUsedForBars = false;
+// Same idea, for BPM value's own EDIT-tap-toggles-showBeatIndicator vs.
+// EDIT-held+UP/DOWN/LEFT/RIGHT-adjusts-manualBpm ambiguity (see
+// handleBpmValueAdjust()).
+bool bpmValueEditUsedForAdjust = false;
 
 void handleBpmRowEditToggle() {
     if (!onBpmRow) return;
 
+    if (bpmRowFocus == BPM_FOCUS_VALUE) {
+        if (Input::justPressed(BTN_EDIT)) {
+            bpmValueEditUsedForAdjust = false;
+        } else if (Input::justReleased(BTN_EDIT)) {
+            if (!bpmValueEditUsedForAdjust) {
+                showBeatIndicator = !showBeatIndicator;
+                // Header row, not the BPM row itself -- masterClockCurrentBeat()
+                // tracks a running track's beat position regardless of
+                // metronomeOn (see updateMasterClock()'s own comment), same
+                // "-1 = nothing lit while the clock isn't running" convention
+                // updateMetronomeBeatIndicator() uses.
+                int beat = showBeatIndicator ? masterClockCurrentBeat() : -1;
+                Ui::updateLooperBeatIndicator(showBeatIndicator, beat, timeSigNum);
+            }
+        }
+        return;
+    }
     if (bpmRowFocus == BPM_FOCUS_METRONOME) {
         if (Input::justPressed(BTN_EDIT)) {
             metronomeEditUsedForVolume = false;
@@ -2414,6 +2849,7 @@ void handleBpmRowEditToggle() {
                                  true, countInEnabled, countInBars, false, (int)bpmRowFocus, true);
         } else if (Input::justReleased(BTN_EDIT)) {
             if (!metronomeEditUsedForVolume) metronomeOn = !metronomeOn;
+            showBeatIndicatorIfMetronomeOn();
             Ui::updateLooperBpm(manualBpm, timeSigNum, timeSigDen, syncMode, metronomeOn, metronomeVolumePercent,
                                  false, countInEnabled, countInBars, false, (int)bpmRowFocus, true);
         }
@@ -2534,6 +2970,7 @@ void handleBpmAdjust() {
 
     if (bpmRowFocus == BPM_FOCUS_METRONOME) {
         setBpmRowBoolField(&metronomeOn);
+        showBeatIndicatorIfMetronomeOn();
         return;
     }
     if (bpmRowFocus == BPM_FOCUS_COUNT_IN) {
@@ -2621,6 +3058,7 @@ void handleBpmValueAdjust() {
     }
 
     if (changed) {
+        bpmValueEditUsedForAdjust = true; // suppresses handleBpmRowEditToggle()'s showBeatIndicator toggle on this press's release
         rescaleBarQuantizedTracks();
         Ui::updateLooperBpm(manualBpm, timeSigNum, timeSigDen, syncMode, metronomeOn, metronomeVolumePercent, false, countInEnabled, countInBars, false, (int)bpmRowFocus, true); // always on the BPM row itself here
     }
@@ -2653,12 +3091,15 @@ void handleTimeSigAdjust() {
     Ui::updateLooperBpm(manualBpm, timeSigNum, timeSigDen, syncMode, metronomeOn, metronomeVolumePercent, false, countInEnabled, countInBars, false, (int)bpmRowFocus, true);
 }
 
-// ALT held + UP/DOWN: adjust the selected track's MIDI channel, repeating
-// while held (same pattern as tempo/volume hold-adjust in FilePlayerMode).
-// UP/DOWN alone move the row cursor instead (see handleRowCursor()'s
-// guard) -- ALT is a pure modifier here, no standalone tap action. No-op
-// while the BPM row is selected -- there's no track to act on.
-void handleChannelHold() {
+// ALT held + UP/DOWN: adjust the selected track's MIDI OUT channel
+// (playback remap), repeating while held (same pattern as tempo/volume
+// hold-adjust in FilePlayerMode). UP/DOWN alone move the row cursor
+// instead (see handleRowCursor()'s guard) -- ALT is a pure modifier here,
+// no standalone tap action. No-op while the BPM row is selected -- there's
+// no track to act on. See handleChannelInHold() just below for the IN
+// channel's own ALT-held counterpart, on the other pair of directional
+// buttons.
+void handleChannelOutHold() {
     if (!Input::isDown(BTN_ALT) || onBpmRow) return;
 
     const uint32_t REPEAT_INTERVAL_MS = 150;
@@ -2669,13 +3110,13 @@ void handleChannelHold() {
     bool changed = false;
     if (Input::isDown(BTN_UP) &&
         (Input::justPressed(BTN_UP) || now - lastUpStep >= REPEAT_INTERVAL_MS)) {
-        adjustChannelOnSelected(1);
+        adjustChannelOutOnSelected(1);
         lastUpStep = now;
         changed = true;
     }
     if (Input::isDown(BTN_DOWN) &&
         (Input::justPressed(BTN_DOWN) || now - lastDownStep >= REPEAT_INTERVAL_MS)) {
-        adjustChannelOnSelected(-1);
+        adjustChannelOutOnSelected(-1);
         lastDownStep = now;
         changed = true;
     }
@@ -2687,16 +3128,57 @@ void handleChannelHold() {
     }
 }
 
-// ALT held + LEFT/RIGHT: cycle the selected track's bar-length preset
-// (Freeform, 1/2/4/8/16/32/64/128 bars) -- replaces the old separate
-// bar-length picker screen with a direct on-row control, same modifier
-// button as channel (ALT+UP/DOWN), just the other pair of directional
-// buttons. A single tap per press (no hold-repeat) since there are only 9
-// discrete steps and each one is a deliberate choice, unlike BPM's
-// continuous-feeling range. No-op while the BPM row is selected -- bar
-// length is per-track.
-void handleBarLengthAdjust() {
+// ALT held + LEFT/RIGHT: adjust the selected track's MIDI IN channel (the
+// record-input filter), repeating while held -- same shape as
+// handleChannelOutHold() above, just the other pair of directional
+// buttons (ALT+UP/DOWN already means the OUT channel, so ALT alone can't
+// disambiguate the two -- LEFT/RIGHT vs UP/DOWN does). No-op while the
+// BPM row is selected -- there's no track to act on.
+void handleChannelInHold() {
     if (!Input::isDown(BTN_ALT) || onBpmRow) return;
+
+    const uint32_t REPEAT_INTERVAL_MS = 150;
+    static uint32_t lastRightStep = 0;
+    static uint32_t lastLeftStep = 0;
+    uint32_t now = millis();
+
+    bool changed = false;
+    if (Input::isDown(BTN_RIGHT) &&
+        (Input::justPressed(BTN_RIGHT) || now - lastRightStep >= REPEAT_INTERVAL_MS)) {
+        adjustChannelInOnSelected(1);
+        lastRightStep = now;
+        changed = true;
+    }
+    if (Input::isDown(BTN_LEFT) &&
+        (Input::justPressed(BTN_LEFT) || now - lastLeftStep >= REPEAT_INTERVAL_MS)) {
+        adjustChannelInOnSelected(-1);
+        lastLeftStep = now;
+        changed = true;
+    }
+
+    if (changed) {
+        Ui::LoopTrackView views[4];
+        buildTrackViews(views);
+        Ui::updateLooperChannel(views, selectedTrack);
+    }
+}
+
+// EDIT held + LEFT/RIGHT: cycle the selected track's bar-length preset
+// (Freeform, 1/2/4/8/16/32/64/128 bars) -- replaces the old separate
+// bar-length picker screen with a direct on-row control. EDIT+UP/DOWN has
+// no meaning on a track row (see handleRecordInput()'s comment for why
+// that's fine to leave unclaimed), so EDIT alone is enough to disambiguate
+// this from the BPM-row EDIT+LEFT/RIGHT meaning (BPM value ±1, see
+// handleBpmValueAdjust()) since the two are mutually exclusive via
+// onBpmRow. EDIT is otherwise free to mean this on a track row without
+// colliding with its own tap-vs-hold meaning there (arm/record vs. "All
+// Start", see handleRecordInput()) because editUsedForBarLength suppresses
+// that release-time action whenever this fires first. A single tap per
+// press (no hold-repeat) since there are only 9 discrete steps and each
+// one is a deliberate choice, unlike BPM's continuous-feeling range.
+// No-op while the BPM row is selected -- bar length is per-track.
+void handleBarLengthAdjust() {
+    if (!Input::isDown(BTN_EDIT) || onBpmRow) return;
 
     bool changed = false;
     if (Input::justPressed(BTN_RIGHT)) {
@@ -2709,6 +3191,7 @@ void handleBarLengthAdjust() {
     }
 
     if (changed) {
+        editUsedForBarLength = true;
         Ui::LoopTrackView views[4];
         buildTrackViews(views);
         Ui::updateLooperBarLength(views, selectedTrack);
@@ -2733,7 +3216,8 @@ bool updateMainScreen() {
     handleRecordInput();
     handleMuteInput();
     handleStopInput();
-    handleChannelHold();
+    handleChannelOutHold();
+    handleChannelInHold();
     handleBarLengthAdjust();
     handleBpmRowFocus();
     handleBpmAdjust();
@@ -2756,10 +3240,10 @@ bool updateMainScreen() {
         if (!enterUsedAsModifier) {
             snprintf(menuEraseLabel, sizeof(menuEraseLabel), "Erase Track %d", selectedTrack + 1);
             menuLabels[0] = "Save";
-            menuLabels[1] = "Load Saved Loop";
+            menuLabels[1] = "Load";
             menuLabels[2] = menuEraseLabel;
             menuLabels[3] = "Erase All Tracks";
-            menuLabels[4] = "Delete Saved Loop";
+            menuLabels[4] = "Delete Loop Bundle";
             menuCursor = 0;
             screen = SCREEN_MENU;
             Ui::drawEntryMenu("Loops", menuLabels, MENU_COUNT, menuCursor);
@@ -2779,19 +3263,31 @@ bool updateMainScreen() {
             //
             // Only when nothing's already running, though (anyTrackAdvancing()
             // -- Recording/Playing/Muted, same "is something actually
-            // happening" check updateMetronome() itself uses): pressing
+            // happening" check updateMasterClock() itself uses): pressing
             // PLAY here while something's already going shouldn't
-            // re-trigger a fresh count-in over music that's already
-            // playing. Any newly-armed track still needs to actually
-            // start, though, so it joins in immediately instead --
-            // startArmedTracksTogether() is the same immediate, no-count-in
-            // start a MIDI note on an armed track's channel already
-            // triggers elsewhere (see handleIncomingMidi()), and is a
-            // no-op if nothing's armed.
+            // re-trigger a fresh count-in (or click-only pre-roll) over
+            // music that's already playing. Any newly-armed track still
+            // needs to actually start, though, so it joins in immediately
+            // instead -- startArmedTracksTogether() is the same immediate,
+            // no-count-in start a MIDI note on an armed track's channel
+            // already triggers elsewhere (see handleIncomingMidi()), and
+            // is a no-op if nothing's armed.
+            //
+            // With Count In on, that overlay already gives a "hear the
+            // tempo before you play" lead-in; with it off,
+            // startMetronomeClickOnly() serves the same purpose more
+            // directly -- just start the click (and the session's shared
+            // clock/epoch) running right away, with nothing armed yet
+            // required. Either way, once a track's later triggered by an
+            // incoming note, startArmedTracksTogether() snaps a freeform
+            // track's start to the nearest beat this click already
+            // established, rather than the raw note-onset instant.
             if (anyTrackAdvancing()) {
                 startArmedTracksTogether();
-            } else {
+            } else if (metronomeOn && countInEnabled) {
                 maybeStartCountIn();
+            } else if (metronomeOn) {
+                startMetronomeClickOnly();
             }
             // Also doubles as a "play everything" gesture: any track
             // that already has content but is just sitting stopped
@@ -2806,11 +3302,12 @@ bool updateMainScreen() {
         }
     }
 
-    // LEFT backs out to mode select only from a track row with ALT not
-    // held -- on the BPM row it decreases the value instead
-    // (handleBpmAdjust()), and with ALT held it cycles bar length down
-    // instead (handleBarLengthAdjust()).
-    if (!onBpmRow && !Input::isDown(BTN_ALT) && Input::justPressed(BTN_LEFT)) {
+    // LEFT backs out to mode select only from a track row with neither
+    // ALT nor EDIT held -- on the BPM row it decreases the value instead
+    // (handleBpmAdjust()), with ALT held it adjusts the in-channel down
+    // instead (handleChannelInHold()), and with EDIT held it cycles bar
+    // length down instead (handleBarLengthAdjust()).
+    if (!onBpmRow && !Input::isDown(BTN_ALT) && !Input::isDown(BTN_EDIT) && Input::justPressed(BTN_LEFT)) {
         if (anyTrackActive()) {
             // Don't exit yet -- freezing tracks (and thus cutting sound)
             // is a real, if reversible, action, so confirm first rather
@@ -2857,19 +3354,13 @@ void updateMenu() {
     }
     if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
         if (menuCursor == 0) {
-            screen = SCREEN_SAVE_CONFIRM;
-            Ui::drawMessage("Save loops?", "ENTER confirm  NAV cancel");
+            saveMenuCursor = 0;
+            screen = SCREEN_SAVE_MENU;
+            Ui::drawEntryMenu("Save", saveMenuLabels, SAVE_MENU_COUNT, saveMenuCursor);
         } else if (menuCursor == 1) {
-            loadSavedSessions();
-            if (savedSessionCount == 0) {
-                showFlashMessage("No saved loops", nullptr, 1200);
-            } else {
-                loadSessionCursor = 0;
-                screen = SCREEN_LOAD_BROWSE;
-                const char* labels[MAX_SAVED_SESSIONS];
-                for (int i = 0; i < savedSessionCount; i++) labels[i] = savedSessionNames[i];
-                Ui::drawEntryMenu("Load Loop", labels, savedSessionCount, loadSessionCursor);
-            }
+            loadMenuCursor = 0;
+            screen = SCREEN_LOAD_MENU;
+            Ui::drawEntryMenu("Load", loadMenuLabels, LOAD_MENU_COUNT, loadMenuCursor);
         } else if (menuCursor == 2) {
             screen = SCREEN_ERASE_CONFIRM;
             char msg[24];
@@ -2893,12 +3384,169 @@ void updateMenu() {
     }
 }
 
+void updateSaveMenu() {
+    if (Input::justPressed(BTN_UP)) {
+        if (saveMenuCursor > 0) {
+            int prev = saveMenuCursor;
+            saveMenuCursor--;
+            Ui::updateEntryMenuSelection(saveMenuLabels, SAVE_MENU_COUNT, prev, saveMenuCursor);
+        }
+    }
+    if (Input::justPressed(BTN_DOWN)) {
+        if (saveMenuCursor < SAVE_MENU_COUNT - 1) {
+            int prev = saveMenuCursor;
+            saveMenuCursor++;
+            Ui::updateEntryMenuSelection(saveMenuLabels, SAVE_MENU_COUNT, prev, saveMenuCursor);
+        }
+    }
+    if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
+        screen = SCREEN_MENU;
+        Ui::drawEntryMenu("Loops", menuLabels, MENU_COUNT, menuCursor);
+    }
+    if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
+        if (saveMenuCursor == 0) {
+            beginSaveLoopName();
+        } else {
+            screen = SCREEN_SAVE_CONFIRM;
+            Ui::drawMessage("Save all loops?", "ENTER confirm  NAV cancel");
+        }
+    }
+}
+
+// Moves the on-screen keyboard cursor for SCREEN_SAVE_LOOP_NAME by
+// (dRow, dCol) -- same grid-clamping shape as FilePlayerMode's own
+// moveKeyboardCursor(), just against this screen's own cursor state (see
+// its declaration's comment for why this isn't shared directly).
+void moveLoopSaveKeyboardCursor(int dRow, int dCol) {
+    int newRow = loopSaveKeyRow + dRow;
+    if (newRow < 0) newRow = 0;
+    if (newRow >= KEYBOARD_ROW_COUNT) newRow = KEYBOARD_ROW_COUNT - 1;
+
+    int newCol = (dRow != 0) ? loopSaveKeyCol : loopSaveKeyCol + dCol;
+    if (newCol < 0) newCol = 0;
+    if (newCol >= KEYBOARD_ROW_LENS[newRow]) newCol = KEYBOARD_ROW_LENS[newRow] - 1;
+
+    if (newRow == loopSaveKeyRow && newCol == loopSaveKeyCol) return;
+
+    int prevRow = loopSaveKeyRow, prevCol = loopSaveKeyCol;
+    loopSaveKeyRow = newRow;
+    loopSaveKeyCol = newCol;
+    Ui::updateNameEntryKey(prevRow, prevCol, loopSaveKeyRow, loopSaveKeyCol);
+}
+
+// Opens SCREEN_SAVE_LOOP_NAME pre-filled with an auto-generated
+// "LoopNNN" name (see generateLoopFileName()) -- good enough to just
+// accept most of the time, so the cursor starts right on OK, same
+// reasoning as FilePlayerMode's New Recording/Capture SysEx Dump (see its
+// beginNameEntry()).
+void beginSaveLoopName() {
+    char base[LOOP_NAME_MAX_LEN + 1];
+    generateLoopFileName(base, sizeof(base));
+    strncpy(loopSaveNameBuf, base, sizeof(loopSaveNameBuf) - 1);
+    loopSaveNameBuf[sizeof(loopSaveNameBuf) - 1] = '\0';
+    loopSaveNameLen = (int)strlen(loopSaveNameBuf);
+    loopSaveError[0] = '\0';
+    loopSaveKeyRow = KEYBOARD_ROW_COUNT - 1;
+    loopSaveKeyCol = KEYBOARD_ROW_LENS[KEYBOARD_ROW_COUNT - 1] - 1; // OK is always the last key of the last row
+    screen = SCREEN_SAVE_LOOP_NAME;
+    Ui::drawNameEntry("Save Loop", loopSaveNameBuf, ".mid", nullptr, loopSaveKeyRow, loopSaveKeyCol);
+}
+
+// Actually writes the file, once any name collision has already been
+// resolved (there wasn't one, or the user just confirmed overwriting it
+// via SCREEN_SAVE_LOOP_OVERWRITE) -- mirrors saveSession()'s own
+// flash-message-then-SCREEN_MAIN ending, same as every other terminal
+// action in this mode's menu tree.
+void performSaveLoopName(const char* trimmed) {
+    bool ok = saveSelectedLoop(trimmed);
+    char msg[32];
+    if (ok) snprintf(msg, sizeof(msg), "Saved as %s.mid", trimmed);
+    else snprintf(msg, sizeof(msg), "Save failed");
+    showFlashMessage(msg, nullptr, 1200);
+}
+
+// Trims trailing spaces off loopSaveNameBuf, then either saves directly
+// or detours through SCREEN_SAVE_LOOP_OVERWRITE first if that name
+// already exists -- same collision handling every other save/rename flow
+// in this app uses (see Ui::drawConfirmOverwrite()).
+void finishSaveLoopName() {
+    char trimmed[LOOP_NAME_MAX_LEN + 1];
+    strncpy(trimmed, loopSaveNameBuf, sizeof(trimmed));
+    trimmed[LOOP_NAME_MAX_LEN] = '\0';
+    int len = (int)strlen(trimmed);
+    while (len > 0 && trimmed[len - 1] == ' ') trimmed[--len] = '\0';
+    if (len == 0) return; // nothing typed -- stay on the naming screen
+
+    char path[96];
+    snprintf(path, sizeof(path), "%s/%s.mid", LOOPS_ROOT, trimmed);
+    if (sd.exists(path)) {
+        strncpy(pendingLoopSaveName, trimmed, sizeof(pendingLoopSaveName) - 1);
+        pendingLoopSaveName[sizeof(pendingLoopSaveName) - 1] = '\0';
+        screen = SCREEN_SAVE_LOOP_OVERWRITE;
+        Ui::drawConfirmOverwrite(pendingLoopSaveName, false);
+    } else {
+        performSaveLoopName(trimmed);
+    }
+}
+
+void updateSaveLoopName() {
+    if (Input::justPressed(BTN_LEFT))  moveLoopSaveKeyboardCursor(0, -1);
+    if (Input::justPressed(BTN_RIGHT)) moveLoopSaveKeyboardCursor(0, 1);
+    if (Input::justPressed(BTN_UP))    moveLoopSaveKeyboardCursor(-1, 0);
+    if (Input::justPressed(BTN_DOWN))  moveLoopSaveKeyboardCursor(1, 0);
+
+    if (Input::justPressed(BTN_NAV)) {
+        screen = SCREEN_SAVE_MENU;
+        Ui::drawEntryMenu("Save", saveMenuLabels, SAVE_MENU_COUNT, saveMenuCursor);
+        return;
+    }
+
+    if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
+        const KeyDef& key = KEYBOARD_ROWS[loopSaveKeyRow][loopSaveKeyCol];
+        bool hadError = (loopSaveError[0] != '\0');
+        loopSaveError[0] = '\0';
+        switch (key.kind) {
+            case KEY_CHAR:
+                if (loopSaveNameLen < LOOP_NAME_MAX_LEN) {
+                    loopSaveNameBuf[loopSaveNameLen++] = key.ch;
+                    loopSaveNameBuf[loopSaveNameLen] = '\0';
+                    Ui::updateNameEntryPreview(loopSaveNameBuf, ".mid");
+                    if (hadError) Ui::updateNameEntryError(nullptr);
+                }
+                break;
+            case KEY_DEL:
+                if (loopSaveNameLen > 0) {
+                    loopSaveNameBuf[--loopSaveNameLen] = '\0';
+                    Ui::updateNameEntryPreview(loopSaveNameBuf, ".mid");
+                    if (hadError) Ui::updateNameEntryError(nullptr);
+                }
+                break;
+            case KEY_OK:
+                finishSaveLoopName();
+                break;
+        }
+    }
+}
+
+void updateSaveLoopOverwrite() {
+    if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
+        screen = SCREEN_SAVE_LOOP_NAME;
+        Ui::drawNameEntry("Save Loop", loopSaveNameBuf, ".mid", nullptr, loopSaveKeyRow, loopSaveKeyCol);
+        return;
+    }
+    if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
+        // saveTrackToFile() opens O_TRUNC, so overwriting just means
+        // writing again -- no separate remove needed first.
+        performSaveLoopName(pendingLoopSaveName);
+    }
+}
+
 void updateSaveConfirm() {
     if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
         saveSession(); // transitions to SCREEN_FLASH_MESSAGE itself
     } else if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
-        screen = SCREEN_MAIN;
-        needsRedraw = true;
+        screen = SCREEN_SAVE_MENU;
+        Ui::drawEntryMenu("Save", saveMenuLabels, SAVE_MENU_COUNT, saveMenuCursor);
     }
 }
 
@@ -2978,6 +3626,221 @@ void updateFlashMessage() {
     }
 }
 
+void updateLoadMenu() {
+    if (Input::justPressed(BTN_UP)) {
+        if (loadMenuCursor > 0) {
+            int prev = loadMenuCursor;
+            loadMenuCursor--;
+            Ui::updateEntryMenuSelection(loadMenuLabels, LOAD_MENU_COUNT, prev, loadMenuCursor);
+        }
+    }
+    if (Input::justPressed(BTN_DOWN)) {
+        if (loadMenuCursor < LOAD_MENU_COUNT - 1) {
+            int prev = loadMenuCursor;
+            loadMenuCursor++;
+            Ui::updateEntryMenuSelection(loadMenuLabels, LOAD_MENU_COUNT, prev, loadMenuCursor);
+        }
+    }
+    if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
+        screen = SCREEN_MENU;
+        Ui::drawEntryMenu("Loops", menuLabels, MENU_COUNT, menuCursor);
+    }
+    if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
+        if (loadMenuCursor == 0) {
+            beginLoadLoopBrowse();
+        } else {
+            loadSavedSessions();
+            if (savedSessionCount == 0) {
+                showFlashMessage("No saved loops", nullptr, 1200);
+            } else {
+                loadSessionCursor = 0;
+                screen = SCREEN_LOAD_BROWSE;
+                const char* labels[MAX_SAVED_SESSIONS];
+                for (int i = 0; i < savedSessionCount; i++) labels[i] = savedSessionNames[i];
+                Ui::drawEntryMenu("Load Loop", labels, savedSessionCount, loadSessionCursor);
+            }
+        }
+    }
+}
+
+// Clamps loopBrowseScrollOffset so loopBrowseSelectedIndex stays on
+// screen -- same math as FilePlayerMode's own ensureSelectionVisible(),
+// just against this screen's independent cursor/scroll state.
+void ensureLoopBrowseVisible() {
+    int rows = Ui::visibleRows();
+    if (rows <= 0) return;
+    if (loopBrowseSelectedIndex < loopBrowseScrollOffset || loopBrowseSelectedIndex >= loopBrowseScrollOffset + rows) {
+        loopBrowseScrollOffset = (loopBrowseSelectedIndex / rows) * rows;
+    }
+    if (loopBrowseScrollOffset < 0) loopBrowseScrollOffset = 0;
+}
+
+// Always re-roots to LOOPS_ROOT and re-reads it, even if the browser was
+// left inside a subfolder last time this screen was open -- "Load
+// Selected Loop" should always start fresh at the top, same as opening
+// any other browser-based menu item.
+void beginLoadLoopBrowse() {
+    loopBrowser.begin(LOOPS_ROOT);
+    loopBrowseSelectedIndex = 0;
+    loopBrowseScrollOffset = 0;
+    screen = SCREEN_LOAD_LOOP_BROWSE;
+    Ui::drawLoopBrowser(loopBrowser, loopBrowseSelectedIndex, loopBrowseScrollOffset);
+}
+
+// ENTER tap: descend into a folder, or import the selected .mid into
+// whichever track was selected when "Load Selected Loop" was opened --
+// same importFileIntoTrack() OMNI-in/this-slot-out/Freeform defaults
+// requestImport() already uses for an arbitrary external file, since an
+// individual loop save carries no metadata of its own either (see
+// saveSelectedLoop()).
+void selectHighlightedLoopEntry() {
+    if (loopBrowseSelectedIndex < 0 || loopBrowseSelectedIndex >= loopBrowser.entryCount()) return;
+    const BrowserEntry& e = loopBrowser.entry(loopBrowseSelectedIndex);
+    if (e.isDir) {
+        loopBrowser.enterDir(loopBrowseSelectedIndex);
+        loopBrowseSelectedIndex = 0;
+        loopBrowseScrollOffset = 0;
+        Ui::drawLoopBrowser(loopBrowser, loopBrowseSelectedIndex, loopBrowseScrollOffset);
+        return;
+    }
+    if (e.kind != FILE_MID) return; // nothing this screen can do with a non-.mid file
+    char path[224];
+    loopBrowser.buildFullPath(loopBrowseSelectedIndex, path, sizeof(path));
+    bool ok = importFileIntoTrack(tracks[selectedTrack], path, selectedTrack);
+    char msg[40];
+    if (ok) snprintf(msg, sizeof(msg), "Loaded into Track %d", selectedTrack + 1);
+    else snprintf(msg, sizeof(msg), "Load failed");
+    // Leaving the screen for good (flash message, then SCREEN_MAIN) --
+    // drop loopBrowser's buffers now rather than leaving them resident
+    // for the rest of the looping session, same reasoning as the
+    // NAV/LEFT-at-root exit below.
+    loopBrowser.freeBuffers();
+    showFlashMessage(msg, nullptr, 1000);
+}
+
+// ENTER held: opens the delete confirm for the selected .mid -- a no-op
+// (returns false) for a folder, since this screen never offers deleting
+// a whole folder, only individual loop files.
+bool beginDeleteHighlightedLoop() {
+    if (loopBrowseSelectedIndex < 0 || loopBrowseSelectedIndex >= loopBrowser.entryCount()) return false;
+    const BrowserEntry& e = loopBrowser.entry(loopBrowseSelectedIndex);
+    if (e.isDir) return false;
+    loopDeleteFailed = false;
+    screen = SCREEN_LOAD_LOOP_DELETE_CONFIRM;
+    Ui::drawConfirmDelete(e.name, false, false);
+    return true;
+}
+
+// Tap-vs-hold on ENTER, same press-start/threshold/"used" pattern as
+// handleStopInput()/handleRecordInput() elsewhere in this file: a tap
+// selects/enters (selectHighlightedLoopEntry()), a hold past
+// HOLD_THRESHOLD_MS opens the delete confirm instead
+// (beginDeleteHighlightedLoop()) -- gated so both never fire off one
+// press. PLAY has no hold gesture here, so it always just taps.
+void updateLoadLoopBrowse() {
+    static uint32_t enterPressStartMs = 0;
+    static bool enterUsedForDelete = false;
+
+    if (Input::justPressed(BTN_UP)) {
+        if (loopBrowseSelectedIndex > 0) {
+            int prev = loopBrowseSelectedIndex;
+            loopBrowseSelectedIndex--;
+            int prevScroll = loopBrowseScrollOffset;
+            ensureLoopBrowseVisible();
+            if (loopBrowseScrollOffset == prevScroll) {
+                Ui::updateBrowserSelection(loopBrowser, prev, loopBrowseSelectedIndex, loopBrowseScrollOffset);
+            } else {
+                Ui::drawLoopBrowser(loopBrowser, loopBrowseSelectedIndex, loopBrowseScrollOffset);
+            }
+        }
+    }
+    if (Input::justPressed(BTN_DOWN)) {
+        if (loopBrowseSelectedIndex < loopBrowser.entryCount() - 1) {
+            int prev = loopBrowseSelectedIndex;
+            loopBrowseSelectedIndex++;
+            int prevScroll = loopBrowseScrollOffset;
+            ensureLoopBrowseVisible();
+            if (loopBrowseScrollOffset == prevScroll) {
+                Ui::updateBrowserSelection(loopBrowser, prev, loopBrowseSelectedIndex, loopBrowseScrollOffset);
+            } else {
+                Ui::drawLoopBrowser(loopBrowser, loopBrowseSelectedIndex, loopBrowseScrollOffset);
+            }
+        }
+    }
+
+    if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
+        // SdBrowser::goUp() doesn't know about a custom root -- left
+        // unchecked it would happily walk up past LOOPS_ROOT to "/".
+        // Exit the screen instead once already sitting at LOOPS_ROOT
+        // itself; only delegate to goUp() from somewhere further down.
+        if (strcmp(loopBrowser.currentPath(), LOOPS_ROOT) == 0) {
+            // Leaving the screen -- drop the buffers rather than holding
+            // them resident for the rest of the looping session (this
+            // mode's tracks[] is already 128KB; no reason to also carry a
+            // large folder's index around while just recording/playing).
+            // Cheap to rebuild: beginLoadLoopBrowse() always refreshes
+            // unconditionally next time this screen opens.
+            loopBrowser.freeBuffers();
+            screen = SCREEN_LOAD_MENU;
+            Ui::drawEntryMenu("Load", loadMenuLabels, LOAD_MENU_COUNT, loadMenuCursor);
+        } else {
+            loopBrowser.goUp();
+            loopBrowseSelectedIndex = 0;
+            loopBrowseScrollOffset = 0;
+            Ui::drawLoopBrowser(loopBrowser, loopBrowseSelectedIndex, loopBrowseScrollOffset);
+        }
+        return;
+    }
+
+    if (Input::justPressed(BTN_ENTER)) {
+        enterPressStartMs = millis();
+        enterUsedForDelete = false;
+    }
+    if (Input::isDown(BTN_ENTER) && !enterUsedForDelete &&
+        millis() - enterPressStartMs >= HOLD_THRESHOLD_MS) {
+        if (beginDeleteHighlightedLoop()) enterUsedForDelete = true;
+    }
+    if (Input::justReleased(BTN_ENTER)) {
+        if (!enterUsedForDelete) selectHighlightedLoopEntry();
+        enterUsedForDelete = false;
+    }
+    if (Input::justPressed(BTN_PLAY)) {
+        selectHighlightedLoopEntry();
+    }
+}
+
+void updateLoadLoopDeleteConfirm() {
+    if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
+        screen = SCREEN_LOAD_LOOP_BROWSE;
+        Ui::drawLoopBrowser(loopBrowser, loopBrowseSelectedIndex, loopBrowseScrollOffset);
+        return;
+    }
+    if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
+        if (loopDeleteFailed) {
+            screen = SCREEN_LOAD_LOOP_BROWSE;
+            Ui::drawLoopBrowser(loopBrowser, loopBrowseSelectedIndex, loopBrowseScrollOffset);
+            return;
+        }
+
+        char path[224];
+        loopBrowser.buildFullPath(loopBrowseSelectedIndex, path, sizeof(path));
+        bool ok = sd.remove(path);
+        if (ok) {
+            loopBrowser.refresh();
+            int count = loopBrowser.entryCount();
+            if (loopBrowseSelectedIndex >= count) loopBrowseSelectedIndex = count > 0 ? count - 1 : 0;
+            if (loopBrowseSelectedIndex < 0) loopBrowseSelectedIndex = 0;
+            ensureLoopBrowseVisible();
+            screen = SCREEN_LOAD_LOOP_BROWSE;
+            Ui::drawLoopBrowser(loopBrowser, loopBrowseSelectedIndex, loopBrowseScrollOffset);
+        } else {
+            loopDeleteFailed = true;
+            const BrowserEntry& e = loopBrowser.entry(loopBrowseSelectedIndex);
+            Ui::drawConfirmDelete(e.name, false, true);
+        }
+    }
+}
+
 void updateLoadBrowse() {
     const char* labels[MAX_SAVED_SESSIONS];
     for (int i = 0; i < savedSessionCount; i++) labels[i] = savedSessionNames[i];
@@ -2997,8 +3860,8 @@ void updateLoadBrowse() {
         }
     }
     if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
-        screen = SCREEN_MAIN;
-        needsRedraw = true;
+        screen = SCREEN_LOAD_MENU;
+        Ui::drawEntryMenu("Load", loadMenuLabels, LOAD_MENU_COUNT, loadMenuCursor);
     }
     if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
         strncpy(loadSessionName, savedSessionNames[loadSessionCursor], sizeof(loadSessionName) - 1);
@@ -3062,7 +3925,7 @@ void updateLoadConfirm() {
 
 void updateImportConfirm() {
     if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
-        bool ok = importFileIntoTrack(tracks[pendingImportTrack], pendingImportPath);
+        bool ok = importFileIntoTrack(tracks[pendingImportTrack], pendingImportPath, pendingImportTrack);
         char msg[32];
         if (ok) snprintf(msg, sizeof(msg), "Imported to Track %d", pendingImportTrack + 1);
         else snprintf(msg, sizeof(msg), "Import failed");
@@ -3077,7 +3940,8 @@ void buildTrackViews(Ui::LoopTrackView out[4]) {
     uint32_t now = millis();
     for (int i = 0; i < NUM_TRACKS; i++) {
         const LoopTrack& t = tracks[i];
-        out[i].channel = t.channel;
+        out[i].channelIn = t.channelIn;
+        out[i].channelOut = t.channelOut;
         out[i].barLength = t.barLength;
         out[i].lengthMs = t.lengthMs;
         out[i].positionFrac = positionFrac(t);
@@ -3105,7 +3969,7 @@ void buildTrackViews(Ui::LoopTrackView out[4]) {
 // session already in progress just because the user happened to also
 // tweak an unrelated default. Per-track barLength is the one exception
 // worth calling out: it's normally sticky per track (the user's own
-// ALT+LEFT/RIGHT choice survives erase/re-record), but with no track
+// EDIT+LEFT/RIGHT choice survives erase/re-record), but with no track
 // holding content yet there's nothing of the user's to protect, so
 // resetting all 4 here is safe.
 void applySettingsIfFresh() {
@@ -3115,6 +3979,10 @@ void applySettingsIfFresh() {
     timeSigDen = SettingsMode::defaultTimeSigDen();
     syncMode = SettingsMode::defaultSyncMode();
     metronomeOn = SettingsMode::defaultMetronomeOn();
+    // No redraw call needed here (unlike showBeatIndicatorIfMetronomeOn()'s
+    // other two call sites) -- enter() already set needsRedraw before
+    // calling this, so the imminent full Ui::drawLooper() picks this up.
+    if (metronomeOn) showBeatIndicator = true;
     countInEnabled = SettingsMode::defaultCountInEnabled();
     countInBars = SettingsMode::defaultCountInBars();
     metronomeVolumePercent = SettingsMode::metronomeVolume();
@@ -3182,6 +4050,16 @@ void begin() {
 void enter() {
     tracksAllocFailed = false;
     if (!tracks) {
+        // Drop loopBrowser's own heap buffers (if it's holding any --
+        // e.g. left over from a "Load Selected Loop" visit before tracks[]
+        // was last freed for FilePlayerMode's benefit) before the big
+        // allocation below -- pure disposable scan data, cheaply rebuilt
+        // next time that screen opens (beginLoadLoopBrowse() always
+        // refreshes unconditionally), so no confirmation needed. main.cpp
+        // does the equivalent for FilePlayerMode's own browser right
+        // before calling into here -- see FilePlayerMode::
+        // freeBrowserBuffers()'s comment.
+        loopBrowser.freeBuffers();
         tracks = new (std::nothrow) LoopTrack[NUM_TRACKS];
         if (!tracks) {
             // Extremely unlikely given the RAM budget this was sized
@@ -3192,6 +4070,14 @@ void enter() {
             showFlashMessage("Not enough RAM", "for looper", 1500);
             return;
         }
+        // channelOut can't default per-track via a LoopTrack member
+        // initializer (those can't see this track's own index) -- set it
+        // here instead, once, right after a fresh allocation: track N
+        // starts out routed to output channel N, so out of the box each
+        // track can already drive a different channel/device without the
+        // user dialing in anything. Only runs on first allocation, same
+        // "once" scope channelIn's own OMNI default effectively has.
+        for (int i = 0; i < NUM_TRACKS; i++) tracks[i].channelOut = (uint8_t)i;
     }
     MidiOutput::setInputHandler(handleIncomingMidi);
     MidiOutput::setRealtimeHandler(handleMidiRealtime);
@@ -3217,7 +4103,7 @@ bool update() {
     }
     updatePlayback(); // always runs, regardless of which screen is up, so loops never stall for a menu/prompt
     updateBarQuantizedRecording();
-    updateMetronome(); // same reasoning -- shouldn't stall for a menu/prompt either
+    updateMasterClock(); // same reasoning -- shouldn't stall for a menu/prompt either
     updateCountIn();
     updatePendingResumes(); // same reasoning -- a Sync-mode Pause resume shouldn't stall for a menu/prompt either
 
@@ -3226,11 +4112,17 @@ bool update() {
         case SCREEN_MAIN:           exitRequested = updateMainScreen(); break;
         case SCREEN_EXIT_CONFIRM:   exitRequested = updateExitConfirm(); break;
         case SCREEN_MENU:           updateMenu(); break;
+        case SCREEN_SAVE_MENU:      updateSaveMenu(); break;
+        case SCREEN_SAVE_LOOP_NAME: updateSaveLoopName(); break;
+        case SCREEN_SAVE_LOOP_OVERWRITE: updateSaveLoopOverwrite(); break;
         case SCREEN_SAVE_CONFIRM:   updateSaveConfirm(); break;
         case SCREEN_ERASE_CONFIRM:  updateEraseConfirm(); break;
         case SCREEN_ERASE_ALL_CONFIRM: updateEraseAllConfirm(); break;
         case SCREEN_DELETE_BROWSE:  updateDeleteBrowse(); break;
         case SCREEN_DELETE_CONFIRM: updateDeleteConfirm(); break;
+        case SCREEN_LOAD_MENU:      updateLoadMenu(); break;
+        case SCREEN_LOAD_LOOP_BROWSE: updateLoadLoopBrowse(); break;
+        case SCREEN_LOAD_LOOP_DELETE_CONFIRM: updateLoadLoopDeleteConfirm(); break;
         case SCREEN_LOAD_BROWSE:    updateLoadBrowse(); break;
         case SCREEN_LOAD_PICK:      updateLoadPick(); break;
         case SCREEN_LOAD_CONFIRM:   updateLoadConfirm(); break;
@@ -3256,16 +4148,22 @@ bool update() {
     }
 
     updateMetronomeBeatIndicator(); // every tick, cheap comparison -- see its own comment
+    updateBpmRowBeatFlash(); // every tick, same reasoning -- see its own comment
 
     Ui::LoopTrackView views[4];
     buildTrackViews(views);
 
     if (needsRedraw) {
         needsRedraw = false;
-        int currentBeat = metronomeOn ? metronomeCurrentBeat() : 0;
+        // -1 ("nothing lit") when the row is hidden, not just whenever
+        // metronomeOn is false -- masterClockCurrentBeat() tracks a running
+        // track's beat position regardless of metronomeOn (see
+        // updateMasterClock()'s own comment), so showBeatIndicator alone
+        // decides whether to show it here.
+        int currentBeat = showBeatIndicator ? masterClockCurrentBeat() : -1;
         Ui::drawLooper(views, selectedTrack, onBpmRow, syncMode, manualBpm, timeSigNum, timeSigDen,
                        metronomeOn, metronomeVolumePercent, false, countInEnabled, countInBars, false,
-                       (int)bpmRowFocus, currentBeat);
+                       (int)bpmRowFocus, showBeatIndicator, currentBeat);
     } else {
         static uint32_t lastPosTick = 0;
         uint32_t now = millis();

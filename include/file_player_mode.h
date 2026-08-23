@@ -43,4 +43,14 @@ bool hasPendingLooperImport();
 // hasPendingLooperImport() is true.
 void consumeLooperImport(char* pathOut, size_t pathOutSize, int& trackIndexOut);
 
+// Drops the file browser's heap-allocated directory index (see
+// SdBrowser::freeBuffers()) without touching anything else -- disposable,
+// cheaply-rebuilt-on-next-refresh scan data, not unsaved user content, so
+// this needs no confirmation. main.cpp calls this right before switching
+// into MODE_LOOPER, so a browser sitting on a large folder doesn't
+// compete with LooperMode::tracks[] (128KB) for RAM -- same
+// one-directional "main.cpp mediates, modes don't call each other"
+// reasoning as hasPendingLooperImport()'s own comment above.
+void freeBrowserBuffers();
+
 } // namespace FilePlayerMode

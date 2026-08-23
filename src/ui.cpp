@@ -11,12 +11,103 @@ namespace {
 
 TFT_eSPI tft = TFT_eSPI();
 
-const uint16_t COLOR_BG        = TFT_BLACK;
-const uint16_t COLOR_TEXT      = TFT_WHITE;
-const uint16_t COLOR_DIM       = TFT_DARKGREY;
-const uint16_t COLOR_HILITE_BG = TFT_NAVY;
-const uint16_t COLOR_ACCENT    = TFT_GREEN;
-const uint16_t COLOR_ERROR     = TFT_RED;
+// ---- theme palette --------------------------------------------------
+// Every color the UI draws with lives here as a named, user-editable
+// variable (not `const` -- see SettingsMode's Theme page, the last
+// Settings page, which lets you edit each of these as R/G/B and
+// save/load/reset the whole set as .thm files on the SD card, via the
+// accessor API at the bottom of this file). Declared individually (rather
+// than as one array indexed by enum) so every draw call site elsewhere in
+// this file can keep referring to them by plain name -- THEME_COLORS just
+// beneath holds a pointer to each, for the handful of places (the Theme
+// page itself, load/save) that need to enumerate all of them generically.
+uint16_t COLOR_BG        = TFT_BLACK;
+uint16_t COLOR_TEXT      = TFT_WHITE;
+uint16_t COLOR_DIM       = TFT_DARKGREY;
+uint16_t COLOR_HILITE_BG = TFT_MAROON;
+uint16_t COLOR_ACCENT    = TFT_GREEN;
+uint16_t COLOR_ERROR     = TFT_BLUE;
+
+// Looper track state badges (see loopStateColor()) -- EMPTY/MUTED
+// deliberately still use COLOR_DIM above rather than getting their own,
+// same as every other "nothing notable happening" indicator in the app.
+uint16_t COLOR_TRACK_ARMED     = TFT_SKYBLUE;
+uint16_t COLOR_TRACK_RECORDING = TFT_BLUE;
+uint16_t COLOR_TRACK_PLAYING   = TFT_GREEN;
+uint16_t COLOR_TRACK_STOPPED   = TFT_CYAN;
+uint16_t COLOR_TRACK_PAUSED    = TFT_YELLOW;
+
+// Rhythm/beat cues -- header beat squares, the BPM row's beat-flash,
+// the generic recording-activity dot on the MIDI/SysEx capture screens,
+// and the SysEx transmit-flash. COLOR_PULSE is this app's one general
+// "something is happening right now" accent; COLOR_DOWNBEAT accents bar 1
+// specifically wherever that distinction is drawn (currently just the BPM
+// row's flash).
+uint16_t COLOR_PULSE    = TFT_SKYBLUE;
+uint16_t COLOR_DOWNBEAT = TFT_CYAN;
+
+// Note-activity strip (drawNoteStrip(), the player screens' live piano
+// roll) -- three velocity tiers each for melodic and percussion notes,
+// independent of the constants above even where a default happens to
+// match, so tuning this strip's look later doesn't also affect track
+// state colors (or vice versa).
+uint16_t COLOR_NOTE_HIGH = TFT_YELLOW;
+uint16_t COLOR_NOTE_MID  = TFT_GREEN;
+uint16_t COLOR_NOTE_LOW  = TFT_DARKGREEN;
+uint16_t COLOR_PERC_HIGH = TFT_RED;
+uint16_t COLOR_PERC_MID  = TFT_ORANGE;
+uint16_t COLOR_PERC_LOW  = TFT_MAROON;
+
+// One entry per variable just above -- `label` is what the Theme page and
+// .thm files identify it by (so file format stays readable and reordering
+// this table can't silently shuffle a saved theme's meaning the way an
+// index-based format would), `value` points at the live variable itself,
+// `def` is what resetThemeColorsToDefault() restores it to.
+struct ThemeColorEntry {
+    const char* label;
+    uint16_t* value;
+    uint16_t def;
+};
+ThemeColorEntry THEME_COLORS[] = {
+    {"Background", &COLOR_BG,        TFT_BLACK},
+    {"Text",       &COLOR_TEXT,      TFT_WHITE},
+    {"Dim",        &COLOR_DIM,       TFT_DARKGREY},
+    {"Highlight",  &COLOR_HILITE_BG, TFT_MAROON},
+    {"Accent",     &COLOR_ACCENT,    TFT_GREEN},
+    {"Error",      &COLOR_ERROR,     TFT_BLUE},
+    {"Armed",      &COLOR_TRACK_ARMED,     TFT_SKYBLUE},
+    {"Recording",  &COLOR_TRACK_RECORDING, TFT_BLUE},
+    {"Playing",    &COLOR_TRACK_PLAYING,   TFT_GREEN},
+    {"Stopped",    &COLOR_TRACK_STOPPED,   TFT_CYAN},
+    {"Paused",     &COLOR_TRACK_PAUSED,    TFT_YELLOW},
+    {"Pulse",      &COLOR_PULSE,    TFT_SKYBLUE},
+    {"Downbeat",   &COLOR_DOWNBEAT, TFT_CYAN},
+    {"Note Hi",    &COLOR_NOTE_HIGH, TFT_YELLOW},
+    {"Note Mid",   &COLOR_NOTE_MID,  TFT_GREEN},
+    {"Note Lo",    &COLOR_NOTE_LOW,  TFT_DARKGREEN},
+    {"Perc Hi",    &COLOR_PERC_HIGH, TFT_RED},
+    {"Perc Mid",   &COLOR_PERC_MID,  TFT_ORANGE},
+    {"Perc Lo",    &COLOR_PERC_LOW,  TFT_MAROON},
+};
+const int THEME_COLOR_COUNT = sizeof(THEME_COLORS) / sizeof(THEME_COLORS[0]);
+
+// RGB565 (TFT_eSPI's native 16-bit color format: 5 bits red, 6 green, 5
+// blue) packing/unpacking -- the Theme page edits each channel as a plain
+// 0-255 byte (familiar, and matches what a .thm file stores), quantized
+// down to whatever the panel can actually display. unpackRGB565()
+// replicates each channel's top bits into its own low bits (rather than
+// just left-shifting and leaving the low bits zero) so e.g. full-scale
+// blue (0-31) unpacks to 255, not 248 -- round-tripping a color through
+// edit-and-store-back doesn't quietly darken it.
+uint16_t packRGB565(uint8_t r, uint8_t g, uint8_t b) {
+    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+void unpackRGB565(uint16_t c, uint8_t& r, uint8_t& g, uint8_t& b) {
+    uint8_t r5 = (c >> 11) & 0x1F, g6 = (c >> 5) & 0x3F, b5 = c & 0x1F;
+    r = (uint8_t)((r5 << 3) | (r5 >> 2));
+    g = (uint8_t)((g6 << 2) | (g6 >> 4));
+    b = (uint8_t)((b5 << 3) | (b5 >> 2));
+}
 
 const int ROW_HEIGHT = 18;
 const int HEADER_HEIGHT = 20;
@@ -183,9 +274,9 @@ void drawNoteStrip(int y) {
             uint8_t vel = MidiOutput::noteVelocity((uint8_t)note);
             barHeight = STRIP_MIN_BAR_HEIGHT + ((STRIP_HEIGHT - STRIP_MIN_BAR_HEIGHT) * vel) / 127;
             if (MidiOutput::isNotePercussion((uint8_t)note)) {
-                color = (vel >= 100) ? TFT_RED : (vel >= 64) ? TFT_ORANGE : TFT_MAROON;
+                color = (vel >= 100) ? COLOR_PERC_HIGH : (vel >= 64) ? COLOR_PERC_MID : COLOR_PERC_LOW;
             } else {
-                color = (vel >= 100) ? TFT_YELLOW : (vel >= 64) ? TFT_GREEN : TFT_DARKGREEN;
+                color = (vel >= 100) ? COLOR_NOTE_HIGH : (vel >= 64) ? COLOR_NOTE_MID : COLOR_NOTE_LOW;
             }
         }
         if (barHeight < STRIP_HEIGHT) {
@@ -307,15 +398,14 @@ const int BEAT_INDICATOR_MAX_WIDTH =
 // Header beat-indicator row: one small square per beat of the current time
 // signature, centered between "MIDI Looper" and "midiTracker" (see
 // drawHeaderBrand()). The whole row is hidden (region just blanked back to
-// the header background) whenever `visible` is false -- gated purely on
-// Metro's own on/off toggle, not on whether anything's actually audible
-// right now (see LooperMode's updateMetronome() -- the same distinction it
-// draws between "clock running" and "click audible"). Three visual states
-// per square: the current beat is lit solid bright (TFT_YELLOW, same
-// "active" color as drawActivityDot()); the downbeat (index 0) gets a
-// solid-outline resting look even when it isn't current, so the bar's start
-// stays visible at a glance; every other beat is a plain dim (COLOR_DIM)
-// filled square. Always clears a fixed BEAT_INDICATOR_MAX_WIDTH-wide region
+// the header background) whenever `visible` is false -- gated on its own
+// showBeatIndicator toggle, independent of Metro's own on/off (see
+// LooperMode's updateMetronomeBeatIndicator()). Three visual states per
+// square: the current beat is lit solid bright (COLOR_PULSE, same "active"
+// color as drawActivityDot()); the downbeat (index 0) gets a solid-outline
+// resting look even when it isn't current, so the bar's start stays
+// visible at a glance; every other beat is a plain dim (COLOR_DIM) filled
+// square. Always clears a fixed BEAT_INDICATOR_MAX_WIDTH-wide region
 // first regardless of the actual (possibly narrower) row about to be drawn,
 // so shrinking timeSigNum (or Metro turning off) can't leave a stray square
 // behind from a wider previous draw.
@@ -330,7 +420,7 @@ void drawLooperBeatIndicator(bool visible, int currentBeat, int timeSigNum) {
 
     for (int i = 0; i < timeSigNum; i++) {
         if (i == currentBeat) {
-            tft.fillRect(x, y, BEAT_INDICATOR_SIZE, BEAT_INDICATOR_SIZE, TFT_YELLOW);
+            tft.fillRect(x, y, BEAT_INDICATOR_SIZE, BEAT_INDICATOR_SIZE, COLOR_PULSE);
         } else if (i == 0) {
             tft.drawRect(x, y, BEAT_INDICATOR_SIZE, BEAT_INDICATOR_SIZE, COLOR_TEXT);
         } else {
@@ -397,7 +487,7 @@ const char* sysExPlayerStateLabel(SysExPlayer::State s) {
 }
 
 void drawActivityDot(int x, int y, bool active) {
-    tft.fillCircle(x, y, 5, active ? TFT_YELLOW : COLOR_DIM);
+    tft.fillCircle(x, y, 5, active ? COLOR_PULSE : COLOR_DIM);
 }
 
 // Byte-progress bar + numeric readout, filling the space drawPlayer()'s
@@ -419,12 +509,20 @@ void drawSysExProgress(const SysExPlayer& player) {
     tft.setTextDatum(TL_DATUM);
     tft.drawString(buf, 8, SYSEX_PROGRESS_LABEL_Y);
 
+    // The bar itself is inset 8px on each side (barX/barW below) --
+    // clear the full row first so the two narrow margins beside it don't
+    // keep showing whatever was drawn there before (e.g. a file browser
+    // row's selection-highlight background). Done on every call, same as
+    // the label clear just above, since this runs both as the entry draw
+    // (drawSysExPlayer()) and the live per-tick update
+    // (updateSysExPlayerLive()).
+    tft.fillRect(0, SYSEX_PROGRESS_BAR_Y, tft.width(), SYSEX_PROGRESS_BAR_H, COLOR_BG);
     int barX = 8, barW = tft.width() - 16;
     tft.fillRect(barX, SYSEX_PROGRESS_BAR_Y, barW, SYSEX_PROGRESS_BAR_H, COLOR_DIM);
     int fillW = total > 0 ? (int)(((uint64_t)barW * sent) / total) : 0;
     if (fillW > 0) {
         bool active = player.msSinceLastSend() < RECORDING_ACTIVITY_MS;
-        tft.fillRect(barX, SYSEX_PROGRESS_BAR_Y, fillW, SYSEX_PROGRESS_BAR_H, active ? TFT_YELLOW : TFT_GREEN);
+        tft.fillRect(barX, SYSEX_PROGRESS_BAR_Y, fillW, SYSEX_PROGRESS_BAR_H, active ? COLOR_PULSE : COLOR_ACCENT);
     }
 
     // Nothing else occupies the space below the bar down to the footer.
@@ -439,9 +537,22 @@ void drawSysExProgress(const SysExPlayer& player) {
 
 namespace Ui {
 
+// 0-100 percent -> a PWM duty cycle on DISPLAY_BACKLIGHT. analogWrite()
+// (Arduino-Pico core, RP2040 PWM hardware) rather than the plain
+// digitalWrite(HIGH) this used to be -- there's no other PWM output
+// anywhere else in this firmware to match a convention against, so this
+// just uses the framework's own default PWM frequency/resolution (8-bit,
+// 0-255), which is already how the framework's other analogWrite() users
+// (e.g. LED dimming) typically leave it.
+void setBacklightBrightness(int percent) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    analogWrite(DISPLAY_BACKLIGHT, (percent * 255) / 100);
+}
+
 void begin() {
     pinMode(DISPLAY_BACKLIGHT, OUTPUT);
-    digitalWrite(DISPLAY_BACKLIGHT, HIGH);
+    setBacklightBrightness(100); // full brightness until SettingsMode::begin() applies the saved value
 
     tft.init();
     tft.setRotation(3);
@@ -474,13 +585,27 @@ void drawSplash() {
     tft.setTextDatum(TL_DATUM);
 }
 
-void drawBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffset) {
-    // Header: current path
+// Header row shared by drawBrowser() and drawLoopBrowser(): current path,
+// plus a short truncation note (see SdBrowser::truncationNote()) appended
+// when the last scan didn't index the whole directory -- a folder of a
+// couple thousand files past what fits in RAM/MAX_INDEX_ENTRIES still
+// browses, just with this as a visible sign some entries aren't listed
+// rather than silently vanishing.
+void drawBrowserHeaderPath(const SdBrowser& browser) {
     tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
     tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
     tft.setTextDatum(TL_DATUM);
-    tft.drawString(browser.currentPath(), 4, 3);
+
+    char note[16];
+    browser.truncationNote(note, sizeof(note));
+    char headerBuf[224];
+    snprintf(headerBuf, sizeof(headerBuf), "%s%s", browser.currentPath(), note);
+    tft.drawString(headerBuf, 4, 3);
     drawHeaderBrand();
+}
+
+void drawBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffset) {
+    drawBrowserHeaderPath(browser);
 
     int rows = rowsOnScreen();
     int count = browser.entryCount();
@@ -526,6 +651,42 @@ void drawBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffset) 
     // as everywhere else redundant alternate triggers go unmentioned.
     tft.drawString("UD move/ALT page  EDIT menu", 4, fy + 1);
     tft.drawString("ENTER open  LEFT/NAV back  ALT output", 4, fy + 17);
+    drawBatteryMeter();
+}
+
+void drawLoopBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffset) {
+    drawBrowserHeaderPath(browser);
+
+    int rows = rowsOnScreen();
+    int count = browser.entryCount();
+
+    // Same "paint every row slot" reasoning as drawBrowser() -- see its
+    // own comment.
+    for (int row = 0; row < rows; row++) {
+        int idx = scrollOffset + row;
+        drawBrowserRow(browser, idx, scrollOffset, idx == selectedIndex);
+    }
+
+    int bodyBottom = tft.height() - FOOTER_HEIGHT;
+    int rowsBottom = HEADER_HEIGHT + rows * ROW_HEIGHT;
+    if (rowsBottom < bodyBottom) {
+        tft.fillRect(0, rowsBottom, tft.width(), bodyBottom - rowsBottom, COLOR_BG);
+    }
+
+    if (count == 0) {
+        tft.setTextColor(COLOR_DIM, COLOR_BG);
+        tft.drawString("(no saved loops here)", 8, HEADER_HEIGHT + 8);
+    } else if (count > rows) {
+        drawScrollbar(count, scrollOffset, rows, HEADER_HEIGHT);
+    }
+
+    // Footer: this screen only offers select/delete/back -- no EDIT
+    // menu or ALT output target, unlike drawBrowser()'s footer.
+    int fy = tft.height() - FOOTER_HEIGHT;
+    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
+    tft.setTextColor(COLOR_DIM, COLOR_BG);
+    tft.drawString("UD move  ENTER select", 4, fy + 1);
+    tft.drawString("HOLD ENTER delete  NAV/LEFT back", 4, fy + 17);
     drawBatteryMeter();
 }
 
@@ -759,7 +920,7 @@ void drawWavProgressBar(const WavPlayer& player) {
     int barX = 8, barW = tft.width() - 16;
     tft.fillRect(barX, WAV_BAR_Y, barW, WAV_BAR_H, COLOR_DIM);
     int fillW = total > 0 ? (int)(((uint64_t)barW * elapsed) / total) : 0;
-    if (fillW > 0) tft.fillRect(barX, WAV_BAR_Y, fillW, WAV_BAR_H, TFT_GREEN);
+    if (fillW > 0) tft.fillRect(barX, WAV_BAR_Y, fillW, WAV_BAR_H, COLOR_ACCENT);
 }
 
 void drawWavPlayer(const char* filename, const WavPlayer& player, int volume, bool stopped) {
@@ -816,6 +977,16 @@ void drawWavPlayer(const char* filename, const WavPlayer& player, int volume, bo
         snprintf(volBuf, sizeof(volBuf), "Volume: %d%%", volume);
         drawStatRow(PLAYER_ROW4_Y, "", volBuf);
 
+        // drawWavProgressBar() only ever paints the inset bar itself
+        // (barX=8, barW=width-16), never the two narrow margins beside
+        // it -- clear the full row here, once, on entry, so nothing left
+        // over from whatever screen was showing before (e.g. a file
+        // browser row's selection-highlight background) lingers in those
+        // margins for the rest of the playback session. Every later tick
+        // only redraws through drawWavProgressBar() (see
+        // updateWavPlayerLive()), which never touches the margins either,
+        // so they stay clean once cleared here.
+        tft.fillRect(0, WAV_BAR_Y, tft.width(), WAV_BAR_H, COLOR_BG);
         drawWavProgressBar(player);
 
         // Same reasoning as the fillRect above -- clears from right after
@@ -1424,6 +1595,41 @@ void drawConfirmDelete(const char* name, bool isDir, bool failed) {
     drawBatteryMeter();
 }
 
+// Same shape as drawConfirmDelete() just above -- header title, question
+// line, warning line, footer hint -- for the "this name is already taken"
+// confirmation saving a recording/SysEx capture or renaming something can
+// hit (see FilePlayerMode's finishNameEntry()).
+void drawConfirmOverwrite(const char* name, bool isDir) {
+    tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
+    tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString("Overwrite", 4, 3);
+
+    int y = HEADER_HEIGHT + 16;
+    tft.fillRect(0, HEADER_HEIGHT, tft.width(), y - HEADER_HEIGHT, COLOR_BG);
+
+    char line[MAX_FILENAME_LEN + 16];
+    tft.fillRect(0, y, tft.width(), ROW_HEIGHT, COLOR_BG);
+    tft.setTextColor(COLOR_TEXT, COLOR_BG);
+    snprintf(line, sizeof(line), "Overwrite %s %s?", isDir ? "folder" : "file", name);
+    tft.drawString(line, 8, y);
+    y += ROW_HEIGHT;
+
+    tft.fillRect(0, y, tft.width(), ROW_HEIGHT, COLOR_BG);
+    tft.setTextColor(COLOR_ERROR, COLOR_BG);
+    tft.drawString("This cannot be undone.", 8, y);
+    y += ROW_HEIGHT;
+
+    int fy = tft.height() - FOOTER_HEIGHT;
+    if (fy > y) {
+        tft.fillRect(0, y, tft.width(), fy - y, COLOR_BG);
+    }
+    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
+    tft.setTextColor(COLOR_DIM, COLOR_BG);
+    tft.drawString("ENTER overwrite  NAV cancel", 4, fy + 1);
+    drawBatteryMeter();
+}
+
 void drawRecording(const char* filename, const MidiRecorder& recorder) {
     tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
     tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
@@ -1660,16 +1866,26 @@ const int LOOPER_BAR_HEIGHT = 6;
 const int LOOPER_BAR_Y_OFFSET = 22; // bar sits below the label line within a row
 const int LOOPER_STATUS_Y = LOOPER_FIRST_ROW_Y + 4 * LOOPER_ROW_HEIGHT + 2;
 const int LOOPER_TRACK_COL_X = 8;
-const int LOOPER_CHANNEL_COL_X = 32;   // wide enough for "T4" plus a gap
-const int LOOPER_STATE_COL_X = 88;     // wide enough for "Ch16"/"OMNI" plus a gap
-const int LOOPER_BARLEN_COL_X = 165;   // wide enough for "RECORDING!" (longest state + overflow marker) plus a gap
-const int LOOPER_ACTIVITY_X = 222;     // wide enough for "128BAR" (longest bar-length value) plus a gap
-const int LOOPER_ACTIVITY_SPACING = 14; // gap between the record and play activity dots
+const int LOOPER_CHANNEL_COL_X = 28;   // wide enough for "T4" plus a gap
+// Both in and out channel show together on one line now (e.g. "OMNI/REC"),
+// same slot the single old "Ch16"/"OMNI" field used to occupy -- see
+// looperChannelText(). Given a deliberately wide gap on both sides (78px,
+// vs. the 56px the single old "Ch16"/"OMNI" field used to get) at the
+// user's explicit request, since it reads as the row's most important
+// field. That leaves STATE/BARLEN/the activity dots noticeably tighter
+// than their old margins -- still sized for their worst case ("RECORDING!"
+// with the buffer-full marker, and the "128BAR" preset) but with only a
+// few px of slack left, unlike before. Flag it if either ever visibly
+// crowds its neighbor on real hardware.
+const int LOOPER_STATE_COL_X = 110;    // wide enough for "OMNI/REC" plus a deliberately generous gap
+const int LOOPER_BARLEN_COL_X = 182;   // wide enough for "RECORD!" (longest state + overflow marker) plus a gap
+const int LOOPER_ACTIVITY_X = 226;     // wide enough for "128BAR" (longest bar-length value) plus a gap
+const int LOOPER_ACTIVITY_SPACING = 10; // gap between the record and play activity dots -- tightened from 14 to help the dots + BARLEN fit ahead of the fixed-position length field
 
 const char* loopStateLabel(LoopTrackState s) {
     switch (s) {
         case LOOP_TRACK_ARMED:     return "ARMED";
-        case LOOP_TRACK_RECORDING: return "RECORDING";
+        case LOOP_TRACK_RECORDING: return "RECORD";
         case LOOP_TRACK_PLAYING:   return "PLAYING";
         case LOOP_TRACK_MUTED:     return "MUTED";
         case LOOP_TRACK_STOPPED:   return "STOPPED";
@@ -1680,21 +1896,29 @@ const char* loopStateLabel(LoopTrackState s) {
 
 uint16_t loopStateColor(LoopTrackState s) {
     switch (s) {
-        case LOOP_TRACK_ARMED:     return TFT_YELLOW;
-        case LOOP_TRACK_RECORDING: return TFT_RED;
-        case LOOP_TRACK_PLAYING:   return TFT_GREEN;
+        case LOOP_TRACK_ARMED:     return COLOR_TRACK_ARMED;
+        case LOOP_TRACK_RECORDING: return COLOR_TRACK_RECORDING;
+        case LOOP_TRACK_PLAYING:   return COLOR_TRACK_PLAYING;
         case LOOP_TRACK_MUTED:     return COLOR_DIM;
-        case LOOP_TRACK_STOPPED:   return TFT_ORANGE;
-        case LOOP_TRACK_PAUSED:    return TFT_CYAN;
+        case LOOP_TRACK_STOPPED:   return COLOR_TRACK_STOPPED;
+        case LOOP_TRACK_PAUSED:    return COLOR_TRACK_PAUSED;
         default:                   return COLOR_DIM;
     }
 }
 
-// "ChNN" (1-16) or "OMNI" -- shared by drawLooperTrackLabel() (full row)
-// and drawLooperTrackChannel() (channel-only partial update).
+// "In/Out", e.g. "OMNI/REC", "OMNI/03", "05/REC", "05/03" -- shared by
+// drawLooperTrackLabel() (full row) and drawLooperTrackChannel()
+// (channel-only partial update).
 void looperChannelText(char* buf, size_t bufSize, const LoopTrackView& t) {
-    if (t.channel >= 16) snprintf(buf, bufSize, "OMNI");
-    else snprintf(buf, bufSize, "Ch%02d", t.channel + 1);
+    char inBuf[6];
+    if (t.channelIn >= 16) snprintf(inBuf, sizeof(inBuf), "OMNI");
+    else snprintf(inBuf, sizeof(inBuf), "%02d", t.channelIn + 1);
+
+    char outBuf[6];
+    if (t.channelOut >= 16) snprintf(outBuf, sizeof(outBuf), "REC");
+    else snprintf(outBuf, sizeof(outBuf), "%02d", t.channelOut + 1);
+
+    snprintf(buf, bufSize, "%s/%s", inBuf, outBuf);
 }
 
 // "FREE" or "NBAR" (e.g. "1BAR", "128BAR") -- shared by drawLooperTrackLabel()
@@ -1725,8 +1949,8 @@ void drawLooperTrackLength(const LoopTrackView& t, int idx, bool selected) {
     tft.setTextDatum(TL_DATUM);
 }
 
-// Draws one track's label line (row background, "T1 / Ch03 / PLAYING" in
-// their fixed columns, selection highlight) -- everything in the row
+// Draws one track's label line (row background, "T1 / OMNI/03 / PLAYING"
+// in their fixed columns, selection highlight) -- everything in the row
 // except the progress bar and activity dot, which updateLooperPositions()
 // owns separately so they can be refreshed on their own at a faster tick
 // without re-drawing this text.
@@ -1749,7 +1973,7 @@ void drawLooperTrackLabel(const LoopTrackView& t, int idx, bool selected) {
     snprintf(trackBuf, sizeof(trackBuf), "T%d", idx + 1);
     tft.drawString(trackBuf, LOOPER_TRACK_COL_X, y + 2);
 
-    char chBuf[8];
+    char chBuf[10];
     looperChannelText(chBuf, sizeof(chBuf), t);
     tft.drawString(chBuf, LOOPER_CHANNEL_COL_X, y + 2);
 
@@ -1767,16 +1991,16 @@ void drawLooperTrackLabel(const LoopTrackView& t, int idx, bool selected) {
 }
 
 // Redraws just the channel field of track idx's row (e.g. after ALT+UP/
-// DOWN changes it) -- clears a fixed-width box at LOOPER_CHANNEL_COL_X,
-// comfortably wide enough for any "ChNN"/"OMNI" value, rather than the
-// whole row. Safe to call on its own since the channel column never
-// overlaps the track number or state text next to it.
+// DOWN or ALT+LEFT/RIGHT changes it) -- clears a fixed-width box at
+// LOOPER_CHANNEL_COL_X, comfortably wide enough for any "OMNI/REC"-style
+// value, rather than the whole row. Safe to call on its own since the
+// channel column never overlaps the track number or state text next to it.
 void drawLooperTrackChannel(const LoopTrackView& t, int idx, bool selected) {
     int y = LOOPER_FIRST_ROW_Y + idx * LOOPER_ROW_HEIGHT;
     uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
     tft.fillRect(LOOPER_CHANNEL_COL_X, y, LOOPER_STATE_COL_X - LOOPER_CHANNEL_COL_X - 4, ROW_HEIGHT, bg);
 
-    char chBuf[8];
+    char chBuf[10];
     looperChannelText(chBuf, sizeof(chBuf), t);
     tft.setTextColor(loopStateColor(t.state), bg);
     tft.setTextDatum(TL_DATUM);
@@ -1830,8 +2054,8 @@ void drawLooperTrackBar(const LoopTrackView& t, int idx) {
 void drawLooperTrackActivity(const LoopTrackView& t, int idx, bool selected) {
     int y = LOOPER_FIRST_ROW_Y + idx * LOOPER_ROW_HEIGHT;
     uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
-    tft.fillCircle(LOOPER_ACTIVITY_X, y + 8, 4, t.recordActive ? TFT_RED : bg);
-    tft.fillCircle(LOOPER_ACTIVITY_X + LOOPER_ACTIVITY_SPACING, y + 8, 4, t.playActive ? TFT_GREEN : bg);
+    tft.fillCircle(LOOPER_ACTIVITY_X, y + 8, 4, t.recordActive ? COLOR_TRACK_RECORDING : bg);
+    tft.fillCircle(LOOPER_ACTIVITY_X + LOOPER_ACTIVITY_SPACING, y + 8, 4, t.playActive ? COLOR_TRACK_PLAYING : bg);
 }
 
 // The BPM row: a 5th, single-line item below the 4 track rows, selectable
@@ -1970,13 +2194,13 @@ void drawLooperBpmRow(float bpm, int timeSigNum, int timeSigDen, bool syncMode, 
 void drawLooper(const LoopTrackView tracksArg[4], int selectedTrack, bool onBpmRow, bool syncMode, float bpm,
                  int timeSigNum, int timeSigDen, bool metronomeOn, int metronomeVolumePercent,
                  bool showMetronomeVolume, bool countInEnabled, int countInBars, bool showCountInBars,
-                 int focusIndex, int metronomeCurrentBeat) {
+                 int focusIndex, bool showBeatIndicator, int metronomeCurrentBeat) {
     tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
     tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
     tft.setTextDatum(TL_DATUM);
     tft.drawString("MIDI Looper", 4, 3);
     drawHeaderBrand();
-    drawLooperBeatIndicator(metronomeOn, metronomeCurrentBeat, timeSigNum);
+    drawLooperBeatIndicator(showBeatIndicator, metronomeCurrentBeat, timeSigNum);
 
     // Small gaps nothing else here covers -- above the first track row,
     // between the last track row and the BPM row, and between the BPM
@@ -2003,23 +2227,23 @@ void drawLooper(const LoopTrackView tracksArg[4], int selectedTrack, bool onBpmR
     tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
     // Row-grouped (see pins.h): line 1 = UP/PLAY/EDIT, line 2 = LEFT/
     // DOWN/RIGHT/ENTER then ALT/NAV. ALT is woven into UD's and LR's own
-    // hints (channel/bar-length on a track row, Metro/Count In/Sync on the
-    // BPM row) rather than getting a separate mention, since it's purely a
-    // modifier here, never a standalone action of its own -- same
-    // reasoning applies wherever else ALT shows up in this app. The BPM
-    // value and Time Sig don't share ALT's hint -- they're EDIT-held
-    // instead (handleBpmValueAdjust()/handleTimeSigAdjust()), woven into
-    // EDIT's own hint instead ("rec/bpm": record on a track row, adjust
-    // BPM/Time Sig when held on the BPM row). PLAY/RIGHT's track-row
-    // meanings (Pause, Mute) are each a single word here since both are
-    // toggles -- pressing the same button again does the opposite, not a
-    // separate action.
+    // hints (out-channel on UD, in-channel on LR, Metro/Count In/Sync on
+    // the BPM row) rather than getting a separate mention, since it's
+    // purely a modifier here, never a standalone action of its own -- same
+    // reasoning applies wherever else ALT shows up in this app. EDIT is
+    // woven in the same way on LR (bar length, handleBarLengthAdjust()) --
+    // EDIT+UP/DOWN has no meaning on a track row (see handleRecordInput()'s
+    // comment), so line 1's EDIT hint only covers record (tap, track row)
+    // and BPM/Time Sig (held, BPM row -- handleBpmValueAdjust()/
+    // handleTimeSigAdjust()). PLAY/RIGHT's track-row meanings (Pause,
+    // Mute) are each a single word here since both are toggles -- pressing
+    // the same button again does the opposite, not a separate action.
     // "L"/"R" (rather than spelled-out LEFT/RIGHT) is this line's own
-    // concession to fitting five distinct hints on one row -- the same
+    // concession to fitting several distinct hints on one row -- the same
     // idea as "UD" above, just naming two buttons that do different
     // things instead of one pair doing the same thing.
-    tft.drawString("UD row/ALT chan  PLAY pause  EDIT rec/bpm", 4, fy + 1);
-    tft.drawString("L back/R mute/ALT bar  ENT menu  NAV stop", 4, fy + 17);
+    tft.drawString("UD row/ALT out  PLAY pause  EDIT rec/bpm", 4, fy + 1);
+    tft.drawString("L back/R mute/ALT in/EDIT bar  ENT menu  NAV stop", 4, fy + 17);
     drawBatteryMeter();
 }
 
@@ -2031,9 +2255,9 @@ void updateLooperPositions(const LoopTrackView tracksArg[4], int selectedTrack) 
 }
 
 // Cheap partial redraw of just the selected track's channel field (see
-// drawLooperTrackChannel()), e.g. after ALT+UP/DOWN changes it. Channel
-// changes only ever apply to the currently selected track, so this is
-// always the highlighted row.
+// drawLooperTrackChannel()), e.g. after ALT+UP/DOWN or ALT+LEFT/RIGHT
+// changes it. Channel changes only ever apply to the currently selected
+// track, so this is always the highlighted row.
 void updateLooperChannel(const LoopTrackView tracksArg[4], int selectedTrack) {
     drawLooperTrackChannel(tracksArg[selectedTrack], selectedTrack, true);
 }
@@ -2056,6 +2280,24 @@ void updateLooperBpm(float bpm, int timeSigNum, int timeSigDen, bool syncMode, b
                       int countInBars, bool showCountInBars, int focusIndex, bool selected) {
     drawLooperBpmRow(bpm, timeSigNum, timeSigDen, syncMode, metronomeOn, metronomeVolumePercent,
                       showMetronomeVolume, countInEnabled, countInBars, showCountInBars, focusIndex, selected);
+}
+
+// Cheap partial redraw of just the BPM row's outline -- a brief accent-
+// colored border flashed on each metronome beat (see LooperMode's
+// updateBpmRowBeatFlash()), a bigger-than-the-header-squares but still
+// non-disruptive "glanceable from a distance" beat cue. Just a stroke
+// (tft.drawRect(), not fillRect()) so it never touches the row's own text
+// underneath -- `active` true draws it, in the same COLOR_PULSE the
+// header's current-beat square uses (see drawLooperBeatIndicator()) for an
+// ordinary beat, or COLOR_DOWNBEAT for the downbeat (`downbeat` true) so
+// bar boundaries stand out from the beats in between, same idea as the
+// metronome's own louder downbeat click. `active` false erases it back to
+// the row's own background (`selected` picks which, same convention
+// drawLooperBpmRow() itself uses) -- `downbeat` is meaningless then.
+void updateLooperBpmRowBeatFlash(bool active, bool downbeat, bool selected) {
+    uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
+    uint16_t color = active ? (downbeat ? COLOR_DOWNBEAT : COLOR_PULSE) : bg;
+    tft.drawRect(0, LOOPER_STATUS_Y, tft.width(), ROW_HEIGHT, color);
 }
 
 // -- count-in overlay -----------------------------------------------------
@@ -2220,6 +2462,116 @@ void updateSettingsSelection(const char* const* labels, const char* const* value
 
 void updateSettingsValue(const char* label, const char* value, int index, int scrollOffset) {
     drawSettingsRow(label, value, index, scrollOffset, true);
+}
+
+// -- Theme page ---------------------------------------------------------
+
+const int THEME_R_X = 130;
+const int THEME_G_X = 178;
+const int THEME_B_X = 226;
+const int THEME_SWATCH_X = 278;
+const int THEME_SWATCH_W = 30;
+const int THEME_SWATCH_H = ROW_HEIGHT - 4;
+
+// Draws (or erases) a single Theme page row: label, three R/G/B fields
+// (the `channelCursor`-focused one drawn with foreground/background
+// swapped, same inverted-field technique drawLooperBpmRow()'s Sync field
+// uses for its own focus highlight), and a small solid swatch previewing
+// the actual resulting color next to them. Used by both the full page
+// redraw and the per-row partial updates below.
+void drawThemeRow(int index, int channelCursor, bool selected, int scrollOffset) {
+    int row = index - scrollOffset;
+    if (row < 0 || row >= visibleRows()) return;
+    int y = SETTINGS_ROW_Y0 + row * ROW_HEIGHT;
+    uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
+    tft.fillRect(0, y, tft.width(), ROW_HEIGHT, bg);
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(COLOR_TEXT, bg);
+    tft.drawString(THEME_COLORS[index].label, 8, y + 1);
+
+    uint8_t r, g, b;
+    unpackRGB565(*THEME_COLORS[index].value, r, g, b);
+    const uint8_t channels[3] = {r, g, b};
+    const char* prefixes[3] = {"R", "G", "B"};
+    const int xs[3] = {THEME_R_X, THEME_G_X, THEME_B_X};
+
+    for (int ch = 0; ch < 3; ch++) {
+        bool focused = selected && channelCursor == ch;
+        uint16_t fieldBg = focused ? COLOR_TEXT : bg;
+        uint16_t fieldFg = focused ? bg : COLOR_TEXT;
+        char buf[6];
+        snprintf(buf, sizeof(buf), "%s%3d", prefixes[ch], channels[ch]);
+        if (focused) {
+            int w = tft.textWidth(buf) + 4;
+            tft.fillRect(xs[ch] - 2, y, w, ROW_HEIGHT, fieldBg);
+        }
+        tft.setTextColor(fieldFg, fieldBg);
+        tft.drawString(buf, xs[ch], y + 1);
+    }
+
+    tft.fillRect(THEME_SWATCH_X, y + 2, THEME_SWATCH_W, THEME_SWATCH_H, *THEME_COLORS[index].value);
+    tft.drawRect(THEME_SWATCH_X, y + 2, THEME_SWATCH_W, THEME_SWATCH_H, COLOR_DIM);
+}
+
+void drawThemePage(int colorCursor, int channelCursor, int scrollOffset) {
+    tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
+    tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString("Settings: Theme", 4, 3);
+    drawHeaderBrand();
+
+    tft.fillRect(0, HEADER_HEIGHT, tft.width(), SETTINGS_ROW_Y0 - HEADER_HEIGHT, COLOR_BG);
+
+    int rows = visibleRows();
+    for (int row = 0; row < rows; row++) {
+        int idx = scrollOffset + row;
+        if (idx < THEME_COLOR_COUNT) {
+            drawThemeRow(idx, channelCursor, idx == colorCursor, scrollOffset);
+        } else {
+            tft.fillRect(0, SETTINGS_ROW_Y0 + row * ROW_HEIGHT, tft.width(), ROW_HEIGHT, COLOR_BG);
+        }
+    }
+
+    int bodyBottom = tft.height() - FOOTER_HEIGHT;
+    int rowsBottom = SETTINGS_ROW_Y0 + rows * ROW_HEIGHT;
+    if (rowsBottom < bodyBottom) {
+        tft.fillRect(0, rowsBottom, tft.width(), bodyBottom - rowsBottom, COLOR_BG);
+    }
+    if (THEME_COLOR_COUNT > rows) drawScrollbar(THEME_COLOR_COUNT, scrollOffset, rows, SETTINGS_ROW_Y0);
+
+    int fy = tft.height() - FOOTER_HEIGHT;
+    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
+    tft.setTextColor(COLOR_DIM, COLOR_BG);
+    tft.drawString("UD color  LR field  ENT menu", 4, fy + 1);
+    tft.drawString("EDIT+UD/LR value  NAV exit", 4, fy + 17);
+    drawBatteryMeter();
+}
+
+void updateThemeRow(int index, int channelCursor, bool selected, int scrollOffset) {
+    drawThemeRow(index, channelCursor, selected, scrollOffset);
+}
+
+void updateThemeSelection(int prevCursor, int newCursor, int channelCursor, int scrollOffset) {
+    if (prevCursor >= 0 && prevCursor < THEME_COLOR_COUNT) drawThemeRow(prevCursor, channelCursor, false, scrollOffset);
+    if (newCursor >= 0 && newCursor < THEME_COLOR_COUNT) drawThemeRow(newCursor, channelCursor, true, scrollOffset);
+    int rows = visibleRows();
+    if (THEME_COLOR_COUNT > rows) drawScrollbar(THEME_COLOR_COUNT, scrollOffset, rows, SETTINGS_ROW_Y0);
+}
+
+int themeColorCount() { return THEME_COLOR_COUNT; }
+const char* themeColorLabel(int index) { return THEME_COLORS[index].label; }
+
+void getThemeColorRGB(int index, uint8_t& r, uint8_t& g, uint8_t& b) {
+    unpackRGB565(*THEME_COLORS[index].value, r, g, b);
+}
+
+void setThemeColorRGB(int index, uint8_t r, uint8_t g, uint8_t b) {
+    *THEME_COLORS[index].value = packRGB565(r, g, b);
+}
+
+void resetThemeColorsToDefault() {
+    for (int i = 0; i < THEME_COLOR_COUNT; i++) *THEME_COLORS[i].value = THEME_COLORS[i].def;
 }
 
 // Cheap partial redraw for moving the looper's row cursor: repaints only

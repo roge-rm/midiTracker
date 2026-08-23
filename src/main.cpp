@@ -31,7 +31,18 @@ void enterMode(TopMode mode) {
     needsRedraw = true;
     switch (mode) {
         case MODE_FILE_PLAYER: FilePlayerMode::enter(); break;
-        case MODE_LOOPER:      LooperMode::enter(); break;
+        case MODE_LOOPER:
+            // Reclaim FilePlayerMode's file browser RAM before
+            // LooperMode::tracks[] (128KB) allocates -- a browser sitting
+            // on a large folder shouldn't compete with it. Pure
+            // disposable scan data (see FilePlayerMode::
+            // freeBrowserBuffers()'s comment), so this is silent/
+            // unconditional, unlike LooperMode's own interactive "Save &
+            // Continue / Discard & Continue / Cancel" gate for its
+            // *unsaved* track content.
+            FilePlayerMode::freeBrowserBuffers();
+            LooperMode::enter();
+            break;
         case MODE_SETTINGS:    SettingsMode::enter(); break;
         case MODE_SELECT:      break;
     }
