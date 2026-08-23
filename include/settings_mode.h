@@ -23,6 +23,10 @@ void enter();
 bool update();
 
 // -- accessors, read by LooperMode::begin()/enter() -----------------------
+int defaultOutputLevel();    // 0=HP Low, 1=HP High, 2=Line Level -- see Synth::setOutputLevel()
+int defaultVolume();         // percent, 0-100 -- see FilePlayerMode's `volume`/Synth::setVolume()
+bool reverbEnabled();        // see Synth::setReverbEnabled()
+int reverbMix();             // percent, 0-100 -- see Synth::setReverbMix()
 float defaultBpm();
 int defaultTimeSigNum();     // beats/bar -- see LooperMode's TimeSig comment
 int defaultTimeSigDen();     // which note value is one beat (4 = quarter, 8 = eighth, ...)

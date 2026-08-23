@@ -164,15 +164,14 @@ private:
     int _numChannels = 4;
     int _numInstruments = 0; // count of samples with nonzero length, for the UI only
     uint32_t _patternDataStart = 0;
-    // Headroom shift for mixOneSample() -- see S3mPlayer::_mixShift's
-    // identical comment (smallest N with (1<<N) >= _numChannels, computed
-    // once in load()) -- replaces a runtime `/ _numChannels` division
-    // (the RP2040's Cortex-M0+ has no hardware integer divide) with a
-    // shift. MOD's usual 4 channels made this less urgent than S3M/XM's
-    // higher channel counts, but real-hardware diagnostics found the
-    // shared audio pipeline running close enough to its throughput
-    // ceiling under load that every avoidable per-sample cost matters.
-    uint8_t _mixShift = 2; // log2(4), matches the _numChannels=4 default above until load() recomputes it
+    // Headroom shift for mixOneSample() -- unconditionally 0 now (see
+    // MIX_SHIFT_TYPICAL_CHANNELS's comment in mod_file.cpp for why a
+    // channel-count-based shift was dropped entirely: even capping it
+    // undershot how quiet it made typical, non-worst-case tracker content,
+    // by a wide enough margin that real-hardware A/B listening against
+    // WAV/MIDI could still hear it). softClampMix() is the only headroom
+    // management left, applied unconditionally regardless of this value.
+    uint8_t _mixShift = 0;
 
     ModChannel _channels[MAX_MOD_CHANNELS];
 

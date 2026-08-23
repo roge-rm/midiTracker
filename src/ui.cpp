@@ -2,8 +2,10 @@
 #include "battery.h"
 #include "pins.h"
 #include "keyboard_layout.h"
+#include "version.h"
 #include <TFT_eSPI.h>
 #include <string.h>
+#include <stdio.h>
 
 namespace {
 
@@ -463,6 +465,11 @@ void drawSplash() {
     tft.setTextFont(2);
     tft.setTextColor(COLOR_DIM, COLOR_BG);
     tft.drawString("play. record. loop.", cx, cy + 18);
+
+    // Bottom middle, same dim/gray styling as the subtext above.
+    char verBuf[24];
+    snprintf(verBuf, sizeof(verBuf), "v%s", VERSIONNUMBER);
+    tft.drawString(verBuf, cx, tft.height() - 12);
 
     tft.setTextDatum(TL_DATUM);
 }
@@ -2149,11 +2156,13 @@ void drawSettingsRow(const char* label, const char* value, int index, int scroll
 }
 
 void drawSettings(const char* const* labels, const char* const* values, int count, int cursor,
-                   int scrollOffset) {
+                   int scrollOffset, const char* pageTitle) {
     tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
     tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
     tft.setTextDatum(TL_DATUM);
-    tft.drawString("Settings", 4, 3);
+    char titleBuf[32];
+    snprintf(titleBuf, sizeof(titleBuf), "Settings: %s", pageTitle);
+    tft.drawString(titleBuf, 4, 3);
     drawHeaderBrand();
 
     // The header-to-first-row gap isn't covered by any row's own draw --
@@ -2189,11 +2198,11 @@ void drawSettings(const char* const* labels, const char* const* values, int coun
     tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
     tft.setTextColor(COLOR_DIM, COLOR_BG);
     // Row-grouped (see pins.h): PLAY (row 1) does nothing on this screen,
-    // so line 1 is just UP/DOWN; line 2 covers LEFT/RIGHT (with EDIT woven
-    // in, since it's a pure modifier here rather than a standalone action)
-    // plus NAV, both rows below it.
-    tft.drawString("UD move", 4, fy + 1);
-    tft.drawString("EDIT+LR change  LEFT/NAV back", 4, fy + 17);
+    // so line 1 covers UP/DOWN plus plain LEFT/RIGHT (page navigation);
+    // line 2 covers EDIT+LEFT/RIGHT (value adjust, EDIT woven in since
+    // it's a pure modifier here) plus NAV (unconditional exit).
+    tft.drawString("UD move  LR page", 4, fy + 1);
+    tft.drawString("EDIT+LR change  NAV back", 4, fy + 17);
     drawBatteryMeter();
 }
 

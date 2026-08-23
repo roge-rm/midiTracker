@@ -17,6 +17,7 @@
 #include "sysex_recorder.h"
 #include "sysex_player.h"
 #include "looper_mode.h" // hasUnsavedTrackContent()/freeTracksIfAllocated()/the free-RAM gate -- see APP_FREE_LOOPER_RAM
+#include "settings_mode.h" // defaultVolume() -- see enter()'s volumeSeededFromSettings comment
 #include "synth.h"
 #include "input.h"
 #include "ui.h"
@@ -107,6 +108,10 @@ int dirStackDepth = 0;
 MidiOutTarget outputTarget = MIDI_OUT_BOTH;
 bool audioOn = false; // onboard synth on/off, see MidiOutput::setAudioOutput()
 int volume = 80; // percent, see Synth::setVolume(); mirrored here so the UI can show it
+// True once `volume` has been seeded from SettingsMode::defaultVolume() --
+// see enter()'s comment for why this only happens once, not on every
+// (re-)entry into this mode.
+bool volumeSeededFromSettings = false;
 
 char nowPlayingName[MAX_FILENAME_LEN] = {0};
 char nowRecordingName[MAX_FILENAME_LEN] = {0}; // base name of the in-progress recording
@@ -1587,6 +1592,23 @@ void enter() {
     });
     MidiOutput::setTarget(outputTarget);
     MidiOutput::setAudioOutput(audioOn);
+    // Output Level/Reverb have no in-session live-adjust control of their
+    // own (unlike Volume, see handleVolumeHold()), so they're simply
+    // re-applied from Settings every entry -- always current, nothing to
+    // protect.
+    Synth::setOutputLevel((uint8_t)SettingsMode::defaultOutputLevel());
+    Synth::setReverbEnabled(SettingsMode::reverbEnabled());
+    Synth::setReverbMix((uint8_t)SettingsMode::reverbMix());
+    // Seed from the Settings default exactly once (the first time this
+    // mode is entered after boot), not on every re-entry -- otherwise
+    // switching to Looper/Settings and back would silently yank any
+    // in-session volume adjustment back to the default, the same "don't
+    // clobber a live value" reasoning LooperMode's own defaults use (see
+    // settings_mode.h's header comment).
+    if (!volumeSeededFromSettings) {
+        volume = SettingsMode::defaultVolume();
+        volumeSeededFromSettings = true;
+    }
     Synth::setVolume((uint8_t)volume);
 
     appState = APP_BROWSE;

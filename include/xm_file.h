@@ -322,10 +322,13 @@ private:
 
     uint8_t _globalVolume = 64;
     uint8_t _globalVolSlideParam = 0; // H's own slide memory -- global, not shared with any channel's A/volSlideParam
-    // Headroom shift for mixOneSample() -- see S3mPlayer::_mixShift's
-    // identical comment on why a runtime `/ _numChannels` there is a
-    // real, measurable cost on the RP2040's Cortex-M0+ (no hardware
-    // divide), computed once here from _numChannels the same way.
+    // Headroom shift for mixOneSample() -- unconditionally 0 now (see
+    // MIX_SHIFT_TYPICAL_CHANNELS's comment in xm_file.cpp for why a
+    // channel-count-based shift was dropped entirely: even capping it
+    // undershot how quiet it made typical, non-worst-case tracker content,
+    // by a wide enough margin that real-hardware A/B listening against
+    // WAV/MIDI could still hear it). softClampMix() is the only headroom
+    // management left, applied unconditionally regardless of this value.
     uint8_t _mixShift = 0;
 
     XmChannel _channels[MAX_CHANNELS];

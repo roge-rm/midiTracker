@@ -338,11 +338,13 @@ void updateLooperBeatIndicator(bool visible, int currentBeat, int timeSigNum);
 // Full redraw of the Settings screen: a scrollable list of labeled
 // default values, `cursor` highlighted, `scrollOffset` rows scrolled down
 // (0 = top). UP/DOWN moves the cursor; EDIT+LEFT/RIGHT adjusts the
-// highlighted item's value (see SettingsMode). `labels`/`values` are
-// parallel arrays, `count` long. Draws a scrollbar (see visibleRows())
-// when `count` exceeds one screenful, same convention as drawBrowser().
+// highlighted item's value; LEFT/RIGHT alone page-navigate (see
+// SettingsMode). `labels`/`values` are parallel arrays, `count` long.
+// Draws a scrollbar (see visibleRows()) when `count` exceeds one
+// screenful, same convention as drawBrowser(). `pageTitle` is shown in
+// the header alongside "Settings" (e.g. "Settings: Audio").
 void drawSettings(const char* const* labels, const char* const* values, int count, int cursor,
-                   int scrollOffset);
+                   int scrollOffset, const char* pageTitle);
 
 // Cheap partial redraw for moving the settings cursor within the current
 // scroll position: repaints only the previously and newly selected rows.

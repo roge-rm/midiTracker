@@ -20,6 +20,10 @@ namespace SettingsMode
 
         enum SettingIndex
         {
+            SETTING_OUTPUT_LEVEL,
+            SETTING_DEFAULT_VOLUME,
+            SETTING_REVERB,
+            SETTING_REVERB_MIX,
             SETTING_BPM,
             SETTING_TIME_SIGNATURE,
             SETTING_CLOCK_SOURCE,
@@ -31,8 +35,45 @@ namespace SettingsMode
             SETTING_COUNT_IN_BARS,
             SETTING_MIDI_TRANSPORT,
             SETTING_MIDI_THRU,
+            SETTING_REBOOT_BOOTLOADER,
             SETTING_COUNT,
         };
+
+        // Settings is split into a handful of themed pages rather than one long
+        // scrolling list -- RIGHT (without EDIT held, so it doesn't collide with
+        // EDIT+RIGHT's "adjust value" meaning) advances to the next page,
+        // looping back to page 0 from the last one; LEFT steps back a page at
+        // a time, and (since page 0 has nowhere further back to go) exits the
+        // screen from page 0 itself, same as it always has. BTN_NAV remains an
+        // unconditional "exit from anywhere" shortcut regardless of page. See
+        // handleInput()/switchPage().
+        enum SettingsPage
+        {
+            PAGE_AUDIO,
+            PAGE_LOOPER,
+            PAGE_METRONOME,
+            PAGE_MIDI_SYSTEM,
+            PAGE_COUNT,
+        };
+
+        const char *PAGE_TITLES[PAGE_COUNT] = {"Audio", "Looper", "Metronome", "MIDI/System"};
+
+        const SettingIndex PAGE_AUDIO_ITEMS[] = {SETTING_OUTPUT_LEVEL, SETTING_DEFAULT_VOLUME, SETTING_REVERB, SETTING_REVERB_MIX};
+        const SettingIndex PAGE_LOOPER_ITEMS[] = {SETTING_BPM, SETTING_TIME_SIGNATURE, SETTING_BAR_LENGTH, SETTING_SYNC};
+        const SettingIndex PAGE_METRONOME_ITEMS[] = {SETTING_METRONOME, SETTING_METRONOME_VOLUME, SETTING_COUNT_IN, SETTING_COUNT_IN_BARS};
+        const SettingIndex PAGE_MIDI_SYSTEM_ITEMS[] = {SETTING_CLOCK_SOURCE, SETTING_MIDI_TRANSPORT, SETTING_MIDI_THRU, SETTING_REBOOT_BOOTLOADER};
+
+        const SettingIndex *PAGE_ITEMS[PAGE_COUNT] = {PAGE_AUDIO_ITEMS, PAGE_LOOPER_ITEMS, PAGE_METRONOME_ITEMS, PAGE_MIDI_SYSTEM_ITEMS};
+        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {4, 4, 4, 4};
+
+        int currentPage = 0;
+
+        // `cursor` (declared further below) is a position *within the current
+        // page* (0..currentPageItemCount()-1), not a raw SettingIndex anymore --
+        // these translate between the two everywhere itemLabel()/formatValue()/
+        // adjustSetting() etc. need the real SettingIndex.
+        SettingIndex currentPageItem(int posInPage) { return PAGE_ITEMS[currentPage][posInPage]; }
+        int currentPageItemCount() { return PAGE_ITEM_COUNTS[currentPage]; }
 
         // Same bar-length preset convention LooperMode's own BAR_PRESETS/
         // cycleBarLengthOnSelected() use (0 = Freeform) -- duplicated rather than
@@ -58,6 +99,14 @@ namespace SettingsMode
             {7, 8},
         };
 
+        // 0 = Headphone Low, 1 = Headphone High, 2 = Line Level -- see
+        // Synth::setOutputLevel()'s comment in synth.h for why this exists
+        // and what each level means. Headphone Low (safest/quietest) by
+        // default.
+        int g_defaultOutputLevel = 0;
+        int g_defaultVolume = 75; // percent -- see FilePlayerMode's `volume`
+        bool g_reverbEnabled = true;  // see Synth::setReverbEnabled()
+        int g_reverbMix = 70;         // percent -- see Synth::setReverbMix()
         float g_defaultBpm = 120.0f;
         int g_defaultTimeSigNum = 4;
         int g_defaultTimeSigDen = 4;
@@ -70,6 +119,21 @@ namespace SettingsMode
         MidiThruMode g_defaultThruMode = MIDI_THRU_OFF;
         bool g_clockSourceSlave = false;     // false = Internal (preset BPM), true = Slave (follow MIDI clock)
         bool g_midiTransportEnabled = false; // react to incoming Start/Stop/Continue
+
+        const char *outputLevelLabel(int level)
+        {
+            switch (level)
+            {
+            case 0:
+                return "HP Low";
+            case 1:
+                return "HP High";
+            case 2:
+                return "Line Level";
+            default:
+                return "HP Low";
+            }
+        }
 
         const char *thruModeLabel(MidiThruMode mode)
         {
@@ -110,6 +174,14 @@ namespace SettingsMode
         {
             switch (index)
             {
+            case SETTING_OUTPUT_LEVEL:
+                return "Output Level";
+            case SETTING_DEFAULT_VOLUME:
+                return "Default Volume";
+            case SETTING_REVERB:
+                return "Reverb";
+            case SETTING_REVERB_MIX:
+                return "Reverb Mix";
             case SETTING_BPM:
                 return "Default BPM";
             case SETTING_TIME_SIGNATURE:
@@ -132,6 +204,8 @@ namespace SettingsMode
                 return "Clock Source";
             case SETTING_MIDI_TRANSPORT:
                 return "MIDI Transport";
+            case SETTING_REBOOT_BOOTLOADER:
+                return "USB Bootloader";
             default:
                 return "";
             }
@@ -144,6 +218,18 @@ namespace SettingsMode
         {
             switch (index)
             {
+            case SETTING_OUTPUT_LEVEL:
+                snprintf(out, outSize, "%s", outputLevelLabel(g_defaultOutputLevel));
+                break;
+            case SETTING_DEFAULT_VOLUME:
+                snprintf(out, outSize, "%d%%", g_defaultVolume);
+                break;
+            case SETTING_REVERB:
+                snprintf(out, outSize, "%s", g_reverbEnabled ? "On" : "Off");
+                break;
+            case SETTING_REVERB_MIX:
+                snprintf(out, outSize, "%d%%", g_reverbMix);
+                break;
             case SETTING_BPM:
                 snprintf(out, outSize, "%d", (int)(g_defaultBpm + 0.5f));
                 break;
@@ -180,6 +266,11 @@ namespace SettingsMode
             case SETTING_MIDI_TRANSPORT:
                 snprintf(out, outSize, "%s", g_midiTransportEnabled ? "On" : "Off");
                 break;
+            case SETTING_REBOOT_BOOTLOADER:
+                // Not a stored value -- see handleBootloaderHold() for the
+                // actual trigger. Static instructional text instead.
+                snprintf(out, outSize, "Hold ENTER");
+                break;
             default:
                 out[0] = '\0';
                 break;
@@ -189,7 +280,7 @@ namespace SettingsMode
         bool isBoolSetting(int index)
         {
             return index == SETTING_SYNC || index == SETTING_METRONOME || index == SETTING_COUNT_IN ||
-                   index == SETTING_CLOCK_SOURCE || index == SETTING_MIDI_TRANSPORT;
+                   index == SETTING_CLOCK_SOURCE || index == SETTING_MIDI_TRANSPORT || index == SETTING_REVERB;
         }
 
         // `direction` is +1 (RIGHT) or -1 (LEFT). Bool items are set directly
@@ -200,6 +291,33 @@ namespace SettingsMode
         {
             switch (index)
             {
+            case SETTING_OUTPUT_LEVEL:
+            {
+                int idx = g_defaultOutputLevel + direction;
+                if (idx < 0)
+                    idx = 0;
+                if (idx > 2)
+                    idx = 2;
+                g_defaultOutputLevel = idx;
+                break;
+            }
+            case SETTING_DEFAULT_VOLUME:
+                g_defaultVolume += direction * 5;
+                if (g_defaultVolume < 0)
+                    g_defaultVolume = 0;
+                if (g_defaultVolume > 100)
+                    g_defaultVolume = 100;
+                break;
+            case SETTING_REVERB:
+                g_reverbEnabled = (direction > 0);
+                break;
+            case SETTING_REVERB_MIX:
+                g_reverbMix += direction * 5;
+                if (g_reverbMix < 0)
+                    g_reverbMix = 0;
+                if (g_reverbMix > 100)
+                    g_reverbMix = 100;
+                break;
             case SETTING_BPM:
                 g_defaultBpm += (float)direction;
                 if (g_defaultBpm < 20.0f)
@@ -280,16 +398,20 @@ namespace SettingsMode
             }
         }
 
-        // Fills caller-owned storage with every item's label/value, and points
-        // labelPtrs/valuePtrs at them -- shared by every call site that needs the
-        // full list (the initial draw and both cursor-move directions), so
-        // there's exactly one place that knows how to assemble it.
+        // Fills caller-owned storage with the *current page's* item labels/
+        // values, and points labelPtrs/valuePtrs at them -- shared by every call
+        // site that needs the list (the initial draw and both cursor-move
+        // directions), so there's exactly one place that knows how to assemble
+        // it. Buffers stay sized to SETTING_COUNT (a safe upper bound) even
+        // though only currentPageItemCount() of each actually gets used.
         void buildLists(const char *labelPtrs[SETTING_COUNT], char values[SETTING_COUNT][16], const char *valuePtrs[SETTING_COUNT])
         {
-            for (int i = 0; i < SETTING_COUNT; i++)
+            int n = currentPageItemCount();
+            for (int i = 0; i < n; i++)
             {
-                labelPtrs[i] = itemLabel(i);
-                formatValue(i, values[i], 16);
+                SettingIndex idx = currentPageItem(i);
+                labelPtrs[i] = itemLabel(idx);
+                formatValue(idx, values[i], 16);
                 valuePtrs[i] = values[i];
             }
         }
@@ -306,6 +428,14 @@ namespace SettingsMode
 
             char line[48];
             int n;
+            n = snprintf(line, sizeof(line), "outputLevel=%d\n", g_defaultOutputLevel);
+            file.write((const uint8_t *)line, n);
+            n = snprintf(line, sizeof(line), "defaultVolume=%d\n", g_defaultVolume);
+            file.write((const uint8_t *)line, n);
+            n = snprintf(line, sizeof(line), "reverbEnabled=%d\n", g_reverbEnabled ? 1 : 0);
+            file.write((const uint8_t *)line, n);
+            n = snprintf(line, sizeof(line), "reverbMix=%d\n", g_reverbMix);
+            file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "bpm=%d\n", (int)(g_defaultBpm + 0.5f));
             file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "timeSigNum=%d\n", g_defaultTimeSigNum);
@@ -337,6 +467,36 @@ namespace SettingsMode
 
         void parseSettingsLine(const char *line)
         {
+            if (strncmp(line, "outputLevel=", 12) == 0)
+            {
+                g_defaultOutputLevel = atoi(line + 12);
+                if (g_defaultOutputLevel < 0 || g_defaultOutputLevel > 2)
+                    g_defaultOutputLevel = 0;
+                return;
+            }
+            if (strncmp(line, "defaultVolume=", 14) == 0)
+            {
+                g_defaultVolume = atoi(line + 14);
+                if (g_defaultVolume < 0)
+                    g_defaultVolume = 0;
+                if (g_defaultVolume > 100)
+                    g_defaultVolume = 100;
+                return;
+            }
+            if (strncmp(line, "reverbEnabled=", 14) == 0)
+            {
+                g_reverbEnabled = atoi(line + 14) != 0;
+                return;
+            }
+            if (strncmp(line, "reverbMix=", 10) == 0)
+            {
+                g_reverbMix = atoi(line + 10);
+                if (g_reverbMix < 0)
+                    g_reverbMix = 0;
+                if (g_reverbMix > 100)
+                    g_reverbMix = 100;
+                return;
+            }
             if (strncmp(line, "bpm=", 4) == 0)
             {
                 g_defaultBpm = (float)atoi(line + 4);
@@ -441,8 +601,9 @@ namespace SettingsMode
         void refreshValue()
         {
             char valBuf[16];
-            formatValue(cursor, valBuf, sizeof(valBuf));
-            Ui::updateSettingsValue(itemLabel(cursor), valBuf, cursor, scrollOffset);
+            SettingIndex idx = currentPageItem(cursor);
+            formatValue(idx, valBuf, sizeof(valBuf));
+            Ui::updateSettingsValue(itemLabel(idx), valBuf, cursor, scrollOffset);
         }
 
         // EDIT held + LEFT/RIGHT: adjusts the selected item. Bool items (Sync/
@@ -454,17 +615,18 @@ namespace SettingsMode
             if (!Input::isDown(BTN_EDIT))
                 return;
 
-            if (isBoolSetting(cursor))
+            SettingIndex idx = currentPageItem(cursor);
+            if (isBoolSetting(idx))
             {
                 bool changed = false;
                 if (Input::justPressed(BTN_RIGHT))
                 {
-                    adjustSetting(cursor, 1);
+                    adjustSetting(idx, 1);
                     changed = true;
                 }
                 if (Input::justPressed(BTN_LEFT))
                 {
-                    adjustSetting(cursor, -1);
+                    adjustSetting(idx, -1);
                     changed = true;
                 }
                 if (changed)
@@ -493,7 +655,7 @@ namespace SettingsMode
                 uint32_t interval = (now - rightPressedAtMs >= ACCEL_AFTER_MS) ? FAST_INTERVAL_MS : NORMAL_INTERVAL_MS;
                 if (Input::justPressed(BTN_RIGHT) || now - lastRightStep >= interval)
                 {
-                    adjustSetting(cursor, 1);
+                    adjustSetting(idx, 1);
                     lastRightStep = now;
                     changed = true;
                 }
@@ -503,13 +665,41 @@ namespace SettingsMode
                 uint32_t interval = (now - leftPressedAtMs >= ACCEL_AFTER_MS) ? FAST_INTERVAL_MS : NORMAL_INTERVAL_MS;
                 if (Input::justPressed(BTN_LEFT) || now - lastLeftStep >= interval)
                 {
-                    adjustSetting(cursor, -1);
+                    adjustSetting(idx, -1);
                     lastLeftStep = now;
                     changed = true;
                 }
             }
             if (changed)
                 refreshValue();
+        }
+
+        // Reboots into the RP2040's USB (BOOTSEL) bootloader -- the device
+        // stops running this firmware entirely and appears as a mass-
+        // storage drive for dragging a new .uf2 onto, until it's power-
+        // cycled or reflashed. That's disruptive enough (and far enough
+        // from anything else EDIT+LEFT/RIGHT's "adjust a value" semantics
+        // cover) that it deserves a deliberate hold rather than a single
+        // tap of ENTER a stray press while scrolling through Settings
+        // could trigger by accident. rp2040.rebootToBootloader() (Arduino-
+        // Pico's wrapper around the pico-sdk's reset_usb_boot()) never
+        // returns, so there's nothing to do after the call succeeds.
+        void handleBootloaderHold()
+        {
+            const uint32_t BOOTLOADER_HOLD_MS = 1200;
+            static uint32_t enterPressedAtMs = 0;
+
+            if (currentPageItem(cursor) != SETTING_REBOOT_BOOTLOADER || !Input::isDown(BTN_ENTER))
+            {
+                enterPressedAtMs = 0;
+                return;
+            }
+            if (Input::justPressed(BTN_ENTER))
+                enterPressedAtMs = millis();
+            if (enterPressedAtMs != 0 && millis() - enterPressedAtMs >= BOOTLOADER_HOLD_MS)
+            {
+                rp2040.rebootToBootloader();
+            }
         }
 
         // Keeps `cursor` within the current scroll window, page-snapping
@@ -546,7 +736,7 @@ namespace SettingsMode
                 char values[SETTING_COUNT][16];
                 const char *valuePtrs[SETTING_COUNT];
                 buildLists(labelPtrs, values, valuePtrs);
-                Ui::updateSettingsSelection(labelPtrs, valuePtrs, SETTING_COUNT, prevCursor, cursor, scrollOffset);
+                Ui::updateSettingsSelection(labelPtrs, valuePtrs, currentPageItemCount(), prevCursor, cursor, scrollOffset);
             }
             else
             {
@@ -554,9 +744,22 @@ namespace SettingsMode
             }
         }
 
+        // Switches to `newPage` and resets cursor/scroll -- a full redraw is
+        // unavoidable here (the whole item list changes), unlike moveCursor()'s
+        // cheap partial-update path within a page.
+        void switchPage(int newPage)
+        {
+            currentPage = newPage;
+            cursor = 0;
+            scrollOffset = 0;
+            needsRedraw = true;
+        }
+
         // Returns true if this tick requested backing out to mode select.
         bool handleInput()
         {
+            handleBootloaderHold();
+
             if (Input::isDown(BTN_EDIT))
             {
                 handleAdjust();
@@ -565,13 +768,37 @@ namespace SettingsMode
 
             if (Input::justPressed(BTN_UP))
             {
-                moveCursor(cursor > 0 ? cursor - 1 : SETTING_COUNT - 1);
+                moveCursor(cursor > 0 ? cursor - 1 : currentPageItemCount() - 1);
             }
             if (Input::justPressed(BTN_DOWN))
             {
-                moveCursor(cursor < SETTING_COUNT - 1 ? cursor + 1 : 0);
+                moveCursor(cursor < currentPageItemCount() - 1 ? cursor + 1 : 0);
             }
-            if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT))
+            // RIGHT/LEFT (without EDIT, which handleAdjust() above already
+            // claimed) page-navigate instead of adjusting a value: RIGHT
+            // advances a page and loops back to page 0 from the last page;
+            // LEFT steps back a page at a time, and -- since page 0 has
+            // nowhere further back to go -- exits the whole screen from
+            // page 0 itself, the same behavior LEFT always had before there
+            // were multiple pages. BTN_NAV is the unconditional "exit from
+            // anywhere" shortcut regardless of page.
+            if (Input::justPressed(BTN_RIGHT))
+            {
+                switchPage((currentPage + 1) % PAGE_COUNT);
+            }
+            if (Input::justPressed(BTN_LEFT))
+            {
+                if (currentPage > 0)
+                {
+                    switchPage(currentPage - 1);
+                }
+                else
+                {
+                    saveSettings();
+                    return true;
+                }
+            }
+            if (Input::justPressed(BTN_NAV))
             {
                 saveSettings();
                 return true;
@@ -593,6 +820,7 @@ namespace SettingsMode
 
     void enter()
     {
+        currentPage = 0;
         cursor = 0;
         scrollOffset = 0;
         needsRedraw = true;
@@ -610,11 +838,15 @@ namespace SettingsMode
             char values[SETTING_COUNT][16];
             const char *valuePtrs[SETTING_COUNT];
             buildLists(labelPtrs, values, valuePtrs);
-            Ui::drawSettings(labelPtrs, valuePtrs, SETTING_COUNT, cursor, scrollOffset);
+            Ui::drawSettings(labelPtrs, valuePtrs, currentPageItemCount(), cursor, scrollOffset, PAGE_TITLES[currentPage]);
         }
         return false;
     }
 
+    int defaultOutputLevel() { return g_defaultOutputLevel; }
+    int defaultVolume() { return g_defaultVolume; }
+    bool reverbEnabled() { return g_reverbEnabled; }
+    int reverbMix() { return g_reverbMix; }
     float defaultBpm() { return g_defaultBpm; }
     int defaultTimeSigNum() { return g_defaultTimeSigNum; }
     int defaultTimeSigDen() { return g_defaultTimeSigDen; }

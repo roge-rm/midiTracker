@@ -49,6 +49,46 @@ bool matchesFormatTag(const char* tag, int& outChannels) {
     return false;
 }
 
+// _mixShift budgets headroom for this many simultaneous full-volume
+// channels, capped well below MAX_MOD_CHANNELS (32, reachable via the
+// numeric "xxCH"/"xCHN" tag convention above) -- see _mixShift's own
+// comment for why a literal all-channels-at-once budget was needlessly
+// quiet for real music, and softClampMix() below for what absorbs the
+// (rare) moments actual content exceeds this budget. Same cap, same
+// reasoning, duplicated in S3mPlayer::load()/XmPlayer::load().
+//
+// No longer actually used to compute _mixShift (see load()) -- capping at
+// 8 channels only ever reduced the shift for files with *more* than 8
+// channels, so a classic 4-channel MOD (or any <=8-channel file) got zero
+// benefit from it and stayed shifted by its full literal channel count.
+// Real-hardware listening found tracker playback still noticeably quieter
+// than WAV/MIDI even after that fix -- by roughly the same factor a
+// 4-channel MOD's unchanged shift=2 (divide by 4) would predict. Kept
+// here only as a reminder of that dead end; _mixShift is unconditionally
+// 0 now, relying entirely on softClampMix() for safety (see its own
+// comment -- it hard-caps output regardless of how large the pre-clamp
+// sum gets, so this is safe at any channel count, just a tradeoff between
+// baseline loudness and how often busy/high-channel files lean on that
+// compression).
+const int MIX_SHIFT_TYPICAL_CHANNELS = 8;
+
+// Soft knee above SOFT_KNEE_START, hard ceiling at HARD_LIMIT -- same
+// shape and same constants as Synth's own softLimit() in synth.cpp (kept
+// independent here rather than shared/exported, matching this file's
+// existing convention of parallel, cross-referenced per-engine mixing
+// code rather than a shared utility). Replaces mixOneSample()'s previous
+// bare +-32767 clamp -- now that MIX_SHIFT_TYPICAL_CHANNELS budgets less
+// headroom than a literal all-channels-at-once bound, that clamp is more
+// likely to actually trigger, so it needs to compress gracefully instead
+// of cutting off flat.
+int32_t softClampMix(int32_t mix) {
+    int32_t sign = (mix < 0) ? -1 : 1;
+    int32_t mag = mix * sign;
+    if (mag > 24576) mag = 24576 + (mag - 24576) / 4;
+    if (mag > 32000) mag = 32000;
+    return mag * sign;
+}
+
 } // namespace
 
 bool ModPlayer::load(const char* path) {
@@ -120,9 +160,10 @@ bool ModPlayer::load(const char* path) {
         return false;
     }
 
-    // See _mixShift's declaration -- smallest N with (1<<N) >= _numChannels.
+    // See _mixShift's declaration and MIX_SHIFT_TYPICAL_CHANNELS's comment --
+    // no channel-count-based headroom shift at all anymore, relying
+    // entirely on softClampMix() for safety.
     _mixShift = 0;
-    while ((1 << _mixShift) < _numChannels) _mixShift++;
 
     int maxPattern = 0;
     for (int i = 0; i < _songLength; i++) {
@@ -315,18 +356,19 @@ void ModPlayer::mixOneSample(int16_t& outL, int16_t& outR) {
         mixL += (s * (int32_t)(255 - c.pan)) >> 8;
         mixR += (s * (int32_t)c.pan) >> 8;
     }
-    // Fixed headroom scale (shift by _mixShift, see its declaration)
-    // rather than a dynamic limiter -- guarantees no clipping even with
-    // every channel simultaneously at full volume, at the cost of
-    // sounding a bit quiet when few channels are actually active at once.
-    // Simpler than a proper compressor; revisit if it sounds too quiet in
-    // practice. Was a runtime `/ _numChannels` -- a real, full-cost
-    // division (not even a compile-time constant) on hardware with none;
-    // rounding the divisor up to a power of 2 turns it into a shift.
+    // _mixShift is always 0 now (see its declaration) -- this shift is a
+    // no-op, kept only so the field still does something if a future
+    // channel-count-based case ever needs it back. Even with the shift
+    // removed entirely, real-hardware A/B listening against WAV/MIDI still
+    // found tracker playback a bit quiet, so a further +25% makeup gain
+    // here closes most of that remaining gap. softClampMix() below absorbs
+    // the rare moments this pushes things over budget.
     mixL = mixL >> _mixShift;
     mixR = mixR >> _mixShift;
-    if (mixL > 32767) mixL = 32767; else if (mixL < -32768) mixL = -32768;
-    if (mixR > 32767) mixR = 32767; else if (mixR < -32768) mixR = -32768;
+    mixL += mixL >> 2;
+    mixR += mixR >> 2;
+    mixL = softClampMix(mixL);
+    mixR = softClampMix(mixR);
     outL = (int16_t)mixL;
     outR = (int16_t)mixR;
 }
