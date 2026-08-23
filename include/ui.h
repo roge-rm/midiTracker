@@ -15,6 +15,13 @@ namespace Ui {
 
 void begin();
 
+// Sets the display backlight brightness via PWM on DISPLAY_BACKLIGHT (see
+// pins.h) -- 0-100 percent, clamped. begin() calls this once at full
+// brightness (before settings have loaded); SettingsMode::begin() then
+// applies the saved value immediately afterward, and again live on every
+// adjustment -- no "session freshness" concept here, same as MIDI Thru.
+void setBacklightBrightness(int percent);
+
 // Boot splash: "midiTracker" / "track your MIDI", centered. Just draws --
 // caller (main.cpp) is responsible for holding it on screen (e.g. delay(2000)).
 void drawSplash();
@@ -36,6 +43,14 @@ void drawBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffset);
 // page (no scroll, no header/footer change): repaints only the previously
 // and newly selected rows instead of the whole screen.
 void updateBrowserSelection(const SdBrowser& browser, int prevIndex, int newIndex, int scrollOffset);
+
+// Full redraw of LooperMode's restricted "Load Selected Loop" browser --
+// same header/row/scrollbar layout as drawBrowser(), just its own footer
+// hint text (tap ENTER to select, hold to delete, no EDIT menu/ALT output
+// here since this view offers neither). updateBrowserSelection() above is
+// reused as-is for the cheap partial redraw -- it never touches the
+// footer, so it works for either screen unmodified.
+void drawLoopBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffset);
 
 // Full redraw of the now-playing screen. `audioOn` is whether the onboard
 // synth is currently enabled (see MidiOutput::setAudioOutput()); `volume`
@@ -180,6 +195,17 @@ void updateEntryMenuSelection(const char* const* labels, int count, int prevCurs
 // switches the screen from "Delete X?" to an error message.
 void drawConfirmDelete(const char* name, bool isDir, bool failed);
 
+// Full redraw of the overwrite confirmation screen -- same shape as
+// drawConfirmDelete() (title/question/warning/footer), shown when saving a
+// new recording/SysEx capture or renaming something would collide with an
+// existing file/folder of the same name (see FilePlayerMode's
+// finishNameEntry()/handleConfirmOverwriteInput()). Unlike
+// drawConfirmDelete(), there's no `failed` state here -- a failure to
+// actually remove the old file on confirm just drops back to the name
+// entry screen with an inline error instead (same as any other name-entry
+// failure), rather than needing its own display here.
+void drawConfirmOverwrite(const char* name, bool isDir);
+
 // Full redraw of the recording status screen (waiting for input / actively
 // recording / error).
 void drawRecording(const char* filename, const MidiRecorder& recorder);
@@ -231,7 +257,8 @@ int visibleRows();
 enum LoopTrackState { LOOP_TRACK_EMPTY, LOOP_TRACK_ARMED, LOOP_TRACK_RECORDING, LOOP_TRACK_PLAYING, LOOP_TRACK_MUTED, LOOP_TRACK_STOPPED, LOOP_TRACK_PAUSED };
 
 struct LoopTrackView {
-    uint8_t channel = 0;     // 0-15 (displayed as 1-16), or 16 for OMNI
+    uint8_t channelIn = 0;   // 0-15 (displayed as 1-16), or 16 for OMNI -- record-input filter
+    uint8_t channelOut = 0;  // 0-15 (displayed as 1-16), or 16 for "as recorded" (no remap) -- playback output channel
     LoopTrackState state = LOOP_TRACK_EMPTY;
     int barLength = 0;       // 0 = Freeform, else the number of bars this track's length is quantized to
     uint32_t lengthMs = 0;   // 0 if empty, armed, or still on an open-ended first recording pass
@@ -262,13 +289,17 @@ struct LoopTrackView {
 // for BPM value/Time Sig) currently targets -- 0 = BPM value, 1 = Time
 // Sig, 2 = Metro, 3 = Count In, 4 = Sync (see LooperMode's
 // handleBpmRowFocus()) -- meaningless unless onBpmRow is also true.
-// `metronomeCurrentBeat` (0-based, 0 = downbeat) drives the header's beat-
-// indicator squares (see updateLooperBeatIndicator()) -- meaningless
-// (ignored) unless `metronomeOn` is also true.
+// `showBeatIndicator` gates the header's beat-indicator row's visibility
+// on its own (EDIT-tap toggle while BPM value has focus, see LooperMode's
+// handleBpmRowEditToggle()) -- independent of `metronomeOn`, since the
+// squares are still useful as a static time-signature reference even with
+// the metronome's own click off. `metronomeCurrentBeat` (0-based, 0 =
+// downbeat, or -1 for "nothing lit") drives which square is highlighted --
+// meaningless (ignored) whenever `showBeatIndicator` is false.
 void drawLooper(const LoopTrackView tracks[4], int selectedTrack, bool onBpmRow, bool syncMode, float bpm,
                  int timeSigNum, int timeSigDen, bool metronomeOn, int metronomeVolumePercent,
                  bool showMetronomeVolume, bool countInEnabled, int countInBars, bool showCountInBars,
-                 int focusIndex, int metronomeCurrentBeat);
+                 int focusIndex, bool showBeatIndicator, int metronomeCurrentBeat);
 
 // Cheap partial redraw of just the 4 tracks' progress bars and MIDI
 // activity indicators, meant to be called at a low fixed rate to animate
@@ -292,9 +323,10 @@ void updateLooperSelection(const LoopTrackView tracks[4], int prevSelected, bool
 // without touching any other row, the BPM row, header, or footer.
 void updateLooperTrackRow(const LoopTrackView tracks[4], int trackIdx, bool selected);
 
-// Cheap partial redraw of just the selected track's channel field, e.g.
-// after ALT+UP/DOWN changes it. Does not touch the rest of that row or
-// any other row.
+// Cheap partial redraw of just the selected track's channel field (shown
+// as "In/Out", e.g. "OMNI/REC"), e.g. after ALT+UP/DOWN (out) or
+// EDIT+UP/DOWN (in) changes it. Does not touch the rest of that row or any
+// other row.
 void updateLooperChannel(const LoopTrackView tracks[4], int selectedTrack);
 
 // Cheap partial redraw of just the selected track's bar-length field, e.g.
@@ -319,6 +351,16 @@ void updateLooperBpm(float bpm, int timeSigNum, int timeSigDen, bool syncMode, b
                       int metronomeVolumePercent, bool showMetronomeVolume, bool countInEnabled,
                       int countInBars, bool showCountInBars, int focusIndex, bool selected);
 
+// Cheap partial redraw of just the BPM row's outline -- a brief flash on
+// each metronome beat (see LooperMode's updateBpmRowBeatFlash()), meant to
+// be visible without close attention but not disruptive if you're already
+// looking right at it. `active` true draws the flash border (orange for
+// the downbeat, `downbeat` true, yellow otherwise -- meaningless when
+// `active` is false); false erases it back to the row's own background.
+// `selected` picks which background to erase into, same convention
+// updateLooperBpm() itself uses.
+void updateLooperBpmRowBeatFlash(bool active, bool downbeat, bool selected);
+
 // Full redraw of the looper's count-in overlay, shown in place of the
 // normal 4-track view while counting in before recording starts (see
 // LooperMode's maybeStartCountIn()). `beatsRemaining` counts down to 1
@@ -331,8 +373,12 @@ void updateLooperCountInBeat(int beatsRemaining);
 
 // Cheap partial redraw of just the header's metronome beat-indicator row --
 // a square per beat of the current time signature, between "MIDI Looper"
-// and "midiTracker". `visible` false (Metro off) hides the whole row.
-// `currentBeat` is 0-based (0 = downbeat), meaningless unless `visible`.
+// and "midiTracker". `visible` false hides the whole row -- gated on its
+// own showBeatIndicator toggle, not directly on Metro being on (see
+// LooperMode's updateMetronomeBeatIndicator()), so the row can still show
+// as a static time-signature reference with the metronome's click off.
+// `currentBeat` is 0-based (0 = downbeat) or -1 for "nothing lit" (Metro
+// not actually running); meaningless unless `visible`.
 void updateLooperBeatIndicator(bool visible, int currentBeat, int timeSigNum);
 
 // Full redraw of the Settings screen: a scrollable list of labeled
@@ -356,6 +402,41 @@ void updateSettingsSelection(const char* const* labels, const char* const* value
 // Cheap partial redraw of just one row's value, e.g. after EDIT+LEFT/
 // RIGHT adjusts it.
 void updateSettingsValue(const char* label, const char* value, int index, int scrollOffset);
+
+// -- Theme editor (opened via ENTER on its row in Settings' MIDI/System
+// page -- user-editable color palette) ---------------------------------
+// Every color the rest of the UI draws with is exposed here by index
+// (0..themeColorCount()-1), independent of the generic label/value Settings
+// list -- each item needs 3 co-editable numbers (R/G/B), not the one value
+// every generic Settings row has, so this gets its own small API and its
+// own page-drawing functions rather than being forced through
+// drawSettings(). SettingsMode owns the actual file I/O (save/load/reset
+// menu, .thm parsing) and just calls through this to read/write values.
+
+int themeColorCount();
+const char* themeColorLabel(int index); // short row label, e.g. "Background", "Recording"
+void getThemeColorRGB(int index, uint8_t& r, uint8_t& g, uint8_t& b);
+void setThemeColorRGB(int index, uint8_t r, uint8_t g, uint8_t b);
+void resetThemeColorsToDefault(); // every color back to its hardcoded shipped value
+
+// Full redraw of the Theme editor: one row per themeColorCount() color
+// (label, R/G/B fields, a small solid swatch previewing the result),
+// `colorCursor` highlighted, `channelCursor` (0=R,1=G,2=B) drawn inverted
+// within that row to show which one EDIT+UP/DOWN/LEFT/RIGHT currently
+// adjusts (see SettingsMode). Scrolls the same way drawSettings() does
+// when the list exceeds one screenful.
+void drawThemePage(int colorCursor, int channelCursor, int scrollOffset);
+
+// Cheap partial redraw of a single Theme row, e.g. after EDIT+UP/DOWN/
+// LEFT/RIGHT changes the focused channel's value, or bare LEFT/RIGHT moves
+// channelCursor to a different field within the same row.
+void updateThemeRow(int index, int channelCursor, bool selected, int scrollOffset);
+
+// Cheap partial redraw for moving the Theme page's row cursor: repaints
+// only the previously and newly selected rows, same shape as
+// updateSettingsSelection(). Caller is responsible for a full
+// drawThemePage() instead whenever the move also changes scrollOffset.
+void updateThemeSelection(int prevCursor, int newCursor, int channelCursor, int scrollOffset);
 
 // Small vertical battery gauge, bottom-right corner, drawn over whatever
 // screen is currently up. See Battery (battery.h) for the underlying

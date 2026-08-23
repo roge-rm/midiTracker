@@ -65,9 +65,19 @@ See `include/pins.h` for the exact pin map.
 
 #### Known limitations
 
-- `MIDI_MAX_TRACKS` (24, in `config.h`) and `SdBrowser::MAX_DIR_ENTRIES`
-  (96) are RAM-bounded caps — raise them if you hit real files/folders
-  that exceed them.
+- `MIDI_MAX_TRACKS` (24, in `config.h`) is a RAM-bounded cap — raise it if
+  you hit a real file that exceeds it.
+- The file browser (`SdBrowser`) indexes a folder's contents on demand
+  rather than eagerly loading everything, so it scales to a couple
+  thousand files per folder rather than the old fixed 96-entry cap.
+  `SdBrowser::MAX_INDEX_ENTRIES` (4096) is a safety ceiling past which a
+  folder stops indexing further entries; real available RAM (checked at
+  scan time, since e.g. the looper's `tracks[]` can already be using
+  128KB) can cap it lower still. Either way, a folder past what got
+  indexed shows a "(+N)"/"(4096+)" note in the header rather than silently
+  dropping entries. Folders past `SdBrowser::SORT_KEY_CEILING` (512
+  entries) are listed in on-disk order instead of alphabetized, to avoid
+  re-opening thousands of files just to compare their names.
 - Clock Source's "External" mode tracks tempo only; it does not
   phase-lock loop playback pulse-for-pulse to the incoming clock.
 - Very rarely, a busy tracker-file passage can trigger a brief (a few
