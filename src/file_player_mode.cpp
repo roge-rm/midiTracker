@@ -108,10 +108,11 @@ int dirStackDepth = 0;
 MidiOutTarget outputTarget = MIDI_OUT_BOTH;
 bool audioOn = false; // onboard synth on/off, see MidiOutput::setAudioOutput()
 int volume = 80; // percent, see Synth::setVolume(); mirrored here so the UI can show it
-// True once `volume` has been seeded from SettingsMode::defaultVolume() --
-// see enter()'s comment for why this only happens once, not on every
-// (re-)entry into this mode.
+// True once `volume`/`audioOn` have been seeded from SettingsMode::
+// defaultVolume()/synthAudioEnabled() -- see enter()'s comment for why
+// this only happens once, not on every (re-)entry into this mode.
 bool volumeSeededFromSettings = false;
+bool audioSeededFromSettings = false;
 
 char nowPlayingName[MAX_FILENAME_LEN] = {0};
 char nowRecordingName[MAX_FILENAME_LEN] = {0}; // base name of the in-progress recording
@@ -1591,6 +1592,15 @@ void enter() {
         sysexRecorder.feed(data, len);
     });
     MidiOutput::setTarget(outputTarget);
+    // Seed from the Settings default exactly once, same "don't clobber a
+    // live in-session toggle" reasoning as volumeSeededFromSettings below
+    // -- someone who's flipped Audio on/off with EDIT this session should
+    // keep that choice switching to Looper/Settings and back, not have it
+    // silently reset to the Settings default every re-entry.
+    if (!audioSeededFromSettings) {
+        audioOn = SettingsMode::synthAudioEnabled();
+        audioSeededFromSettings = true;
+    }
     MidiOutput::setAudioOutput(audioOn);
     // Output Level/Reverb have no in-session live-adjust control of their
     // own (unlike Volume, see handleVolumeHold()), so they're simply
@@ -1599,6 +1609,7 @@ void enter() {
     Synth::setOutputLevel((uint8_t)SettingsMode::defaultOutputLevel());
     Synth::setReverbEnabled(SettingsMode::reverbEnabled());
     Synth::setReverbMix((uint8_t)SettingsMode::reverbMix());
+    Synth::setReverbType((uint8_t)SettingsMode::reverbType());
     // Seed from the Settings default exactly once (the first time this
     // mode is entered after boot), not on every re-entry -- otherwise
     // switching to Looper/Settings and back would silently yank any

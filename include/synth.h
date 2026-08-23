@@ -91,12 +91,13 @@ void setVolume(uint8_t percent);
 // this is called.
 void setOutputLevel(uint8_t level);
 
-// On/off for the lo-fi reverb applied to the whole mix (synth + WAV +
-// tracker alike) -- see reverbProcess()'s long comment in synth.cpp for
-// what it actually is and why it's deliberately lo-fi/chiptune-flavored
-// rather than a generic "nice hall" sound. Defaults on. Off costs nothing
-// extra (the tank itself is skipped, not just muted), and re-enabling
-// starts from a cold/silent tank rather than resuming a stale one.
+// On/off for the lo-fi reverb applied to the onboard MIDI synth's own
+// voices (not WAV/tracker playback -- see reverbProcess()'s long comment
+// in synth.cpp for why) -- see that same comment for what it actually is
+// and why it's deliberately lo-fi/chiptune-flavored rather than a generic
+// "nice hall" sound. Defaults on. Off costs nothing extra (the tank
+// itself is skipped, not just muted), and re-enabling starts from a
+// cold/silent tank rather than resuming a stale one.
 void setReverbEnabled(bool enabled);
 
 // Reverb wet/dry mix, 0-100%. Not a literal 0-100% wet blend -- it scales
@@ -104,6 +105,17 @@ void setReverbEnabled(bool enabled);
 // REVERB_WET_MAX_Q16 in synth.cpp), so 100% means "as strong as this
 // reverb was designed to go," not "fully wet." Defaults to 70.
 void setReverbMix(uint8_t percent);
+
+// Which reverb algorithm runs, 0-2: 0 = Lo-fi/chiptune (bitcrushed/
+// decimated tank, the original), 1 = Lush (the tank's tail run through a
+// slow LFO-wobbled chorus instead), 2 = Shimmer (the tail pitch-shifted up
+// an octave and fed back into itself for an ascending, evolving wash --
+// see synth.cpp's g_reverbType/chorusProcess()/shimmerProcess() comments
+// for how each actually works). Only matters while setReverbEnabled(true)
+// -- the value is remembered either way, so switching Reverb back on
+// resumes whichever type was last selected, same as Reverb Mix already
+// does. An out-of-range value is treated as 0. Defaults to 0.
+void setReverbType(uint8_t type);
 
 // -- WAV playback stream --------------------------------------------------
 //

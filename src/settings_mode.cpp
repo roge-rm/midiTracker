@@ -24,6 +24,8 @@ namespace SettingsMode
             SETTING_DEFAULT_VOLUME,
             SETTING_REVERB,
             SETTING_REVERB_MIX,
+            SETTING_REVERB_TYPE,
+            SETTING_SYNTH_AUDIO,
             SETTING_BPM,
             SETTING_TIME_SIGNATURE,
             SETTING_CLOCK_SOURCE,
@@ -58,13 +60,13 @@ namespace SettingsMode
 
         const char *PAGE_TITLES[PAGE_COUNT] = {"Audio", "Looper", "Metronome", "MIDI/System"};
 
-        const SettingIndex PAGE_AUDIO_ITEMS[] = {SETTING_OUTPUT_LEVEL, SETTING_DEFAULT_VOLUME, SETTING_REVERB, SETTING_REVERB_MIX};
+        const SettingIndex PAGE_AUDIO_ITEMS[] = {SETTING_OUTPUT_LEVEL, SETTING_DEFAULT_VOLUME, SETTING_REVERB, SETTING_REVERB_MIX, SETTING_REVERB_TYPE, SETTING_SYNTH_AUDIO};
         const SettingIndex PAGE_LOOPER_ITEMS[] = {SETTING_BPM, SETTING_TIME_SIGNATURE, SETTING_BAR_LENGTH, SETTING_SYNC};
         const SettingIndex PAGE_METRONOME_ITEMS[] = {SETTING_METRONOME, SETTING_METRONOME_VOLUME, SETTING_COUNT_IN, SETTING_COUNT_IN_BARS};
         const SettingIndex PAGE_MIDI_SYSTEM_ITEMS[] = {SETTING_CLOCK_SOURCE, SETTING_MIDI_TRANSPORT, SETTING_MIDI_THRU, SETTING_REBOOT_BOOTLOADER};
 
         const SettingIndex *PAGE_ITEMS[PAGE_COUNT] = {PAGE_AUDIO_ITEMS, PAGE_LOOPER_ITEMS, PAGE_METRONOME_ITEMS, PAGE_MIDI_SYSTEM_ITEMS};
-        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {4, 4, 4, 4};
+        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {6, 4, 4, 4};
 
         int currentPage = 0;
 
@@ -107,6 +109,8 @@ namespace SettingsMode
         int g_defaultVolume = 75; // percent -- see FilePlayerMode's `volume`
         bool g_reverbEnabled = true;  // see Synth::setReverbEnabled()
         int g_reverbMix = 70;         // percent -- see Synth::setReverbMix()
+        int g_reverbType = 0;         // 0=Lo-fi, 1=Lush, 2=Shimmer -- see Synth::setReverbType()
+        bool g_synthAudioEnabled = false; // see Synth::setSynthAudioEnabled() -- off by default
         float g_defaultBpm = 120.0f;
         int g_defaultTimeSigNum = 4;
         int g_defaultTimeSigDen = 4;
@@ -132,6 +136,21 @@ namespace SettingsMode
                 return "Line Level";
             default:
                 return "HP Low";
+            }
+        }
+
+        const char *reverbTypeLabel(int type)
+        {
+            switch (type)
+            {
+            case 0:
+                return "Lo-fi";
+            case 1:
+                return "Lush";
+            case 2:
+                return "Shimmer";
+            default:
+                return "Lo-fi";
             }
         }
 
@@ -182,6 +201,10 @@ namespace SettingsMode
                 return "Reverb";
             case SETTING_REVERB_MIX:
                 return "Reverb Mix";
+            case SETTING_REVERB_TYPE:
+                return "Reverb Type";
+            case SETTING_SYNTH_AUDIO:
+                return "Synth Audio";
             case SETTING_BPM:
                 return "Default BPM";
             case SETTING_TIME_SIGNATURE:
@@ -229,6 +252,12 @@ namespace SettingsMode
                 break;
             case SETTING_REVERB_MIX:
                 snprintf(out, outSize, "%d%%", g_reverbMix);
+                break;
+            case SETTING_REVERB_TYPE:
+                snprintf(out, outSize, "%s", reverbTypeLabel(g_reverbType));
+                break;
+            case SETTING_SYNTH_AUDIO:
+                snprintf(out, outSize, "%s", g_synthAudioEnabled ? "On" : "Off");
                 break;
             case SETTING_BPM:
                 snprintf(out, outSize, "%d", (int)(g_defaultBpm + 0.5f));
@@ -280,7 +309,8 @@ namespace SettingsMode
         bool isBoolSetting(int index)
         {
             return index == SETTING_SYNC || index == SETTING_METRONOME || index == SETTING_COUNT_IN ||
-                   index == SETTING_CLOCK_SOURCE || index == SETTING_MIDI_TRANSPORT || index == SETTING_REVERB;
+                   index == SETTING_CLOCK_SOURCE || index == SETTING_MIDI_TRANSPORT || index == SETTING_REVERB ||
+                   index == SETTING_SYNTH_AUDIO;
         }
 
         // `direction` is +1 (RIGHT) or -1 (LEFT). Bool items are set directly
@@ -311,6 +341,9 @@ namespace SettingsMode
             case SETTING_REVERB:
                 g_reverbEnabled = (direction > 0);
                 break;
+            case SETTING_SYNTH_AUDIO:
+                g_synthAudioEnabled = (direction > 0);
+                break;
             case SETTING_REVERB_MIX:
                 g_reverbMix += direction * 5;
                 if (g_reverbMix < 0)
@@ -318,6 +351,16 @@ namespace SettingsMode
                 if (g_reverbMix > 100)
                     g_reverbMix = 100;
                 break;
+            case SETTING_REVERB_TYPE:
+            {
+                int idx = g_reverbType + direction;
+                if (idx < 0)
+                    idx = 0;
+                if (idx > 2)
+                    idx = 2;
+                g_reverbType = idx;
+                break;
+            }
             case SETTING_BPM:
                 g_defaultBpm += (float)direction;
                 if (g_defaultBpm < 20.0f)
@@ -436,6 +479,10 @@ namespace SettingsMode
             file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "reverbMix=%d\n", g_reverbMix);
             file.write((const uint8_t *)line, n);
+            n = snprintf(line, sizeof(line), "reverbType=%d\n", g_reverbType);
+            file.write((const uint8_t *)line, n);
+            n = snprintf(line, sizeof(line), "synthAudio=%d\n", g_synthAudioEnabled ? 1 : 0);
+            file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "bpm=%d\n", (int)(g_defaultBpm + 0.5f));
             file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "timeSigNum=%d\n", g_defaultTimeSigNum);
@@ -495,6 +542,18 @@ namespace SettingsMode
                     g_reverbMix = 0;
                 if (g_reverbMix > 100)
                     g_reverbMix = 100;
+                return;
+            }
+            if (strncmp(line, "reverbType=", 11) == 0)
+            {
+                g_reverbType = atoi(line + 11);
+                if (g_reverbType < 0 || g_reverbType > 2)
+                    g_reverbType = 0;
+                return;
+            }
+            if (strncmp(line, "synthAudio=", 11) == 0)
+            {
+                g_synthAudioEnabled = atoi(line + 11) != 0;
                 return;
             }
             if (strncmp(line, "bpm=", 4) == 0)
@@ -847,6 +906,8 @@ namespace SettingsMode
     int defaultVolume() { return g_defaultVolume; }
     bool reverbEnabled() { return g_reverbEnabled; }
     int reverbMix() { return g_reverbMix; }
+    int reverbType() { return g_reverbType; }
+    bool synthAudioEnabled() { return g_synthAudioEnabled; }
     float defaultBpm() { return g_defaultBpm; }
     int defaultTimeSigNum() { return g_defaultTimeSigNum; }
     int defaultTimeSigDen() { return g_defaultTimeSigDen; }
