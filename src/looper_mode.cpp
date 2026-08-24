@@ -3202,8 +3202,8 @@ void handleBarLengthAdjust() {
 // togglePauseOnSelected()) -- arming/recording moved to EDIT (see
 // handleRecordInput()), and Mute moved to RIGHT (see handleMuteInput()).
 // ENTER is dual-purpose: tapped alone it opens the loop menu (Save /
-// Delete Saved Loop); held while PLAY is tapped it erases the selected
-// track instead. `enterUsedAsModifier` distinguishes the two on ENTER's
+// Load / Erase Track N / Erase All Tracks / Delete Loop Bundle); held
+// while PLAY is tapped it erases the selected track instead. `enterUsedAsModifier` distinguishes the two on ENTER's
 // release -- without it, simply pressing ENTER (on the way to the
 // ENTER+PLAY chord) would open the menu immediately, before PLAY is even
 // reachable. LEFT alone backs out to mode select -- NAV is dedicated to

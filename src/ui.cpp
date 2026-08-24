@@ -1873,13 +1873,17 @@ const int LOOPER_CHANNEL_COL_X = 28;   // wide enough for "T4" plus a gap
 // vs. the 56px the single old "Ch16"/"OMNI" field used to get) at the
 // user's explicit request, since it reads as the row's most important
 // field. That leaves STATE/BARLEN/the activity dots noticeably tighter
-// than their old margins -- still sized for their worst case ("RECORDING!"
-// with the buffer-full marker, and the "128BAR" preset) but with only a
-// few px of slack left, unlike before. Flag it if either ever visibly
-// crowds its neighbor on real hardware.
+// than their old margins. STATE's worst case is "PLAYING!"/"STOPPED!"
+// (7-char label + the buffer-full "!" marker, see the stateBuf snprintf
+// below -- NOT "RECORD!", which is shorter now that the RECORDING label
+// was shortened to RECORD). BARLEN's worst case is the "128BAR" preset --
+// confirmed too tight on real hardware (its trailing "R" ran into the
+// activity dots), so its column now borrows from the wide stretch of
+// unused space to the right of the dots (row content only reaches ~x244
+// of the 320px screen width) rather than the tight STATE/BARLEN boundary.
 const int LOOPER_STATE_COL_X = 110;    // wide enough for "OMNI/REC" plus a deliberately generous gap
-const int LOOPER_BARLEN_COL_X = 182;   // wide enough for "RECORD!" (longest state + overflow marker) plus a gap
-const int LOOPER_ACTIVITY_X = 226;     // wide enough for "128BAR" (longest bar-length value) plus a gap
+const int LOOPER_BARLEN_COL_X = 182;   // wide enough for "PLAYING!"/"STOPPED!" (longest state + overflow marker) plus a gap
+const int LOOPER_ACTIVITY_X = 246;     // wide enough for "128BAR" (longest bar-length value) plus a real safety margin -- was 226, too tight (see above)
 const int LOOPER_ACTIVITY_SPACING = 10; // gap between the record and play activity dots -- tightened from 14 to help the dots + BARLEN fit ahead of the fixed-position length field
 
 const char* loopStateLabel(LoopTrackState s) {
@@ -2007,11 +2011,12 @@ void drawLooperTrackChannel(const LoopTrackView& t, int idx, bool selected) {
     tft.drawString(chBuf, LOOPER_CHANNEL_COL_X, y + 2);
 }
 
-// Redraws just the bar-length field of track idx's row (e.g. after ALT+
-// LEFT/RIGHT changes it) -- same approach as drawLooperTrackChannel(): a
-// fixed-width box at LOOPER_BARLEN_COL_X, comfortably wide enough for any
-// "FREE"/"NBAR" value, so it never collides with the state text or
-// activity dots on either side.
+// Redraws just the bar-length field of track idx's row (e.g. after EDIT+
+// LEFT/RIGHT changes it, see handleBarLengthAdjust()) -- same approach as
+// drawLooperTrackChannel(): a fixed-width box at LOOPER_BARLEN_COL_X, wide
+// enough for any "FREE"/"NBAR" value (see LOOPER_ACTIVITY_X's own comment
+// for the real-hardware fix behind that width) so it never collides with
+// the state text or activity dots on either side.
 void drawLooperTrackBarLength(const LoopTrackView& t, int idx, bool selected) {
     int y = LOOPER_FIRST_ROW_Y + idx * LOOPER_ROW_HEIGHT;
     uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
@@ -2225,25 +2230,30 @@ void drawLooper(const LoopTrackView tracksArg[4], int selectedTrack, bool onBpmR
 
     int fy = tft.height() - FOOTER_HEIGHT;
     tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    // Row-grouped (see pins.h): line 1 = UP/PLAY/EDIT, line 2 = LEFT/
-    // DOWN/RIGHT/ENTER then ALT/NAV. ALT is woven into UD's and LR's own
-    // hints (out-channel on UD, in-channel on LR, Metro/Count In/Sync on
-    // the BPM row) rather than getting a separate mention, since it's
-    // purely a modifier here, never a standalone action of its own -- same
-    // reasoning applies wherever else ALT shows up in this app. EDIT is
-    // woven in the same way on LR (bar length, handleBarLengthAdjust()) --
-    // EDIT+UP/DOWN has no meaning on a track row (see handleRecordInput()'s
-    // comment), so line 1's EDIT hint only covers record (tap, track row)
-    // and BPM/Time Sig (held, BPM row -- handleBpmValueAdjust()/
-    // handleTimeSigAdjust()). PLAY/RIGHT's track-row meanings (Pause,
-    // Mute) are each a single word here since both are toggles -- pressing
-    // the same button again does the opposite, not a separate action.
-    // "L"/"R" (rather than spelled-out LEFT/RIGHT) is this line's own
-    // concession to fitting several distinct hints on one row -- the same
-    // idea as "UD" above, just naming two buttons that do different
-    // things instead of one pair doing the same thing.
-    tft.drawString("UD row/ALT out  PLAY pause  EDIT rec/bpm", 4, fy + 1);
-    tft.drawString("L back/R mute/ALT in/EDIT bar  ENT menu  NAV stop", 4, fy + 17);
+    // These two lines have to fit ~43 characters each before running into
+    // the battery meter at the right edge (see drawBatteryMeter()) -- with
+    // 10 distinct button/modifier meanings to cover, that budget is tight
+    // enough that grouping matters. Grouped by MODIFIER BUTTON here
+    // (everything ALT does together, everything EDIT-as-a-tap/BPM-row-hold
+    // does together) rather than by which physical D-pad axis it uses --
+    // "ALT out/in" reads as one coherent idea (ALT affects channel
+    // routing, both directions) instead of splitting across two lines, and
+    // it's what keeps both lines within the proven-safe length (a past
+    // version that split ALT's two meanings across lines pushed line 2 to
+    // 49 characters and visibly overlapped the battery meter). EDIT+LEFT/
+    // RIGHT (bar length, handleBarLengthAdjust()) stays on line 2 instead
+    // of joining EDIT's other meanings on line 1 -- adding it there would
+    // overflow line 1 the same way. EDIT+UP/DOWN has no meaning on a track
+    // row (see handleRecordInput()'s comment), so line 1's EDIT hint only
+    // covers record (tap) and BPM/Time Sig (held, BPM row only --
+    // handleBpmValueAdjust()/handleTimeSigAdjust()). PLAY/RIGHT's
+    // track-row meanings (Pause, Mute) are each a single word since both
+    // are toggles -- pressing the same button again does the opposite,
+    // not a separate action. "L"/"R" (rather than spelled-out LEFT/RIGHT)
+    // is line 2's own concession to fitting several hints on one row, same
+    // idea as "UD" above.
+    tft.drawString("UD row/ALT out/in  PLAY pause  EDIT rec/bpm", 4, fy + 1);
+    tft.drawString("L back/R mute/EDIT bar  ENT menu  NAV stop", 4, fy + 17);
     drawBatteryMeter();
 }
 
