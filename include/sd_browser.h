@@ -122,11 +122,16 @@ private:
     // never eats into what the stack or other transient allocations need
     // right after -- especially important for LooperMode's own
     // loopBrowser, which can only ever scan while tracks[] (128KB) is
-    // already resident, unlike FilePlayerMode's browser. Placeholder
-    // pending a real-hardware rp2040.getFreeHeap() measurement in that
-    // exact scenario (see loadEntries()) -- tune before shipping, don't
-    // trust this number as final.
-    static const uint32_t HEAP_SAFETY_MARGIN = 24 * 1024;
+    // already resident, unlike FilePlayerMode's browser. Measured on real
+    // hardware in that exact scenario: with tracks[] resident, free heap
+    // was ~24.4KB total -- the old 24KB placeholder here consumed nearly
+    // all of it, leaving a 7-entry root folder unable to show *any*
+    // entries. Nothing else allocates heap concurrently with a browser
+    // scan (tracker-format players are only constructed after a file is
+    // chosen, and only once tracks[] has already been reclaimed via the
+    // save/discard gate -- see APP_FREE_LOOPER_RAM), so this only needs to
+    // cover estimation slop, not a real competing consumer.
+    static const uint32_t HEAP_SAFETY_MARGIN = 4 * 1024;
 
     // Per-entry index record -- see loadEntries(). ~8 bytes with
     // alignment, not the ~76-byte full BrowserEntry this replaces; that's

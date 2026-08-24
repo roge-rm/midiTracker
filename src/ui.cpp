@@ -3,6 +3,7 @@
 #include "pins.h"
 #include "keyboard_layout.h"
 #include "version.h"
+#include "synth.h" // pariSynth play screen -- see drawPariSynthPlay()
 #include <TFT_eSPI.h>
 #include <string.h>
 #include <stdio.h>
@@ -151,6 +152,30 @@ const int STAT_COL2_X = 164;
 const int PIANO_LO = 21;
 const int PIANO_HI = 108;
 
+// pariSynth play screen layout: a 16-channel grid, 2 columns (channels
+// 1-8 left, 9-16 right) x 8 rows, above the shared note-activity strip
+// (see PIANO_LO/PIANO_HI/STRIP_HEIGHT above -- reused as-is, same widget
+// drawPlayer() uses). Channel numbers form an aligned "spine" down the
+// middle of the screen (right-aligned for the left column, left-aligned
+// for the right column, via TR_DATUM/TL_DATUM rather than a measured
+// offset), with instrument names radiating outward from there -- right-
+// aligned on the left column, left-aligned on the right -- so a name
+// grows toward its own screen edge as it gets longer instead of crowding
+// its neighbor column, and the numbers stay put regardless of name length.
+// PARISYNTH_NUM_SLOT_W is a fixed reservation (not measured against any
+// specific string) sized for the widest number this screen ever shows,
+// "16".
+const int PARISYNTH_GRID_Y = HEADER_HEIGHT + 6;
+const int PARISYNTH_ROWS = 8;
+const int PARISYNTH_ROW_SPLIT_X = 160; // left/right cell-background boundary -- screen center (tft.width()/2)
+const int PARISYNTH_NUM_SLOT_W = 20;
+const int PARISYNTH_NUM_LEFT_X = PARISYNTH_ROW_SPLIT_X - 8;  // right edge of left-column numbers (TR_DATUM)
+const int PARISYNTH_NUM_RIGHT_X = PARISYNTH_ROW_SPLIT_X + 8; // left edge of right-column numbers (TL_DATUM)
+const int PARISYNTH_NAME_LEFT_X = PARISYNTH_NUM_LEFT_X - PARISYNTH_NUM_SLOT_W;   // right edge of left-column names (TR_DATUM)
+const int PARISYNTH_NAME_RIGHT_X = PARISYNTH_NUM_RIGHT_X + PARISYNTH_NUM_SLOT_W; // left edge of right-column names (TL_DATUM)
+const int PARISYNTH_GRID_BOTTOM = PARISYNTH_GRID_Y + PARISYNTH_ROWS * ROW_HEIGHT;
+const int PARISYNTH_STRIP_Y = PARISYNTH_GRID_BOTTOM + 8;
+
 // Recording screen layout, same fixed-offset approach as the player
 // screen above so updateRecordingLive() can repaint just the elapsed/
 // event-count rows.
@@ -250,17 +275,20 @@ void drawScrollbar(int count, int scrollOffset, int rows, int trackY) {
     tft.fillRect(trackX, trackY + thumbY, SCROLLBAR_W, thumbH, COLOR_TEXT);
 }
 
-// Redraws the full note-activity strip at `y`: one column per piano key,
-// bar height scaled to that note's velocity (max velocity = full height,
-// floored at STRIP_MIN_BAR_HEIGHT so soft notes stay visible), anchored
-// to the bottom like a keybed/VU meter. Percussion-channel notes (see
+// Redraws the full note-activity strip at `y`, `height` tall (default
+// STRIP_HEIGHT, drawPlayer()'s own budgeted size -- pariSynth's screen
+// passes a smaller value that actually fits its own layout, see
+// parisynthStripHeight()): one column per piano key, bar height scaled to
+// that note's velocity (max velocity = full height, floored at
+// STRIP_MIN_BAR_HEIGHT so soft notes stay visible), anchored to the
+// bottom like a keybed/VU meter. Percussion-channel notes (see
 // MidiOutput::isNotePercussion()) get a warm red/orange palette instead of
 // the melodic green/yellow one, so drum hits read as visually distinct
 // from melodic notes at a glance rather than just being more activity in
 // the same color. Every column is fully repainted every call -- cheap
 // enough (88 small fillRects) to just call at a fixed low rate rather
 // than diffing.
-void drawNoteStrip(int y) {
+void drawNoteStrip(int y, int height = STRIP_HEIGHT) {
     int span = PIANO_HI - PIANO_LO + 1;
     int colWidth = tft.width() / span;
     if (colWidth < 1) colWidth = 1;
@@ -272,18 +300,18 @@ void drawNoteStrip(int y) {
         uint16_t color = COLOR_BG;
         if (MidiOutput::isNoteActive((uint8_t)note)) {
             uint8_t vel = MidiOutput::noteVelocity((uint8_t)note);
-            barHeight = STRIP_MIN_BAR_HEIGHT + ((STRIP_HEIGHT - STRIP_MIN_BAR_HEIGHT) * vel) / 127;
+            barHeight = STRIP_MIN_BAR_HEIGHT + ((height - STRIP_MIN_BAR_HEIGHT) * vel) / 127;
             if (MidiOutput::isNotePercussion((uint8_t)note)) {
                 color = (vel >= 100) ? COLOR_PERC_HIGH : (vel >= 64) ? COLOR_PERC_MID : COLOR_PERC_LOW;
             } else {
                 color = (vel >= 100) ? COLOR_NOTE_HIGH : (vel >= 64) ? COLOR_NOTE_MID : COLOR_NOTE_LOW;
             }
         }
-        if (barHeight < STRIP_HEIGHT) {
-            tft.fillRect(x, y, barWidth, STRIP_HEIGHT - barHeight, COLOR_BG);
+        if (barHeight < height) {
+            tft.fillRect(x, y, barWidth, height - barHeight, COLOR_BG);
         }
         if (barHeight > 0) {
-            tft.fillRect(x, y + STRIP_HEIGHT - barHeight, barWidth, barHeight, color);
+            tft.fillRect(x, y + height - barHeight, barWidth, barHeight, color);
         }
     }
 }
@@ -533,6 +561,105 @@ void drawSysExProgress(const SysExPlayer& player) {
     }
 }
 
+// Splits one pariSynth channel cell's text into its two independently-
+// positioned parts (see PARISYNTH_ROW_SPLIT_X's comment) -- `numBuf` gets
+// the 1-based channel number (matching every other on-screen channel
+// display in this app, e.g. LoopTrackView's own "In/Out" fields), `nameBuf`
+// the resolved instrument name. Channel 10 (index 9) always names "Drums"
+// regardless of its program, same GM convention Synth uses.
+void parisynthChannelParts(int channel, char* numBuf, size_t numBufSize, char* nameBuf, size_t nameBufSize) {
+    snprintf(numBuf, numBufSize, "%d", channel + 1);
+    if (channel == 9) {
+        snprintf(nameBuf, nameBufSize, "Drums");
+        return;
+    }
+    uint8_t program = Synth::getChannelProgram((uint8_t)channel);
+    uint8_t family = (program >> 3) & 0x0F;
+    snprintf(nameBuf, nameBufSize, "%s", Synth::instrumentFamilyName(family));
+}
+
+// Redraws exactly one cell -- shared by the full-grid draw and the two
+// cheap partial-update entry points below. Left column (channels 0-7):
+// name and number both right-aligned (TR_DATUM), number closer to center
+// -- reads "Instrument Name  1". Right column (8-15): both left-aligned
+// (TL_DATUM), mirrored -- reads "9  Instrument Name". See
+// PARISYNTH_ROW_SPLIT_X's comment for why the numbers don't need their
+// own width measured to stay clear of the names. `active` (see
+// drawPariSynthPlay()'s activeMask comment) swaps the number from
+// COLOR_ACCENT to COLOR_NOTE_HIGH -- the same color the note strip already
+// uses for a hard-hit note just below this grid, rather than inventing a
+// new color meaning -- while at least one note is currently held on that
+// channel.
+void drawParisynthCell(int channel, bool selected, bool active) {
+    int col = channel / PARISYNTH_ROWS;
+    int row = channel % PARISYNTH_ROWS;
+    int y = PARISYNTH_GRID_Y + row * ROW_HEIGHT;
+    uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
+    uint16_t numColor = active ? COLOR_NOTE_HIGH : COLOR_ACCENT;
+
+    char numBuf[4], nameBuf[20];
+    parisynthChannelParts(channel, numBuf, sizeof(numBuf), nameBuf, sizeof(nameBuf));
+
+    if (col == 0) {
+        tft.fillRect(0, y, PARISYNTH_ROW_SPLIT_X, ROW_HEIGHT, bg);
+        tft.setTextDatum(TR_DATUM);
+        tft.setTextColor(COLOR_TEXT, bg);
+        tft.drawString(nameBuf, PARISYNTH_NAME_LEFT_X, y + 2);
+        tft.setTextColor(numColor, bg);
+        tft.drawString(numBuf, PARISYNTH_NUM_LEFT_X, y + 2);
+    } else {
+        tft.fillRect(PARISYNTH_ROW_SPLIT_X, y, tft.width() - PARISYNTH_ROW_SPLIT_X, ROW_HEIGHT, bg);
+        tft.setTextDatum(TL_DATUM);
+        tft.setTextColor(numColor, bg);
+        tft.drawString(numBuf, PARISYNTH_NUM_RIGHT_X, y + 2);
+        tft.setTextColor(COLOR_TEXT, bg);
+        tft.drawString(nameBuf, PARISYNTH_NAME_RIGHT_X, y + 2);
+    }
+    tft.setTextDatum(TL_DATUM);
+}
+
+// How tall the note strip can actually be on this screen without reaching
+// into the footer's row -- the 16-channel grid above it (144px) leaves far
+// less headroom than drawPlayer()'s own stat rows do, so STRIP_HEIGHT (74,
+// budgeted for that other screen) doesn't fit here. Using it unclipped
+// used to make drawNoteStrip() paint note-activity bars straight over the
+// footer text on every live tick (updatePariSynthPlayLive() only redraws
+// the strip, not the footer) -- clamping to what's actually free keeps the
+// strip's own fillRect calls from ever touching footer pixels in the
+// first place, so there's nothing left to redraw over.
+int parisynthStripHeight() {
+    int available = tft.height() - FOOTER_HEIGHT - PARISYNTH_STRIP_Y;
+    if (available > STRIP_HEIGHT) available = STRIP_HEIGHT;
+    if (available < STRIP_MIN_BAR_HEIGHT) available = STRIP_MIN_BAR_HEIGHT;
+    return available;
+}
+
+// Shared footer band: clears it to background, resets text color/datum
+// (rather than trusting whatever the screen's own content last left
+// them as -- see drawLooper()'s Sync-label color leaking into its footer,
+// the bug that motivated pulling this out of ~20 near-identical copies),
+// then draws up to two left-aligned button-hint lines (line1 at fy+1,
+// line2 at fy+17 if non-null/non-empty) plus the battery meter every
+// footer already ends with. Callers that also need to clear body content
+// down to the footer's top still compute their own `tft.height() -
+// FOOTER_HEIGHT` for that -- cheap to recompute, and keeps this helper
+// from having to hand anything back.
+//
+// Not a fit for everything: drawNameEntry()'s footer needs its second
+// line independently redrawable (with a different color for an error)
+// without touching the first, so it keeps its own drawNameEntryFooterLine2()
+// instead; drawMessage()'s bare centered dialogs have no footer band at
+// all, just the battery icon, so they call that directly.
+void drawFooter(const char* line1, const char* line2 = nullptr) {
+    int fy = tft.height() - FOOTER_HEIGHT;
+    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
+    tft.setTextColor(COLOR_DIM, COLOR_BG);
+    tft.setTextDatum(TL_DATUM);
+    if (line1 && line1[0]) tft.drawString(line1, 4, fy + 1);
+    if (line2 && line2[0]) tft.drawString(line2, 4, fy + 17);
+    Ui::drawBatteryMeter();
+}
+
 } // namespace
 
 namespace Ui {
@@ -639,19 +766,13 @@ void drawBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffset) 
         drawScrollbar(count, scrollOffset, rows, HEADER_HEIGHT);
     }
 
-    // Footer: button hints
-    int fy = tft.height() - FOOTER_HEIGHT;
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
     // Grouped by physical button row (see pins.h's layout diagram): line 1
     // is the row nearest the screen (UP/PLAY/EDIT), line 2 the two rows
     // below it (LEFT/DOWN/RIGHT/ENTER, then ALT/NAV) -- same convention
     // every other footer in this file follows. PLAY/RIGHT also open a
     // file here (same as ENTER) but aren't separately called out, same
     // as everywhere else redundant alternate triggers go unmentioned.
-    tft.drawString("UD move/ALT page  EDIT menu", 4, fy + 1);
-    tft.drawString("ENTER open  LEFT/NAV back  ALT output", 4, fy + 17);
-    drawBatteryMeter();
+    drawFooter("UD move/ALT page  EDIT menu", "ENTER open  ALT output");
 }
 
 void drawLoopBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffset) {
@@ -680,14 +801,9 @@ void drawLoopBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffs
         drawScrollbar(count, scrollOffset, rows, HEADER_HEIGHT);
     }
 
-    // Footer: this screen only offers select/delete/back -- no EDIT
-    // menu or ALT output target, unlike drawBrowser()'s footer.
-    int fy = tft.height() - FOOTER_HEIGHT;
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.drawString("UD move  ENTER select", 4, fy + 1);
-    tft.drawString("HOLD ENTER delete  NAV/LEFT back", 4, fy + 17);
-    drawBatteryMeter();
+    // This screen only offers select/delete/back -- no EDIT menu or ALT
+    // output target, unlike drawBrowser()'s footer.
+    drawFooter("UD move  ENTER select", "HOLD ENTER delete");
 }
 
 void updateBrowserSelection(const SdBrowser& browser, int prevIndex, int newIndex, int scrollOffset) {
@@ -800,21 +916,13 @@ void drawPlayer(const char* filename, const MidiPlayer& player, MidiOutTarget ta
         tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
     }
     drawNoteStrip(PLAYER_STRIP_Y);
-    // This footer was never explicitly cleared even before the
-    // fillScreen() removal above -- it relied on that same blanket clear
-    // too, unlike drawBrowser()'s/drawLooper()'s own footers which
-    // already fillRect their own area.
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
     // Row-grouped (see pins.h): line 1 = UP/PLAY/EDIT, with EDIT+UP/DOWN
     // (volume) woven into UD's own hint since EDIT is a modifier there
     // (as opposed to its own tap, which toggles Audio) -- same reasoning
     // ALT gets woven into hints elsewhere instead of a separate mention
     // wherever it's a modifier rather than its own tap action. Line 2
     // similarly weaves in ENTER+LEFT/RIGHT (scrub).
-    tft.drawString("UD tempo/EDIT+UD vol  PLAY tog  EDIT aud", 4, fy + 1);
-    tft.drawString("LEFT back/ENT+LR seek  ALT midi  NAV stop", 4, fy + 17);
-    drawBatteryMeter();
+    drawFooter("UD tempo/EDIT+UD vol  PLAY tog  EDIT inst", "ENT+LR seek  ALT midi/+EDIT aud  NAV stop");
 }
 
 // Repaints only the volume half of its row (right side of ROW4, next to
@@ -873,6 +981,75 @@ void updatePlayerLive(const MidiPlayer& player) {
                      buf, g_lastTempoStr, sizeof(g_lastTempoStr));
 
     drawNoteStrip(PLAYER_STRIP_Y);
+}
+
+// -- pariSynth play screen -----------------------------------------------
+
+void drawPariSynthPlay(int selectedChannel, uint16_t activeMask, const char* footerLine1, const char* footerLine2) {
+    tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
+    tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString("pariSynth", 4, 3);
+    drawHeaderBrand();
+
+    // Full-width clear for the whole grid area. drawParisynthCell() itself
+    // covers every row's full width now (its two halves meet exactly at
+    // PARISYNTH_ROW_SPLIT_X), but the small header-to-first-row gap above
+    // row 0 isn't part of any cell's own fillRect -- clear that here too
+    // rather than relying on whatever the previous screen last drew at
+    // those Y coordinates, same reasoning as the note-strip's right-edge
+    // remainder below.
+    tft.fillRect(0, HEADER_HEIGHT, tft.width(), PARISYNTH_GRID_BOTTOM - HEADER_HEIGHT, COLOR_BG);
+    for (int ch = 0; ch < 16; ch++) {
+        drawParisynthCell(ch, ch == selectedChannel, (activeMask & (1u << ch)) != 0);
+    }
+
+    // Cleared as one full-width span down to the footer -- covers the gap
+    // above the strip *and* the strip's own right-edge remainder (320px
+    // doesn't divide evenly by its 88 note-columns, see drawNoteStrip()'s
+    // comment), same reasoning drawPlayer() documents for its own
+    // contentBottom-to-footer clear. Splitting this into two conditional
+    // gap-fills around drawNoteStrip() (the old version here) missed that
+    // remainder whenever the strip's bottom landed exactly on the footer,
+    // which it always does now that parisynthStripHeight() sizes it to fit
+    // -- leaving whatever the editor screen last painted there stuck on
+    // screen after returning from it.
+    int fy = tft.height() - FOOTER_HEIGHT;
+    if (fy > PARISYNTH_GRID_BOTTOM) {
+        tft.fillRect(0, PARISYNTH_GRID_BOTTOM, tft.width(), fy - PARISYNTH_GRID_BOTTOM, COLOR_BG);
+    }
+    drawNoteStrip(PARISYNTH_STRIP_Y, parisynthStripHeight());
+
+    drawFooter(footerLine1, footerLine2);
+}
+
+void updatePariSynthPlayLive() {
+    drawNoteStrip(PARISYNTH_STRIP_Y, parisynthStripHeight());
+}
+
+void updatePariSynthChannelCell(int channel, bool selected, bool active) {
+    drawParisynthCell(channel, selected, active);
+}
+
+void updatePariSynthSelection(int prevChannel, int newChannel, bool prevActive, bool newActive) {
+    drawParisynthCell(prevChannel, false, prevActive);
+    drawParisynthCell(newChannel, true, newActive);
+}
+
+// Same rect channel 9's own cell occupies (index 8, row 0 of the right
+// column -- top-right, right under the header row) -- see PariSynthGrid's
+// own comment on why an overlay here rather than new permanent screen
+// space. COLOR_HILITE_BG/COLOR_TEXT, the same highlight-chip look the
+// selected cell already uses elsewhere on this screen, so it reads as
+// this app's own visual language rather than a new one.
+void updatePariSynthVolumeOverlay(int volume) {
+    tft.fillRect(PARISYNTH_ROW_SPLIT_X, PARISYNTH_GRID_Y, tft.width() - PARISYNTH_ROW_SPLIT_X, ROW_HEIGHT, COLOR_HILITE_BG);
+    tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
+    tft.setTextDatum(TR_DATUM);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "Vol %d%%", volume);
+    tft.drawString(buf, tft.width() - 4, PARISYNTH_GRID_Y + 2);
+    tft.setTextDatum(TL_DATUM);
 }
 
 // -- WAV player screen -------------------------------------------------
@@ -1006,15 +1183,11 @@ void drawWavPlayer(const char* filename, const WavPlayer& player, int volume, bo
     if (fy > contentBottom) {
         tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
     }
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
     // No ALT (no MIDI output target -- WAV never goes out a MIDI port)
     // and no bare-EDIT-tap action (WAV playback is always audible, no
     // separate on/off toggle) -- EDIT only ever acts as a hold-modifier
     // here, same weaving convention drawPlayer()'s footer uses.
-    tft.drawString("EDIT+UD vol  PLAY tog", 4, fy + 1);
-    tft.drawString("LEFT back  ENT+LR seek  NAV stop", 4, fy + 17);
-    drawBatteryMeter();
+    drawFooter("EDIT+UD vol  PLAY tog", "ENT+LR seek  NAV stop");
 }
 
 void updateWavPlayerState(WavPlayer::State state, bool stopped) {
@@ -1125,14 +1298,10 @@ void drawModPlayer(const char* filename, const ModPlayer& player, int volume, bo
     if (fy > contentBottom) {
         tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
     }
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
     // No ALT (no MIDI target), no seek (ModPlayer doesn't support it, see
     // its header comment), no bare-EDIT-tap action -- same reasoning the
     // WAV screen's footer already documents.
-    tft.drawString("EDIT+UD vol  PLAY tog", 4, fy + 1);
-    tft.drawString("LEFT back  NAV stop", 4, fy + 17);
-    drawBatteryMeter();
+    drawFooter("EDIT+UD vol  PLAY tog", "NAV stop");
 }
 
 void updateModPlayerState(ModPlayer::State state, bool stopped) {
@@ -1236,13 +1405,9 @@ void drawS3mPlayer(const char* filename, const S3mPlayer& player, int volume, bo
     if (fy > contentBottom) {
         tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
     }
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
     // Same footer reasoning as drawModPlayer() -- no ALT, no seek, no
     // bare-EDIT-tap action.
-    tft.drawString("EDIT+UD vol  PLAY tog", 4, fy + 1);
-    tft.drawString("LEFT back  NAV stop", 4, fy + 17);
-    drawBatteryMeter();
+    drawFooter("EDIT+UD vol  PLAY tog", "NAV stop");
 }
 
 void updateS3mPlayerState(S3mPlayer::State state, bool stopped) {
@@ -1349,13 +1514,9 @@ void drawXmPlayer(const char* filename, const XmPlayer& player, int volume, bool
     if (fy > contentBottom) {
         tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
     }
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
     // Same footer reasoning as drawS3mPlayer() -- no ALT, no seek, no
     // bare-EDIT-tap action.
-    tft.drawString("EDIT+UD vol  PLAY tog", 4, fy + 1);
-    tft.drawString("LEFT back  NAV stop", 4, fy + 17);
-    drawBatteryMeter();
+    drawFooter("EDIT+UD vol  PLAY tog", "NAV stop");
 }
 
 void updateXmPlayerState(XmPlayer::State state, bool stopped) {
@@ -1405,7 +1566,7 @@ void drawNameEntryFooterLine2(const char* error) {
     int fy = tft.height() - FOOTER_HEIGHT;
     tft.fillRect(0, fy + 16, tft.width(), FOOTER_HEIGHT - 16, COLOR_BG);
     tft.setTextColor(error ? COLOR_ERROR : COLOR_DIM, COLOR_BG);
-    tft.drawString(error ? error : "DEL/OK on keyboard  NAV cancel", 4, fy + 17);
+    tft.drawString(error ? error : "DEL/OK on keyboard", 4, fy + 17);
     drawBatteryMeter();
 }
 
@@ -1474,10 +1635,22 @@ void updateNameEntryError(const char* error) {
     drawNameEntryFooterLine2(error);
 }
 
-// Draws a single entry-menu row, highlighted or not. Used by both the
-// full redraw and the cursor-move partial redraw.
-void drawMenuRow(const char* label, int row, bool selected) {
+// Draws a single entry-menu-style row at list index `idx`, given the list
+// is currently scrolled to `scrollOffset` -- same "blank out-of-range
+// slots so a shorter list doesn't leave stale rows behind" convention
+// drawBrowserRow() uses (pass label == nullptr for a slot past the end of
+// the list). Used by drawModeSelect()/updateModeSelectCursor() (always
+// scrollOffset 0 -- MODE_COUNT is fixed and always fits one screen) and by
+// drawEntryMenu()/updateEntryMenuSelection() (whose list can exceed one
+// screen, e.g. a folder scan or the pariSynth instrument picker).
+void drawMenuRow(const char* label, int idx, int scrollOffset, bool selected) {
+    int row = idx - scrollOffset;
+    if (row < 0 || row >= rowsOnScreen()) return;
     int y = HEADER_HEIGHT + 6 + row * ROW_HEIGHT;
+    if (!label) {
+        tft.fillRect(0, y, tft.width(), ROW_HEIGHT, COLOR_BG);
+        return;
+    }
     uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
     tft.fillRect(0, y, tft.width(), ROW_HEIGHT, bg);
     tft.setTextColor(COLOR_TEXT, bg);
@@ -1504,21 +1677,18 @@ void drawModeSelect(const char* const* labels, int count, int cursor) {
     }
 
     for (int i = 0; i < count; i++) {
-        drawMenuRow(labels[i], i, i == cursor);
+        drawMenuRow(labels[i], i, 0, i == cursor);
     }
 
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.drawString("UP/DN move  ENTER select", 4, fy + 1);
-    drawBatteryMeter();
+    drawFooter("UP/DN move  ENTER select");
 }
 
 void updateModeSelectCursor(const char* const* labels, int count, int prevCursor, int newCursor) {
-    if (prevCursor >= 0 && prevCursor < count) drawMenuRow(labels[prevCursor], prevCursor, false);
-    if (newCursor >= 0 && newCursor < count) drawMenuRow(labels[newCursor], newCursor, true);
+    if (prevCursor >= 0 && prevCursor < count) drawMenuRow(labels[prevCursor], prevCursor, 0, false);
+    if (newCursor >= 0 && newCursor < count) drawMenuRow(labels[newCursor], newCursor, 0, true);
 }
 
-void drawEntryMenu(const char* subtitle, const char* const* labels, int count, int cursor) {
+void drawEntryMenu(const char* subtitle, const char* const* labels, int count, int cursor, int scrollOffset) {
     tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
     tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
     tft.setTextDatum(TL_DATUM);
@@ -1527,25 +1697,31 @@ void drawEntryMenu(const char* subtitle, const char* const* labels, int count, i
     // Same gaps as drawModeSelect() -- see its comment.
     int rowsTop = HEADER_HEIGHT + 6;
     tft.fillRect(0, HEADER_HEIGHT, tft.width(), 6, COLOR_BG);
+
+    // Same "paint every row slot, blank the ones past count" shape as
+    // drawBrowser() -- see drawMenuRow()'s comment.
+    int rows = rowsOnScreen();
+    for (int row = 0; row < rows; row++) {
+        int idx = scrollOffset + row;
+        drawMenuRow(idx < count ? labels[idx] : nullptr, idx, scrollOffset, idx == cursor);
+    }
+
     int fy = tft.height() - FOOTER_HEIGHT;
-    int rowsBottom = rowsTop + count * ROW_HEIGHT;
+    int rowsBottom = rowsTop + rows * ROW_HEIGHT;
     if (rowsBottom < fy) {
         tft.fillRect(0, rowsBottom, tft.width(), fy - rowsBottom, COLOR_BG);
     }
 
-    for (int i = 0; i < count; i++) {
-        drawMenuRow(labels[i], i, i == cursor);
+    if (count > rows) {
+        drawScrollbar(count, scrollOffset, rows, rowsTop);
     }
 
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.drawString("UP/DN move  ENTER select  NAV cancel", 4, fy + 1);
-    drawBatteryMeter();
+    drawFooter("UP/DN move  ENTER select");
 }
 
-void updateEntryMenuSelection(const char* const* labels, int count, int prevCursor, int newCursor) {
-    if (prevCursor >= 0 && prevCursor < count) drawMenuRow(labels[prevCursor], prevCursor, false);
-    if (newCursor >= 0 && newCursor < count) drawMenuRow(labels[newCursor], newCursor, true);
+void updateEntryMenuSelection(const char* const* labels, int count, int prevCursor, int newCursor, int scrollOffset) {
+    if (prevCursor >= 0 && prevCursor < count) drawMenuRow(labels[prevCursor], prevCursor, scrollOffset, false);
+    if (newCursor >= 0 && newCursor < count) drawMenuRow(labels[newCursor], newCursor, scrollOffset, true);
 }
 
 void drawConfirmDelete(const char* name, bool isDir, bool failed) {
@@ -1589,10 +1765,7 @@ void drawConfirmDelete(const char* name, bool isDir, bool failed) {
     if (fy > y) {
         tft.fillRect(0, y, tft.width(), fy - y, COLOR_BG);
     }
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.drawString(failed ? "NAV/ENTER back" : "ENTER delete  NAV cancel", 4, fy + 1);
-    drawBatteryMeter();
+    drawFooter(failed ? nullptr : "ENTER delete");
 }
 
 // Same shape as drawConfirmDelete() just above -- header title, question
@@ -1624,10 +1797,7 @@ void drawConfirmOverwrite(const char* name, bool isDir) {
     if (fy > y) {
         tft.fillRect(0, y, tft.width(), fy - y, COLOR_BG);
     }
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.drawString("ENTER overwrite  NAV cancel", 4, fy + 1);
-    drawBatteryMeter();
+    drawFooter("ENTER overwrite");
 }
 
 void drawRecording(const char* filename, const MidiRecorder& recorder) {
@@ -1682,10 +1852,7 @@ void drawRecording(const char* filename, const MidiRecorder& recorder) {
     if (fy > contentBottom) {
         tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
     }
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.drawString("NAV/LEFT stop & save  EDIT discard", 4, fy + 1);
-    drawBatteryMeter();
+    drawFooter("NAV/LEFT stop & save  EDIT discard");
 }
 
 void updateRecordingLive(const MidiRecorder& recorder) {
@@ -1756,10 +1923,7 @@ void drawSysExCapture(const char* filename, const SysExRecorder& recorder) {
     if (fy > contentBottom) {
         tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
     }
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.drawString("NAV/LEFT stop & save  EDIT discard", 4, fy + 1);
-    drawBatteryMeter();
+    drawFooter("NAV/LEFT stop & save  EDIT discard");
 }
 
 void updateSysExCaptureLive(const SysExRecorder& recorder) {
@@ -1828,11 +1992,9 @@ void drawSysExPlayer(const char* filename, const SysExPlayer& player) {
         drawSysExProgress(player);
     }
 
-    int fy = tft.height() - FOOTER_HEIGHT;
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.drawString("NAV/LEFT stop", 4, fy + 1);
-    drawBatteryMeter();
+    // No footer hint line -- NAV/LEFT (stop & back) is this screen's only
+    // input, and that's standard back-navigation, not called out here.
+    drawFooter(nullptr);
 }
 
 void updateSysExPlayerLive(const SysExPlayer& player) {
@@ -1879,13 +2041,33 @@ const int LOOPER_CHANNEL_COL_X = 28;   // wide enough for "T4" plus a gap
 // crowds its neighbor on real hardware.
 const int LOOPER_STATE_COL_X = 110;    // wide enough for "OMNI/REC" plus a deliberately generous gap
 const int LOOPER_BARLEN_COL_X = 182;   // wide enough for "RECORD!" (longest state + overflow marker) plus a gap
-const int LOOPER_ACTIVITY_X = 226;     // wide enough for "128BAR" (longest bar-length value) plus a gap
-const int LOOPER_ACTIVITY_SPACING = 10; // gap between the record and play activity dots -- tightened from 14 to help the dots + BARLEN fit ahead of the fixed-position length field
+// Shifted from 226 -- "128BAR" (the longest bar-length value) was actually
+// running into the record-activity dot at the old position, not just
+// "wide enough" as the comment here used to claim. The BARLEN box (see
+// drawLooperTrackLabel()'s fillRect, sized off LOOPER_ACTIVITY_X) widens
+// for free with this move.
+const int LOOPER_ACTIVITY_X = 236;
+// Two radius-4 circles need their centers >= 9px apart just to stop
+// sharing a pixel column (4+4), and a full 10px to leave one genuinely
+// clear column between them -- 8px (tried first) put center+radius of
+// the record dot and center-radius of the play dot on the very same
+// column, which read as the two dots overlapping. Widening this to 10
+// pushes the play dot's right edge to LOOPER_ACTIVITY_X+10+4 == 250,
+// which is why drawLooperTrackLength()'s own reserved box (below) was
+// trimmed to start at 254 instead of 248 -- otherwise this fix would
+// have just traded one collision for another.
+const int LOOPER_ACTIVITY_SPACING = 10;
 
-const char* loopStateLabel(LoopTrackState s) {
-    switch (s) {
+// RECORDING covers two different situations that read very differently to
+// the person playing: a fresh, still open-ended first pass (t.lengthMs==0,
+// see LoopTrackView's own comment and looper_mode.cpp's recordStartMs) vs.
+// capturing more on top of a track that already has committed content
+// (t.lengthMs>0) -- the latter is an overdub, not a first recording, so it
+// gets its own label rather than both reading as plain "RECORD".
+const char* loopStateLabel(const LoopTrackView& t) {
+    switch (t.state) {
         case LOOP_TRACK_ARMED:     return "ARMED";
-        case LOOP_TRACK_RECORDING: return "RECORD";
+        case LOOP_TRACK_RECORDING: return t.lengthMs > 0 ? "OVERDUB" : "RECORD";
         case LOOP_TRACK_PLAYING:   return "PLAYING";
         case LOOP_TRACK_MUTED:     return "MUTED";
         case LOOP_TRACK_STOPPED:   return "STOPPED";
@@ -1936,7 +2118,10 @@ void looperBarLenText(char* buf, size_t bufSize, const LoopTrackView& t) {
 void drawLooperTrackLength(const LoopTrackView& t, int idx, bool selected) {
     int y = LOOPER_FIRST_ROW_Y + idx * LOOPER_ROW_HEIGHT;
     uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
-    int boxX = tft.width() - 72; // generous width for "NNN.Ns"
+    // Trimmed from 72 -- still comfortable room for "NNN.Ns", and frees up
+    // the few px the activity dots' 1px-gap fix (see LOOPER_ACTIVITY_SPACING)
+    // needed on the other side of this box's start.
+    int boxX = tft.width() - 66;
     tft.fillRect(boxX, y, tft.width() - boxX, ROW_HEIGHT, bg);
 
     if (t.lengthMs == 0) return;
@@ -1980,7 +2165,7 @@ void drawLooperTrackLabel(const LoopTrackView& t, int idx, bool selected) {
     // "!" appended when the event buffer filled up and further events are
     // being silently dropped -- surfaced rather than left invisible.
     char stateBuf[12];
-    snprintf(stateBuf, sizeof(stateBuf), t.bufferFull ? "%s!" : "%s", loopStateLabel(t.state));
+    snprintf(stateBuf, sizeof(stateBuf), t.bufferFull ? "%s!" : "%s", loopStateLabel(t));
     tft.drawString(stateBuf, LOOPER_STATE_COL_X, y + 2);
 
     char barBuf[10];
@@ -2223,8 +2408,11 @@ void drawLooper(const LoopTrackView tracksArg[4], int selectedTrack, bool onBpmR
     drawLooperBpmRow(bpm, timeSigNum, timeSigDen, syncMode, metronomeOn, metronomeVolumePercent,
                       showMetronomeVolume, countInEnabled, countInBars, showCountInBars, focusIndex, onBpmRow);
 
-    int fy = tft.height() - FOOTER_HEIGHT;
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
+    // drawLooperBpmRow() (just above) ends by setting its own "Sync" label
+    // color, which depends on focus/selection state -- drawFooter() resets
+    // color/datum unconditionally rather than trusting whatever that left
+    // behind, which is what fixed this footer showing up in the wrong
+    // color depending on BPM-row focus.
     // Row-grouped (see pins.h): line 1 = UP/PLAY/EDIT, line 2 = LEFT/
     // DOWN/RIGHT/ENTER then ALT/NAV. ALT is woven into UD's and LR's own
     // hints (out-channel on UD, in-channel on LR, Metro/Count In/Sync on
@@ -2242,9 +2430,7 @@ void drawLooper(const LoopTrackView tracksArg[4], int selectedTrack, bool onBpmR
     // concession to fitting several distinct hints on one row -- the same
     // idea as "UD" above, just naming two buttons that do different
     // things instead of one pair doing the same thing.
-    tft.drawString("UD row/ALT out  PLAY pause  EDIT rec/bpm", 4, fy + 1);
-    tft.drawString("L back/R mute/ALT in/EDIT bar  ENT menu  NAV stop", 4, fy + 17);
-    drawBatteryMeter();
+    drawFooter("UD row/ALT out  PLAY pause  EDIT rec/bpm", "R mute/ALT in/EDIT bar  ENT menu  NAV stop");
 }
 
 void updateLooperPositions(const LoopTrackView tracksArg[4], int selectedTrack) {
@@ -2362,10 +2548,7 @@ void drawLooperCountIn(int beatsRemaining) {
 
     drawLooperCountInBeat(beatsRemaining);
 
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.drawString("Recording starts after the count-in", 4, fy + 1);
-    drawBatteryMeter();
+    drawFooter("Recording starts after the count-in");
 }
 
 void updateLooperCountInBeat(int beatsRemaining) {
@@ -2398,7 +2581,8 @@ void drawSettingsRow(const char* label, const char* value, int index, int scroll
 }
 
 void drawSettings(const char* const* labels, const char* const* values, int count, int cursor,
-                   int scrollOffset, const char* pageTitle) {
+                   int scrollOffset, const char* pageTitle,
+                   const char* footerLine1, const char* footerLine2) {
     tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
     tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
     tft.setTextDatum(TL_DATUM);
@@ -2436,16 +2620,13 @@ void drawSettings(const char* const* labels, const char* const* values, int coun
 
     if (count > rows) drawScrollbar(count, scrollOffset, rows, SETTINGS_ROW_Y0);
 
-    int fy = tft.height() - FOOTER_HEIGHT;
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
     // Row-grouped (see pins.h): PLAY (row 1) does nothing on this screen,
     // so line 1 covers UP/DOWN plus plain LEFT/RIGHT (page navigation);
     // line 2 covers EDIT+LEFT/RIGHT (value adjust, EDIT woven in since
-    // it's a pure modifier here) plus NAV (unconditional exit).
-    tft.drawString("UD move  LR page", 4, fy + 1);
-    tft.drawString("EDIT+LR change  NAV back", 4, fy + 17);
-    drawBatteryMeter();
+    // it's a pure modifier here). SettingsMode's own hint text by default
+    // -- see this function's header comment for why SynthEditor passes
+    // something else.
+    drawFooter(footerLine1, footerLine2);
 }
 
 void updateSettingsSelection(const char* const* labels, const char* const* values, int count,
@@ -2540,12 +2721,7 @@ void drawThemePage(int colorCursor, int channelCursor, int scrollOffset) {
     }
     if (THEME_COLOR_COUNT > rows) drawScrollbar(THEME_COLOR_COUNT, scrollOffset, rows, SETTINGS_ROW_Y0);
 
-    int fy = tft.height() - FOOTER_HEIGHT;
-    tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.drawString("UD color  LR field  ENT menu", 4, fy + 1);
-    tft.drawString("EDIT+UD/LR value  NAV exit", 4, fy + 17);
-    drawBatteryMeter();
+    drawFooter("UD color  LR field  ENT menu", "EDIT+UD/LR value");
 }
 
 void updateThemeRow(int index, int channelCursor, bool selected, int scrollOffset) {
@@ -2638,7 +2814,7 @@ void drawMessage(const char* line1, const char* line2) {
 
 // Small vertical battery gauge in the bottom-right corner. Footer
 // button-hint text is left-aligned starting at x=4 and, even at its
-// widest ("LEFT back/ENT+LR seek  ALT midi  NAV stop" in drawWavPlayer()),
+// widest ("R mute/ALT in/EDIT bar  ENT menu  NAV stop" in drawLooper()),
 // stays well clear of this corner, so it's free across every screen.
 // Called on main.cpp's own ~1s timer (not tied to Battery::update()'s
 // much slower ~15s actual sample rate) so the icon reappears quickly

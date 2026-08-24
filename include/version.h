@@ -4,4 +4,4 @@
 // Bumped manually alongside each version-tagged release (see `git tag`) --
 // nothing derives this automatically from git, so remember to update it
 // when cutting a new tag.
-#define VERSIONNUMBER "0.4.0"
+#define VERSIONNUMBER "0.5.0"

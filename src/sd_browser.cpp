@@ -143,8 +143,8 @@ void SdBrowser::loadEntries() {
     // right now, not just what the folder has -- rp2040.getFreeHeap() is
     // a real runtime measurement, unlike the linker's static RAM%, which
     // says nothing about tracks[] or any other heap allocation already
-    // made. HEAP_SAFETY_MARGIN is a placeholder pending real-hardware
-    // tuning (see this class's header comment).
+    // made. HEAP_SAFETY_MARGIN is tuned against a real-hardware measurement
+    // (see this class's header comment).
     bool wantSortKeys = (total <= SORT_KEY_CEILING);
     size_t perEntryBytes = sizeof(DirIndexEntry) + (wantSortKeys ? sizeof(SortKeyEntry) : 0);
     uint32_t freeHeap = rp2040.getFreeHeap();
