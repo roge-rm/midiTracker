@@ -325,12 +325,12 @@ void updateLooperTrackRow(const LoopTrackView tracks[4], int trackIdx, bool sele
 
 // Cheap partial redraw of just the selected track's channel field (shown
 // as "In/Out", e.g. "OMNI/REC"), e.g. after ALT+UP/DOWN (out) or
-// EDIT+UP/DOWN (in) changes it. Does not touch the rest of that row or any
-// other row.
+// ALT+LEFT/RIGHT (in) changes it. Does not touch the rest of that row or
+// any other row.
 void updateLooperChannel(const LoopTrackView tracks[4], int selectedTrack);
 
 // Cheap partial redraw of just the selected track's bar-length field, e.g.
-// after ALT+LEFT/RIGHT changes it. Does not touch the rest of that row or
+// after EDIT+LEFT/RIGHT changes it. Does not touch the rest of that row or
 // any other row.
 void updateLooperBarLength(const LoopTrackView tracks[4], int selectedTrack);
 

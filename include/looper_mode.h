@@ -2,10 +2,13 @@
 
 // Owns the 4-track MIDI looper workflow: live recording/overdub/mute/stop
 // per track, Sync vs. Independent playback, and SD persistence under
-// /loops/ (whole-session save/load/delete, or a single track at a time).
-// Mirrors FilePlayerMode's begin()/enter()/update() shape so main.cpp's
-// mode dispatch doesn't need to know anything about what's inside either
-// mode.
+// /loops/ -- either as an individual per-track save (a loose .mid file
+// directly under /loops/) or as a whole-session bundle (auto-named,
+// restoring every track plus BPM/sync/time signature together, under
+// /loops/bundles/ -- which can also be loaded one track at a time instead
+// of all at once). Mirrors FilePlayerMode's begin()/enter()/update() shape
+// so main.cpp's mode dispatch doesn't need to know anything about what's
+// inside either mode.
 namespace LooperMode {
 
 void begin(); // one-time setup, call once from the top-level setup()
@@ -25,7 +28,8 @@ bool update();
 // bridge that lets that action reach into looper track state without
 // FilePlayerMode needing to know this mode exists at all. Shows its own
 // overwrite-confirm screen before actually touching the track, same as
-// the Saved Loop load flow, so both entry points warn consistently.
+// the Load Selected Loop / Load All Loops flows, so every entry point
+// warns consistently.
 void requestImport(const char* path, int trackIndex);
 
 // -- On-demand RAM for the track event buffers --------------------------
