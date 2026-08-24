@@ -159,6 +159,17 @@ const int REC_STATE_Y    = REC_FILENAME_Y + ROW_HEIGHT + 6;
 const int REC_ELAPSED_Y  = REC_STATE_Y + ROW_HEIGHT;
 const int REC_EVENTS_Y   = REC_ELAPSED_Y + ROW_HEIGHT;
 
+// Scrolling MIDI-in log (see updateRecordingLog()), filling the otherwise-
+// empty stretch between the Events row and the footer. Row count isn't a
+// fixed constant -- it's however many ROW_HEIGHT rows actually fit between
+// REC_LOG_Y and the footer, computed at draw time the same way drawPlayer()
+// et al. compute fy from tft.height() rather than assuming a screen size.
+// Same ROW_HEIGHT/font as the rest of this screen rather than a smaller
+// font to pack in more lines -- shrinking the font to fit more on screen
+// was tried for a different layout and rejected on real hardware as
+// illegible (see embedded-ui-change-approach memory).
+const int REC_LOG_Y = REC_EVENTS_Y + ROW_HEIGHT + 8;
+
 // SysEx capture/playback screens reuse the REC_* rows above (filename/
 // state/elapsed/message-count) for a consistent look with drawRecording()
 // -- see drawSysExCapture()/drawSysExPlayer()'s own comments for what
@@ -465,6 +476,63 @@ const char* recordStateLabel(MidiRecorder::State s) {
         case MidiRecorder::STATE_RECORDING: return "Recording";
         case MidiRecorder::STATE_ERROR:     return "Error";
         default:                            return "Idle";
+    }
+}
+
+// Writes note number 60 as "C4" (scientific pitch notation, middle C = C4)
+// into a caller-supplied 5-char buffer (worst case "C#-1" + NUL, for the
+// sharps down at note 1/3/6/8/10) -- just for the MIDI-in log below, so no
+// claim is made that this matches any particular DAW/tracker's own octave
+// numbering.
+void midiNoteName(uint8_t note, char* out) {
+    static const char* const NAMES[12] = { "C", "C#", "D", "D#", "E", "F",
+                                            "F#", "G", "G#", "A", "A#", "B" };
+    int octave = note / 12 - 1;
+    snprintf(out, 5, "%s%d", NAMES[note % 12], octave);
+}
+
+// Formats one MidiLogEntry (see updateRecordingLog()) into a single short
+// line, e.g. "Ch1  Note On   C4  v100" or "Ch3  CC 74  = 90". `out` should
+// be sized generously (see the callers) -- proportional-font width, not
+// character count, is what actually has to fit the row.
+void formatMidiLogLine(const Ui::MidiLogEntry& e, char* out, size_t outSize) {
+    if (e.isSysEx) {
+        snprintf(out, outSize, "SysEx  %u bytes", (unsigned)e.sysExLen);
+        return;
+    }
+    uint8_t type = e.status & 0xF0;
+    int channel = (e.status & 0x0F) + 1;
+    char note[5];
+    switch (type) {
+        case 0x80:
+            midiNoteName(e.data1, note);
+            snprintf(out, outSize, "Ch%-2d Note Off  %-3s v%d", channel, note, e.data2);
+            break;
+        case 0x90:
+            midiNoteName(e.data1, note);
+            snprintf(out, outSize, "Ch%-2d Note On   %-3s v%d", channel, note, e.data2);
+            break;
+        case 0xA0:
+            midiNoteName(e.data1, note);
+            snprintf(out, outSize, "Ch%-2d Poly AT   %-3s %d", channel, note, e.data2);
+            break;
+        case 0xB0:
+            snprintf(out, outSize, "Ch%-2d CC %-3d = %d", channel, e.data1, e.data2);
+            break;
+        case 0xC0:
+            snprintf(out, outSize, "Ch%-2d Prog Chg  %d", channel, e.data1);
+            break;
+        case 0xD0:
+            snprintf(out, outSize, "Ch%-2d Chan AT   %d", channel, e.data1);
+            break;
+        case 0xE0: {
+            int bend = (int)(((uint16_t)e.data2 << 7) | e.data1) - 8192;
+            snprintf(out, outSize, "Ch%-2d Bend      %+d", channel, bend);
+            break;
+        }
+        default:
+            snprintf(out, outSize, "Ch%-2d %02X %02X %02X", channel, e.status, e.data1, e.data2);
+            break;
     }
 }
 
@@ -1630,7 +1698,8 @@ void drawConfirmOverwrite(const char* name, bool isDir) {
     drawBatteryMeter();
 }
 
-void drawRecording(const char* filename, const MidiRecorder& recorder) {
+void drawRecording(const char* filename, const MidiRecorder& recorder,
+                    const MidiLogEntry* log, int logCount) {
     tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
     tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
     tft.setTextDatum(TL_DATUM);
@@ -1682,6 +1751,9 @@ void drawRecording(const char* filename, const MidiRecorder& recorder) {
     if (fy > contentBottom) {
         tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
     }
+    if (recorder.state() != MidiRecorder::STATE_ERROR) {
+        updateRecordingLog(log, logCount);
+    }
     tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
     tft.setTextColor(COLOR_DIM, COLOR_BG);
     tft.drawString("NAV/LEFT stop & save  EDIT discard", 4, fy + 1);
@@ -1707,7 +1779,28 @@ void updateRecordingLive(const MidiRecorder& recorder) {
                      recorder.msSinceLastEvent() < RECORDING_ACTIVITY_MS);
 }
 
-void drawSysExCapture(const char* filename, const SysExRecorder& recorder) {
+void updateRecordingLog(const MidiLogEntry* entries, int count) {
+    int fy = tft.height() - FOOTER_HEIGHT;
+    int rows = (fy - REC_LOG_Y) / ROW_HEIGHT;
+    if (rows <= 0) return;
+    tft.fillRect(0, REC_LOG_Y, tft.width(), rows * ROW_HEIGHT, COLOR_BG);
+    if (count <= 0) return;
+
+    tft.setTextColor(COLOR_DIM, COLOR_BG);
+    // entries[] is oldest-first; show only the most recent `shown`, newest
+    // at the bottom, so it reads like a scrolling log rather than a
+    // shrinking one.
+    int shown = count < rows ? count : rows;
+    int startIdx = count - shown;
+    for (int i = 0; i < shown; i++) {
+        char buf[40];
+        formatMidiLogLine(entries[startIdx + i], buf, sizeof(buf));
+        tft.drawString(buf, 8, REC_LOG_Y + i * ROW_HEIGHT);
+    }
+}
+
+void drawSysExCapture(const char* filename, const SysExRecorder& recorder,
+                       const MidiLogEntry* log, int logCount) {
     tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
     tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
     tft.setTextDatum(TL_DATUM);
@@ -1755,6 +1848,9 @@ void drawSysExCapture(const char* filename, const SysExRecorder& recorder) {
     int contentBottom = REC_EVENTS_Y + ROW_HEIGHT;
     if (fy > contentBottom) {
         tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
+    }
+    if (recorder.state() != SysExRecorder::STATE_ERROR) {
+        updateRecordingLog(log, logCount);
     }
     tft.fillRect(0, fy, tft.width(), FOOTER_HEIGHT, COLOR_BG);
     tft.setTextColor(COLOR_DIM, COLOR_BG);

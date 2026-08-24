@@ -4,7 +4,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
-#include <new> // std::nothrow, see tracks' declaration below
+#include <new> // placement new, see tracks' declaration below
 
 #include "sd_card.h"
 #include "sd_browser.h"
@@ -15,6 +15,7 @@
 #include "config.h"
 #include "synth.h"
 #include "settings_mode.h"
+#include "shared_ram_arena.h"
 
 // A 4-track MIDI looper. Each track is filtered to one MIDI channel: any
 // channel-voice message arriving on that channel gets captured into that
@@ -121,8 +122,16 @@ struct LoopTrack {
 // the one point that actually needs the RAM back: entering File Player
 // mode. All 37 existing tracks[i]/LoopTrack& call sites throughout this
 // file are untouched by this -- T* and T[N] support operator[] identically.
+//
+// Backed by SharedRamArena rather than a plain heap new[] -- see that
+// header's comment for why (a real-hardware freeze traced to this exact
+// 131KB allocation hanging once the heap had already served other,
+// smaller allocations first). enter()/freeTracksIfAllocated() placement-
+// new/explicitly-destruct into that fixed block instead of new[]/delete[],
+// so allocation can never fail and never touches the general heap's
+// allocator at all -- tracksAllocFailed and its "Not enough RAM" path
+// existed only for the old new(nothrow) path and are gone with it.
 LoopTrack* tracks = nullptr;
-bool tracksAllocFailed = false; // set by enter() if the lazy allocation fails; see update()'s first line
 int selectedTrack = 0;
 // The row cursor is really 5 positions (4 tracks + BPM), circular --
 // selectedTrack always holds a valid track index (0..3) regardless, and
@@ -3352,7 +3361,17 @@ void updateMenu() {
         screen = SCREEN_MAIN;
         needsRedraw = true;
     }
-    if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
+    // Release- rather than press-triggered: this menu is itself opened by
+    // a release-triggered ENTER tap (see updateMainScreen()), so by the
+    // time it's showing the button is already up and a selection here is
+    // always a deliberate fresh press+release, never a leftover from
+    // opening the menu. Needed so every screen this leads into (in
+    // particular SCREEN_LOAD_MENU, see updateLoadMenu()) also starts with
+    // the button already up -- if this fired on press instead, the
+    // trailing release of that same press would land in whichever screen
+    // comes next and could get misread as an immediate action there (see
+    // updateLoadMenu()'s own comment for the concrete case this caused).
+    if (Input::justReleased(BTN_ENTER) || Input::justReleased(BTN_PLAY)) {
         if (menuCursor == 0) {
             saveMenuCursor = 0;
             screen = SCREEN_SAVE_MENU;
@@ -3645,7 +3664,14 @@ void updateLoadMenu() {
         screen = SCREEN_MENU;
         Ui::drawEntryMenu("Loops", menuLabels, MENU_COUNT, menuCursor);
     }
-    if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
+    // Release- rather than press-triggered -- beginLoadLoopBrowse() below
+    // switches straight to SCREEN_LOAD_LOOP_BROWSE, which itself commits
+    // ENTER's tap on release (see updateLoadLoopBrowse()); firing this on
+    // press instead left that same physical press's later release to land
+    // in the new screen and get read as an immediate tap on its first
+    // entry, loading/entering it unintentionally before the user ever let
+    // go of the button they used to open the browser.
+    if (Input::justReleased(BTN_ENTER) || Input::justReleased(BTN_PLAY)) {
         if (loadMenuCursor == 0) {
             beginLoadLoopBrowse();
         } else {
@@ -4007,7 +4033,14 @@ bool hasUnsavedTrackContent() {
 }
 
 void freeTracksIfAllocated() {
-    delete[] tracks;
+    // Not a heap allocation (see SharedRamArena) -- no delete[], just end
+    // each element's lifetime in place so the same bytes are safe for
+    // whichever of ModPlayer/S3mPlayer/XmPlayer placement-news into them
+    // next (see shared_ram_arena.h). No-op (the loop just doesn't run) if
+    // tracks was never allocated -- same as the old delete[] on nullptr.
+    if (tracks) {
+        for (int i = 0; i < NUM_TRACKS; i++) tracks[i].~LoopTrack();
+    }
     tracks = nullptr;
 }
 
@@ -4048,28 +4081,32 @@ void begin() {
 }
 
 void enter() {
-    tracksAllocFailed = false;
+    static_assert(sizeof(LoopTrack) * NUM_TRACKS <= SharedRamArena::SIZE,
+                  "LoopTrack[NUM_TRACKS] no longer fits SharedRamArena -- see shared_ram_arena.h");
     if (!tracks) {
         // Drop loopBrowser's own heap buffers (if it's holding any --
         // e.g. left over from a "Load Selected Loop" visit before tracks[]
-        // was last freed for FilePlayerMode's benefit) before the big
-        // allocation below -- pure disposable scan data, cheaply rebuilt
-        // next time that screen opens (beginLoadLoopBrowse() always
-        // refreshes unconditionally), so no confirmation needed. main.cpp
-        // does the equivalent for FilePlayerMode's own browser right
-        // before calling into here -- see FilePlayerMode::
-        // freeBrowserBuffers()'s comment.
+        // was last freed for FilePlayerMode's benefit) before the
+        // placement-new below -- pure disposable scan data, cheaply
+        // rebuilt next time that screen opens (beginLoadLoopBrowse()
+        // always refreshes unconditionally), so no confirmation needed.
+        // main.cpp does the equivalent for FilePlayerMode's own browser
+        // right before calling into here -- see FilePlayerMode::
+        // freeBrowserBuffers()'s comment. Not RAM-motivated anymore now
+        // that tracks[] doesn't compete with the heap at all (see
+        // shared_ram_arena.h), just keeping the screen from showing a
+        // stale index if loopBrowser is later reopened.
         loopBrowser.freeBuffers();
-        tracks = new (std::nothrow) LoopTrack[NUM_TRACKS];
-        if (!tracks) {
-            // Extremely unlikely given the RAM budget this was sized
-            // against, but fail safe rather than let anything below
-            // dereference a null tracks -- bounce back to Mode Select
-            // instead of pretending the looper is usable.
-            tracksAllocFailed = true;
-            showFlashMessage("Not enough RAM", "for looper", 1500);
-            return;
-        }
+        // Scalar placement-new per element, not `new (ptr) LoopTrack[N]`
+        // -- array placement-new is free to reserve a few extra bytes
+        // ahead of the returned pointer for an array cookie (so a later
+        // delete[] knows the element count), which would write outside
+        // SharedRamArena's exactly-sized buffer. Looping scalar
+        // placement-new sidesteps that entirely, at the cost of needing
+        // the matching per-element destructor loop in
+        // freeTracksIfAllocated() below instead of a single delete[].
+        tracks = static_cast<LoopTrack*>(SharedRamArena::data());
+        for (int i = 0; i < NUM_TRACKS; i++) new (&tracks[i]) LoopTrack();
         // channelOut can't default per-track via a LoopTrack member
         // initializer (those can't see this track's own index) -- set it
         // here instead, once, right after a fresh allocation: track N
@@ -4094,13 +4131,6 @@ void enter() {
 }
 
 bool update() {
-    if (tracksAllocFailed) {
-        // enter() already drew the message via showFlashMessage(); just
-        // let it sit on screen for its duration, then bail out to Mode
-        // Select -- don't fall through to anything below, all of which
-        // assumes tracks != nullptr.
-        return millis() >= flashUntilMs;
-    }
     updatePlayback(); // always runs, regardless of which screen is up, so loops never stall for a menu/prompt
     updateBarQuantizedRecording();
     updateMasterClock(); // same reasoning -- shouldn't stall for a menu/prompt either

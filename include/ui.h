@@ -206,9 +206,25 @@ void drawConfirmDelete(const char* name, bool isDir, bool failed);
 // failure), rather than needing its own display here.
 void drawConfirmOverwrite(const char* name, bool isDir);
 
+// One entry in the live MIDI-in log shown on the Recording screen, between
+// the Events row and the footer (see updateRecordingLog()). A SysEx entry
+// only carries its byte length -- the raw bytes aren't kept around for
+// display, just a count.
+struct MidiLogEntry {
+    bool isSysEx;
+    uint8_t status; // channel-voice entries only
+    uint8_t data1;
+    uint8_t data2;
+    uint8_t len;       // 1 or 2, channel-voice entries only
+    uint16_t sysExLen; // SysEx entries only
+};
+
 // Full redraw of the recording status screen (waiting for input / actively
-// recording / error).
-void drawRecording(const char* filename, const MidiRecorder& recorder);
+// recording / error). `log`/`logCount` are the most recent MIDI-in events
+// (oldest-first, see updateRecordingLog()) to seed the scrolling log with;
+// pass logCount 0 for a fresh recording that hasn't received anything yet.
+void drawRecording(const char* filename, const MidiRecorder& recorder,
+                    const MidiLogEntry* log, int logCount);
 
 // Cheap partial redraw of the recording screen: updates only the elapsed-
 // time and event-count rows. Meant to be called at a low fixed rate while
@@ -216,13 +232,24 @@ void drawRecording(const char* filename, const MidiRecorder& recorder);
 // drawRecording().
 void updateRecordingLive(const MidiRecorder& recorder);
 
+// Redraws the scrolling MIDI-in log on the Recording screen: fills its
+// region and draws up to as many of the most recent `count` entries
+// (oldest-first) as actually fit. Meant to be called from the same low
+// fixed rate tick as updateRecordingLive(), but only when something new
+// has actually arrived -- an idle stretch costs nothing. Also called by
+// drawRecording() itself for the initial/full-redraw case.
+void updateRecordingLog(const MidiLogEntry* entries, int count);
+
 // Full redraw of the SysEx capture screen -- deliberately the same shape
 // as drawRecording() (filename/state/elapsed/message-count rows), plus a
 // receive-activity dot next to the message count: lit while a message
 // arrived within the last moment, dim once it's been quiet a while, so
 // it's obvious at a glance when the dump has actually stopped arriving
 // and it's time to stop & save rather than having to watch the count.
-void drawSysExCapture(const char* filename, const SysExRecorder& recorder);
+// `log`/`logCount` are the same MIDI-in log updateRecordingLog() draws for
+// the plain Recording screen -- every entry here is naturally a SysEx one.
+void drawSysExCapture(const char* filename, const SysExRecorder& recorder,
+                       const MidiLogEntry* log, int logCount);
 
 // Cheap partial redraw of the SysEx capture screen: elapsed time, message
 // count, and the activity dot. Meant to be called at a fairly fast fixed

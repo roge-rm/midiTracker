@@ -17,6 +17,7 @@
 #include "sysex_recorder.h"
 #include "sysex_player.h"
 #include "looper_mode.h" // hasUnsavedTrackContent()/freeTracksIfAllocated()/the free-RAM gate -- see APP_FREE_LOOPER_RAM
+#include "shared_ram_arena.h" // ModPlayer/S3mPlayer/XmPlayer placement-new into the same block as LooperMode::tracks[] -- see that header
 #include "settings_mode.h" // defaultVolume() -- see enter()'s volumeSeededFromSettings comment
 #include "synth.h"
 #include "input.h"
@@ -77,6 +78,16 @@ SdBrowser browser;
 // as a special case for any one format. WavPlayer/SysExPlayer/
 // MidiRecorder/SysExRecorder stay plain value objects -- each only a few
 // hundred bytes, not worth this.
+//
+// modPlayer/s3mPlayer/xmPlayer specifically placement-new into
+// SharedRamArena (the same fixed block LooperMode::tracks[] uses) rather
+// than the general heap -- see that header's comment. player (MidiPlayer)
+// stays on the plain heap: unlike the other three, opening a MIDI file
+// was never gated behind freeing tracks[] first (browsing/MIDI preview/
+// WAV playback never touch that gate, see openSelected()'s FILE_MOD/
+// FILE_S3M/FILE_XM check), so its lifetime isn't guaranteed disjoint from
+// tracks[]'s the way the other three's is -- it can't safely share that
+// block.
 MidiPlayer* player = nullptr;
 WavPlayer wavPlayer;
 ModPlayer* modPlayer = nullptr;
@@ -85,6 +96,41 @@ XmPlayer* xmPlayer = nullptr;
 MidiRecorder recorder;
 SysExPlayer sysexPlayer;
 SysExRecorder sysexRecorder;
+
+// -- live MIDI-in log, shared by the Recording and Capture SysEx screens
+// (see Ui::updateRecordingLog()) -- recorder and sysexRecorder are never
+// both active at once (see enter()'s comment), so one buffer for whichever
+// of the two is actually running is enough; each arm() clears it so a
+// previous take's entries never bleed into the next.
+// A small fixed shift-array rather than a ring buffer -- MIDI_LOG_CAPACITY
+// is tiny (a handful of struct-copies on push is nothing next to an SPI
+// text draw) and this is far easier to read than index/modulo bookkeeping
+// for so little gain. Capacity is a bit larger than what actually fits on
+// screen (Ui::updateRecordingLog() clips to whatever rows fit) so scrolling
+// has a little history to draw from rather than clipping to exactly one
+// screen's worth.
+const int MIDI_LOG_CAPACITY = 8;
+Ui::MidiLogEntry midiLog[MIDI_LOG_CAPACITY];
+int midiLogCount = 0;
+// Set on every push, cleared once the log's been repainted -- lets the
+// APP_RECORDING/APP_CAPTURING_SYSEX ticks below skip the redraw (and its
+// SPI cost) entirely during idle stretches with nothing new to show.
+bool midiLogDirty = false;
+
+// Pushed from the channel-voice/SysEx input-handler callbacks in enter()
+// below, only while the relevant recorder is actually STATE_RECORDING --
+// cheap enough (a struct copy, worst case a 7-element memmove) to call
+// straight from those callbacks with no throttling; the drawing side is
+// what's rate-limited, see APP_RECORDING/APP_CAPTURING_SYSEX's ticks.
+void pushMidiLogEntry(const Ui::MidiLogEntry& e) {
+    if (midiLogCount == MIDI_LOG_CAPACITY) {
+        memmove(&midiLog[0], &midiLog[1], sizeof(Ui::MidiLogEntry) * (MIDI_LOG_CAPACITY - 1));
+        midiLog[MIDI_LOG_CAPACITY - 1] = e;
+    } else {
+        midiLog[midiLogCount++] = e;
+    }
+    midiLogDirty = true;
+}
 
 AppState appState = APP_BROWSE;
 int selectedIndex = 0;
@@ -188,6 +234,19 @@ void cycleOutputTarget() {
 void toggleAudio() {
     audioOn = !audioOn;
     MidiOutput::setAudioOutput(audioOn);
+    if (!audioOn) {
+        // MidiOutput::sendNoteOn()/sendNoteOff() only forward to Synth
+        // while audioOutEnabled() -- so a note whose NoteOn arrived while
+        // audio was on but whose NoteOff arrives after this toggle would
+        // never reach Synth::noteOff(), leaving that voice stuck sounding
+        // forever. Release everything on the way out, same as playback
+        // stop/panic already does (see MidiOutput::allNotesOffAllChannels()'s
+        // own Synth::allNotesOff() call) -- calling Synth::allNotesOff()
+        // directly rather than that wrapper, since this is purely a local-
+        // monitoring toggle and firing CC 120/123 out the actual MIDI ports
+        // too would be an unrelated, unwanted side effect.
+        Synth::allNotesOff();
+    }
 }
 
 void adjustVolume(int delta) {
@@ -424,13 +483,16 @@ void openSelected() {
     }
 
     if (e.kind == FILE_MOD) {
-        // Allocated on demand, freed on the "LEFT -> back to browser"
-        // handler in handlePlayModInput() -- see modPlayer's declaration.
-        if (!modPlayer) modPlayer = new (std::nothrow) ModPlayer();
-        if (!modPlayer) {
-            Ui::drawMessage("Not enough RAM", "to open this file");
-            return; // stay on APP_BROWSE -- next input naturally redraws it
-        }
+        // Placement-new into SharedRamArena rather than a plain heap
+        // new() -- see that header's comment: this shares LooperMode::
+        // tracks[]'s fixed block (the LooperMode::freeTracksIfAllocated()
+        // call just above guarantees tracks is down first), so opening a
+        // .mod can never fail or hang on heap fragmentation the way the
+        // old new(nothrow) path theoretically could. Freed on the "LEFT ->
+        // back to browser" handler in handlePlayModInput().
+        static_assert(sizeof(ModPlayer) <= SharedRamArena::SIZE,
+                      "ModPlayer no longer fits SharedRamArena -- see shared_ram_arena.h");
+        if (!modPlayer) modPlayer = new (SharedRamArena::data()) ModPlayer();
         if (modPlayer->load(path)) modPlayer->play();
         // Same "switch screens either way, error shows on-screen" convention.
         appState = APP_PLAY_MOD;
@@ -439,12 +501,10 @@ void openSelected() {
     }
 
     if (e.kind == FILE_S3M) {
-        // See modPlayer's identical on-demand comment just above.
-        if (!s3mPlayer) s3mPlayer = new (std::nothrow) S3mPlayer();
-        if (!s3mPlayer) {
-            Ui::drawMessage("Not enough RAM", "to open this file");
-            return;
-        }
+        // See modPlayer's identical comment just above.
+        static_assert(sizeof(S3mPlayer) <= SharedRamArena::SIZE,
+                      "S3mPlayer no longer fits SharedRamArena -- see shared_ram_arena.h");
+        if (!s3mPlayer) s3mPlayer = new (SharedRamArena::data()) S3mPlayer();
         if (s3mPlayer->load(path)) s3mPlayer->play();
         // Same "switch screens either way, error shows on-screen" convention.
         appState = APP_PLAY_S3M;
@@ -453,21 +513,14 @@ void openSelected() {
     }
 
     if (e.kind == FILE_XM) {
-        // See modPlayer's identical on-demand comment just above.
-        // Temporary diagnostic (see xm_file.cpp's own g_xmDiag* block) --
-        // real measured heap, not the paper RAM-budget estimate, needed
-        // after a same-session CHUNK_SIZE increase caused a real-hardware
-        // crash that heap exhaustion/fragmentation is the leading
-        // suspect for.
-        Serial.printf("XM alloc: freeHeap=%d usedHeap=%d before sizeof(XmPlayer)=%u\n",
-                       rp2040.getFreeHeap(), rp2040.getUsedHeap(), (unsigned)sizeof(XmPlayer));
-        if (!xmPlayer) xmPlayer = new (std::nothrow) XmPlayer();
-        Serial.printf("XM alloc: freeHeap=%d usedHeap=%d after, xmPlayer=%p\n",
-                       rp2040.getFreeHeap(), rp2040.getUsedHeap(), (void*)xmPlayer);
-        if (!xmPlayer) {
-            Ui::drawMessage("Not enough RAM", "to open this file");
-            return;
-        }
+        // See modPlayer's identical comment just above -- this also
+        // resolves the heap-fragmentation crash the g_xmDiag*/Serial
+        // diagnostics in xm_file.cpp were added to chase (a same-session
+        // CHUNK_SIZE increase crashing on real hardware): XmPlayer no
+        // longer competes with the general heap at all.
+        static_assert(sizeof(XmPlayer) <= SharedRamArena::SIZE,
+                      "XmPlayer no longer fits SharedRamArena -- see shared_ram_arena.h");
+        if (!xmPlayer) xmPlayer = new (SharedRamArena::data()) XmPlayer();
         if (xmPlayer->load(path)) xmPlayer->play();
         // Same "switch screens either way, error shows on-screen" convention.
         appState = APP_PLAY_XM;
@@ -662,6 +715,7 @@ void performNameEntryAction(const char* trimmed) {
         nowRecordingName[sizeof(nowRecordingName) - 1] = '\0';
 
         recorder.arm(path); // failure (e.g. the collision we already cleared reappearing from a race) surfaces via recorder.state() on the recording screen
+        midiLogCount = 0; // clear any previous take's log before this one starts receiving
         appState = APP_RECORDING;
         needsRedraw = true;
         return;
@@ -677,6 +731,7 @@ void performNameEntryAction(const char* trimmed) {
         nowCapturingSysExName[sizeof(nowCapturingSysExName) - 1] = '\0';
 
         sysexRecorder.arm(path); // failure surfaces via sysexRecorder.state() on the capture screen
+        midiLogCount = 0; // clear any previous take's log before this one starts receiving
         appState = APP_CAPTURING_SYSEX;
         needsRedraw = true;
         return;
@@ -920,6 +975,16 @@ bool handleBrowseInput() {
             }
             needsRedraw = true;
         } else {
+            // Leaving the browser entirely from its true root -- unlike
+            // every other goUp() call above, there's no smaller parent
+            // folder's loadEntries() to naturally replace whatever's
+            // currently indexed. If the root itself was a huge folder,
+            // its full index (up to MAX_INDEX_ENTRIES) would otherwise
+            // sit resident for as long as Mode Select/Settings is up,
+            // same disposable-data reclaim reasoning as freeBrowserBuffers()
+            // -- just triggered here instead of waiting for a future
+            // Looper entry to need the RAM back.
+            browser.freeBuffers();
             return true;
         }
     }
@@ -1201,8 +1266,8 @@ void handlePlayModInput() {
         }
     }
     if (Input::justPressed(BTN_LEFT)) {
-        modPlayer->stop(); // already closes SD handles internally -- safe to delete right after
-        delete modPlayer;
+        modPlayer->stop(); // already closes SD handles internally -- safe to destroy right after
+        modPlayer->~ModPlayer(); // not heap-owned (see SharedRamArena) -- no delete
         modPlayer = nullptr;
         appState = APP_BROWSE;
         needsRedraw = true;
@@ -1253,8 +1318,8 @@ void handlePlayS3mInput() {
         }
     }
     if (Input::justPressed(BTN_LEFT)) {
-        s3mPlayer->stop(); // already closes SD handles internally -- safe to delete right after
-        delete s3mPlayer;
+        s3mPlayer->stop(); // already closes SD handles internally -- safe to destroy right after
+        s3mPlayer->~S3mPlayer(); // not heap-owned (see SharedRamArena) -- no delete
         s3mPlayer = nullptr;
         appState = APP_BROWSE;
         needsRedraw = true;
@@ -1304,8 +1369,8 @@ void handlePlayXmInput() {
         }
     }
     if (Input::justPressed(BTN_LEFT)) {
-        xmPlayer->stop(); // already closes SD handles internally -- safe to delete right after
-        delete xmPlayer;
+        xmPlayer->stop(); // already closes SD handles internally -- safe to destroy right after
+        xmPlayer->~XmPlayer(); // not heap-owned (see SharedRamArena) -- no delete
         xmPlayer = nullptr;
         appState = APP_BROWSE;
         needsRedraw = true;
@@ -1684,6 +1749,9 @@ void enter() {
     // them over instead whenever it's the active one.
     MidiOutput::setInputHandler([](uint8_t status, uint8_t d1, uint8_t d2, uint8_t len) {
         recorder.feed(status, d1, d2, len);
+        if (recorder.state() == MidiRecorder::STATE_RECORDING) {
+            pushMidiLogEntry({false, status, d1, d2, len, 0});
+        }
     });
     // Both feed() calls below self-guard on their own ARMED/RECORDING
     // state (same as the channel-voice handler above), so it's safe to
@@ -1696,6 +1764,14 @@ void enter() {
     MidiOutput::setSysExHandler([](const uint8_t* data, size_t len) {
         recorder.feedSysEx(data, len);
         sysexRecorder.feed(data, len);
+        // Both recorders self-guard on their own ARMED/RECORDING state
+        // (see the comment below), and only one of APP_RECORDING/
+        // APP_CAPTURING_SYSEX is ever current, so at most one of these is
+        // ever true -- same log/gate either way.
+        if (recorder.state() == MidiRecorder::STATE_RECORDING ||
+            sysexRecorder.state() == SysExRecorder::STATE_RECORDING) {
+            pushMidiLogEntry({true, 0, 0, 0, 0, (uint16_t)len});
+        }
     });
     MidiOutput::setTarget(outputTarget);
     // Seed from the Settings default exactly once, same "don't clobber a
@@ -1916,6 +1992,13 @@ bool update() {
             if (recorder.state() == MidiRecorder::STATE_RECORDING && now - lastRecTick >= 100) {
                 lastRecTick = now;
                 Ui::updateRecordingLive(recorder);
+                // Only when something new actually arrived -- most 100ms
+                // ticks during a quiet stretch have nothing to redraw, and
+                // skipping the call skips its SPI cost entirely.
+                if (midiLogDirty) {
+                    midiLogDirty = false;
+                    Ui::updateRecordingLog(midiLog, midiLogCount);
+                }
             }
             break;
         }
@@ -1944,6 +2027,10 @@ bool update() {
             if (sysexRecorder.state() == SysExRecorder::STATE_RECORDING && now - lastSysExRecTick >= 100) {
                 lastSysExRecTick = now;
                 Ui::updateSysExCaptureLive(sysexRecorder);
+                if (midiLogDirty) {
+                    midiLogDirty = false;
+                    Ui::updateRecordingLog(midiLog, midiLogCount);
+                }
             }
             break;
         }
@@ -2030,7 +2117,8 @@ bool update() {
             }
 
             case APP_RECORDING:
-                Ui::drawRecording(nowRecordingName, recorder);
+                Ui::drawRecording(nowRecordingName, recorder, midiLog, midiLogCount);
+                midiLogDirty = false; // just drawn above, nothing new to catch on the next tick
                 break;
 
             case APP_CONFIRM_CANCEL_RECORDING:
@@ -2043,7 +2131,8 @@ bool update() {
                 break;
 
             case APP_CAPTURING_SYSEX:
-                Ui::drawSysExCapture(nowCapturingSysExName, sysexRecorder);
+                Ui::drawSysExCapture(nowCapturingSysExName, sysexRecorder, midiLog, midiLogCount);
+                midiLogDirty = false; // just drawn above, nothing new to catch on the next tick
                 break;
 
             case APP_CONFIRM_CANCEL_SYSEX_CAPTURE:
