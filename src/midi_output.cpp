@@ -293,6 +293,31 @@ uint8_t noteVelocity(uint8_t note) {
     return note < 128 ? g_noteVelocity[note] : 0;
 }
 
+bool isChannelActive(uint8_t channel) {
+    if (channel >= 16) return false;
+    uint16_t bit = (uint16_t)(1u << channel);
+    for (int note = 0; note < 128; note++) {
+        if (g_noteChannelMask[note] & bit) return true;
+    }
+    return false;
+}
+
+uint16_t activeChannelMask() {
+    uint16_t mask = 0;
+    for (int note = 0; note < 128; note++) mask |= g_noteChannelMask[note];
+    return mask;
+}
+
+void noteActivityIn(uint8_t channel, uint8_t note, uint8_t velocity) {
+    if (note >= 128) return;
+    if (velocity > 0) {
+        g_noteChannelMask[note] |= (uint16_t)(1u << channel);
+        g_noteVelocity[note] = velocity;
+    } else {
+        g_noteChannelMask[note] &= (uint16_t)~(1u << channel);
+    }
+}
+
 void setInputHandler(InputHandler handler) { g_inputHandler = handler; }
 void setSysExHandler(SysExHandler handler) { g_sysExHandler = handler; }
 void setRealtimeHandler(RealtimeHandler handler) { g_realtimeHandler = handler; }

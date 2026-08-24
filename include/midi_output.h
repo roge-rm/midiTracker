@@ -107,6 +107,34 @@ uint8_t noteVelocity(uint8_t note); // last note-on velocity; meaningful while i
 // they share the same note-number range.
 bool isNotePercussion(uint8_t note);
 
+// True if any note is currently held on `channel` (0-15) specifically --
+// derived from the same per-note channel bitmask isNoteActive() reads, so
+// it reflects both real outgoing notes (sendNoteOn()/sendNoteOff(), e.g.
+// file playback) and visualization-only ones (noteActivityIn(), e.g.
+// pariSynth's own live MIDI input) with no extra bookkeeping of its own --
+// a caller doesn't need to know or care which source lit a channel up.
+// Drives pariSynth's per-channel "receiving notes" glow (see
+// Ui::drawPariSynthPlay()'s activeMask parameter).
+bool isChannelActive(uint8_t channel);
+
+// All 16 channels' isChannelActive() at once, as a bitmask (bit N =
+// channel N) -- one pass over the same per-note data instead of 16
+// separate scans, for callers that want the whole picture at once (a
+// full-grid redraw) rather than checking one channel at a time (a single
+// Note On/Off event).
+uint16_t activeChannelMask();
+
+// Visualization-only bookkeeping for a note this device did NOT play
+// itself but wants shown on the note-activity strip anyway -- namely
+// PariSynthMode's live incoming-MIDI input, which drives Synth::noteOn()/
+// noteOff() directly rather than through sendNoteOn()/sendNoteOff() (that
+// pair would additionally transmit the note back out over HW/USB, double-
+// sending on top of whatever MIDI Thru already independently forwards).
+// Same channel-bitmask/velocity bookkeeping as sendNoteOn()/sendNoteOff(),
+// just without the Synth::/HW/USB side effects; `velocity` 0 means note-
+// off, same convention used everywhere else in this file.
+void noteActivityIn(uint8_t channel, uint8_t note, uint8_t velocity);
+
 // Called for every incoming channel-voice message read from either
 // transport (merged into one stream), e.g. to feed a MidiRecorder.
 // `len` is 1 for Program Change/Channel Pressure, 2 otherwise.

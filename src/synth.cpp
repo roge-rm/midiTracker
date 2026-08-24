@@ -17,6 +17,13 @@ const uint32_t MSG_TYPE_OUTPUT_LEVEL = 0x3u;
 const uint32_t MSG_TYPE_REVERB_ENABLED = 0x4u;
 const uint32_t MSG_TYPE_REVERB_MIX = 0x5u;
 const uint32_t MSG_TYPE_REVERB_TYPE = 0x6u;
+// Doorbell only -- the actual preset fields are written directly into the
+// shared PRESETS[]/DRUM_PRESETS[] arrays by Synth::setInstrumentPreset()/
+// setDrumPreset() before this is pushed (see synth.h's long comment on
+// why that's safe); this message just tells core 1 which index's derived
+// caches (filter alpha, vibrato/tremolo/PWM depth) need recomputing.
+const uint32_t MSG_TYPE_PRESET_DIRTY = 0x7u;
+const uint32_t MSG_TYPE_DRUM_PRESET_DIRTY = 0x8u;
 const uint32_t PANIC_MSG = 0xFFFFFFFFu;
 const uint32_t RESET_PROGRAMS_MSG = 0xFFFFFFFEu;
 
@@ -43,6 +50,12 @@ inline uint32_t packReverbMixMsg(uint8_t percent) {
 }
 inline uint32_t packReverbTypeMsg(uint8_t type) {
     return (MSG_TYPE_REVERB_TYPE << 28) | type;
+}
+inline uint32_t packPresetDirtyMsg(uint8_t family) {
+    return (MSG_TYPE_PRESET_DIRTY << 28) | family;
+}
+inline uint32_t packDrumPresetDirtyMsg(uint8_t drumType) {
+    return (MSG_TYPE_DRUM_PRESET_DIRTY << 28) | drumType;
 }
 
 // Set by Synth::begin() on core 0, polled by setup1() on core 1 -- see
@@ -465,7 +478,7 @@ struct InstrumentPreset {
 // a gentle tremolo alongside their existing vibrato for a bit of shimmer.
 // Everything else stays at 0/0 -- not every instrument needs movement on
 // top of what the filter/vibrato pass already gave it.
-const InstrumentPreset PRESETS[16] = {
+const InstrumentPreset DEFAULT_PRESETS[16] = {
     /* 0 Piano             */ {WAVE_TRIANGLE, 50, 4000, 40, 12000, 6500.0f, 0.0f, 0.0f, 0.0f},
     /* 1 Chromatic Percus. */ {WAVE_SINE, 20, 3000, 15, 30000, 18000.0f, 0.0f, 0.0f, 0.0f},
     /* 2 Organ             */ {WAVE_SQUARE, 10, 0, 100, 800, 9000.0f, 0.0f, 18.0f, 15.0f},
@@ -483,6 +496,23 @@ const InstrumentPreset PRESETS[16] = {
     /*14 Percussive        */ {WAVE_SQUARE, 10, 1500, 5, 800, 7000.0f, 0.0f, 0.0f, 0.0f},
     /*15 Sound Effects     */ {WAVE_SINE, 50, 2000, 30, 3000, 18000.0f, 0.0f, 0.0f, 0.0f},
 };
+
+// Short display names, in the same order as DEFAULT_PRESETS/PRESETS --
+// used by both the pariSynth editor's UI and its .syn bank files (see
+// Synth::instrumentFamilyName()). Matches the family comments above.
+const char* const INSTRUMENT_FAMILY_NAMES[16] = {
+    "Piano", "Chrom.Percus.", "Organ", "Guitar", "Bass", "Strings",
+    "Ensemble", "Brass", "Reed", "Pipe", "SynthLead", "SynthPad",
+    "SynthFX", "Ethnic", "Percussive", "SoundFX",
+};
+
+// Live-editable copy of DEFAULT_PRESETS above -- what note-start actually
+// reads (startMelodicVoice(), unchanged by this addition). Initialized
+// from DEFAULT_PRESETS in setup1(); mutated only via
+// Synth::setInstrumentPreset()/resetInstrumentPresetToDefault(), both of
+// which write here directly from core 0 -- see synth.h's long comment on
+// why that's safe. Not const.
+InstrumentPreset PRESETS[16];
 
 // Basic synthesized drum kit: the GM percussion key map assigns specific
 // meanings to note numbers 27-87 on the percussion channel; this buckets
@@ -509,7 +539,7 @@ struct DrumPreset {
                      // had to carry closed-hat-vs-cymbal distinctiveness.
 };
 
-const DrumPreset DRUM_PRESETS[DRUM_TYPE_COUNT] = {
+const DrumPreset DEFAULT_DRUM_PRESETS[DRUM_TYPE_COUNT] = {
     // decaySamples bumped up for Kick/Tom (7000->8500, 8000->9500, ~20%
     // longer) for a fuller low-end body/tail -- see startPercussionVoice()'s
     // comment for the accompanying extra level boost these two get. Pitch
@@ -535,6 +565,36 @@ const DrumPreset DRUM_PRESETS[DRUM_TYPE_COUNT] = {
     /*WOODBLOCK  */ {WAVE_SINE, 900.0f, 900, 300.0f, 150, 18000.0f},
     /*DEFAULT    */ {WAVE_NOISE, 0.0f, 3000, 0.0f, 0, 6000.0f},
 };
+
+// Short display names, same order/meaning as DrumType/DEFAULT_DRUM_PRESETS
+// above -- see Synth::drumPresetName().
+const char* const DRUM_PRESET_NAMES[DRUM_TYPE_COUNT] = {
+    "Kick", "Snare", "ClosedHat", "OpenHat", "Tom", "Cymbal", "Woodblock", "Default",
+};
+
+// Live-editable copy of DEFAULT_DRUM_PRESETS above -- see PRESETS[16]'s
+// identical comment just above; same pattern, same safety argument.
+DrumPreset DRUM_PRESETS[DRUM_TYPE_COUNT];
+
+// Recomputes PRESETS[family]'s derived caches (filter alpha, vibrato/
+// tremolo/PWM depth in Q16) from its current field values -- called once
+// per family from setup1(), and again for a single family whenever
+// Synth::setInstrumentPreset()/resetInstrumentPresetToDefault() pushes a
+// MSG_TYPE_PRESET_DIRTY doorbell (see loop1()). cutoffHzToAlphaQ14() is
+// declared further up this file (used by setup1() already, before this
+// function existed).
+void recomputeInstrumentPresetCache(int family) {
+    g_presetFilterAlpha[family] = cutoffHzToAlphaQ14(PRESETS[family].cutoffHz);
+    g_presetVibratoDepthQ16[family] = (uint32_t)(PRESETS[family].vibratoDepthPercent / 100.0f * 65536.0f + 0.5f);
+    g_presetTremoloDepthQ16[family] = (uint32_t)(PRESETS[family].tremoloDepthPercent / 100.0f * 65536.0f + 0.5f);
+    g_presetPwmDepthQ16[family] = (uint32_t)(PRESETS[family].pwmDepthPercent / 100.0f * 65536.0f + 0.5f);
+}
+
+// Same as recomputeInstrumentPresetCache() above, for one drum type's
+// single derived cache value.
+void recomputeDrumPresetCache(int drumType) {
+    g_drumFilterAlpha[drumType] = cutoffHzToAlphaQ14(DRUM_PRESETS[drumType].cutoffHz);
+}
 
 DrumType classifyDrum(uint8_t note) {
     switch (note) {
@@ -1339,6 +1399,18 @@ void Synth::noteOff(uint8_t note) {
 }
 
 void Synth::programChange(uint8_t channel, uint8_t program) {
+    // Written here immediately, not just via the FIFO message below --
+    // Synth::getChannelProgram() reads g_channelProgram[] directly, and a
+    // caller that reads it back on the very same tick (e.g. pariSynth's
+    // manual EDIT+LEFT/RIGHT handler, which calls
+    // Ui::updatePariSynthChannelCell() right after this) would otherwise
+    // often see the stale value -- core1 only applies the FIFO message
+    // whenever it next drains its queue, not synchronously. Plain uint8_t
+    // writes are already treated as safely atomic across cores in this
+    // codebase (see synth.h's comment on the live-editable preset arrays);
+    // core1's own write of the identical value when it later drains the
+    // FIFO is redundant but harmless.
+    g_channelProgram[channel] = program;
     rp2040.fifo.push(packProgramMsg(channel, program));
 }
 
@@ -1372,6 +1444,100 @@ void Synth::setReverbMix(uint8_t percent) {
 void Synth::setReverbType(uint8_t type) {
     if (type > 2) type = 0;
     rp2040.fifo.push(packReverbTypeMsg(type));
+}
+
+// -- Instrument/drum preset editing (see synth.h's long comment) --------
+// Waveform/SynthWaveform enumerator order is kept identical by
+// construction (see both declarations), so these are plain value casts,
+// not a lookup -- but written as named functions rather than an inline
+// static_cast at each call site so a future reordering of either enum
+// fails loudly (a bad cast here is easy to spot; a silent static_cast
+// elsewhere is not).
+Waveform toInternalWaveform(Synth::SynthWaveform w) { return (Waveform)w; }
+Synth::SynthWaveform toPublicWaveform(Waveform w) { return (Synth::SynthWaveform)w; }
+
+const char* Synth::instrumentFamilyName(uint8_t family) {
+    if (family >= 16) return "";
+    return INSTRUMENT_FAMILY_NAMES[family];
+}
+
+void Synth::getInstrumentPreset(uint8_t family, Synth::InstrumentPresetParams& out) {
+    if (family >= 16) return;
+    const InstrumentPreset& p = PRESETS[family];
+    out.waveform = toPublicWaveform(p.waveform);
+    out.attackSamples = p.attackSamples;
+    out.decaySamples = p.decaySamples;
+    out.sustainPercent = p.sustainPercent;
+    out.releaseSamples = p.releaseSamples;
+    out.cutoffHz = p.cutoffHz;
+    out.vibratoDepthPercent = p.vibratoDepthPercent;
+    out.tremoloDepthPercent = p.tremoloDepthPercent;
+    out.pwmDepthPercent = p.pwmDepthPercent;
+}
+
+void Synth::setInstrumentPreset(uint8_t family, const Synth::InstrumentPresetParams& in) {
+    if (family >= 16) return;
+    InstrumentPreset& p = PRESETS[family];
+    p.waveform = toInternalWaveform(in.waveform);
+    p.attackSamples = in.attackSamples;
+    p.decaySamples = in.decaySamples;
+    p.sustainPercent = in.sustainPercent;
+    p.releaseSamples = in.releaseSamples;
+    p.cutoffHz = in.cutoffHz;
+    p.vibratoDepthPercent = in.vibratoDepthPercent;
+    p.tremoloDepthPercent = in.tremoloDepthPercent;
+    p.pwmDepthPercent = in.pwmDepthPercent;
+    rp2040.fifo.push(packPresetDirtyMsg(family));
+}
+
+void Synth::resetInstrumentPresetToDefault(uint8_t family) {
+    if (family >= 16) return;
+    PRESETS[family] = DEFAULT_PRESETS[family];
+    rp2040.fifo.push(packPresetDirtyMsg(family));
+}
+
+const char* Synth::drumPresetName(uint8_t drumType) {
+    if (drumType >= DRUM_TYPE_COUNT) return "";
+    return DRUM_PRESET_NAMES[drumType];
+}
+
+void Synth::getDrumPreset(uint8_t drumType, Synth::DrumPresetParams& out) {
+    if (drumType >= DRUM_TYPE_COUNT) return;
+    const DrumPreset& p = DRUM_PRESETS[drumType];
+    out.waveform = toPublicWaveform(p.waveform);
+    out.basePitchHz = p.basePitchHz;
+    out.decaySamples = p.decaySamples;
+    out.pitchDropStartHz = p.pitchDropStartHz;
+    out.pitchDropSamples = p.pitchDropSamples;
+    out.cutoffHz = p.cutoffHz;
+}
+
+void Synth::setDrumPreset(uint8_t drumType, const Synth::DrumPresetParams& in) {
+    if (drumType >= DRUM_TYPE_COUNT) return;
+    DrumPreset& p = DRUM_PRESETS[drumType];
+    p.waveform = toInternalWaveform(in.waveform);
+    p.basePitchHz = in.basePitchHz;
+    p.decaySamples = in.decaySamples;
+    p.pitchDropStartHz = in.pitchDropStartHz;
+    p.pitchDropSamples = in.pitchDropSamples;
+    p.cutoffHz = in.cutoffHz;
+    rp2040.fifo.push(packDrumPresetDirtyMsg(drumType));
+}
+
+void Synth::resetDrumPresetToDefault(uint8_t drumType) {
+    if (drumType >= DRUM_TYPE_COUNT) return;
+    DRUM_PRESETS[drumType] = DEFAULT_DRUM_PRESETS[drumType];
+    rp2040.fifo.push(packDrumPresetDirtyMsg(drumType));
+}
+
+void Synth::resetAllPresetsToDefault() {
+    for (uint8_t i = 0; i < 16; i++) Synth::resetInstrumentPresetToDefault(i);
+    for (uint8_t i = 0; i < DRUM_TYPE_COUNT; i++) Synth::resetDrumPresetToDefault(i);
+}
+
+uint8_t Synth::getChannelProgram(uint8_t channel) {
+    if (channel >= 16) return 0;
+    return g_channelProgram[channel];
 }
 
 // -- WAV playback stream (see synth.h) -- called from core 0 (WavPlayer);
@@ -1434,13 +1600,15 @@ void setup1() {
         g_sineTable[i] = (int16_t)(32000.0f * sinf(2.0f * (float)M_PI * i / SINE_TABLE_SIZE));
     }
 
-    for (int i = 0; i < 16; i++) g_presetFilterAlpha[i] = cutoffHzToAlphaQ14(PRESETS[i].cutoffHz);
-    for (int i = 0; i < DRUM_TYPE_COUNT; i++) g_drumFilterAlpha[i] = cutoffHzToAlphaQ14(DRUM_PRESETS[i].cutoffHz);
-    for (int i = 0; i < 16; i++) {
-        g_presetVibratoDepthQ16[i] = (uint32_t)(PRESETS[i].vibratoDepthPercent / 100.0f * 65536.0f + 0.5f);
-        g_presetTremoloDepthQ16[i] = (uint32_t)(PRESETS[i].tremoloDepthPercent / 100.0f * 65536.0f + 0.5f);
-        g_presetPwmDepthQ16[i] = (uint32_t)(PRESETS[i].pwmDepthPercent / 100.0f * 65536.0f + 0.5f);
-    }
+    // Seed the live-editable preset tables from their shipped defaults --
+    // see PRESETS[16]/DRUM_PRESETS[]'s comments just above their
+    // declarations. Must happen before the cache-fill loops right below,
+    // which read PRESETS[i]/DRUM_PRESETS[i].
+    for (int i = 0; i < 16; i++) PRESETS[i] = DEFAULT_PRESETS[i];
+    for (int i = 0; i < DRUM_TYPE_COUNT; i++) DRUM_PRESETS[i] = DEFAULT_DRUM_PRESETS[i];
+
+    for (int i = 0; i < 16; i++) recomputeInstrumentPresetCache(i);
+    for (int i = 0; i < DRUM_TYPE_COUNT; i++) recomputeDrumPresetCache(i);
     g_lfoPhaseInc = hzToPhaseInc(LFO_RATE_HZ);
     g_reverbChorusLfoPhaseInc = hzToPhaseInc(REVERB_CHORUS_LFO_RATE_HZ);
     g_masterGainQ16 = volumePercentToGainQ16(80); // matches the previous default percent
@@ -1495,6 +1663,16 @@ void loop1() {
         if (type == MSG_TYPE_REVERB_TYPE) {
             uint8_t t = (uint8_t)(msg & 0xFF);
             if (t <= REVERB_TYPE_SHIMMER && t != g_reverbType) reverbTypeChanged(t);
+            continue;
+        }
+        if (type == MSG_TYPE_PRESET_DIRTY) {
+            uint8_t family = (uint8_t)(msg & 0xFF);
+            if (family < 16) recomputeInstrumentPresetCache(family);
+            continue;
+        }
+        if (type == MSG_TYPE_DRUM_PRESET_DIRTY) {
+            uint8_t drumType = (uint8_t)(msg & 0xFF);
+            if (drumType < DRUM_TYPE_COUNT) recomputeDrumPresetCache(drumType);
             continue;
         }
         uint8_t channel = (msg >> 16) & 0x0F;

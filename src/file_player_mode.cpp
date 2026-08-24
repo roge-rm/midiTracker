@@ -19,6 +19,8 @@
 #include "looper_mode.h" // hasUnsavedTrackContent()/freeTracksIfAllocated()/the free-RAM gate -- see APP_FREE_LOOPER_RAM
 #include "settings_mode.h" // defaultVolume() -- see enter()'s volumeSeededFromSettings comment
 #include "synth.h"
+#include "synth_editor.h"
+#include "pari_synth_grid.h"
 #include "input.h"
 #include "ui.h"
 #include "keyboard_layout.h"
@@ -43,6 +45,20 @@ enum AppState {
     APP_CAPTURING_SYSEX,          // waiting for/capturing an incoming .syx dump
     APP_CONFIRM_CANCEL_SYSEX_CAPTURE, // same as APP_CONFIRM_CANCEL_RECORDING, for a SysEx capture
     APP_LOOPER_TRACK_PICK, // "Load to Looper": pick which of the 4 tracks to load the selected .mid into
+    // pariSynth quick-edit overlay, opened via EDIT (tap) from APP_PLAY
+    // (only -- .wav/.mod/.s3m/.xm playback never drives
+    // Synth::noteOn/programChange at all, so editing presets while one of
+    // those plays would have no audible effect, not worth wiring a
+    // shortcut for). Two sub-screens, tracked by synthEditShowingGrid:
+    // first the same 16-channel grid PariSynthMode's own play screen shows
+    // (Ui::drawPariSynthPlay(), reused as-is), then -- once a channel's
+    // picked -- SynthEditor's field editor (see synth_editor.h) for that
+    // channel's instrument/drum. player->update() keeps being ticked
+    // unconditionally while either sub-screen is active (see update()'s
+    // top, before the input-handling switch) so the file keeps playing in
+    // the background the whole time -- see handlePlayInput()'s ALT+EDIT
+    // check and this state's own case in update().
+    APP_SYNTH_EDIT,
     // Shown instead of actually opening a .mod/.s3m/.xm file (see openSelected())
     // when LooperMode::tracks[] is holding unsaved loop content that needs
     // freeing first -- browsing, MIDI preview, and WAV playback never
@@ -133,6 +149,36 @@ bool stoppedViaNav = false;
 // tap, same tap-vs-hold disambiguation LooperMode uses for its own
 // Metro/Count-In EDIT-tap-vs-EDIT-held rows.
 bool editUsedAsModifier = false;
+
+// Same tap-vs-hold-modifier disambiguation as editUsedAsModifier above,
+// for ALT: a bare tap cycles the MIDI output target (cycleOutputTarget()),
+// but ALT held + EDIT (tap) toggles Audio instead (see handlePlayInput()'s
+// ALT+EDIT check) -- set true the moment that combo fires, so ALT's own
+// release doesn't ALSO cycle the output target for the same physical
+// press.
+bool altUsedAsModifier = false;
+
+// -- APP_SYNTH_EDIT: pariSynth channel-grid quick-edit overlay -----------
+//
+// ALT+EDIT opens the same 16-channel grid PariSynthMode's own play screen
+// shows -- input handling for it is owned by the shared PariSynthGrid
+// component (see pari_synth_grid.h), not hand-written here, so this
+// screen behaves identically to PariSynthMode's own (manual EDIT+LEFT/
+// RIGHT reassignment, EDIT-tap to edit, ENTER for the bank menu, PLAY for
+// the picker, EDIT+UP/DOWN for volume, all included) instead of the
+// smaller hand-rolled subset this used to implement separately. Wraps
+// SynthEditor the same way PariSynthMode itself does: SynthEditor::
+// update() returning true means "the field editor was backed out of",
+// which resumes this grid rather than exiting APP_SYNTH_EDIT outright --
+// NAV/LEFT from the grid itself is what actually returns to APP_PLAY (see
+// pari_synth_grid.h's own comment on why that deliberately does NOT call
+// MidiOutput::allNotesOffAllChannels() the way PariSynthMode's own exit
+// does -- the file is still playing underneath). No live-input
+// registration here either way -- this is reached mid-playback, where the
+// file's own Program Change events already drive every channel, and
+// FilePlayerMode's existing MIDI Thru/input handler stays registered
+// throughout (see APP_SYNTH_EDIT's own enum comment).
+bool synthEditShowingGrid = false; // false once the field editor (SynthEditor) has draw/input focus
 
 // -- shared name-entry editor state (New Recording / New Folder / Rename) --
 NamePurpose namePurpose = NAME_NEW_RECORDING;
@@ -454,16 +500,7 @@ void openSelected() {
 
     if (e.kind == FILE_XM) {
         // See modPlayer's identical on-demand comment just above.
-        // Temporary diagnostic (see xm_file.cpp's own g_xmDiag* block) --
-        // real measured heap, not the paper RAM-budget estimate, needed
-        // after a same-session CHUNK_SIZE increase caused a real-hardware
-        // crash that heap exhaustion/fragmentation is the leading
-        // suspect for.
-        Serial.printf("XM alloc: freeHeap=%d usedHeap=%d before sizeof(XmPlayer)=%u\n",
-                       rp2040.getFreeHeap(), rp2040.getUsedHeap(), (unsigned)sizeof(XmPlayer));
         if (!xmPlayer) xmPlayer = new (std::nothrow) XmPlayer();
-        Serial.printf("XM alloc: freeHeap=%d usedHeap=%d after, xmPlayer=%p\n",
-                       rp2040.getFreeHeap(), rp2040.getUsedHeap(), (void*)xmPlayer);
         if (!xmPlayer) {
             Ui::drawMessage("Not enough RAM", "to open this file");
             return;
@@ -1413,23 +1450,51 @@ void handlePlayInput() {
     // STATE_ERROR replaces this whole row (and everything below State)
     // with the error message -- see drawPlayer() -- so a partial update
     // isn't safe there; fall back to a full redraw in that case.
+    //
+    // ALT is a tap-vs-hold modifier here, same disambiguation as EDIT just
+    // below: a bare tap cycles the MIDI output target, but ALT held + EDIT
+    // (tap) toggles Audio instead (see the combo check just after EDIT's
+    // own tap-vs-hold split) -- the cycle itself is deferred to
+    // justReleased, gated on altUsedAsModifier, so a press that turns into
+    // that combo doesn't ALSO cycle the output target for the same
+    // physical press.
     if (Input::justPressed(BTN_ALT)) {
-        cycleOutputTarget();
-        if (player->state() == MidiPlayer::STATE_ERROR) needsRedraw = true;
-        else Ui::updatePlayerOutputTarget(outputTarget);
+        altUsedAsModifier = false;
+    } else if (Input::justReleased(BTN_ALT)) {
+        if (!altUsedAsModifier) {
+            cycleOutputTarget();
+            if (player->state() == MidiPlayer::STATE_ERROR) needsRedraw = true;
+            else Ui::updatePlayerOutputTarget(outputTarget);
+        }
     }
     // EDIT is a tap-vs-hold modifier here, same disambiguation LooperMode
-    // uses for its own Metro/Count-In rows: tap toggles Audio, but only if
-    // this press wasn't also used as a hold-modifier for Volume
-    // (handleVolumeHold()) or Scrub (handleSeekHold()) below.
+    // uses for its own Metro/Count-In rows: tap opens the pariSynth quick-
+    // edit overlay, but only if this press wasn't also used as a hold-
+    // modifier for Volume (handleVolumeHold()), Scrub (handleSeekHold()),
+    // or ALT+EDIT (below, which toggles Audio instead).
     if (Input::justPressed(BTN_EDIT)) {
         editUsedAsModifier = false;
     } else if (Input::justReleased(BTN_EDIT)) {
         if (!editUsedAsModifier) {
-            toggleAudio();
-            if (player->state() == MidiPlayer::STATE_ERROR) needsRedraw = true;
-            else Ui::updatePlayerAudioState(audioOn);
+            // See APP_SYNTH_EDIT's own case in update(), which keeps
+            // player->update() ticking underneath so playback doesn't
+            // stall while the editor has input/draw focus.
+            appState = APP_SYNTH_EDIT;
+            synthEditShowingGrid = true;
+            PariSynthGrid::enter();
+            needsRedraw = true;
         }
+    }
+    // ALT held + EDIT (tap): toggles Audio on/off, replacing EDIT's own
+    // bare-tap meaning above for this press. Marks both modifiers "used"
+    // so releasing either afterward doesn't also cycle the output target
+    // or open the editor for this same physical press.
+    if (Input::isDown(BTN_ALT) && Input::justPressed(BTN_EDIT)) {
+        altUsedAsModifier = true;
+        editUsedAsModifier = true;
+        toggleAudio();
+        if (player->state() == MidiPlayer::STATE_ERROR) needsRedraw = true;
+        else Ui::updatePlayerAudioState(audioOn);
     }
     handleTempoHold();
     handleVolumeHold();
@@ -1743,13 +1808,29 @@ void enter() {
 bool update() {
     bool exitRequested = false;
 
+    // MidiPlayer::update() paces itself off wall-clock time (micros()
+    // comparisons against each event's own scheduled time), not a tick
+    // counter -- so ticking it here, unconditionally before the state
+    // switch below, rather than nested inside APP_PLAY's own case, keeps
+    // playback exactly on schedule even while APP_SYNTH_EDIT has input/
+    // draw focus instead. This is the only structural change needed to
+    // let a file keep playing in the background while the user edits an
+    // instrument mid-song (see APP_SYNTH_EDIT's own case below).
+    // wavPlayer/modPlayer/s3mPlayer/xmPlayer are untouched -- none of
+    // them drive Synth::noteOn/programChange at all (they render their
+    // own audio directly), so APP_SYNTH_EDIT is only ever reached from
+    // APP_PLAY (see the AppState enum's own comment on why).
+    if (appState == APP_PLAY || appState == APP_SYNTH_EDIT) {
+        player->update();
+    }
+
     switch (appState) {
         case APP_BROWSE:
             exitRequested = handleBrowseInput();
             break;
 
         case APP_PLAY: {
-            player->update();
+            // player->update() already ticked above.
             // Once the file finishes, keep showing the final "Finished"
             // screen until the user presses a button to go back.
             handlePlayInput();
@@ -1762,6 +1843,64 @@ bool update() {
             if (player->state() == MidiPlayer::STATE_PLAYING && now - lastPlayTick >= 50) {
                 lastPlayTick = now;
                 Ui::updatePlayerLive(*player);
+            }
+            break;
+        }
+
+        case APP_SYNTH_EDIT: {
+            if (synthEditShowingGrid) {
+                // Own input/redraw here, same shape as APP_PLAY's own
+                // handling just above -- see PariSynthGrid::update().
+                PariSynthGrid::Result result = PariSynthGrid::update(volume);
+                if (result == PariSynthGrid::RESULT_OPEN_EDITOR) {
+                    synthEditShowingGrid = false;
+                    break;
+                }
+                if (result == PariSynthGrid::RESULT_EXIT) {
+                    // Deliberately no MidiOutput::allNotesOffAllChannels()
+                    // here, unlike PariSynthMode's own exit -- the file is
+                    // still playing underneath this overlay, and closing
+                    // it must not silence its notes. See pari_synth_grid.h's
+                    // own header comment.
+                    appState = APP_PLAY;
+                    needsRedraw = true;
+                    break;
+                }
+                static uint32_t lastSynthEditLiveMs = 0;
+                uint32_t now = millis();
+                if (now - lastSynthEditLiveMs >= 50) {
+                    lastSynthEditLiveMs = now;
+                    Ui::updatePariSynthPlayLive();
+                    // Unlike PariSynthMode's own grid, nothing here calls
+                    // back into this screen as the file's notes start/stop
+                    // (MidiPlayer just drives MidiOutput::sendNoteOn/
+                    // sendNoteOff on its own schedule, with no hook into
+                    // whatever UI happens to be showing) -- so this poll is
+                    // the only thing keeping each channel's glow current
+                    // while the file keeps playing underneath. Diffed
+                    // against the mask from last tick so only the channels
+                    // that actually changed get repainted, not all 16.
+                    static uint16_t lastSynthEditActiveMask = 0;
+                    uint16_t activeMask = MidiOutput::activeChannelMask();
+                    if (activeMask != lastSynthEditActiveMask) {
+                        uint16_t changed = activeMask ^ lastSynthEditActiveMask;
+                        for (int ch = 0; ch < 16; ch++) {
+                            if (changed & (1u << ch)) {
+                                Ui::updatePariSynthChannelCell(ch, ch == PariSynthGrid::selectedChannel(), (activeMask & (1u << ch)) != 0);
+                            }
+                        }
+                        lastSynthEditActiveMask = activeMask;
+                    }
+                }
+            } else {
+                // SynthEditor::update() handles its own input and redraws
+                // itself every call (see synth_editor.h) -- resume the
+                // channel grid once it reports done, same wrapping
+                // PariSynthMode's own play screen does around SynthEditor.
+                if (SynthEditor::update()) {
+                    synthEditShowingGrid = true;
+                    needsRedraw = true;
+                }
             }
             break;
         }
@@ -1796,43 +1935,17 @@ bool update() {
 
         case APP_PLAY_S3M: {
             s3mPlayer->update();
-
-            // Temporary diagnostic: s3mPlayer->update()'s own "S3M diag:"
-            // print showed busyUs alone reaching ~95% of the 1-second
-            // budget during a busy passage on "The Reflex.s3m" -- close
-            // enough to saturating that any other main-loop work (button
-            // polling, screen redraw) sharing the same core could tip the
-            // total over 100% and explain the remaining underruns even
-            // though update() itself isn't the whole story. Measuring
-            // separately here rather than guessing which of the two (if
-            // either) actually matters.
-            static uint32_t s3mInputUs = 0, s3mUiUs = 0;
-            uint32_t __diagInputStart = micros();
             handlePlayS3mInput();
-            s3mInputUs += micros() - __diagInputStart;
 
-            // Confirmed by the diagnostic above: uiUs alone was running
-            // ~40-49ms/sec (a ~2-2.5ms SPI redraw x up to 20/sec at the
-            // old 50ms throttle) against a busyUs budget already at
-            // ~95% during busy passages -- enough by itself to tip the
-            // combined total over the 1-second real-time budget. A
-            // "Row: N" counter updating 5x/sec instead of 20x/sec is
-            // imperceptible, so widening the throttle is free headroom.
+            // 200ms, not 50ms -- a busy S3M passage's own mixing cost
+            // leaves little headroom for a frequent SPI redraw on top of
+            // it; a "Row: N" counter updating 5x/sec instead of 20x/sec
+            // is imperceptible, so widening the throttle is free headroom.
             static uint32_t lastS3mPlayTick = 0;
             uint32_t now = millis();
             if (s3mPlayer->state() == S3mPlayer::STATE_PLAYING && now - lastS3mPlayTick >= 200) {
                 lastS3mPlayTick = now;
-                uint32_t __diagUiStart = micros();
                 Ui::updateS3mPlayerLive(*s3mPlayer);
-                s3mUiUs += micros() - __diagUiStart;
-            }
-
-            static uint32_t lastS3mLoopDiagMs = 0;
-            if (now - lastS3mLoopDiagMs >= 1000) {
-                lastS3mLoopDiagMs = now;
-                Serial.printf("S3M loop diag: inputUs=%lu uiUs=%lu\n",
-                               (unsigned long)s3mInputUs, (unsigned long)s3mUiUs);
-                s3mInputUs = 0; s3mUiUs = 0;
             }
             break;
         }
@@ -1972,6 +2085,25 @@ bool update() {
 
             case APP_PLAY:
                 Ui::drawPlayer(nowPlayingName, *player, outputTarget, audioOn, volume, stoppedViaNav);
+                break;
+
+            case APP_SYNTH_EDIT:
+                // Only the channel-grid half of this state draws through
+                // needsRedraw -- while SynthEditor has focus instead
+                // (!synthEditShowingGrid), it redraws itself internally
+                // and this flag is never set for this state at all.
+                // activeChannelMask() reflects the file's own notes here
+                // (MidiPlayer plays them via MidiOutput::sendNoteOn/
+                // sendNoteOff, which feed the same per-note bookkeeping
+                // isChannelActive() reads) -- see the live-tick above for
+                // why this alone isn't enough to keep it current while the
+                // file keeps playing underneath this screen. No explicit
+                // footer args -- both entry points into this screen now
+                // share one default (see drawPariSynthPlay()'s own
+                // comment), which is itself what keeps the footer from
+                // silently drifting out of sync between them again.
+                Ui::drawPariSynthPlay(PariSynthGrid::selectedChannel(), MidiOutput::activeChannelMask());
+                if (PariSynthGrid::volumeOverlayVisible()) Ui::updatePariSynthVolumeOverlay(volume);
                 break;
 
             case APP_PLAY_SYSEX:
