@@ -122,11 +122,21 @@ private:
     // never eats into what the stack or other transient allocations need
     // right after -- especially important for LooperMode's own
     // loopBrowser, which can only ever scan while tracks[] (128KB) is
-    // already resident, unlike FilePlayerMode's browser. Placeholder
-    // pending a real-hardware rp2040.getFreeHeap() measurement in that
-    // exact scenario (see loadEntries()) -- tune before shipping, don't
-    // trust this number as final.
-    static const uint32_t HEAP_SAFETY_MARGIN = 24 * 1024;
+    // already resident, unlike FilePlayerMode's browser... except
+    // FilePlayerMode's own `browser` can ALSO end up scanning while
+    // tracks[] is resident, since tracks[] deliberately stays allocated
+    // across ordinary mode switches (see looper_mode.h) -- File Player ->
+    // Looper -> back to File Player hits exactly this. Real-hardware
+    // measurement in that exact scenario (rp2040.getFreeHeap() logged
+    // right after tracks[] allocates): only 24320 bytes free, which the
+    // old 24*1024 (24576) margin here was *just* over -- available clamped
+    // to 0 and even a folder with a handful of entries indexed nothing at
+    // all (see truncationNote()'s "(+N)" case with entryCount()==0, an
+    // unnavigable browser). 12KB leaves comfortable room for the far
+    // smaller stack/transient needs this margin actually guards against
+    // while still letting an ordinary folder index normally in that
+    // tightest-known-real case.
+    static const uint32_t HEAP_SAFETY_MARGIN = 12 * 1024;
 
     // Per-entry index record -- see loadEntries(). ~8 bytes with
     // alignment, not the ~76-byte full BrowserEntry this replaces; that's

@@ -33,13 +33,16 @@ void enterMode(TopMode mode) {
         case MODE_FILE_PLAYER: FilePlayerMode::enter(); break;
         case MODE_LOOPER:
             // Reclaim FilePlayerMode's file browser RAM before
-            // LooperMode::tracks[] (128KB) allocates -- a browser sitting
-            // on a large folder shouldn't compete with it. Pure
-            // disposable scan data (see FilePlayerMode::
-            // freeBrowserBuffers()'s comment), so this is silent/
-            // unconditional, unlike LooperMode's own interactive "Save &
-            // Continue / Discard & Continue / Cancel" gate for its
-            // *unsaved* track content.
+            // LooperMode::tracks[] allocates -- pure disposable scan data
+            // (see FilePlayerMode::freeBrowserBuffers()'s comment), so
+            // this is silent/unconditional, unlike LooperMode's own
+            // interactive "Save & Continue / Discard & Continue / Cancel"
+            // gate for its *unsaved* track content. No longer RAM-
+            // motivated for tracks[] itself now that it's placement-newed
+            // into SharedRamArena rather than the general heap (see
+            // shared_ram_arena.h) -- kept so the browser doesn't sit on a
+            // huge folder's index for the rest of the session for no
+            // reason.
             FilePlayerMode::freeBrowserBuffers();
             LooperMode::enter();
             break;
