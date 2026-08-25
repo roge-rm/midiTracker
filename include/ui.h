@@ -97,6 +97,75 @@ void updatePlayerOutputTarget(MidiOutTarget target);
 // after EDIT toggles the onboard synth. Does not touch the MIDI field.
 void updatePlayerAudioState(bool audioOn);
 
+// -- pariSynth live play screen -------------------------------------------
+// A 16-channel grid (2 columns x 8 rows, channel numbers 1-16) showing
+// each channel's resolved instrument (via Synth::getChannelProgram()/
+// instrumentFamilyName() -- pulled directly, the same "reach into the
+// lower-level module for my own data" precedent drawNoteStrip() already
+// sets for MidiOutput, rather than being handed a snapshot struct),
+// channel 10 always shown as "Drums" regardless of its program. The
+// shared note-activity strip (see drawNoteStrip()/updatePlayerLive())
+// sits below the grid, fed by MidiOutput::noteActivityIn() -- PariSynthMode
+// calls that instead of MidiOutput::sendNoteOn/sendNoteOff for its live
+// incoming notes, see that function's own comment for why.
+//
+// `activeMask` (bit N = channel N) tints that channel's number a
+// different color while at least one note is currently held on it --
+// derived from MidiOutput::isChannelActive()/activeChannelMask(), which
+// both PariSynthMode's own live incoming MIDI and FilePlayerMode's file
+// playback feed (see midi_output.h's comment on isChannelActive()), so a
+// caller just passes through whichever it's got. Same "caller owns the
+// state, this just draws it" split `selected` already uses.
+
+// Full redraw: the whole 16-channel grid plus the note strip.
+// `selectedChannel` (0-15) is highlighted. `footerLine1`/`footerLine2`
+// default to the input handling PariSynthGrid actually implements (see
+// pari_synth_grid.h) -- RIGHT/LEFT column jump, EDIT-tap to edit,
+// EDIT+LEFT/RIGHT manual family reassignment, EDIT+UP/DOWN volume, ENTER
+// for the bank menu, PLAY for the picker -- identical from both places
+// this screen is reachable (PariSynthMode's own play screen and
+// FilePlayerMode's APP_SYNTH_EDIT overlay), since both drive the same
+// PariSynthGrid and neither overrides these defaults. Keeping the string
+// literals only here, not duplicated at each call site, is what makes it
+// impossible for the footer to silently drift out of sync with itself
+// again the way it once did.
+void drawPariSynthPlay(int selectedChannel, uint16_t activeMask = 0,
+                        const char* footerLine1 = "UD channel/R col  EDIT+LR/UD inst/vol",
+                        const char* footerLine2 = "EDIT edit  ENTER bank  PLAY pick");
+
+// Cheap partial redraw of just the note-activity strip, meant to be called
+// at a low fixed rate (same convention as updatePlayerLive()). Does not
+// touch the channel grid.
+void updatePariSynthPlayLive();
+
+// Cheap partial redraw of one channel's grid cell, e.g. after a Program
+// Change or a manual instrument assignment changes what it resolves to, or
+// a Note On/Off changes whether it should be glowing (see activeMask's
+// comment above). `selected` is whether that channel is also the current
+// cursor position (picks the cell's highlight background). Does not touch
+// any other cell, the header, or the strip.
+void updatePariSynthChannelCell(int channel, bool selected, bool active);
+
+// Cheap partial redraw for moving the channel cursor: repaints only the
+// previously and newly selected cells instead of the whole grid.
+// `prevActive`/`newActive` are each channel's own current glow state (see
+// activeMask's comment above) -- moving the cursor doesn't change either.
+void updatePariSynthSelection(int prevChannel, int newChannel, bool prevActive, bool newActive);
+
+// Brief "Vol NN%" overlay, shown while EDIT+UP/DOWN adjusts the shared
+// synth volume (see PariSynthGrid::update()) -- drawn directly over
+// channel 9's grid cell (index 8 -- row 0 of the right column, the
+// top-right corner, right under the header row), since this screen has no
+// spare header-adjacent row the way drawPlayer()'s stat rows do. This
+// function doesn't know how to erase itself: once its own fade timer
+// elapses, the caller (PariSynthGrid) restores the cell underneath with a
+// plain updatePariSynthChannelCell(8, ...) call instead -- the same rect,
+// so it cleanly covers this overlay. A host must also call this again
+// immediately after any full
+// drawPariSynthPlay() redraw while the overlay is still showing, since
+// that redraw repaints every cell including this one.
+void updatePariSynthVolumeOverlay(int volume);
+
 // Full redraw of the WAV "Now Playing" screen -- Filename/State/Time
 // (total known up front, unlike MidiPlayer)/Volume/format info (sample
 // rate, bit depth, channel count), no Tempo/Tracks/MIDI-target rows since
@@ -185,11 +254,21 @@ void updateNameEntryError(const char* error);
 // Full redraw of the per-entry action menu (Open/Rename/Delete/New
 // Recording/New Folder, contextually filtered). `subtitle` names the
 // entry the menu was opened on (or a generic label if none is selected).
-void drawEntryMenu(const char* subtitle, const char* const* labels, int count, int cursor);
+// `scrollOffset` (0 by default) scrolls the list the same way
+// drawBrowser()/drawSettings() do, drawing a scrollbar (see visibleRows())
+// once `count` exceeds one screenful -- callers whose list always fits
+// one screen (e.g. the fixed 3-item Save/Load/Reset menus) can omit it;
+// callers with a growing list (a folder scan, a picker) should track
+// their own scrollOffset the same way SettingsMode's ensureThemeVisible()/
+// moveThemeCursor() already do for the Theme editor's own scrollable list,
+// and pass it through here.
+void drawEntryMenu(const char* subtitle, const char* const* labels, int count, int cursor, int scrollOffset = 0);
 
-// Cheap partial redraw for moving the entry-menu highlight: repaints only
-// the previously and newly selected rows instead of the whole screen.
-void updateEntryMenuSelection(const char* const* labels, int count, int prevCursor, int newCursor);
+// Cheap partial redraw for moving the entry-menu highlight within the
+// current scroll position: repaints only the previously and newly
+// selected rows. Caller is responsible for a full drawEntryMenu() instead
+// whenever the move also changes scrollOffset.
+void updateEntryMenuSelection(const char* const* labels, int count, int prevCursor, int newCursor, int scrollOffset = 0);
 
 // Full redraw of the delete confirmation screen. `failed`, once set,
 // switches the screen from "Delete X?" to an error message.
@@ -416,8 +495,15 @@ void updateLooperBeatIndicator(bool visible, int currentBeat, int timeSigNum);
 // Draws a scrollbar (see visibleRows()) when `count` exceeds one
 // screenful, same convention as drawBrowser(). `pageTitle` is shown in
 // the header alongside "Settings" (e.g. "Settings: Audio").
+// `footerLine1`/`footerLine2` default to SettingsMode's own hint text --
+// SynthEditor's field editor (see synth_editor.cpp), the only other
+// caller, passes its own instead: it has no paging (LEFT/RIGHT do nothing
+// here, unlike Settings) and ENTER opens its Save/Load/Reset bank menu,
+// neither of which the Settings-flavored default text would say correctly.
 void drawSettings(const char* const* labels, const char* const* values, int count, int cursor,
-                   int scrollOffset, const char* pageTitle);
+                   int scrollOffset, const char* pageTitle,
+                   const char* footerLine1 = "UD move  LR page",
+                   const char* footerLine2 = "EDIT+LR change");
 
 // Cheap partial redraw for moving the settings cursor within the current
 // scroll position: repaints only the previously and newly selected rows.

@@ -117,6 +117,81 @@ void setReverbMix(uint8_t percent);
 // does. An out-of-range value is treated as 0. Defaults to 0.
 void setReverbType(uint8_t type);
 
+// -- Instrument/drum preset editing (pariSynth) ----------------------------
+//
+// Live editing of the same per-GM-family/per-drum-type presets described
+// at the top of this file -- shared with file/tracker playback, not a
+// separate patch bank, so editing e.g. the Piano family here also changes
+// how a .mid using Piano sounds afterwards. Safe to call at any time,
+// including while notes are currently sounding on the record being
+// edited: every preset field is only ever read at note-start (see
+// startMelodicVoice()/startPercussionVoice() in synth.cpp), never per-
+// sample, so an edit can only affect the *next* note-on for that family/
+// drum type -- already-sounding voices keep whatever they snapshotted at
+// their own note-on, with no click or audible discontinuity. Both cores
+// share plain SRAM (see Synth::begin()'s g_readyForPioInit precedent), so
+// these setters write the shared preset tables directly from core 0; a
+// one-word "dirty" doorbell over the same inter-core FIFO used elsewhere
+// in this file then tells core 1 to recompute that one record's derived
+// caches (filter alpha, vibrato/tremolo/PWM depth). Getters read the same
+// shared tables directly -- no FIFO round trip needed for a read.
+
+enum SynthWaveform : uint8_t { SYNTH_WAVE_SINE, SYNTH_WAVE_TRIANGLE, SYNTH_WAVE_SAW, SYNTH_WAVE_SQUARE, SYNTH_WAVE_NOISE };
+
+const uint8_t INSTRUMENT_FAMILY_COUNT = 16; // matches PRESETS[16] in synth.cpp
+const uint8_t DRUM_PRESET_COUNT = 8;        // matches DrumType/DRUM_PRESETS in synth.cpp
+
+// Mirrors the TU-local InstrumentPreset/DrumPreset structs in synth.cpp --
+// duplicated here (rather than shared) because those stay private to
+// synth.cpp's anonymous namespace; this is the public field-for-field
+// shape core 0 callers (the pariSynth editor) read/write through.
+struct InstrumentPresetParams {
+    SynthWaveform waveform;
+    uint16_t attackSamples;
+    uint16_t decaySamples;
+    uint8_t sustainPercent;   // 0-100
+    uint16_t releaseSamples;
+    float cutoffHz;
+    float vibratoDepthPercent;
+    float tremoloDepthPercent;
+    float pwmDepthPercent;    // only audible when waveform == SYNTH_WAVE_SQUARE
+};
+
+struct DrumPresetParams {
+    SynthWaveform waveform;
+    float basePitchHz;
+    uint16_t decaySamples;
+    float pitchDropStartHz;   // 0 = no pitch sweep
+    uint16_t pitchDropSamples;
+    float cutoffHz;
+};
+
+// `family` is 0-15 (program / 8 -- see programChange()'s own comment).
+// Short display name for a melodic family, e.g. "Piano", "Strings".
+const char* instrumentFamilyName(uint8_t family);
+void getInstrumentPreset(uint8_t family, InstrumentPresetParams& out);
+void setInstrumentPreset(uint8_t family, const InstrumentPresetParams& in);
+void resetInstrumentPresetToDefault(uint8_t family);
+
+// `drumType` is 0-7, one of the archetypes GM percussion notes classify
+// into (see classifyDrum() in synth.cpp) -- not a GM note number.
+const char* drumPresetName(uint8_t drumType);
+void getDrumPreset(uint8_t drumType, DrumPresetParams& out);
+void setDrumPreset(uint8_t drumType, const DrumPresetParams& in);
+void resetDrumPresetToDefault(uint8_t drumType);
+
+// Restores every melodic family and drum type to its shipped default in
+// one call (the pariSynth editor's "Reset to Default" action).
+void resetAllPresetsToDefault();
+
+// Read-through accessor for g_channelProgram -- lets the UI show e.g.
+// "channel 3 -> Strings" without duplicating channel-program tracking
+// outside synth.cpp. Percussion (channel 9) always reads back whatever
+// was last set even though programChange() ignores it for sound
+// selection -- callers should special-case channel 9 as "Drums" rather
+// than resolving its program through instrumentFamilyName().
+uint8_t getChannelProgram(uint8_t channel);
+
 // -- WAV playback stream --------------------------------------------------
 //
 // A second, independent audio source mixed into the same per-sample
