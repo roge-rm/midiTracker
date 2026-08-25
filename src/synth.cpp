@@ -109,9 +109,25 @@ uint32_t g_lfoPhase = 0;
 // voices is generous (a full kit hit -- kick+snare+hats+a cymbal -- is
 // nowhere near that); 24 melodic voices is a large step up from the
 // previous 16-voice shared pool for the "still lots of voice stealing"
-// complaint on dense multi-track files. Per-voice CPU cost is trivial
-// (Cortex-M0+ has single-cycle multiply, no per-sample division), so the
-// real cost of a larger ceiling is mostly just unused headroom, not time.
+// complaint on dense multi-track files.
+//
+// Per-voice CPU cost is NOT trivial -- a real-hardware g_synthDiag* test
+// (doubling this to 48/16) measured ~2.0-2.2us per simultaneously ACTIVE
+// voice, not the single-cycle-multiply "basically free" this comment used
+// to claim. At just 11 peak active voices (an ordinary two-handed chord,
+// nowhere near either ceiling) with reverb on, renderSample()'s average
+// cost alone exceeded the 22us/sample budget SAMPLE_RATE enforces, and
+// core 1 measurably fell behind real time (~300ms of audio backing up per
+// second) -- the same "song slows down" failure mode as the S3M/XM/MOD
+// mixing-throughput bug, reproduced here. The voice-array *ceiling*
+// barely matters (an inactive voice's cost is a cheap early-return), but
+// how many voices actually sound at once does, and this project's own
+// live multitimbral pariSynth mode makes 10+ simultaneous notes an
+// entirely ordinary case, not a rare edge case. 24/8 is the last value
+// confirmed to not reproduce this at ordinary polyphony; raising it
+// further needs either a repeat of this measurement or a real reduction
+// in renderVoice()'s per-sample cost first, not just picking a bigger
+// number.
 const int NUM_MELODIC_VOICES = 24;
 const int NUM_DRUM_VOICES = 8;
 const uint16_t PANIC_RELEASE_SAMPLES = 100; // ~2ms, prompt but click-free
@@ -355,6 +371,52 @@ volatile bool g_wavUnderrun = false;
 // opposed to something else entirely.
 volatile uint32_t g_wavUnderrunSamples = 0;
 
+// Temporary real-hardware diagnostic for the NUM_MELODIC_VOICES/
+// NUM_DRUM_VOICES bump above -- same "measure, don't guess" approach as
+// g_wavUnderrunSamples/g_xmDiag* (see xm_file.cpp). loop1() times how long
+// each sample's FIFO-drain + renderSample() actually takes and compares it
+// against SAMPLE_PERIOD_US, the hard per-sample budget g_i2s.write16()'s
+// blocking pacing enforces -- if that's routinely being exceeded, core 1 is
+// falling behind and eating into the I2S DMA buffer's ~70ms cushion
+// (see setup1()'s setBuffers(12, 256) comment), which is what would
+// eventually surface as audible crackle, same failure mode as the S3M/XM/
+// MOD mixing-throughput bug. Active-voice count is tracked alongside so a
+// reported busyUs/maxUs can be correlated with how many voices were
+// actually sounding, not just assumed from NUM_MELODIC_VOICES/
+// NUM_DRUM_VOICES's ceiling. Printed once/sec, reset after each print.
+const uint32_t SAMPLE_PERIOD_US = 1000000UL / SAMPLE_RATE;
+uint32_t g_synthDiagCalls = 0;
+uint32_t g_synthDiagBusyUs = 0, g_synthDiagMaxUs = 0;
+uint32_t g_synthDiagOverBudget = 0; // samples whose compute time alone exceeded SAMPLE_PERIOD_US
+uint32_t g_synthDiagActiveSum = 0, g_synthDiagActivePeak = 0;
+uint32_t g_synthDiagActiveThisSample = 0; // set by renderSample(), consumed by loop1() right after
+// Round 2: the round-1 result showed overBudget firing even at
+// peakActive==0, meaning the cost isn't coming from voice count at all --
+// so this splits renderSample()'s own total into "the two voice-mixing
+// for loops" (voiceUs, scales with NUM_MELODIC_VOICES/NUM_DRUM_VOICES and
+// how many are active) vs. everything after (reverb tank/chorus/shimmer,
+// WAV mixing, softLimit -- none of which depend on voice count), to find
+// out which one is actually eating the budget. g_reverbEnabled defaults to
+// true (see its own declaration), so the reverb tank is the prime suspect.
+uint32_t g_synthDiagVoiceUsThisSample = 0; // set by renderSample(), consumed by loop1() right after
+uint32_t g_synthDiagVoiceBusyUs = 0, g_synthDiagVoiceMaxUs = 0;
+// Round 3: round 2 found the ~2us/active-voice cost survives even after
+// commit 1019e07 already eliminated every int64_t multiply from this exact
+// hot path (see cutoffHzToAlphaQ14()'s comment) chasing this same "10-11
+// active voices blows the budget" symptom -- so it isn't 64-bit-multiply
+// emulation either. Two more angles, cheap to test without per-voice
+// timing overhead (micros() itself isn't free called 32-64x/sample, so
+// this splits at the loop level, not per-voice): (1) is melodic
+// (vibrato/tremolo/PWM-capable) per-voice cost higher than drum (mostly
+// vibrato-less, see Voice::vibratoRange's comment)? -- melodicUs/drumUs
+// below. (2) does forcing renderVoice()/waveformSample() fully inline
+// (see their ALWAYS_INLINE below) change anything vs. this same build
+// with it removed? -- compare voiceAvgUs before/after at a similar
+// avgActive.
+uint32_t g_synthDiagMelodicUsThisSample = 0, g_synthDiagDrumUsThisSample = 0;
+uint32_t g_synthDiagMelodicBusyUs = 0, g_synthDiagDrumBusyUs = 0;
+#define ALWAYS_INLINE __attribute__((always_inline)) inline
+
 // Consumer-side pop, called once per sample from renderSample() while
 // g_wavActive. Returns false on empty (caller decides whether that means
 // "done" or "underrun" via g_wavEnded).
@@ -380,7 +442,7 @@ int16_t nextNoise() {
 // pulseWidth is only meaningful for WAVE_SQUARE (the duty-cycle threshold,
 // 32768 == fixed 50% -- see Voice::pwmDepthQ16 for who modulates it and
 // why); every other waveform ignores it.
-int16_t waveformSample(Waveform w, uint32_t phase, uint16_t pulseWidth) {
+ALWAYS_INLINE int16_t waveformSample(Waveform w, uint32_t phase, uint16_t pulseWidth) {
     uint16_t p16 = (uint16_t)(phase >> 16);
     switch (w) {
         case WAVE_TRIANGLE:
@@ -801,7 +863,7 @@ void handlePanic() {
 // Renders one voice's current sample and advances its phase/envelope by
 // one sample. Returns its contribution to the mix (0 if inactive). Shared
 // by both voice pools so the envelope state machine only exists once.
-void renderVoice(Voice& v, int16_t lfoValue, int32_t& outL, int32_t& outR) {
+ALWAYS_INLINE void renderVoice(Voice& v, int16_t lfoValue, int32_t& outL, int32_t& outR) {
     if (!v.active) { outL = 0; outR = 0; return; }
 
     // Signed accumulate: pitchDrop (percussion pitch-sweep) and the shared
@@ -1264,17 +1326,26 @@ void renderSample(int16_t& outLeft, int16_t& outRight) {
     int16_t lfoValue = g_sineTable[(g_lfoPhase >> 24) & (SINE_TABLE_SIZE - 1)];
     g_lfoPhase += g_lfoPhaseInc;
 
+    uint32_t __diagVoiceStartUs = micros(); // see g_synthDiagVoiceUsThisSample's own comment
     int32_t mixL = 0, mixR = 0;
+    uint32_t activeCount = 0; // see g_synthDiagActiveThisSample's own comment
     for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
+        if (g_melodicVoices[i].active) activeCount++;
         int32_t l, r;
         renderVoice(g_melodicVoices[i], lfoValue, l, r);
         mixL += l; mixR += r;
     }
+    uint32_t __diagMelodicDoneUs = micros(); // see g_synthDiagMelodicUsThisSample's own comment
+    g_synthDiagMelodicUsThisSample = __diagMelodicDoneUs - __diagVoiceStartUs;
     for (int i = 0; i < NUM_DRUM_VOICES; i++) {
+        if (g_drumVoices[i].active) activeCount++;
         int32_t l, r;
         renderVoice(g_drumVoices[i], lfoValue, l, r);
         mixL += l; mixR += r;
     }
+    g_synthDiagDrumUsThisSample = micros() - __diagMelodicDoneUs;
+    g_synthDiagActiveThisSample = activeCount;
+    g_synthDiagVoiceUsThisSample = micros() - __diagVoiceStartUs;
 
     // Reverb sends from the synth voices only (see reverbProcess()'s
     // header comment) -- captured before WAV/tracker content is mixed in
@@ -1685,8 +1756,52 @@ void loop1() {
         if (velocity > 0) handleNoteOn(channel, note, velocity);
         else handleNoteOff(note);
     }
+
+    uint32_t __diagStartUs = micros(); // see g_synthDiagCalls's own comment
     int16_t left, right;
     renderSample(left, right);
+    uint32_t __diagThisUs = micros() - __diagStartUs;
+
+    g_synthDiagCalls++;
+    g_synthDiagBusyUs += __diagThisUs;
+    if (__diagThisUs > g_synthDiagMaxUs) g_synthDiagMaxUs = __diagThisUs;
+    if (__diagThisUs > SAMPLE_PERIOD_US) g_synthDiagOverBudget++;
+    g_synthDiagActiveSum += g_synthDiagActiveThisSample;
+    if (g_synthDiagActiveThisSample > g_synthDiagActivePeak) g_synthDiagActivePeak = g_synthDiagActiveThisSample;
+    g_synthDiagVoiceBusyUs += g_synthDiagVoiceUsThisSample;
+    if (g_synthDiagVoiceUsThisSample > g_synthDiagVoiceMaxUs) g_synthDiagVoiceMaxUs = g_synthDiagVoiceUsThisSample;
+    g_synthDiagMelodicBusyUs += g_synthDiagMelodicUsThisSample;
+    g_synthDiagDrumBusyUs += g_synthDiagDrumUsThisSample;
+
+    static uint32_t __diagLastPrintMs = 0;
+    uint32_t nowMs = millis();
+    if (nowMs - __diagLastPrintMs >= 1000) {
+        __diagLastPrintMs = nowMs;
+        uint32_t avgUs = g_synthDiagCalls ? (g_synthDiagBusyUs / g_synthDiagCalls) : 0;
+        uint32_t voiceAvgUs = g_synthDiagCalls ? (g_synthDiagVoiceBusyUs / g_synthDiagCalls) : 0;
+        uint32_t melodicAvgUs = g_synthDiagCalls ? (g_synthDiagMelodicBusyUs / g_synthDiagCalls) : 0;
+        uint32_t drumAvgUs = g_synthDiagCalls ? (g_synthDiagDrumBusyUs / g_synthDiagCalls) : 0;
+        uint32_t avgActive100 = g_synthDiagCalls ? (g_synthDiagActiveSum * 100 / g_synthDiagCalls) : 0;
+        Serial.printf(
+            "[synthDiag] calls=%lu budgetUs=%lu avgUs=%lu maxUs=%lu voiceAvgUs=%lu voiceMaxUs=%lu "
+            "melodicAvgUs=%lu drumAvgUs=%lu overBudget=%lu "
+            "avgActive=%lu.%02lu peakActive=%lu/%d reverb=%d/%d\n",
+            (unsigned long)g_synthDiagCalls, (unsigned long)SAMPLE_PERIOD_US,
+            (unsigned long)avgUs, (unsigned long)g_synthDiagMaxUs,
+            (unsigned long)voiceAvgUs, (unsigned long)g_synthDiagVoiceMaxUs,
+            (unsigned long)melodicAvgUs, (unsigned long)drumAvgUs,
+            (unsigned long)g_synthDiagOverBudget,
+            (unsigned long)(avgActive100 / 100), (unsigned long)(avgActive100 % 100),
+            (unsigned long)g_synthDiagActivePeak, NUM_MELODIC_VOICES + NUM_DRUM_VOICES,
+            (int)g_reverbEnabled, (int)g_reverbType
+        );
+        g_synthDiagCalls = 0;
+        g_synthDiagBusyUs = 0; g_synthDiagMaxUs = 0;
+        g_synthDiagVoiceBusyUs = 0; g_synthDiagVoiceMaxUs = 0;
+        g_synthDiagMelodicBusyUs = 0; g_synthDiagDrumBusyUs = 0;
+        g_synthDiagOverBudget = 0;
+        g_synthDiagActiveSum = 0; g_synthDiagActivePeak = 0;
+    }
 
     g_i2s.write16(left, right); // blocks until DMA buffer space is free, paces this loop
 }
