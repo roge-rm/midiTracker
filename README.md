@@ -34,6 +34,12 @@ The looper supports variable BPM (set internally or driven by MIDI) as well as a
 
 A metronome is included, with visual and audio feedback, with configurable count in.
 
+### pariSynth
+
+A third top-level mode, alongside Player/Recorder and the Looper, for playing the onboard synth live over incoming MIDI - multitimbral across all 16 channels, each shown in a grid with its assigned instrument (or "Drums" on channel 10). Channels follow incoming Program Change by default, or can be manually reassigned per-channel. A shared instrument/drum editor (waveform, ADSR, cutoff, vibrato/tremolo/PWM) is reachable from the grid, with named presets saved/loaded/reset as .syn banks on the SD card under `/synth/`.
+
+The same grid and editor are also available as a quick-edit overlay mid-playback in the Player (ALT+EDIT), without interrupting whatever's playing.
+
 ### Themes
 
 The UI's color scheme is fully customizable through a dedicated theme editor (Settings > MIDI/System > Theme), covering 19 individual color roles - UI chrome, looper track states, beat/rhythm accents, and the note-activity display's velocity tiers - each editable as its own R/G/B value with a live swatch preview. Themes can be saved to and loaded from the SD card as .thm files, and reset back to the default palette at any time. The active theme is remembered and reloaded automatically on boot.
