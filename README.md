@@ -12,7 +12,7 @@ midiTracker plays standard '.mid' MIDI files, type 0 or 1, out over TRS or USB M
 
 It also plays .wav files, as well as a few tracker modules - .mod, .s3m, and .xm. These are experimental and not 100% tested, there may be slowdowns or audio glitches. Attempts have been made to make these sound as authentic as possible but of course there are hardware limitations that make this an interesting challenge.
 
-Additionally there is a simple onboard synth, supporting 24 melodic notes and 8 drum notes simultaneously, that you can use to listen to MIDI files without driving external gear (this is also what renders the tracker/WAV formats above). This is intended as a way to verify the contents of recordings and sounds very chiptune-y but it can be a lot of fun to play various MIDI files from the internet and enjoy the not-so-realistic sounds it makes.
+Additionally there is a simple onboard synth, supporting 24 melodic notes and 8 drum notes simultaneously, that you can use to listen to MIDI files without driving external gear. This is intended as a way to verify the contents of recordings - and sounds very chiptuney - but it can be a lot of fun to play various MIDI files from the internet and enjoy the not-so-realistic sounds it makes. The synth's own voices can be run through a lo-fi/chiptune-flavored reverb, with a choice of three algorithms (Lo-fi, Lush, Shimmer) and adjustable wet/dry mix. Output level can also be matched to how you have the device hooked up (Headphone Low, Headphone High, or Line Level).
 
 ### Recorder
 
@@ -26,17 +26,23 @@ SysEx recording is similar and can be used to back up memory banks, individual p
 
 midiTracker has a 4 track MIDI looper. Each loop can be freeform in length or set to a certain number of bars. There is a hard limit of 4096 events per loop as loops are held in the Pico's limited RAM until you choose to save them. You can mute, overdub, pause/resume, and stop/restart each loop.
 
-Loops can be saved as a group and loaded, again as a group. Each track can also be loaded with an individual MIDI file of your choice from the browser - not just prerecorded loops (you can loop your favourite Rick Astley song and play along).
+Each track has independent input and output MIDI channels. The input channel filters which incoming channel gets recorded while the output channel controls playback - either remapped to a fixed channel or sent back out on whichever channel each event was originally recorded on.
 
-The looper supports variable BPM (set internally or driven by MIDI) as well as a number of common time signatures. Loops can run synced to each other, tied to BPM/bars (if using set bar limits), or run independantly. MIDI transport can be enabled and the looper with respond to START/STOP/CONTINUE messages to help automate loop recording and playback.
+Loops can be saved and loaded individually, as standalone .mid files, or as a full session bundle covering all 4 tracks at once. Each track can also be loaded with an individual MIDI file of your choice from the browser - not just prerecorded loops (you can loop your favourite Rick Astley MIDI and play along).
 
-A metronome, with optional count in, is included and features a visual indicator on the top of the screen to go along with the audio signal (the audio out is required for audio metronome, of course).
+The looper supports variable BPM (set internally or driven by MIDI) as well as a number of common time signatures. Loops can run synced to each other, tied to BPM/bars (if using set bar limits), or run independantly. MIDI transport can be enabled and the looper will respond to START/STOP/CONTINUE messages to help automate loop recording and playback.
+
+A metronome is included, with visual and audio feedback, with configurable count in.
+
+### Themes
+
+The UI's color scheme is fully customizable through a dedicated theme editor (Settings > MIDI/System > Theme), covering 19 individual color roles - UI chrome, looper track states, beat/rhythm accents, and the note-activity display's velocity tiers - each editable as its own R/G/B value with a live swatch preview. Themes can be saved to and loaded from the SD card as .thm files, and reset back to the default palette at any time. The active theme is remembered and reloaded automatically on boot.
 
 ### Settings
 
 Various settings can be modified and will be saved to the SD card to be loaded on boot. Currently the following items can be set:
 
-BPM, time signature, clock source, loop length, sync mode, metronome, metronome volume, count in, count in bars, MIDI transport, MIDI thru
+BPM, time signature, clock source, loop length, sync mode, metronome, metronome volume, count in, count in bars, MIDI transport, MIDI thru, default volume, output level, reverb on/off, reverb mix, reverb type, onboard synth audio on/off, display brightness, theme
 
 ---
 
@@ -48,7 +54,7 @@ LEFT  DOWN  RIGHT  ENTER
       ALT   NAV
 ```
 
-Every screen has a two line UI hint footer that explains what buttons (or combination) do what. The dpad buttons navigate through menus (generally right enters a menu and left backs out of it) and most modifications to settings are done while holding ALT or EDIT and changing the values with the direction arrows.
+Every screen has a two line UI hint footer that explains what buttons (or combination) do what. The dpad buttons navigate through menus (generally right enters a menu and left backs out of it) and most modifications to settings are done while holding ALT or EDIT and changing the values with the direction arrows. Menu cursors wrap top-to-bottom and back rather than stopping at either end.
 
 #### Hardware
 
@@ -65,7 +71,7 @@ See `include/pins.h` for the exact pin map.
 
 #### Known limitations
 
-- `MIDI_MAX_TRACKS` (24, in `config.h`) is a RAM-bounded cap — raise it if
+- `MIDI_MAX_TRACKS` (64, in `config.h`) is a RAM-bounded cap — raise it if
   you hit a real file that exceeds it.
 - The file browser (`SdBrowser`) indexes a folder's contents on demand
   rather than eagerly loading everything, so it scales to a couple
@@ -87,7 +93,7 @@ See `include/pins.h` for the exact pin map.
 
 ### Installation
 
-Mount your picoTracker in firmware update mode (through the menu if you are on the picoTracker firmware - or by holding the boot pin on the bottom and then connecting the USB cable) and copy the .uf2 file from the latest release to your mounted device.
+Mount your picoTracker in firmware update mode - via Settings > MIDI/System > USB Bootloader if you're already running midiTracker, through the menu if you are on the picoTracker firmware, or by holding the boot pin on the bottom and then connecting the USB cable - and copy the .uf2 file from the latest release to your mounted device.
 
 You can also pull the source and build it yourself - this was made mostly by Claude in platformio on VS Code.
 

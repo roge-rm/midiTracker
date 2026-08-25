@@ -110,10 +110,11 @@ namespace SettingsMode
         const int THEME_MENU_COUNT = 3;
         int themeMenuCursor = 0;
 
-        const int MAX_SAVED_THEMES = 20; // generous headroom -- see LooperMode's own MAX_SAVED_SESSIONS precedent
+        const int MAX_SAVED_THEMES = 64; // comfortably above realistic use -- same "bump the constant" precedent MIDI_MAX_TRACKS documents
         char themeLoadNames[MAX_SAVED_THEMES][THEME_NAME_MAX_LEN + 1];
         int themeLoadCount = 0;
         int themeLoadCursor = 0;
+        int themeLoadScrollOffset = 0; // see ensureThemeLoadVisible()
 
         char themeFlashMsg[32] = {0};
         uint32_t themeFlashUntilMs = 0;
@@ -1172,10 +1173,26 @@ namespace SettingsMode
                 dir.close();
         }
 
+        // Same page-snap scroll-window convention as ensureThemeVisible() --
+        // keeps themeLoadCursor's row inside the visible window as it moves.
+        void ensureThemeLoadVisible()
+        {
+            int rows = Ui::visibleRows();
+            if (rows <= 0)
+                return;
+            if (themeLoadCursor < themeLoadScrollOffset || themeLoadCursor >= themeLoadScrollOffset + rows)
+            {
+                themeLoadScrollOffset = (themeLoadCursor / rows) * rows;
+            }
+            if (themeLoadScrollOffset < 0)
+                themeLoadScrollOffset = 0;
+        }
+
         void beginThemeLoadPick()
         {
             scanThemesFolder();
             themeLoadCursor = 0;
+            themeLoadScrollOffset = 0;
             themeScreen = THEME_LOAD_PICK;
             needsRedraw = true;
         }
@@ -1372,11 +1389,13 @@ namespace SettingsMode
             if (Input::justPressed(BTN_UP) && themeLoadCount > 0)
             {
                 themeLoadCursor = (themeLoadCursor > 0) ? themeLoadCursor - 1 : themeLoadCount - 1;
+                ensureThemeLoadVisible();
                 needsRedraw = true;
             }
             if (Input::justPressed(BTN_DOWN) && themeLoadCount > 0)
             {
                 themeLoadCursor = (themeLoadCursor < themeLoadCount - 1) ? themeLoadCursor + 1 : 0;
+                ensureThemeLoadVisible();
                 needsRedraw = true;
             }
             if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT))
@@ -1628,7 +1647,7 @@ namespace SettingsMode
                         const char *labels[MAX_SAVED_THEMES];
                         for (int i = 0; i < themeLoadCount; i++)
                             labels[i] = themeLoadNames[i];
-                        Ui::drawEntryMenu("Load Theme", labels, themeLoadCount, themeLoadCursor);
+                        Ui::drawEntryMenu("Load Theme", labels, themeLoadCount, themeLoadCursor, themeLoadScrollOffset);
                     }
                     else
                     {

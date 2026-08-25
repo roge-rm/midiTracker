@@ -8,7 +8,10 @@
 #include "battery.h"
 #include "file_player_mode.h"
 #include "looper_mode.h"
+#include "pari_synth_mode.h"
+#include "pari_synth_grid.h"
 #include "settings_mode.h"
+#include "synth_editor.h"
 
 // Top-level boot screen: the user picks one of a small number of
 // self-contained modes, each of which owns its own screens/input/state
@@ -17,10 +20,16 @@
 // doesn't know anything about what's inside a mode.
 namespace {
 
-enum TopMode { MODE_SELECT, MODE_FILE_PLAYER, MODE_LOOPER, MODE_SETTINGS };
+enum TopMode { MODE_SELECT, MODE_FILE_PLAYER, MODE_LOOPER, MODE_PARI_SYNTH, MODE_SETTINGS };
 
-const char* MODE_LABELS[] = { "Play / Record Files", "MIDI Looper", "Settings" };
-const int MODE_COUNT = 3;
+const char* MODE_LABELS[] = { "Play / Record Files", "MIDI Looper", "pariSynth", "Settings" };
+const int MODE_COUNT = 4;
+
+// Parallel to MODE_LABELS -- modeCursor (a position in that list) maps to
+// a TopMode through this array, not a hardcoded chain of ternaries, so
+// adding/reordering an entry only ever needs a change in one place. See
+// handleModeSelectInput().
+const TopMode MODE_ORDER[] = { MODE_FILE_PLAYER, MODE_LOOPER, MODE_PARI_SYNTH, MODE_SETTINGS };
 
 TopMode topMode = MODE_SELECT;
 int modeCursor = 0;
@@ -46,6 +55,7 @@ void enterMode(TopMode mode) {
             FilePlayerMode::freeBrowserBuffers();
             LooperMode::enter();
             break;
+        case MODE_PARI_SYNTH:  PariSynthMode::enter(); break;
         case MODE_SETTINGS:    SettingsMode::enter(); break;
         case MODE_SELECT:      break;
     }
@@ -76,10 +86,7 @@ void handleModeSelectInput() {
     // new mode ever sees an update() tick.
     if (Input::justReleased(BTN_ENTER) || Input::justReleased(BTN_PLAY) ||
         Input::justReleased(BTN_RIGHT)) {
-        TopMode target = modeCursor == 0 ? MODE_FILE_PLAYER
-                        : modeCursor == 1 ? MODE_LOOPER
-                                          : MODE_SETTINGS;
-        enterMode(target);
+        enterMode(MODE_ORDER[modeCursor]);
     }
 }
 
@@ -118,6 +125,9 @@ void setup() {
     FilePlayerMode::begin();
     SettingsMode::begin();
     LooperMode::begin(); // no ordering requirement on SettingsMode anymore -- see its own comment
+    PariSynthMode::begin(); // after Synth::begin() above -- see its own comment on why
+    SynthEditor::begin(); // same ordering requirement -- loading the active bank pushes dirty-doorbell messages core 1 must already be running to drain
+    PariSynthGrid::begin(); // no ordering requirement -- no-op today, kept for symmetry with SynthEditor::begin()
 }
 
 void loop() {
@@ -147,6 +157,10 @@ void loop() {
 
         case MODE_LOOPER:
             if (LooperMode::update()) enterMode(MODE_SELECT);
+            break;
+
+        case MODE_PARI_SYNTH:
+            if (PariSynthMode::update()) enterMode(MODE_SELECT);
             break;
 
         case MODE_SETTINGS:
