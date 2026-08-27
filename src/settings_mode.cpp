@@ -29,6 +29,7 @@ namespace SettingsMode
             SETTING_SYNTH_AUDIO,
             SETTING_LFO_RATE,
             SETTING_LFO_VOICES,
+            SETTING_STEREO_SPREAD,
             SETTING_BPM,
             SETTING_TIME_SIGNATURE,
             SETTING_CLOCK_SOURCE,
@@ -65,13 +66,13 @@ namespace SettingsMode
 
         const char *PAGE_TITLES[PAGE_COUNT] = {"Audio", "Looper", "Metronome", "MIDI/System"};
 
-        const SettingIndex PAGE_AUDIO_ITEMS[] = {SETTING_OUTPUT_LEVEL, SETTING_DEFAULT_VOLUME, SETTING_REVERB, SETTING_REVERB_MIX, SETTING_REVERB_TYPE, SETTING_SYNTH_AUDIO, SETTING_LFO_RATE, SETTING_LFO_VOICES};
+        const SettingIndex PAGE_AUDIO_ITEMS[] = {SETTING_OUTPUT_LEVEL, SETTING_DEFAULT_VOLUME, SETTING_REVERB, SETTING_REVERB_MIX, SETTING_REVERB_TYPE, SETTING_SYNTH_AUDIO, SETTING_LFO_RATE, SETTING_LFO_VOICES, SETTING_STEREO_SPREAD};
         const SettingIndex PAGE_LOOPER_ITEMS[] = {SETTING_BPM, SETTING_TIME_SIGNATURE, SETTING_BAR_LENGTH, SETTING_SYNC};
         const SettingIndex PAGE_METRONOME_ITEMS[] = {SETTING_METRONOME, SETTING_METRONOME_VOLUME, SETTING_COUNT_IN, SETTING_COUNT_IN_BARS};
         const SettingIndex PAGE_MIDI_SYSTEM_ITEMS[] = {SETTING_CLOCK_SOURCE, SETTING_MIDI_TRANSPORT, SETTING_MIDI_THRU, SETTING_BRIGHTNESS, SETTING_THEME_EDITOR, SETTING_REBOOT_BOOTLOADER};
 
         const SettingIndex *PAGE_ITEMS[PAGE_COUNT] = {PAGE_AUDIO_ITEMS, PAGE_LOOPER_ITEMS, PAGE_METRONOME_ITEMS, PAGE_MIDI_SYSTEM_ITEMS};
-        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {8, 4, 4, 6};
+        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {9, 4, 4, 6};
 
         int currentPage = 0;
 
@@ -183,6 +184,7 @@ namespace SettingsMode
         // would defeat the setting's own "keeps it from sounding busy"
         // purpose.
         int g_lfoVoices = 3;
+        int g_stereoSpread = 30; // percent -- see Synth::setStereoSpread(); 100 would be unchanged from before this setting existed, but real-hardware listening found even the alternating L/R mapping (see startMelodicVoice()'s comment) too wide at full strength
         float g_defaultBpm = 120.0f;
         int g_defaultTimeSigNum = 4;
         int g_defaultTimeSigDen = 4;
@@ -290,6 +292,8 @@ namespace SettingsMode
                 return "LFO Rate";
             case SETTING_LFO_VOICES:
                 return "LFO Voices";
+            case SETTING_STEREO_SPREAD:
+                return "Stereo Spread";
             case SETTING_BPM:
                 return "Default BPM";
             case SETTING_TIME_SIGNATURE:
@@ -362,6 +366,9 @@ namespace SettingsMode
                     snprintf(out, outSize, "Off");
                 else
                     snprintf(out, outSize, "%d", g_lfoVoices);
+                break;
+            case SETTING_STEREO_SPREAD:
+                snprintf(out, outSize, "%d%%", g_stereoSpread);
                 break;
             case SETTING_BPM:
                 snprintf(out, outSize, "%d", (int)(g_defaultBpm + 0.5f));
@@ -488,6 +495,13 @@ namespace SettingsMode
                     g_lfoVoices = 0; // Off, at the very bottom
                 if (g_lfoVoices > LFO_VOICES_MAX)
                     g_lfoVoices = LFO_VOICES_MAX;
+                break;
+            case SETTING_STEREO_SPREAD:
+                g_stereoSpread += direction * 5;
+                if (g_stereoSpread < 0)
+                    g_stereoSpread = 0;
+                if (g_stereoSpread > 100)
+                    g_stereoSpread = 100;
                 break;
             case SETTING_BPM:
                 g_defaultBpm += (float)direction;
@@ -625,6 +639,8 @@ namespace SettingsMode
             file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "lfoVoices=%d\n", g_lfoVoices);
             file.write((const uint8_t *)line, n);
+            n = snprintf(line, sizeof(line), "stereoSpread=%d\n", g_stereoSpread);
+            file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "bpm=%d\n", (int)(g_defaultBpm + 0.5f));
             file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "timeSigNum=%d\n", g_defaultTimeSigNum);
@@ -720,6 +736,15 @@ namespace SettingsMode
                     g_lfoVoices = 0;
                 if (g_lfoVoices > LFO_VOICES_MAX)
                     g_lfoVoices = LFO_VOICES_MAX;
+                return;
+            }
+            if (strncmp(line, "stereoSpread=", 13) == 0)
+            {
+                g_stereoSpread = atoi(line + 13);
+                if (g_stereoSpread < 0)
+                    g_stereoSpread = 0;
+                if (g_stereoSpread > 100)
+                    g_stereoSpread = 100;
                 return;
             }
             if (strncmp(line, "bpm=", 4) == 0)
@@ -1762,6 +1787,7 @@ namespace SettingsMode
     bool synthAudioEnabled() { return g_synthAudioEnabled; }
     int lfoRateTenthsHz() { return g_lfoRateTenthsHz; }
     int lfoVoices() { return g_lfoVoices; }
+    int stereoSpreadPercent() { return g_stereoSpread; }
     float defaultBpm() { return g_defaultBpm; }
     int defaultTimeSigNum() { return g_defaultTimeSigNum; }
     int defaultTimeSigDen() { return g_defaultTimeSigDen; }

@@ -172,6 +172,7 @@ void enter() {
     Synth::setReverbType((uint8_t)SettingsMode::reverbType());
     Synth::setLfoRateTenthsHz((uint16_t)SettingsMode::lfoRateTenthsHz());
     Synth::setLfoVoices((uint8_t)SettingsMode::lfoVoices());
+    Synth::setStereoSpread((uint8_t)SettingsMode::stereoSpreadPercent());
     MidiOutput::setInputHandler(handleIncomingMidi);
     PariSynthGrid::enter();
     needsRedraw = true;

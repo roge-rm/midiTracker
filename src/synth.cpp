@@ -26,6 +26,7 @@ const uint32_t MSG_TYPE_PRESET_DIRTY = 0x7u;
 const uint32_t MSG_TYPE_DRUM_PRESET_DIRTY = 0x8u;
 const uint32_t MSG_TYPE_LFO_RATE = 0x9u;
 const uint32_t MSG_TYPE_LFO_VOICES = 0xAu;
+const uint32_t MSG_TYPE_STEREO_SPREAD = 0xBu;
 const uint32_t PANIC_MSG = 0xFFFFFFFFu;
 const uint32_t RESET_PROGRAMS_MSG = 0xFFFFFFFEu;
 
@@ -67,6 +68,9 @@ inline uint32_t packLfoRateMsg(uint16_t tenthsHz) {
 }
 inline uint32_t packLfoVoicesMsg(uint8_t maxVoices) {
     return (MSG_TYPE_LFO_VOICES << 28) | maxVoices;
+}
+inline uint32_t packStereoSpreadMsg(uint8_t percent) {
+    return (MSG_TYPE_STEREO_SPREAD << 28) | percent;
 }
 
 // Set by Synth::begin() on core 0, polled by setup1() on core 1 -- see
@@ -128,6 +132,19 @@ const float LFO_RATE_HZ = 5.5f; // a natural vocal/instrumental vibrato rate
 uint32_t g_lfoPhaseInc = 0; // seeded in setup1() from LFO_RATE_HZ, then Synth::setLfoRateTenthsHz()
 uint32_t g_lfoPhase = 0;
 bool g_lfoEnabled = true;
+
+// Settings "Stereo Spread" -- see Synth::setStereoSpread() and its use in
+// startMelodicVoice() below. 0 = every melodic channel centered (mono
+// panning-wise -- drums already always are, see startPercussionVoice()),
+// 100 = startMelodicVoice()'s alternating-by-channel-parity mapping at
+// its full +-96 width (see that function's own comment for why it
+// alternates sides rather than ramping linearly by channel number, which
+// used to put every commonly-used low channel on the same side). This
+// dial is purely about overall width on top of that mapping -- it
+// doesn't affect which side a channel lands on. Defaults to 30 (not
+// 100): real-hardware listening found even the alternating layout too
+// wide at full strength.
+int g_stereoSpreadPercent = 30;
 
 // Percussion gets its own dedicated pool rather than sharing one with
 // melodic voices: with a 14-25 track file, melodic content alone can
@@ -399,35 +416,6 @@ volatile bool g_wavUnderrun = false;
 // symptom is a long, sustained underrun (this counter climbing fast) as
 // opposed to something else entirely.
 volatile uint32_t g_wavUnderrunSamples = 0;
-
-// Round 8 diagnostic (re-added after round 7 stripped everything -- see
-// parisynth_voice_render_cost memory): chasing a confirmed-by-ear crackle/
-// dropout at ordinary pariSynth polyphony (11-13 active voices) that the
-// old overBudget-percentage metric had missed entirely. Two differences
-// from the earlier rounds' version: (1) the print block below reports an
-// explicit shortfall against the 44100 nominal sample rate -- callsUs
-// alone (samples actually produced per wall-clock second) is what
-// actually caught the real bug, not overBudget; (2) no reverb tank/tail
-// split this time (that investigation already concluded with no further
-// lever there) -- scope is narrowed to voice/melodic/drum only, plus
-// which LFO state was active, since isolating vibrato's own cost from
-// tremolo/PWM's doesn't need new code: LFO Rate=Off zeroes all three
-// (vibrato+tremolo+PWM), LFO Voices=0 zeroes just tremolo/PWM leaving
-// vibrato alone (drum voices already have zero vibrato by construction,
-// see Voice::vibratoRange's comment, so melodicAvgUs vs. drumAvgUs at
-// LFO Voices=0 isolates vibrato's own contribution), and LFO Voices>0
-// restores all three -- the existing Settings are the toggle, no
-// diagnostic-only code path needed.
-uint32_t g_synthDiagCalls = 0;
-uint32_t g_synthDiagBusyUs = 0, g_synthDiagMaxUs = 0;
-uint32_t g_synthDiagOverBudget = 0; // samples whose compute time alone exceeded SAMPLE_PERIOD_US
-uint32_t g_synthDiagActiveSum = 0, g_synthDiagActivePeak = 0;
-uint32_t g_synthDiagActiveThisSample = 0; // set by renderSample(), consumed by loop1() right after
-uint32_t g_synthDiagVoiceUsThisSample = 0; // set by renderSample(), consumed by loop1() right after
-uint32_t g_synthDiagVoiceBusyUs = 0, g_synthDiagVoiceMaxUs = 0;
-uint32_t g_synthDiagMelodicUsThisSample = 0, g_synthDiagDrumUsThisSample = 0;
-uint32_t g_synthDiagMelodicBusyUs = 0, g_synthDiagDrumBusyUs = 0;
-const uint32_t SAMPLE_PERIOD_US = 1000000UL / SAMPLE_RATE;
 
 #define ALWAYS_INLINE __attribute__((always_inline)) inline
 
@@ -765,11 +753,28 @@ void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity
         v.pwmDepthQ16 = 0;
     }
     // Spread channels 0-15 across the stereo field, but not hard to the
-    // extremes (32..224 of the 0..255 range) -- a channel fully isolated
-    // to one ear is fatiguing on headphones/earbuds, which is exactly
-    // what most listeners here will be using (see this file's whole
-    // Volume/Output Level history).
-    v.pan = 32 + ((int32_t)channel * 192) / 15;
+    // extremes (+-96 out of the 0..255 range's +-127 half-width at full
+    // Stereo Spread) -- a channel fully isolated to one ear is fatiguing
+    // on headphones/earbuds, which is exactly what most listeners here
+    // will be using (see this file's whole Volume/Output Level history).
+    //
+    // Alternating by parity (even channels left, odd right), fanning both
+    // sides out together as channel number increases, rather than a
+    // straight left-to-right ramp across channel number -- see
+    // g_stereoSpreadPercent's own comment for why a plain linear ramp was
+    // a real bug, not just a width preference: real GM files fill
+    // channels upward from 1 with channel 10 reserved for drums, so a
+    // linear mapping put every commonly-used low channel on the *same*
+    // side. Channels 0/1 (the most commonly used pair) now sit close
+    // together near center with only gentle separation; only the rarely-
+    // used high channels reach the full +-96 extremes. fullOffset is this
+    // channel's position at 100% spread; g_stereoSpreadPercent scales it
+    // around center (pan 128).
+    int32_t rank = channel / 2; // 0..7 -- distance from center, in steps
+    int32_t side = (channel % 2 == 0) ? -1 : 1; // even = left, odd = right
+    int32_t magnitude = (2 * rank + 1) * 96 / 15; // 6..96, odd steps so rank 0 isn't dead center
+    int32_t fullOffset = side * magnitude;
+    v.pan = 128 + (fullOffset * g_stereoSpreadPercent) / 100;
 
     int32_t peak = ((int32_t)VOICE_PEAK * velocity) / 127;
     v.peakLevel = peak;
@@ -1393,26 +1398,17 @@ void renderSample(int16_t& outLeft, int16_t& outRight) {
         g_lfoPhase += g_lfoPhaseInc;
     }
 
-    uint32_t __diagVoiceStartUs = micros(); // see g_synthDiagVoiceUsThisSample's own comment
     int32_t mixL = 0, mixR = 0;
-    uint32_t activeCount = 0; // see g_synthDiagActiveThisSample's own comment
     for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
-        if (g_melodicVoices[i].active) activeCount++;
         int32_t l, r;
         renderVoice(g_melodicVoices[i], lfoValue, l, r);
         mixL += l; mixR += r;
     }
-    uint32_t __diagMelodicDoneUs = micros(); // see g_synthDiagMelodicUsThisSample's own comment
-    g_synthDiagMelodicUsThisSample = __diagMelodicDoneUs - __diagVoiceStartUs;
     for (int i = 0; i < NUM_DRUM_VOICES; i++) {
-        if (g_drumVoices[i].active) activeCount++;
         int32_t l, r;
         renderVoice(g_drumVoices[i], lfoValue, l, r);
         mixL += l; mixR += r;
     }
-    g_synthDiagDrumUsThisSample = micros() - __diagMelodicDoneUs;
-    g_synthDiagActiveThisSample = activeCount;
-    g_synthDiagVoiceUsThisSample = micros() - __diagVoiceStartUs;
 
     // Reverb sends from the synth voices only (see reverbProcess()'s
     // header comment) -- captured before WAV/tracker content is mixed in
@@ -1601,6 +1597,11 @@ void Synth::setLfoRateTenthsHz(uint16_t tenthsHz) {
 void Synth::setLfoVoices(uint8_t maxVoices) {
     if (maxVoices > NUM_MELODIC_VOICES) maxVoices = NUM_MELODIC_VOICES;
     rp2040.fifo.push(packLfoVoicesMsg(maxVoices));
+}
+
+void Synth::setStereoSpread(uint8_t percent) {
+    if (percent > 100) percent = 100;
+    rp2040.fifo.push(packStereoSpreadMsg(percent));
 }
 
 // -- Instrument/drum preset editing (see synth.h's long comment) --------
@@ -1846,6 +1847,10 @@ void loop1() {
             g_maxModulatedVoices = (int)(uint8_t)(msg & 0xFF);
             continue;
         }
+        if (type == MSG_TYPE_STEREO_SPREAD) {
+            g_stereoSpreadPercent = (int)(uint8_t)(msg & 0xFF);
+            continue;
+        }
         uint8_t channel = (msg >> 16) & 0x0F;
         if (type == MSG_TYPE_PROGRAM) {
             g_channelProgram[channel] = (uint8_t)(msg & 0xFF);
@@ -1857,58 +1862,7 @@ void loop1() {
         else handleNoteOff(note);
     }
 
-    uint32_t __diagStartUs = micros(); // see g_synthDiagCalls's own comment
     int16_t left, right;
     renderSample(left, right);
-    uint32_t __diagThisUs = micros() - __diagStartUs;
-
-    g_synthDiagCalls++;
-    g_synthDiagBusyUs += __diagThisUs;
-    if (__diagThisUs > g_synthDiagMaxUs) g_synthDiagMaxUs = __diagThisUs;
-    if (__diagThisUs > SAMPLE_PERIOD_US) g_synthDiagOverBudget++;
-    g_synthDiagActiveSum += g_synthDiagActiveThisSample;
-    if (g_synthDiagActiveThisSample > g_synthDiagActivePeak) g_synthDiagActivePeak = g_synthDiagActiveThisSample;
-    g_synthDiagVoiceBusyUs += g_synthDiagVoiceUsThisSample;
-    if (g_synthDiagVoiceUsThisSample > g_synthDiagVoiceMaxUs) g_synthDiagVoiceMaxUs = g_synthDiagVoiceUsThisSample;
-    g_synthDiagMelodicBusyUs += g_synthDiagMelodicUsThisSample;
-    g_synthDiagDrumBusyUs += g_synthDiagDrumUsThisSample;
-
-    static uint32_t __diagLastPrintMs = 0;
-    uint32_t nowMs = millis();
-    if (nowMs - __diagLastPrintMs >= 1000) {
-        __diagLastPrintMs = nowMs;
-        uint32_t avgUs = g_synthDiagCalls ? (g_synthDiagBusyUs / g_synthDiagCalls) : 0;
-        uint32_t voiceAvgUs = g_synthDiagCalls ? (g_synthDiagVoiceBusyUs / g_synthDiagCalls) : 0;
-        uint32_t melodicAvgUs = g_synthDiagCalls ? (g_synthDiagMelodicBusyUs / g_synthDiagCalls) : 0;
-        uint32_t drumAvgUs = g_synthDiagCalls ? (g_synthDiagDrumBusyUs / g_synthDiagCalls) : 0;
-        uint32_t avgActive100 = g_synthDiagCalls ? (g_synthDiagActiveSum * 100 / g_synthDiagCalls) : 0;
-        // This is the metric that actually caught the confirmed-by-ear
-        // dropout -- see this diag block's own header comment. Positive
-        // means core 1 produced fewer samples than the nominal rate this
-        // second; a sustained (not one-off) positive value here is the
-        // real symptom, more so than overBudget below.
-        int32_t callsShortfall = (int32_t)SAMPLE_RATE - (int32_t)g_synthDiagCalls;
-        Serial.printf(
-            "[synthDiag] calls=%lu callsShortfall=%ld avgUs=%lu maxUs=%lu voiceAvgUs=%lu voiceMaxUs=%lu "
-            "melodicAvgUs=%lu drumAvgUs=%lu overBudget=%lu "
-            "avgActive=%lu.%02lu peakActive=%lu/%d reverb=%d/%d lfoOn=%d maxModVoices=%d\n",
-            (unsigned long)g_synthDiagCalls, (long)callsShortfall,
-            (unsigned long)avgUs, (unsigned long)g_synthDiagMaxUs,
-            (unsigned long)voiceAvgUs, (unsigned long)g_synthDiagVoiceMaxUs,
-            (unsigned long)melodicAvgUs, (unsigned long)drumAvgUs,
-            (unsigned long)g_synthDiagOverBudget,
-            (unsigned long)(avgActive100 / 100), (unsigned long)(avgActive100 % 100),
-            (unsigned long)g_synthDiagActivePeak, NUM_MELODIC_VOICES + NUM_DRUM_VOICES,
-            (int)g_reverbEnabled, (int)g_reverbType,
-            (int)g_lfoEnabled, g_maxModulatedVoices
-        );
-        g_synthDiagCalls = 0;
-        g_synthDiagBusyUs = 0; g_synthDiagMaxUs = 0;
-        g_synthDiagVoiceBusyUs = 0; g_synthDiagVoiceMaxUs = 0;
-        g_synthDiagMelodicBusyUs = 0; g_synthDiagDrumBusyUs = 0;
-        g_synthDiagOverBudget = 0;
-        g_synthDiagActiveSum = 0; g_synthDiagActivePeak = 0;
-    }
-
     g_i2s.write16(left, right); // blocks until DMA buffer space is free, paces this loop
 }
