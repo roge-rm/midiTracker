@@ -268,7 +268,8 @@ void cycleOutputTarget() {
     switch (outputTarget) {
         case MIDI_OUT_HARDWARE: outputTarget = MIDI_OUT_USB; break;
         case MIDI_OUT_USB:      outputTarget = MIDI_OUT_BOTH; break;
-        default:                outputTarget = MIDI_OUT_HARDWARE; break;
+        case MIDI_OUT_BOTH:     outputTarget = MIDI_OUT_OFF; break;
+        default:                outputTarget = MIDI_OUT_HARDWARE; break; // MIDI_OUT_OFF falls here too
     }
     MidiOutput::setTarget(outputTarget);
 }
@@ -1858,14 +1859,16 @@ void enter() {
         audioSeededFromSettings = true;
     }
     MidiOutput::setAudioOutput(audioOn);
-    // Output Level/Reverb have no in-session live-adjust control of their
-    // own (unlike Volume, see handleVolumeHold()), so they're simply
-    // re-applied from Settings every entry -- always current, nothing to
-    // protect.
+    // Output Level/Reverb/LFO Rate/LFO Voices have no in-session live-
+    // adjust control of their own (unlike Volume, see handleVolumeHold()),
+    // so they're simply re-applied from Settings every entry -- always
+    // current, nothing to protect.
     Synth::setOutputLevel((uint8_t)SettingsMode::defaultOutputLevel());
     Synth::setReverbEnabled(SettingsMode::reverbEnabled());
     Synth::setReverbMix((uint8_t)SettingsMode::reverbMix());
     Synth::setReverbType((uint8_t)SettingsMode::reverbType());
+    Synth::setLfoRateTenthsHz((uint16_t)SettingsMode::lfoRateTenthsHz());
+    Synth::setLfoVoices((uint8_t)SettingsMode::lfoVoices());
     // Seed from the Settings default exactly once (the first time this
     // mode is entered after boot), not on every re-entry -- otherwise
     // switching to Looper/Settings and back would silently yank any

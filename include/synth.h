@@ -117,6 +117,39 @@ void setReverbMix(uint8_t percent);
 // does. An out-of-range value is treated as 0. Defaults to 0.
 void setReverbType(uint8_t type);
 
+// -- Shared vibrato/tremolo/PWM LFO ----------------------------------------
+//
+// Both controls affect the one shared LFO described in synth.cpp's
+// g_lfoPhase comment -- vibrato, tremolo, and square-wave PWM all read the
+// same per-sample value, so these apply to all three at once, for every
+// instrument family/preset that uses any of them. Neither affects the
+// reverb's own separate Lush-mode chorus LFO.
+
+// Rate, in tenths of a Hz (e.g. 55 == 5.5Hz). 0 means fully Off: disables
+// vibrato, tremolo, and PWM simultaneously for every voice (see
+// g_lfoEnabled's comment in synth.cpp for why forcing the shared LFO's
+// value to a constant 0, rather than just freezing its phase, is what
+// actually achieves that), without touching any preset's own depth
+// settings -- so turning this back on resumes exactly the modulation
+// each preset already had. Defaults to 55 (5.5Hz, a natural vocal/
+// instrumental vibrato rate -- this synth's original, previously-fixed
+// rate).
+void setLfoRateTenthsHz(uint16_t tenthsHz);
+
+// Caps how many melodic voices can have tremolo and/or PWM modulation
+// running *at once* -- not which instrument families are allowed to use
+// them at all (that's still each preset's own tremoloDepthPercent/
+// pwmDepthPercent, edited via setInstrumentPreset() below). See
+// g_maxModulatedVoices' own comment in synth.cpp for why this exists:
+// several voices audibly wavering in lockstep at once reads as busy/
+// unfocused rather than lively. 0 means no voice ever modulates,
+// regardless of preset -- the same practical "off" as setLfoRateTenthsHz()
+// above, just reached from the voice-count side instead of the rate side.
+// Percussion never modulates at all either way. A value above the melodic
+// voice pool's actual size is clamped to it (harmless either way -- it
+// would just never trigger). Defaults to 3.
+void setLfoVoices(uint8_t maxVoices);
+
 // -- Instrument/drum preset editing (pariSynth) ----------------------------
 //
 // Live editing of the same per-GM-family/per-drum-type presets described

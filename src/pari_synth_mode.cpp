@@ -157,6 +157,21 @@ void enter() {
         volumeSeededFromSettings = true;
     }
     Synth::setVolume((uint8_t)volume);
+    // Output Level/Reverb/LFO Rate/LFO Voices have no in-session live-
+    // adjust control of their own (unlike Volume just above), so they're
+    // simply re-applied from Settings every entry -- always current,
+    // nothing to protect. Same reasoning and the same calls as
+    // FilePlayerMode::enter()'s identical block; pariSynth didn't make
+    // these calls at all until this was noticed as a gap (a fresh boot
+    // straight into pariSynth, never visiting FilePlayerMode first, ran
+    // reverb on setup1()'s hardcoded defaults instead of whatever the user
+    // last saved in Settings).
+    Synth::setOutputLevel((uint8_t)SettingsMode::defaultOutputLevel());
+    Synth::setReverbEnabled(SettingsMode::reverbEnabled());
+    Synth::setReverbMix((uint8_t)SettingsMode::reverbMix());
+    Synth::setReverbType((uint8_t)SettingsMode::reverbType());
+    Synth::setLfoRateTenthsHz((uint16_t)SettingsMode::lfoRateTenthsHz());
+    Synth::setLfoVoices((uint8_t)SettingsMode::lfoVoices());
     MidiOutput::setInputHandler(handleIncomingMidi);
     PariSynthGrid::enter();
     needsRedraw = true;

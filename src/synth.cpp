@@ -24,6 +24,8 @@ const uint32_t MSG_TYPE_REVERB_TYPE = 0x6u;
 // caches (filter alpha, vibrato/tremolo/PWM depth) need recomputing.
 const uint32_t MSG_TYPE_PRESET_DIRTY = 0x7u;
 const uint32_t MSG_TYPE_DRUM_PRESET_DIRTY = 0x8u;
+const uint32_t MSG_TYPE_LFO_RATE = 0x9u;
+const uint32_t MSG_TYPE_LFO_VOICES = 0xAu;
 const uint32_t PANIC_MSG = 0xFFFFFFFFu;
 const uint32_t RESET_PROGRAMS_MSG = 0xFFFFFFFEu;
 
@@ -57,6 +59,15 @@ inline uint32_t packPresetDirtyMsg(uint8_t family) {
 inline uint32_t packDrumPresetDirtyMsg(uint8_t drumType) {
     return (MSG_TYPE_DRUM_PRESET_DIRTY << 28) | drumType;
 }
+// tenthsHz easily fits the 28 payload bits available (max realistic value
+// is a few hundred), 0 is the sentinel for the "Off" setting -- see
+// g_lfoEnabled's comment.
+inline uint32_t packLfoRateMsg(uint16_t tenthsHz) {
+    return (MSG_TYPE_LFO_RATE << 28) | tenthsHz;
+}
+inline uint32_t packLfoVoicesMsg(uint8_t maxVoices) {
+    return (MSG_TYPE_LFO_VOICES << 28) | maxVoices;
+}
 
 // Set by Synth::begin() on core 0, polled by setup1() on core 1 -- see
 // the long comment on Synth::begin() in synth.h for why this exists.
@@ -87,18 +98,36 @@ uint32_t g_presetVibratoDepthQ16[16];
 uint32_t g_presetTremoloDepthQ16[16];
 uint32_t g_presetPwmDepthQ16[16];
 
-// Shared vibrato LFO: a single phase accumulator advanced once per sample
-// (in renderSample(), not per voice) and read by every melodic voice, each
-// scaled by its own preset depth (see Voice::vibratoRange and its use in
-// renderVoice()). Deliberate simplification: every voice's vibrato is
-// therefore in-phase with every other voice's, rather than each note
-// having its own independent LFO phase -- a true per-voice LFO would need
-// its own accumulator (and a sine lookup) per voice for a difference
-// unlikely to be audible at this fidelity level, whereas this is one
-// lookup total per sample no matter how many voices are active.
+// Shared vibrato/tremolo/PWM LFO: a single phase accumulator advanced once
+// per sample (in renderSample(), not per voice) and read by every melodic
+// voice, each scaled by its own preset depth (see Voice::vibratoRange/
+// tremoloDepthQ16/pwmDepthQ16 and their use in renderVoice()). Deliberate
+// simplification: every voice's modulation is therefore in-phase with
+// every other voice's, rather than each note having its own independent
+// LFO phase -- a true per-voice LFO would need its own accumulator (and a
+// sine lookup) per voice for a difference unlikely to be audible at this
+// fidelity level, whereas this is one lookup total per sample no matter
+// how many voices are active.
+//
+// Rate is user-adjustable at runtime (Settings "LFO Rate" -- see
+// Synth::setLfoRateTenthsHz()), unlike this file's other fixed LFO
+// (REVERB_CHORUS_LFO_RATE_HZ, Lush reverb's own separate chorus wobble,
+// untouched by this setting). LFO_RATE_HZ remains the shipped/default
+// rate (matches this synth's original, previously-fixed value) -- read
+// only once, at setup1(), to seed g_lfoPhaseInc before any Settings value
+// has been applied; every later rate change goes through
+// Synth::setLfoRateTenthsHz() instead. g_lfoEnabled is the "Off" position
+// at the bottom of that same setting: rather than freezing g_lfoPhase
+// wherever it happened to stop (which would leave every voice offset by
+// whatever that frozen phase's sine value was, not neutral), renderSample()
+// substitutes a constant 0 for lfoValue when this is false -- since
+// vibrato/tremolo/PWM are each just `something * lfoValue`, a 0 disables
+// all three at once, for every voice, without touching any preset's own
+// depth fields.
 const float LFO_RATE_HZ = 5.5f; // a natural vocal/instrumental vibrato rate
-uint32_t g_lfoPhaseInc = 0; // computed in setup1() from LFO_RATE_HZ
+uint32_t g_lfoPhaseInc = 0; // seeded in setup1() from LFO_RATE_HZ, then Synth::setLfoRateTenthsHz()
 uint32_t g_lfoPhase = 0;
+bool g_lfoEnabled = true;
 
 // Percussion gets its own dedicated pool rather than sharing one with
 // melodic voices: with a 14-25 track file, melodic content alone can
@@ -371,50 +400,35 @@ volatile bool g_wavUnderrun = false;
 // opposed to something else entirely.
 volatile uint32_t g_wavUnderrunSamples = 0;
 
-// Temporary real-hardware diagnostic for the NUM_MELODIC_VOICES/
-// NUM_DRUM_VOICES bump above -- same "measure, don't guess" approach as
-// g_wavUnderrunSamples/g_xmDiag* (see xm_file.cpp). loop1() times how long
-// each sample's FIFO-drain + renderSample() actually takes and compares it
-// against SAMPLE_PERIOD_US, the hard per-sample budget g_i2s.write16()'s
-// blocking pacing enforces -- if that's routinely being exceeded, core 1 is
-// falling behind and eating into the I2S DMA buffer's ~70ms cushion
-// (see setup1()'s setBuffers(12, 256) comment), which is what would
-// eventually surface as audible crackle, same failure mode as the S3M/XM/
-// MOD mixing-throughput bug. Active-voice count is tracked alongside so a
-// reported busyUs/maxUs can be correlated with how many voices were
-// actually sounding, not just assumed from NUM_MELODIC_VOICES/
-// NUM_DRUM_VOICES's ceiling. Printed once/sec, reset after each print.
-const uint32_t SAMPLE_PERIOD_US = 1000000UL / SAMPLE_RATE;
+// Round 8 diagnostic (re-added after round 7 stripped everything -- see
+// parisynth_voice_render_cost memory): chasing a confirmed-by-ear crackle/
+// dropout at ordinary pariSynth polyphony (11-13 active voices) that the
+// old overBudget-percentage metric had missed entirely. Two differences
+// from the earlier rounds' version: (1) the print block below reports an
+// explicit shortfall against the 44100 nominal sample rate -- callsUs
+// alone (samples actually produced per wall-clock second) is what
+// actually caught the real bug, not overBudget; (2) no reverb tank/tail
+// split this time (that investigation already concluded with no further
+// lever there) -- scope is narrowed to voice/melodic/drum only, plus
+// which LFO state was active, since isolating vibrato's own cost from
+// tremolo/PWM's doesn't need new code: LFO Rate=Off zeroes all three
+// (vibrato+tremolo+PWM), LFO Voices=0 zeroes just tremolo/PWM leaving
+// vibrato alone (drum voices already have zero vibrato by construction,
+// see Voice::vibratoRange's comment, so melodicAvgUs vs. drumAvgUs at
+// LFO Voices=0 isolates vibrato's own contribution), and LFO Voices>0
+// restores all three -- the existing Settings are the toggle, no
+// diagnostic-only code path needed.
 uint32_t g_synthDiagCalls = 0;
 uint32_t g_synthDiagBusyUs = 0, g_synthDiagMaxUs = 0;
 uint32_t g_synthDiagOverBudget = 0; // samples whose compute time alone exceeded SAMPLE_PERIOD_US
 uint32_t g_synthDiagActiveSum = 0, g_synthDiagActivePeak = 0;
 uint32_t g_synthDiagActiveThisSample = 0; // set by renderSample(), consumed by loop1() right after
-// Round 2: the round-1 result showed overBudget firing even at
-// peakActive==0, meaning the cost isn't coming from voice count at all --
-// so this splits renderSample()'s own total into "the two voice-mixing
-// for loops" (voiceUs, scales with NUM_MELODIC_VOICES/NUM_DRUM_VOICES and
-// how many are active) vs. everything after (reverb tank/chorus/shimmer,
-// WAV mixing, softLimit -- none of which depend on voice count), to find
-// out which one is actually eating the budget. g_reverbEnabled defaults to
-// true (see its own declaration), so the reverb tank is the prime suspect.
 uint32_t g_synthDiagVoiceUsThisSample = 0; // set by renderSample(), consumed by loop1() right after
 uint32_t g_synthDiagVoiceBusyUs = 0, g_synthDiagVoiceMaxUs = 0;
-// Round 3: round 2 found the ~2us/active-voice cost survives even after
-// commit 1019e07 already eliminated every int64_t multiply from this exact
-// hot path (see cutoffHzToAlphaQ14()'s comment) chasing this same "10-11
-// active voices blows the budget" symptom -- so it isn't 64-bit-multiply
-// emulation either. Two more angles, cheap to test without per-voice
-// timing overhead (micros() itself isn't free called 32-64x/sample, so
-// this splits at the loop level, not per-voice): (1) is melodic
-// (vibrato/tremolo/PWM-capable) per-voice cost higher than drum (mostly
-// vibrato-less, see Voice::vibratoRange's comment)? -- melodicUs/drumUs
-// below. (2) does forcing renderVoice()/waveformSample() fully inline
-// (see their ALWAYS_INLINE below) change anything vs. this same build
-// with it removed? -- compare voiceAvgUs before/after at a similar
-// avgActive.
 uint32_t g_synthDiagMelodicUsThisSample = 0, g_synthDiagDrumUsThisSample = 0;
 uint32_t g_synthDiagMelodicBusyUs = 0, g_synthDiagDrumBusyUs = 0;
+const uint32_t SAMPLE_PERIOD_US = 1000000UL / SAMPLE_RATE;
+
 #define ALWAYS_INLINE __attribute__((always_inline)) inline
 
 // Consumer-side pop, called once per sample from renderSample() while
@@ -671,6 +685,44 @@ DrumType classifyDrum(uint8_t note) {
     }
 }
 
+// Musical, not CPU, motivation (see recomputeInstrumentPresetCache()'s
+// tremoloDepthQ16/pwmDepthQ16 and DEFAULT_PRESETS' tremoloDepthPercent/
+// pwmDepthPercent for who has either at all -- Organ, Strings, Ensemble,
+// Brass, Reed, Synth Lead, Synth Pad): several of those voices audibly
+// wavering in lockstep at once (a wide chord built from any of those
+// families) reads as busy/unfocused rather than lively. Capping how many
+// melodic voices modulate *at once* -- not how many voices exist, or
+// which families can modulate -- keeps that "alive" character on the
+// first few notes of a chord without every simultaneous note wobbling
+// together. Voices beyond the cap still play normally, just flat
+// (v.tremoloDepthQ16/pwmDepthQ16 forced to 0 for their whole note
+// lifetime, decided once at note-on like everything else about a voice's
+// character -- see startMelodicVoice()'s own comment on why mid-note
+// changes are avoided). Percussion never modulates at all (see
+// startPercussionVoice()), so this only applies to the melodic pool.
+// User-adjustable at runtime (Settings "LFO Voices" -- see
+// Synth::setLfoVoices()); 0 means no voice ever modulates, regardless of
+// preset. 3 is just the shipped default -- there's no objectively correct
+// number, just what stops sounding cluttered to a given ear.
+int g_maxModulatedVoices = 3;
+
+// Counts currently-active melodic voices with tremolo and/or PWM already
+// running, for g_maxModulatedVoices above. Excludes `exclude` itself so a
+// retriggered voice (already in g_melodicVoices[], possibly already
+// modulated from its previous life) doesn't count against its own past
+// state when startMelodicVoice() re-decides whether it gets modulation
+// this time. One-time note-on cost, not per-sample, so a plain linear
+// scan over NUM_MELODIC_VOICES is fine.
+int activeModulatedVoiceCount(const Voice* exclude) {
+    int count = 0;
+    for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
+        const Voice& v = g_melodicVoices[i];
+        if (&v == exclude) continue;
+        if (v.active && (v.tremoloDepthQ16 != 0 || v.pwmDepthQ16 != 0)) count++;
+    }
+    return count;
+}
+
 void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity) {
     // Retriggering an already-sounding note, or stealing a busy voice
     // (more notes than NUM_MELODIC_VOICES at once), means `v.amplitude`
@@ -703,6 +755,15 @@ void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity
     v.vibratoRange = (uint32_t)(((uint64_t)v.phaseInc * g_presetVibratoDepthQ16[family]) >> 24);
     v.tremoloDepthQ16 = g_presetTremoloDepthQ16[family];
     v.pwmDepthQ16 = g_presetPwmDepthQ16[family];
+    // See g_maxModulatedVoices' own comment: cap how many voices wobble at
+    // once, not which families are allowed to. A voice that already has
+    // neither (the common case -- most families use neither effect) skips
+    // the scan entirely, since there's nothing to cap.
+    if ((v.tremoloDepthQ16 != 0 || v.pwmDepthQ16 != 0) &&
+        activeModulatedVoiceCount(&v) >= g_maxModulatedVoices) {
+        v.tremoloDepthQ16 = 0;
+        v.pwmDepthQ16 = 0;
+    }
     // Spread channels 0-15 across the stereo field, but not hard to the
     // extremes (32..224 of the 0..255 range) -- a channel fully isolated
     // to one ear is fatiguing on headphones/earbuds, which is exactly
@@ -1322,9 +1383,15 @@ void reverbTypeChanged(uint8_t newType) {
 void renderSample(int16_t& outLeft, int16_t& outRight) {
     // One shared LFO lookup for this whole sample -- see g_lfoPhase's
     // comment -- rather than each voice maintaining (and advancing) its
-    // own phase.
-    int16_t lfoValue = g_sineTable[(g_lfoPhase >> 24) & (SINE_TABLE_SIZE - 1)];
-    g_lfoPhase += g_lfoPhaseInc;
+    // own phase. g_lfoEnabled false (Settings "LFO Rate" == Off) leaves
+    // lfoValue at a constant 0 instead -- see g_lfoEnabled's own comment
+    // for why that, not freezing the phase, is what actually disables
+    // vibrato/tremolo/PWM.
+    int16_t lfoValue = 0;
+    if (g_lfoEnabled) {
+        lfoValue = g_sineTable[(g_lfoPhase >> 24) & (SINE_TABLE_SIZE - 1)];
+        g_lfoPhase += g_lfoPhaseInc;
+    }
 
     uint32_t __diagVoiceStartUs = micros(); // see g_synthDiagVoiceUsThisSample's own comment
     int32_t mixL = 0, mixR = 0;
@@ -1444,8 +1511,18 @@ void renderSample(int16_t& outLeft, int16_t& outRight) {
     // divide, correct by construction for the audio taper. g_outputLevelShift
     // (see its own comment) is a final plain right-shift on top -- the
     // Headphone Low/High/Line Level coarse attenuation.
-    outLeft = (int16_t)((((int64_t)limitedL * g_masterGainQ16) >> 16) >> g_outputLevelShift);
-    outRight = (int16_t)((((int64_t)limitedR * g_masterGainQ16) >> 16) >> g_outputLevelShift);
+    // Plain int32 multiply, not int64_t: limitedL/R are softLimit()'s
+    // output, hard-bounded to +-HARD_LIMIT (32000), and g_masterGainQ16
+    // maxes out at 65536 -- worst case 32000*65536 = 2,097,152,000, safely
+    // inside int32's +-2,147,483,647 range (see cutoffHzToAlphaQ14()'s
+    // comment for why this class of fix matters on a Cortex-M0+, which has
+    // no hardware 32x32->64 multiply and would otherwise emulate this in
+    // software every single sample, unconditionally, regardless of voice
+    // count). g_levelerGainQ16's own multiply just above is NOT the same
+    // case -- mixL/R there are the *pre-limiter* mix, not bounded this
+    // tightly, so it still needs the wider multiply.
+    outLeft = (int16_t)(((limitedL * (int32_t)g_masterGainQ16) >> 16) >> g_outputLevelShift);
+    outRight = (int16_t)(((limitedR * (int32_t)g_masterGainQ16) >> 16) >> g_outputLevelShift);
 }
 
 } // namespace
@@ -1515,6 +1592,15 @@ void Synth::setReverbMix(uint8_t percent) {
 void Synth::setReverbType(uint8_t type) {
     if (type > 2) type = 0;
     rp2040.fifo.push(packReverbTypeMsg(type));
+}
+
+void Synth::setLfoRateTenthsHz(uint16_t tenthsHz) {
+    rp2040.fifo.push(packLfoRateMsg(tenthsHz));
+}
+
+void Synth::setLfoVoices(uint8_t maxVoices) {
+    if (maxVoices > NUM_MELODIC_VOICES) maxVoices = NUM_MELODIC_VOICES;
+    rp2040.fifo.push(packLfoVoicesMsg(maxVoices));
 }
 
 // -- Instrument/drum preset editing (see synth.h's long comment) --------
@@ -1746,6 +1832,20 @@ void loop1() {
             if (drumType < DRUM_TYPE_COUNT) recomputeDrumPresetCache(drumType);
             continue;
         }
+        if (type == MSG_TYPE_LFO_RATE) {
+            uint16_t tenthsHz = (uint16_t)(msg & 0xFFFF);
+            if (tenthsHz == 0) {
+                g_lfoEnabled = false;
+            } else {
+                g_lfoEnabled = true;
+                g_lfoPhaseInc = hzToPhaseInc((float)tenthsHz / 10.0f);
+            }
+            continue;
+        }
+        if (type == MSG_TYPE_LFO_VOICES) {
+            g_maxModulatedVoices = (int)(uint8_t)(msg & 0xFF);
+            continue;
+        }
         uint8_t channel = (msg >> 16) & 0x0F;
         if (type == MSG_TYPE_PROGRAM) {
             g_channelProgram[channel] = (uint8_t)(msg & 0xFF);
@@ -1782,18 +1882,25 @@ void loop1() {
         uint32_t melodicAvgUs = g_synthDiagCalls ? (g_synthDiagMelodicBusyUs / g_synthDiagCalls) : 0;
         uint32_t drumAvgUs = g_synthDiagCalls ? (g_synthDiagDrumBusyUs / g_synthDiagCalls) : 0;
         uint32_t avgActive100 = g_synthDiagCalls ? (g_synthDiagActiveSum * 100 / g_synthDiagCalls) : 0;
+        // This is the metric that actually caught the confirmed-by-ear
+        // dropout -- see this diag block's own header comment. Positive
+        // means core 1 produced fewer samples than the nominal rate this
+        // second; a sustained (not one-off) positive value here is the
+        // real symptom, more so than overBudget below.
+        int32_t callsShortfall = (int32_t)SAMPLE_RATE - (int32_t)g_synthDiagCalls;
         Serial.printf(
-            "[synthDiag] calls=%lu budgetUs=%lu avgUs=%lu maxUs=%lu voiceAvgUs=%lu voiceMaxUs=%lu "
+            "[synthDiag] calls=%lu callsShortfall=%ld avgUs=%lu maxUs=%lu voiceAvgUs=%lu voiceMaxUs=%lu "
             "melodicAvgUs=%lu drumAvgUs=%lu overBudget=%lu "
-            "avgActive=%lu.%02lu peakActive=%lu/%d reverb=%d/%d\n",
-            (unsigned long)g_synthDiagCalls, (unsigned long)SAMPLE_PERIOD_US,
+            "avgActive=%lu.%02lu peakActive=%lu/%d reverb=%d/%d lfoOn=%d maxModVoices=%d\n",
+            (unsigned long)g_synthDiagCalls, (long)callsShortfall,
             (unsigned long)avgUs, (unsigned long)g_synthDiagMaxUs,
             (unsigned long)voiceAvgUs, (unsigned long)g_synthDiagVoiceMaxUs,
             (unsigned long)melodicAvgUs, (unsigned long)drumAvgUs,
             (unsigned long)g_synthDiagOverBudget,
             (unsigned long)(avgActive100 / 100), (unsigned long)(avgActive100 % 100),
             (unsigned long)g_synthDiagActivePeak, NUM_MELODIC_VOICES + NUM_DRUM_VOICES,
-            (int)g_reverbEnabled, (int)g_reverbType
+            (int)g_reverbEnabled, (int)g_reverbType,
+            (int)g_lfoEnabled, g_maxModulatedVoices
         );
         g_synthDiagCalls = 0;
         g_synthDiagBusyUs = 0; g_synthDiagMaxUs = 0;
