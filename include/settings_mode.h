@@ -31,6 +31,7 @@ int reverbType();            // 0-2, see Synth::setReverbType()
 bool synthAudioEnabled();    // see Synth::setSynthAudioEnabled()
 int lfoRateTenthsHz();       // tenths of a Hz, 0 = Off -- see Synth::setLfoRateTenthsHz()
 int lfoVoices();             // 0 = Off, else max simultaneously-modulated voices -- see Synth::setLfoVoices()
+int stereoSpreadPercent();   // 0-100 -- see Synth::setStereoSpread()
 float defaultBpm();
 int defaultTimeSigNum();     // beats/bar -- see LooperMode's TimeSig comment
 int defaultTimeSigDen();     // which note value is one beat (4 = quarter, 8 = eighth, ...)

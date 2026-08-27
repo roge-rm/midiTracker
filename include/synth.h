@@ -150,6 +150,17 @@ void setLfoRateTenthsHz(uint16_t tenthsHz);
 // would just never trigger). Defaults to 3.
 void setLfoVoices(uint8_t maxVoices);
 
+// How widely melodic voices spread across the stereo field by MIDI
+// channel (drums always stay centered -- see synth.cpp's Voice::pan
+// comment). 0-100%: 0 centers every channel (mono panning-wise), 100 is
+// startMelodicVoice()'s alternating-by-channel-parity mapping at full
+// width (channels fan out left/right together as channel number
+// increases, rather than a naive linear ramp that would put every
+// commonly-used low channel on the same side -- see that function's own
+// comment). Defaults to 30 -- real-hardware listening found even the
+// alternating layout too wide at full strength.
+void setStereoSpread(uint8_t percent);
+
 // -- Instrument/drum preset editing (pariSynth) ----------------------------
 //
 // Live editing of the same per-GM-family/per-drum-type presets described
