@@ -748,13 +748,15 @@ void setBacklightBrightness(int percent) {
 
 void begin() {
     pinMode(DISPLAY_BACKLIGHT, OUTPUT);
-    setBacklightBrightness(100); // full brightness until SettingsMode::begin() applies the saved value
+    setBacklightBrightness(0); // stay dark until the screen is cleared, so GRAM garbage never reaches the eye
 
     tft.init();
     tft.setRotation(3);
     tft.fillScreen(COLOR_BG);
     tft.setTextFont(2);
     tft.setTextDatum(TL_DATUM);
+
+    setBacklightBrightness(100); // full brightness until SettingsMode::begin() applies the saved value
 }
 
 int visibleRows() { return rowsOnScreen(); }
