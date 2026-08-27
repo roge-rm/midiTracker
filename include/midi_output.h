@@ -1,7 +1,12 @@
 #pragma once
 #include <Arduino.h>
 
+// Bitmask by construction (see hwEnabled()/usbEnabled() in midi_output.cpp,
+// which just `&` this against MIDI_OUT_HARDWARE/MIDI_OUT_USB) -- MIDI_OUT_OFF
+// (0x00) needs no special-casing anywhere in the send path, it's simply the
+// value where neither bit is set.
 enum MidiOutTarget {
+    MIDI_OUT_OFF      = 0x00,
     MIDI_OUT_HARDWARE = 0x01,
     MIDI_OUT_USB      = 0x02,
     MIDI_OUT_BOTH      = 0x03,
@@ -44,7 +49,12 @@ namespace MidiOutput {
 void begin();
 void update();
 
-// Which transport(s) are currently enabled. Defaults to MIDI_OUT_BOTH.
+// Which transport(s) are currently enabled. MIDI_OUT_OFF disables outgoing
+// MIDI entirely (hardware and USB both) -- purely about this device's own
+// outgoing wire/USB MIDI, same scope note as MidiOutTarget's own comment;
+// it has no bearing on the onboard synth (see setAudioOutput() below) or
+// on MIDI Thru (see setThruMode()), both independent axes. Defaults to
+// MIDI_OUT_BOTH.
 void setTarget(MidiOutTarget target);
 MidiOutTarget getTarget();
 

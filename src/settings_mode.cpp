@@ -27,6 +27,8 @@ namespace SettingsMode
             SETTING_REVERB_MIX,
             SETTING_REVERB_TYPE,
             SETTING_SYNTH_AUDIO,
+            SETTING_LFO_RATE,
+            SETTING_LFO_VOICES,
             SETTING_BPM,
             SETTING_TIME_SIGNATURE,
             SETTING_CLOCK_SOURCE,
@@ -63,13 +65,13 @@ namespace SettingsMode
 
         const char *PAGE_TITLES[PAGE_COUNT] = {"Audio", "Looper", "Metronome", "MIDI/System"};
 
-        const SettingIndex PAGE_AUDIO_ITEMS[] = {SETTING_OUTPUT_LEVEL, SETTING_DEFAULT_VOLUME, SETTING_REVERB, SETTING_REVERB_MIX, SETTING_REVERB_TYPE, SETTING_SYNTH_AUDIO};
+        const SettingIndex PAGE_AUDIO_ITEMS[] = {SETTING_OUTPUT_LEVEL, SETTING_DEFAULT_VOLUME, SETTING_REVERB, SETTING_REVERB_MIX, SETTING_REVERB_TYPE, SETTING_SYNTH_AUDIO, SETTING_LFO_RATE, SETTING_LFO_VOICES};
         const SettingIndex PAGE_LOOPER_ITEMS[] = {SETTING_BPM, SETTING_TIME_SIGNATURE, SETTING_BAR_LENGTH, SETTING_SYNC};
         const SettingIndex PAGE_METRONOME_ITEMS[] = {SETTING_METRONOME, SETTING_METRONOME_VOLUME, SETTING_COUNT_IN, SETTING_COUNT_IN_BARS};
         const SettingIndex PAGE_MIDI_SYSTEM_ITEMS[] = {SETTING_CLOCK_SOURCE, SETTING_MIDI_TRANSPORT, SETTING_MIDI_THRU, SETTING_BRIGHTNESS, SETTING_THEME_EDITOR, SETTING_REBOOT_BOOTLOADER};
 
         const SettingIndex *PAGE_ITEMS[PAGE_COUNT] = {PAGE_AUDIO_ITEMS, PAGE_LOOPER_ITEMS, PAGE_METRONOME_ITEMS, PAGE_MIDI_SYSTEM_ITEMS};
-        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {6, 4, 4, 6};
+        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {8, 4, 4, 6};
 
         int currentPage = 0;
 
@@ -160,6 +162,27 @@ namespace SettingsMode
         int g_reverbMix = 70;         // percent -- see Synth::setReverbMix()
         int g_reverbType = 0;         // 0=Lo-fi, 1=Lush, 2=Shimmer -- see Synth::setReverbType()
         bool g_synthAudioEnabled = false; // see Synth::setSynthAudioEnabled() -- off by default
+
+        // See g_lfoRateTenthsHz/g_lfoVoices below for what these bound.
+        const int LFO_RATE_MIN_TENTHS = 5;   // 0.5Hz
+        const int LFO_RATE_MAX_TENTHS = 100; // 10.0Hz
+        const int LFO_RATE_STEP_TENTHS = 5;  // 0.5Hz per EDIT+LEFT/RIGHT
+        const int LFO_VOICES_MAX = 12;
+
+        // Tenths of a Hz (e.g. 55 == 5.5Hz) -- see Synth::setLfoRateTenthsHz().
+        // 55 matches this synth's original, previously-fixed vibrato rate.
+        // Bounds picked as a reasonable vibrato/tremolo/PWM range: LFO_RATE_MIN_TENTHS
+        // (0.5Hz, a slow chorus-like drift) to LFO_RATE_MAX_TENTHS (10.0Hz, a
+        // brisk trill) in LFO_RATE_STEP_TENTHS (0.5Hz) steps; 0 (below the
+        // minimum) is the "Off" sentinel, at the very bottom of the range.
+        int g_lfoRateTenthsHz = 55;
+        // See Synth::setLfoVoices()/g_maxModulatedVoices' own comment in
+        // synth.cpp. 0 (Off, at the very bottom) means no voice ever
+        // modulates; LFO_VOICES_MAX is a practical ceiling, not a hardware
+        // one -- the melodic voice pool is larger, but capping this high
+        // would defeat the setting's own "keeps it from sounding busy"
+        // purpose.
+        int g_lfoVoices = 3;
         float g_defaultBpm = 120.0f;
         int g_defaultTimeSigNum = 4;
         int g_defaultTimeSigDen = 4;
@@ -263,6 +286,10 @@ namespace SettingsMode
                 return "Reverb Type";
             case SETTING_SYNTH_AUDIO:
                 return "Synth Audio";
+            case SETTING_LFO_RATE:
+                return "LFO Rate";
+            case SETTING_LFO_VOICES:
+                return "LFO Voices";
             case SETTING_BPM:
                 return "Default BPM";
             case SETTING_TIME_SIGNATURE:
@@ -320,6 +347,21 @@ namespace SettingsMode
                 break;
             case SETTING_SYNTH_AUDIO:
                 snprintf(out, outSize, "%s", g_synthAudioEnabled ? "On" : "Off");
+                break;
+            case SETTING_LFO_RATE:
+                // Manual integer/fractional split, not %f -- kept consistent
+                // with SETTING_BPM's own int-only formatting elsewhere in
+                // this function.
+                if (g_lfoRateTenthsHz <= 0)
+                    snprintf(out, outSize, "Off");
+                else
+                    snprintf(out, outSize, "%d.%dHz", g_lfoRateTenthsHz / 10, g_lfoRateTenthsHz % 10);
+                break;
+            case SETTING_LFO_VOICES:
+                if (g_lfoVoices <= 0)
+                    snprintf(out, outSize, "Off");
+                else
+                    snprintf(out, outSize, "%d", g_lfoVoices);
                 break;
             case SETTING_BPM:
                 snprintf(out, outSize, "%d", (int)(g_defaultBpm + 0.5f));
@@ -431,6 +473,22 @@ namespace SettingsMode
                 g_reverbType = idx;
                 break;
             }
+            case SETTING_LFO_RATE:
+                g_lfoRateTenthsHz += direction * LFO_RATE_STEP_TENTHS;
+                if (g_lfoRateTenthsHz < 0)
+                    g_lfoRateTenthsHz = 0; // Off, at the very bottom
+                if (g_lfoRateTenthsHz > 0 && g_lfoRateTenthsHz < LFO_RATE_MIN_TENTHS)
+                    g_lfoRateTenthsHz = LFO_RATE_MIN_TENTHS;
+                if (g_lfoRateTenthsHz > LFO_RATE_MAX_TENTHS)
+                    g_lfoRateTenthsHz = LFO_RATE_MAX_TENTHS;
+                break;
+            case SETTING_LFO_VOICES:
+                g_lfoVoices += direction;
+                if (g_lfoVoices < 0)
+                    g_lfoVoices = 0; // Off, at the very bottom
+                if (g_lfoVoices > LFO_VOICES_MAX)
+                    g_lfoVoices = LFO_VOICES_MAX;
+                break;
             case SETTING_BPM:
                 g_defaultBpm += (float)direction;
                 if (g_defaultBpm < 20.0f)
@@ -563,6 +621,10 @@ namespace SettingsMode
             file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "synthAudio=%d\n", g_synthAudioEnabled ? 1 : 0);
             file.write((const uint8_t *)line, n);
+            n = snprintf(line, sizeof(line), "lfoRateTenthsHz=%d\n", g_lfoRateTenthsHz);
+            file.write((const uint8_t *)line, n);
+            n = snprintf(line, sizeof(line), "lfoVoices=%d\n", g_lfoVoices);
+            file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "bpm=%d\n", (int)(g_defaultBpm + 0.5f));
             file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "timeSigNum=%d\n", g_defaultTimeSigNum);
@@ -638,6 +700,26 @@ namespace SettingsMode
             if (strncmp(line, "synthAudio=", 11) == 0)
             {
                 g_synthAudioEnabled = atoi(line + 11) != 0;
+                return;
+            }
+            if (strncmp(line, "lfoRateTenthsHz=", 16) == 0)
+            {
+                g_lfoRateTenthsHz = atoi(line + 16);
+                if (g_lfoRateTenthsHz < 0)
+                    g_lfoRateTenthsHz = 0;
+                if (g_lfoRateTenthsHz > 0 && g_lfoRateTenthsHz < LFO_RATE_MIN_TENTHS)
+                    g_lfoRateTenthsHz = LFO_RATE_MIN_TENTHS;
+                if (g_lfoRateTenthsHz > LFO_RATE_MAX_TENTHS)
+                    g_lfoRateTenthsHz = LFO_RATE_MAX_TENTHS;
+                return;
+            }
+            if (strncmp(line, "lfoVoices=", 10) == 0)
+            {
+                g_lfoVoices = atoi(line + 10);
+                if (g_lfoVoices < 0)
+                    g_lfoVoices = 0;
+                if (g_lfoVoices > LFO_VOICES_MAX)
+                    g_lfoVoices = LFO_VOICES_MAX;
                 return;
             }
             if (strncmp(line, "bpm=", 4) == 0)
@@ -1678,6 +1760,8 @@ namespace SettingsMode
     int reverbMix() { return g_reverbMix; }
     int reverbType() { return g_reverbType; }
     bool synthAudioEnabled() { return g_synthAudioEnabled; }
+    int lfoRateTenthsHz() { return g_lfoRateTenthsHz; }
+    int lfoVoices() { return g_lfoVoices; }
     float defaultBpm() { return g_defaultBpm; }
     int defaultTimeSigNum() { return g_defaultTimeSigNum; }
     int defaultTimeSigDen() { return g_defaultTimeSigDen; }

@@ -478,6 +478,7 @@ void formatDuration(uint32_t ms, char* out, size_t outSize) {
 
 const char* targetLabel(MidiOutTarget t) {
     switch (t) {
+        case MIDI_OUT_OFF:      return "Off";
         case MIDI_OUT_HARDWARE: return "HW MIDI";
         case MIDI_OUT_USB:      return "USB MIDI";
         default:                return "HW+USB";
