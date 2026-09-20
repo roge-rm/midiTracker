@@ -6,6 +6,8 @@ You can order your own <a href=https://xiphonics.com/products/picotracker-pcb-ki
 
 It turns the device into a MIDI/SysEx/tracker-file player, MIDI/SysEx recorder, and 4 track MIDI looper.
 
+Questions, bug reports, suggestions? Check out the #miditracker channel **[on my discord](https://discord.gg/9Wun47jGC6)**.
+
 ### Player
 
 midiTracker plays standard '.mid' MIDI files, type 0 or 1, out over TRS or USB MIDI. It will also play standard '.syx' SysEx files (eg patch backups from a synth). File are streamed from the SD card and MIDI files can be paused/resumed, scrubbed through forwards and backwards and played at an adjustable tempo. A piano-style display lights up with the played back notes to provide visual feedback while playing.
