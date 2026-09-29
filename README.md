@@ -8,7 +8,7 @@ It turns the device into a MIDI/SysEx/tracker-file player, MIDI/SysEx recorder, 
 
 Questions, bug reports, suggestions? Check out the #miditracker channel **[on my discord](https://discord.gg/9Wun47jGC6)**.
 
-Disclaimer: I am not a programmer and this was made using Claude Opus 5.0/5.5
+Disclaimer: I am not a great programmer and this was made using Claude Opus 5.0/5.5
 
 Cheers,
 Dan
