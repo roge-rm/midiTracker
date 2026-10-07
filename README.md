@@ -8,8 +8,6 @@ It turns the device into a MIDI/SysEx/tracker-file player, MIDI/SysEx recorder, 
 
 Questions, bug reports, suggestions? Check out the #miditracker channel **[on my discord](https://discord.gg/9Wun47jGC6)**.
 
-Disclaimer: I am not a great programmer and this was made using Claude Opus 5.0/5.5
-
 Cheers,
 Dan
 
@@ -104,11 +102,13 @@ See `include/pins.h` for the exact pin map.
 
 Mount your picoTracker in firmware update mode - via Settings > MIDI/System > USB Bootloader if you're already running midiTracker, through the menu if you are on the picoTracker firmware, or by holding the boot pin on the bottom and then connecting the USB cable - and copy the .uf2 file from the latest release to your mounted device.
 
-You can also pull the source and build it yourself - this was made mostly by Claude in platformio on VS Code.
+You can also pull the source and build it yourself.
+
+Disclaimer: I am not a great programmer and this was made using Claude Opus 5.0/5.5
 
 ---
 
 While most of my intended functionality has been built in I need to do a lot more testing to make sure the UI and operation are rock solid and ready for use. Please submit issues you find here or find me on the picoTracker discord to tell me about them there.
 
 Cheers,
-rm
+Dan
