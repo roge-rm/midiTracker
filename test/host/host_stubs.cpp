@@ -4,6 +4,8 @@
 #include "synth.h"
 #include <chrono>
 #include <vector>
+#include <sys/stat.h>
+#include "sd_card.h"
 
 HostSerial Serial;
 
@@ -15,9 +17,11 @@ uint32_t millis() { return micros() / 1000; }
 
 unsigned long FsFile::readCalls = 0;
 
-bool FsFile::open(const char* path, int) {
+bool FsFile::open(const char* path, int flags) {
     close();
-    _f = fopen(path, "rb");
+    if (flags & O_TRUNC) _f = fopen(path, "w+b");
+    else if (flags & O_RDWR) _f = fopen(path, "r+b");
+    else _f = fopen(path, "rb");
     if (!_f) return false;
     fseek(_f, 0, SEEK_END);
     _size = (uint64_t)ftell(_f);
@@ -41,6 +45,19 @@ int FsFile::read(void* buf, size_t n) {
     _pos += got;
     return (int)got;
 }
+
+size_t FsFile::write(const void* buf, size_t n) {
+    if (!_f || fseek(_f, (long)_pos, SEEK_SET) != 0) return 0;
+    size_t put = fwrite(buf, 1, n, _f);
+    _pos += put;
+    if (_pos > _size) _size = _pos;
+    return put;
+}
+
+SdFs sd;
+bool SdFs::exists(const char* path) { struct stat st; return stat(path, &st) == 0; }
+bool SdFs::mkdir(const char* path) { return ::mkdir(path, 0755) == 0; }
+bool SdFs::remove(const char* path) { return ::remove(path) == 0; }
 
 bool FsFile::seekSet(uint64_t pos) {
     if (!_f || pos > _size) return false;

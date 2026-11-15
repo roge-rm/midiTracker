@@ -208,7 +208,7 @@ void __not_in_flash_func(TrackerPlayer::update)() {
         if (_samplesUntilNextTick == 0) {
             advanceTick();
             if (_state == STATE_DONE) break;
-            _samplesUntilNextTick = ticksToSamples(_tempo); // tempo may have just changed
+            _samplesUntilNextTick = tickLength(); // tempo may have just changed
         }
         int16_t frame[2];
         mixOneSample(frame[0], frame[1]);

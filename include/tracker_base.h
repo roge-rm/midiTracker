@@ -104,6 +104,9 @@ protected:
     void resetSequencer(uint8_t speed, uint16_t tempo);
 
     static uint32_t ticksToSamples(uint16_t tempo);
+    // Output frames in the tick that just started. IT overrides this to
+    // carry the fraction ticksToSamples() drops.
+    virtual uint32_t tickLength() { return ticksToSamples(_tempo); }
     // Every step goes through one of these so the MAX_STEP16 floor is applied in one place.
     static uint32_t limitStep(uint32_t step16) { return step16 > MAX_STEP16 ? MAX_STEP16 : step16; }
     static uint32_t stepForHz(float hz);

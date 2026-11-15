@@ -183,7 +183,7 @@ void updateWavPlayerState(WavPlayer::State state, bool stopped);
 // Volume/format rows.
 void updateWavPlayerLive(const WavPlayer& player);
 
-// Full redraw of the tracker (MOD/S3M/XM) "Now Playing" screen:
+// Full redraw of the tracker (MOD/S3M/XM/IT) "Now Playing" screen:
 // Filename/State/Time (elapsed only, a tracker song has no fixed length)/
 // Volume/`Pattern: N/M  Row: R`/channel and instrument counts.
 void drawTrackerPlayer(const char* filename, const TrackerPlayer& player, int volume, bool stopped);

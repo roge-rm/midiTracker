@@ -12,6 +12,7 @@
 #include "mod_file.h"
 #include "s3m_file.h"
 #include "xm_file.h"
+#include "it_file.h"
 #include "midi_output.h"
 #include "midi_recorder.h"
 #include "sysex_recorder.h"
@@ -37,6 +38,7 @@ enum AppState {
     APP_PLAY_MOD,     // playing back a .mod file (see openSelected())
     APP_PLAY_S3M,     // playing back a .s3m file (see openSelected())
     APP_PLAY_XM,      // playing back a .xm file (see openSelected())
+    APP_PLAY_IT,      // playing back a .it file (see openSelected())
     APP_ENTRY_MENU,   // Open/Rename/Delete/Load to Looper/New Recording/Capture SysEx Dump/New Folder
     APP_NAME_ENTRY,   // shared on-screen-keyboard editor for the actions above
     APP_CONFIRM_OVERWRITE, // "overwrite X?" -- the name just entered collides with an existing file/folder, see finishNameEntry()
@@ -109,6 +111,7 @@ WavPlayer wavPlayer;
 ModPlayer* modPlayer = nullptr;
 S3mPlayer* s3mPlayer = nullptr;
 XmPlayer* xmPlayer = nullptr;
+ItPlayer* itPlayer = nullptr;
 MidiRecorder recorder;
 SysExPlayer sysexPlayer;
 SysExRecorder sysexRecorder;
@@ -464,6 +467,13 @@ bool handleBrowsePaging() {
     return usedAsModifier;
 }
 
+// ItPlayer::progressCallback while compressed samples unpack.
+static void showUnpackProgress(int percent) {
+    char line[8];
+    snprintf(line, sizeof(line), "%d%%", percent);
+    Ui::drawMessage("Unpacking samples", line);
+}
+
 void openSelected() {
     int count = browser.entryCount();
     if (selectedIndex < 0 || selectedIndex >= count) return;
@@ -510,7 +520,7 @@ void openSelected() {
         return;
     }
 
-    if (e.kind == FILE_MOD || e.kind == FILE_S3M || e.kind == FILE_XM) {
+    if (e.kind == FILE_MOD || e.kind == FILE_S3M || e.kind == FILE_XM || e.kind == FILE_IT) {
         // The big tracker-format players are the only reason File Player
         // needs LooperMode's tracks[] RAM back -- browsing, MIDI preview,
         // and WAV playback never hit this. Only worth the interactive gate
@@ -568,6 +578,20 @@ void openSelected() {
         if (xmPlayer->load(path)) xmPlayer->play();
         // Same "switch screens either way, error shows on-screen" convention.
         appState = APP_PLAY_XM;
+        needsRedraw = true;
+        return;
+    }
+
+    if (e.kind == FILE_IT) {
+        // See modPlayer's identical comment just above.
+        static_assert(sizeof(ItPlayer) <= SharedRamArena::SIZE,
+                      "ItPlayer no longer fits SharedRamArena -- see shared_ram_arena.h");
+        if (!itPlayer) itPlayer = new (SharedRamArena::data()) ItPlayer();
+        // The first open of a file with compressed samples unpacks them to the card.
+        ItPlayer::progressCallback = showUnpackProgress;
+        if (itPlayer->load(path)) itPlayer->play();
+        ItPlayer::progressCallback = nullptr;
+        appState = APP_PLAY_IT;
         needsRedraw = true;
         return;
     }
@@ -684,6 +708,7 @@ const char* extensionForKind(FileKind kind) {
         case FILE_MOD: return ".mod";
         case FILE_S3M: return ".s3m";
         case FILE_XM:  return ".xm";
+        case FILE_IT:  return ".it";
         default:        return ".mid";
     }
 }
@@ -1420,18 +1445,22 @@ bool restartXmFromTop() {
     return xmPlayer->load(path);
 }
 
-void handlePlayXmInput() {
+// PLAY, LEFT, NAV and volume on an XM or IT player screen. LEFT frees the
+// player and nulls `p`.
+template <class P>
+void handleTrackerInput(P*& p, bool (*restartFromTop)()) {
+    P* player = p;
     if (Input::justPressed(BTN_PLAY)) {
-        if (xmPlayer->state() == XmPlayer::STATE_PLAYING) {
-            xmPlayer->pause();
+        if (player->state() == P::STATE_PLAYING) {
+            player->pause();
             stoppedViaNav = false;
-            Ui::updateTrackerPlayerState(xmPlayer->state(), stoppedViaNav);
-        } else if (xmPlayer->state() == XmPlayer::STATE_PAUSED) {
-            xmPlayer->play();
+            Ui::updateTrackerPlayerState(player->state(), stoppedViaNav);
+        } else if (player->state() == P::STATE_PAUSED) {
+            player->play();
             stoppedViaNav = false;
-            Ui::updateTrackerPlayerState(xmPlayer->state(), stoppedViaNav);
-        } else if (xmPlayer->state() == XmPlayer::STATE_DONE) {
-            if (restartXmFromTop()) xmPlayer->play();
+            Ui::updateTrackerPlayerState(player->state(), stoppedViaNav);
+        } else if (player->state() == P::STATE_DONE) {
+            if (restartFromTop()) player->play();
             stoppedViaNav = false;
             // A reload resets far more than State at once (Time/Pattern/
             // Row), same "full redraw is the right tool" reasoning as the
@@ -1440,9 +1469,9 @@ void handlePlayXmInput() {
         }
     }
     if (Input::justPressed(BTN_LEFT)) {
-        xmPlayer->stop(); // already closes SD handles internally -- safe to destroy right after
-        xmPlayer->~XmPlayer(); // not heap-owned (see SharedRamArena) -- no delete
-        xmPlayer = nullptr;
+        player->stop(); // already closes SD handles internally -- safe to destroy right after
+        player->~P(); // not heap-owned (see SharedRamArena) -- no delete
+        p = nullptr;
         appState = APP_BROWSE;
         needsRedraw = true;
         return;
@@ -1450,10 +1479,10 @@ void handlePlayXmInput() {
     // NAV stops playback: reloads to the start and pauses there, shown as
     // "Stopped" -- same stoppedViaNav convention as the other players.
     if (Input::justPressed(BTN_NAV)) {
-        if (xmPlayer->state() == XmPlayer::STATE_PLAYING ||
-            xmPlayer->state() == XmPlayer::STATE_PAUSED ||
-            xmPlayer->state() == XmPlayer::STATE_DONE) {
-            restartXmFromTop();
+        if (player->state() == P::STATE_PLAYING ||
+            player->state() == P::STATE_PAUSED ||
+            player->state() == P::STATE_DONE) {
+            restartFromTop();
             stoppedViaNav = true;
             needsRedraw = true;
         }
@@ -1461,6 +1490,21 @@ void handlePlayXmInput() {
     // EDIT+UP/DOWN volume, reused as-is -- same reasoning as the MOD/S3M
     // screens. No seek (XmPlayer doesn't support it) and no ALT/MIDI-target.
     handleVolumeHold();
+}
+
+void handlePlayXmInput() {
+    handleTrackerInput(xmPlayer, restartXmFromTop);
+}
+
+// Reloads the currently-open .it from the start, same as restartXmFromTop().
+bool restartItFromTop() {
+    char path[192];
+    browser.buildFullPath(selectedIndex, path, sizeof(path));
+    return itPlayer->load(path);
+}
+
+void handlePlayItInput() {
+    handleTrackerInput(itPlayer, restartItFromTop);
 }
 
 // Reloads the currently-open file from the start -- shared by PLAY's
@@ -2086,6 +2130,20 @@ bool update() {
             break;
         }
 
+        case APP_PLAY_IT: {
+            itPlayer->update();
+            handlePlayItInput();
+            if (appState != APP_PLAY_IT) break;
+            // 200ms, same as APP_PLAY_XM above.
+            static uint32_t lastItPlayTick = 0;
+            uint32_t now = millis();
+            if (itPlayer->state() == ItPlayer::STATE_PLAYING && now - lastItPlayTick >= 200) {
+                lastItPlayTick = now;
+                Ui::updateTrackerPlayerLive(*itPlayer);
+            }
+            break;
+        }
+
         case APP_PLAY_SYSEX: {
             sysexPlayer.update();
             handlePlaySysExInput();
@@ -2256,6 +2314,10 @@ bool update() {
 
             case APP_PLAY_XM:
                 Ui::drawTrackerPlayer(nowPlayingName, *xmPlayer, volume, stoppedViaNav);
+                break;
+
+            case APP_PLAY_IT:
+                Ui::drawTrackerPlayer(nowPlayingName, *itPlayer, volume, stoppedViaNav);
                 break;
 
             case APP_ENTRY_MENU: {

@@ -4,9 +4,9 @@
 #include "config.h"
 
 // Meaningless for directories. FILE_MID/FILE_SYX/FILE_WAV/FILE_MOD/
-// FILE_S3M/FILE_XM, see isMidiFilename()/isSysExFilename()/isWavFilename()/
-// isModFilename()/isS3mFilename()/isXmFilename().
-enum FileKind { FILE_MID, FILE_SYX, FILE_WAV, FILE_MOD, FILE_S3M, FILE_XM };
+// FILE_S3M/FILE_XM/FILE_IT, see isMidiFilename()/isSysExFilename()/isWavFilename()/
+// isModFilename()/isS3mFilename()/isXmFilename()/isItFilename().
+enum FileKind { FILE_MID, FILE_SYX, FILE_WAV, FILE_MOD, FILE_S3M, FILE_XM, FILE_IT };
 
 struct BrowserEntry {
     char name[MAX_FILENAME_LEN];
@@ -182,4 +182,5 @@ private:
     static bool isModFilename(const char* name);
     static bool isS3mFilename(const char* name);
     static bool isXmFilename(const char* name);
+    static bool isItFilename(const char* name);
 };

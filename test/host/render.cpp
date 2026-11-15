@@ -8,6 +8,7 @@
 #include "mod_file.h"
 #include "s3m_file.h"
 #include "xm_file.h"
+#include "it_file.h"
 #include <new>
 #include <string>
 #include <strings.h>
@@ -50,7 +51,7 @@ static int run(const char* path, double seconds, FILE* out) {
 
 int main(int argc, char** argv) {
     if (argc != 4) {
-        fprintf(stderr, "usage: render <file.mod|s3m|xm> <seconds> <out.raw>\n");
+        fprintf(stderr, "usage: render <file.mod|s3m|xm|it> <seconds> <out.raw>\n");
         return 2;
     }
     const char* path = argv[1];
@@ -62,6 +63,13 @@ int main(int argc, char** argv) {
     if (dot && strcasecmp(dot, ".mod") == 0) rc = run<ModPlayer>(path, seconds, out);
     else if (dot && strcasecmp(dot, ".s3m") == 0) rc = run<S3mPlayer>(path, seconds, out);
     else if (dot && strcasecmp(dot, ".xm") == 0) rc = run<XmPlayer>(path, seconds, out);
+    else if (dot && strcasecmp(dot, ".it") == 0) {
+        // Sample cache next to the renders, see ItPlayer::cacheDir.
+        // Sample cache in itcache/ beside the render binary.
+        static std::string dir = std::string(argv[0]).substr(0, std::string(argv[0]).find_last_of('/') + 1) + "itcache";
+        ItPlayer::cacheDir = dir.c_str();
+        rc = run<ItPlayer>(path, seconds, out);
+    }
     else { fprintf(stderr, "unknown extension\n"); rc = 2; }
     fclose(out);
     return rc;

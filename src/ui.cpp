@@ -832,7 +832,7 @@ void drawBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffset) 
 
     if (count == 0) {
         tft.setTextColor(COLOR_DIM, COLOR_BG);
-        tft.drawString("(no .mid/.syx/.wav/.mod/.s3m files here)", 8, HEADER_HEIGHT + 8);
+        tft.drawString("(no .mid/.syx/.wav/.mod/.s3m/.xm/.it files)", 8, HEADER_HEIGHT + 8);
     } else if (count > rows) {
         drawScrollbar(count, scrollOffset, rows, HEADER_HEIGHT);
     }
@@ -1280,7 +1280,7 @@ void updateWavPlayerLive(const WavPlayer& player) {
     drawWavProgressBar(player);
 }
 
-// -- Tracker player screen (MOD/S3M/XM) -----------------------------------
+// -- Tracker player screen (MOD/S3M/XM/IT) --------------------------------
 //
 // Same rows as the WAV screen (PLAYER_FILENAME_Y/ROW2_Y/ROW4_Y), Volume at
 // ROW4_Y's right column so Ui::updateVolume() redraws it. No progress bar:
