@@ -200,6 +200,14 @@ void begin() {
     // USB MIDI
     MIDIUSB.begin(MIDI_CHANNEL_OMNI);
     MIDIUSB.turnThruOff();
+
+    // The MIDI interface is added after the core has enumerated the
+    // serial port, so re-enumerate for the host to see it.
+    if (TinyUSBDevice.mounted()) {
+        TinyUSBDevice.detach();
+        delay(10);
+        TinyUSBDevice.attach();
+    }
 }
 
 void update() {
