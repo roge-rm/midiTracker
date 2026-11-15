@@ -11,6 +11,17 @@ Questions, bug reports, suggestions? Check out the #miditracker channel **[on my
 Cheers,
 Dan
 
+### What's new in 0.6.0
+
+- .it playback.
+- USB Drive, in Settings > MIDI/System, shows the SD card to your computer.
+- USB MIDI shows up on computers.
+- More accurate MOD, S3M and XM effects, and 15-sample MODs play.
+- Long and non-ASCII file names open from the browser.
+- Looper timing and MIDI input fixes.
+- Fixes for crashes and lost data, including settings, banks and looper sessions.
+- Faster screen redraws and about 41 KB more free RAM.
+
 ### Player
 
 midiTracker plays standard '.mid' MIDI files, type 0 or 1, out over TRS or USB MIDI. It will also play standard '.syx' SysEx files (eg patch backups from a synth). File are streamed from the SD card and MIDI files can be paused/resumed, scrubbed through forwards and backwards and played at an adjustable tempo. A piano-style display lights up with the played back notes to provide visual feedback while playing.
