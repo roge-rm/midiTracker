@@ -81,20 +81,10 @@ const uint8_t DEFAULT_CHANNEL_FAMILY[16] = {
 // own header comment on why swapping input handlers between hosts would be
 // dangerous.
 
-// Only actually redraws while the grid itself has draw focus -- while
-// SynthEditor owns the screen instead (SCREEN_EDIT_OVERLAY),
-// MidiOutput::isChannelActive() still reflects the current state
-// underneath (it's driven by MidiOutput::noteActivityIn(), called from the
-// Note On/Off cases below regardless of which screen is showing), so the
-// grid picks up whatever's current for free on its next full redraw when
-// the user backs out, without this needing to draw over whatever
-// SynthEditor is currently showing.
-void redrawChannelCellIfPlaying(uint8_t channel) {
-    if (screen == SCREEN_PLAY) {
-        Ui::updatePariSynthChannelCell(channel, channel == PariSynthGrid::selectedChannel(),
-                                        MidiOutput::isChannelActive(channel));
-    }
-}
+// Channels whose cell needs a redraw for a reason other than its active
+// state (a program change renames it). Set by the MIDI handler, drawn in
+// update(), both on core 0.
+uint16_t cellDirty = 0;
 
 void handleIncomingMidi(uint8_t status, uint8_t data1, uint8_t data2, uint8_t len) {
     (void)len;
@@ -104,16 +94,14 @@ void handleIncomingMidi(uint8_t status, uint8_t data1, uint8_t data2, uint8_t le
         case 0x90: // Note On (velocity 0 == Note Off, same convention as everywhere else in this app)
             Synth::noteOn(channel, data1, data2);
             MidiOutput::noteActivityIn(channel, data1, data2);
-            redrawChannelCellIfPlaying(channel);
             break;
         case 0x80: // Note Off
             Synth::noteOff(channel, data1);
             MidiOutput::noteActivityIn(channel, data1, 0);
-            redrawChannelCellIfPlaying(channel);
             break;
         case 0xC0: // Program Change -- overwrites a manual assignment on this channel, see PariSynthGrid's own comment on that
             Synth::programChange(channel, data1);
-            redrawChannelCellIfPlaying(channel);
+            cellDirty |= (uint16_t)(1u << channel);
             break;
         default:
             // CC/PitchBend/AfterTouch: no backing DSP for any of these yet
@@ -175,6 +163,7 @@ void enter() {
     Synth::setStereoSpread((uint8_t)SettingsMode::stereoSpreadPercent());
     MidiOutput::setInputHandler(handleIncomingMidi);
     PariSynthGrid::enter();
+    cellDirty = 0;
     needsRedraw = true;
 }
 
@@ -205,8 +194,20 @@ bool update() {
 
     if (needsRedraw) {
         needsRedraw = false;
+        cellDirty = 0;
         Ui::drawPariSynthPlay(PariSynthGrid::selectedChannel(), MidiOutput::activeChannelMask());
         if (PariSynthGrid::volumeOverlayVisible()) Ui::updatePariSynthVolumeOverlay(volume);
+    } else {
+        // Redraw cells whose active state or program changed since drawn.
+        uint16_t todo = (uint16_t)((MidiOutput::activeChannelMask() ^ Ui::pariSynthDrawnActiveMask()) | cellDirty);
+        cellDirty = 0;
+        for (int ch = 0; todo; ch++, todo >>= 1) {
+            if (!(todo & 1)) continue;
+            Ui::updatePariSynthChannelCell(ch, ch == PariSynthGrid::selectedChannel(),
+                                            MidiOutput::isChannelActive((uint8_t)ch));
+            // Channel 9's cell shares its rect with the volume overlay.
+            if (ch == 8 && PariSynthGrid::volumeOverlayVisible()) Ui::updatePariSynthVolumeOverlay(volume);
+        }
     }
 
     // Live note-strip refresh -- same fixed low-rate poll convention

@@ -296,28 +296,40 @@ void drawScrollbar(int count, int scrollOffset, int rows, int trackY) {
 // MidiOutput::isNotePercussion()) get a warm red/orange palette instead of
 // the melodic green/yellow one, so drum hits read as visually distinct
 // from melodic notes at a glance rather than just being more activity in
-// the same color. Every column is fully repainted every call -- cheap
-// enough (88 small fillRects) to just call at a fixed low rate rather
-// than diffing.
-void drawNoteStrip(int y, int height = STRIP_HEIGHT) {
+// the same color. Each column remembers what it last painted (tier and
+// bar height) and is only repainted when that changes; `full` forgets
+// that, for the screens' full redraws (entry, theme change, cleared area).
+uint16_t g_stripKey[PIANO_HI - PIANO_LO + 1];
+
+void drawNoteStrip(int y, int height = STRIP_HEIGHT, bool full = false) {
     int span = PIANO_HI - PIANO_LO + 1;
     int colWidth = tft.width() / span;
     if (colWidth < 1) colWidth = 1;
     int barWidth = colWidth > 1 ? colWidth - 1 : 1;
+    if (full) {
+        for (int i = 0; i < span; i++) g_stripKey[i] = 0xFFFF;
+    }
 
     for (int note = PIANO_LO; note <= PIANO_HI; note++) {
         int x = (note - PIANO_LO) * colWidth;
         int barHeight = 0;
+        uint8_t tier = 0;
         uint16_t color = COLOR_BG;
         if (MidiOutput::isNoteActive((uint8_t)note)) {
             uint8_t vel = MidiOutput::noteVelocity((uint8_t)note);
             barHeight = STRIP_MIN_BAR_HEIGHT + ((height - STRIP_MIN_BAR_HEIGHT) * vel) / 127;
-            if (MidiOutput::isNotePercussion((uint8_t)note)) {
-                color = (vel >= 100) ? COLOR_PERC_HIGH : (vel >= 64) ? COLOR_PERC_MID : COLOR_PERC_LOW;
+            uint8_t level = (vel >= 100) ? 3 : (vel >= 64) ? 2 : 1;
+            bool perc = MidiOutput::isNotePercussion((uint8_t)note);
+            tier = perc ? level + 3 : level;
+            if (perc) {
+                color = (level == 3) ? COLOR_PERC_HIGH : (level == 2) ? COLOR_PERC_MID : COLOR_PERC_LOW;
             } else {
-                color = (vel >= 100) ? COLOR_NOTE_HIGH : (vel >= 64) ? COLOR_NOTE_MID : COLOR_NOTE_LOW;
+                color = (level == 3) ? COLOR_NOTE_HIGH : (level == 2) ? COLOR_NOTE_MID : COLOR_NOTE_LOW;
             }
         }
+        uint16_t key = (uint16_t)((tier << 8) | (barHeight & 0xFF));
+        if (key == g_stripKey[note - PIANO_LO]) continue;
+        g_stripKey[note - PIANO_LO] = key;
         if (barHeight < height) {
             tft.fillRect(x, y, barWidth, height - barHeight, COLOR_BG);
         }
@@ -587,6 +599,23 @@ void drawActivityDot(int x, int y, bool active) {
     tft.fillCircle(x, y, 5, active ? COLOR_PULSE : COLOR_DIM);
 }
 
+// Paints a progress bar's change from `lastFill` to `fillW` pixels (the bar
+// is `barW` wide at x, y, `h` high, COLOR_DIM behind the fill). lastFill < 0
+// paints the whole bar; colorChanged repaints the whole fill.
+void paintBarDelta(int x, int y, int h, int barW, int fillW, int lastFill, uint16_t color, bool colorChanged) {
+    if (lastFill < 0) {
+        tft.fillRect(x, y, barW, h, COLOR_DIM);
+        if (fillW > 0) tft.fillRect(x, y, fillW, h, color);
+        return;
+    }
+    if (fillW < lastFill) tft.fillRect(x + fillW, y, lastFill - fillW, h, COLOR_DIM);
+    if (colorChanged) {
+        if (fillW > 0) tft.fillRect(x, y, fillW, h, color);
+    } else if (fillW > lastFill) {
+        tft.fillRect(x + lastFill, y, fillW - lastFill, h, color);
+    }
+}
+
 // Byte-progress bar + numeric readout, filling the space drawPlayer()'s
 // note strip would otherwise occupy (meaningless for a raw SysEx dump --
 // there are no notes). The filled portion briefly switches from steady
@@ -594,40 +623,48 @@ void drawActivityDot(int x, int y, bool active) {
 // (see RECORDING_ACTIVITY_MS), then settles back -- a static bar alone reads
 // as "how far along", the flash is what reads as "actively sending right
 // now" per this screen's whole point.
-void drawSysExProgress(const SysExPlayer& player) {
+char g_sysexLabel[32] = {0};
+int g_sysexFill = -1;
+uint16_t g_sysexColor = 0;
+
+// `full` (the screen's entry draw) clears the whole progress area and
+// repaints it; live ticks only repaint the label if its text changed and
+// the part of the bar that changed.
+void drawSysExProgress(const SysExPlayer& player, bool full) {
     uint32_t total = player.totalBytes();
     uint32_t sent = player.bytesSent();
     int pct = total > 0 ? (int)(((uint64_t)sent * 100) / total) : 0;
 
     char buf[32];
     snprintf(buf, sizeof(buf), "%lu / %lu bytes (%d%%)", (unsigned long)sent, (unsigned long)total, pct);
-    tft.fillRect(0, SYSEX_PROGRESS_LABEL_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString(buf, 8, SYSEX_PROGRESS_LABEL_Y);
+    if (full) {
+        g_sysexLabel[0] = '\0';
+        g_sysexFill = -1;
+        // The bar is inset 8px each side; clear its margins once.
+        tft.fillRect(0, SYSEX_PROGRESS_BAR_Y, tft.width(), SYSEX_PROGRESS_BAR_H, COLOR_BG);
+        // Nothing else occupies the space below the bar down to the footer.
+        int fy = tft.height() - FOOTER_HEIGHT;
+        int contentBottom = SYSEX_PROGRESS_BAR_Y + SYSEX_PROGRESS_BAR_H;
+        if (fy > contentBottom) {
+            tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
+        }
+    }
+    if (strcmp(buf, g_sysexLabel) != 0) {
+        tft.fillRect(0, SYSEX_PROGRESS_LABEL_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
+        tft.setTextColor(COLOR_DIM, COLOR_BG);
+        tft.setTextDatum(TL_DATUM);
+        tft.drawString(buf, 8, SYSEX_PROGRESS_LABEL_Y);
+        strcpy(g_sysexLabel, buf);
+    }
 
-    // The bar itself is inset 8px on each side (barX/barW below) --
-    // clear the full row first so the two narrow margins beside it don't
-    // keep showing whatever was drawn there before (e.g. a file browser
-    // row's selection-highlight background). Done on every call, same as
-    // the label clear just above, since this runs both as the entry draw
-    // (drawSysExPlayer()) and the live per-tick update
-    // (updateSysExPlayerLive()).
-    tft.fillRect(0, SYSEX_PROGRESS_BAR_Y, tft.width(), SYSEX_PROGRESS_BAR_H, COLOR_BG);
     int barX = 8, barW = tft.width() - 16;
-    tft.fillRect(barX, SYSEX_PROGRESS_BAR_Y, barW, SYSEX_PROGRESS_BAR_H, COLOR_DIM);
     int fillW = total > 0 ? (int)(((uint64_t)barW * sent) / total) : 0;
-    if (fillW > 0) {
-        bool active = player.msSinceLastSend() < RECORDING_ACTIVITY_MS;
-        tft.fillRect(barX, SYSEX_PROGRESS_BAR_Y, fillW, SYSEX_PROGRESS_BAR_H, active ? COLOR_PULSE : COLOR_ACCENT);
-    }
-
-    // Nothing else occupies the space below the bar down to the footer.
-    int fy = tft.height() - FOOTER_HEIGHT;
-    int contentBottom = SYSEX_PROGRESS_BAR_Y + SYSEX_PROGRESS_BAR_H;
-    if (fy > contentBottom) {
-        tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
-    }
+    uint16_t color = (fillW > 0 && player.msSinceLastSend() < RECORDING_ACTIVITY_MS) ? COLOR_PULSE : COLOR_ACCENT;
+    if (fillW == g_sysexFill && (fillW == 0 || color == g_sysexColor)) return;
+    paintBarDelta(barX, SYSEX_PROGRESS_BAR_Y, SYSEX_PROGRESS_BAR_H, barW, fillW, g_sysexFill,
+                  color, color != g_sysexColor);
+    g_sysexFill = fillW;
+    g_sysexColor = color;
 }
 
 // Splits one pariSynth channel cell's text into its two independently-
@@ -659,7 +696,11 @@ void parisynthChannelParts(int channel, char* numBuf, size_t numBufSize, char* n
 // uses for a hard-hit note just below this grid, rather than inventing a
 // new color meaning -- while at least one note is currently held on that
 // channel.
+uint16_t g_cellActiveDrawn = 0;
+
 void drawParisynthCell(int channel, bool selected, bool active) {
+    if (active) g_cellActiveDrawn |= (uint16_t)(1u << channel);
+    else g_cellActiveDrawn &= (uint16_t)~(1u << channel);
     int col = channel / PARISYNTH_ROWS;
     int row = channel % PARISYNTH_ROWS;
     int y = PARISYNTH_GRID_Y + row * ROW_HEIGHT;
@@ -798,7 +839,22 @@ void drawBrowserHeaderPath(const SdBrowser& browser) {
     browser.truncationNote(note, sizeof(note));
     char headerBuf[224];
     snprintf(headerBuf, sizeof(headerBuf), "%s%s", browser.currentPath(), note);
-    tft.drawString(headerBuf, 4, 3);
+    // A long path shows its end, with "..." in front, so it stops short
+    // of the brand label.
+    int maxW = tft.width() - 4 - tft.textWidth("midiTracker") - 4 - 8;
+    const char* shown = headerBuf;
+    char clipped[sizeof(headerBuf) + 4];
+    if (tft.textWidth(shown) > maxW) {
+        const char* tail = headerBuf;
+        while (*tail) {
+            tail++;
+            while ((*tail & 0xC0) == 0x80) tail++;
+            snprintf(clipped, sizeof(clipped), "...%s", tail);
+            if (tft.textWidth(clipped) <= maxW) break;
+        }
+        shown = clipped;
+    }
+    tft.drawString(shown, 4, 3);
     drawHeaderBrand();
 }
 
@@ -986,7 +1042,7 @@ void drawPlayer(const char* filename, const MidiPlayer& player, MidiOutTarget ta
     if (fy > contentBottom) {
         tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
     }
-    drawNoteStrip(PLAYER_STRIP_Y);
+    drawNoteStrip(PLAYER_STRIP_Y, STRIP_HEIGHT, true);
     // Row-grouped (see pins.h): line 1 = UP/PLAY/EDIT, with EDIT+UP/DOWN
     // (volume) woven into UD's own hint since EDIT is a modifier there
     // (as opposed to its own tap, which toggles Audio) -- same reasoning
@@ -1089,10 +1145,12 @@ void drawPariSynthPlay(int selectedChannel, uint16_t activeMask, const char* foo
     if (fy > PARISYNTH_GRID_BOTTOM) {
         tft.fillRect(0, PARISYNTH_GRID_BOTTOM, tft.width(), fy - PARISYNTH_GRID_BOTTOM, COLOR_BG);
     }
-    drawNoteStrip(PARISYNTH_STRIP_Y, parisynthStripHeight());
+    drawNoteStrip(PARISYNTH_STRIP_Y, parisynthStripHeight(), true);
 
     drawFooter(footerLine1, footerLine2);
 }
+
+uint16_t pariSynthDrawnActiveMask() { return g_cellActiveDrawn; }
 
 void updatePariSynthPlayLive() {
     drawNoteStrip(PARISYNTH_STRIP_Y, parisynthStripHeight());
@@ -1160,15 +1218,20 @@ const char* wavStateLabel(WavPlayer::State s, bool stopped) {
 // Steady elapsed/total fill -- no activity flash the way
 // drawSysExProgress() has, since WAV streaming isn't message-bursty the
 // way SysEx sending is.
-void drawWavProgressBar(const WavPlayer& player) {
+int g_wavFill = -1;
+
+// `full` repaints the whole bar, otherwise only what changed.
+void drawWavProgressBar(const WavPlayer& player, bool full) {
     uint32_t total = player.totalMs();
     uint32_t elapsed = player.elapsedMs();
     if (elapsed > total) elapsed = total;
 
     int barX = 8, barW = tft.width() - 16;
-    tft.fillRect(barX, WAV_BAR_Y, barW, WAV_BAR_H, COLOR_DIM);
     int fillW = total > 0 ? (int)(((uint64_t)barW * elapsed) / total) : 0;
-    if (fillW > 0) tft.fillRect(barX, WAV_BAR_Y, fillW, WAV_BAR_H, COLOR_ACCENT);
+    if (full) g_wavFill = -1;
+    if (fillW == g_wavFill) return;
+    paintBarDelta(barX, WAV_BAR_Y, WAV_BAR_H, barW, fillW, g_wavFill, COLOR_ACCENT, false);
+    g_wavFill = fillW;
 }
 
 void drawWavPlayer(const char* filename, const WavPlayer& player, int volume, bool stopped) {
@@ -1235,7 +1298,7 @@ void drawWavPlayer(const char* filename, const WavPlayer& player, int volume, bo
         // updateWavPlayerLive()), which never touches the margins either,
         // so they stay clean once cleared here.
         tft.fillRect(0, WAV_BAR_Y, tft.width(), WAV_BAR_H, COLOR_BG);
-        drawWavProgressBar(player);
+        drawWavProgressBar(player, true);
 
         // Same reasoning as the fillRect above -- clears from right after
         // the bar's own bottom edge (not just this row's own height), so
@@ -1277,7 +1340,7 @@ void updateWavPlayerLive(const WavPlayer& player) {
     updateStatValue(STAT_COL2_X + tft.textWidth(TIME_LABEL), PLAYER_ROW2_Y,
                      timeStr, g_lastWavTimeStr, sizeof(g_lastWavTimeStr));
 
-    drawWavProgressBar(player);
+    drawWavProgressBar(player, false);
 }
 
 // -- Tracker player screen (MOD/S3M/XM/IT) --------------------------------
@@ -1649,8 +1712,44 @@ void drawConfirmOverwrite(const char* name, bool isDir) {
     drawFooter("ENTER overwrite");
 }
 
+// What the live Elapsed/count rows and activity dot last showed, so a tick
+// only repaints what changed. Cleared by every full draw of those screens.
+char g_liveElapsed[24] = {0};
+char g_liveCount[24] = {0};
+int8_t g_liveDot = -1;
+uint32_t g_logHash[12] = {0};
+
+void resetLiveRows() {
+    g_liveElapsed[0] = '\0';
+    g_liveCount[0] = '\0';
+    g_liveDot = -1;
+    for (uint32_t& h : g_logHash) h = 0;
+}
+
+// dot < 0: this screen has no activity dot.
+void drawLiveRows(const char* elapsed, const char* count, int dot) {
+    tft.setTextColor(COLOR_DIM, COLOR_BG);
+    tft.setTextDatum(TL_DATUM);
+    if (strcmp(elapsed, g_liveElapsed) != 0) {
+        tft.fillRect(0, REC_ELAPSED_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
+        tft.drawString(elapsed, 8, REC_ELAPSED_Y);
+        strlcpy(g_liveElapsed, elapsed, sizeof(g_liveElapsed));
+    }
+    bool countChanged = strcmp(count, g_liveCount) != 0;
+    if (countChanged) {
+        tft.fillRect(0, REC_EVENTS_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
+        tft.drawString(count, 8, REC_EVENTS_Y);
+        strlcpy(g_liveCount, count, sizeof(g_liveCount));
+    }
+    if (dot >= 0 && (countChanged || g_liveDot != (int8_t)dot)) {
+        drawActivityDot(tft.width() - 16, REC_EVENTS_Y + ROW_HEIGHT / 2, dot != 0);
+        g_liveDot = (int8_t)dot;
+    }
+}
+
 void drawRecording(const char* filename, const MidiRecorder& recorder,
                     const MidiLogEntry* log, int logCount) {
+    resetLiveRows();
     tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
     tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
     tft.setTextDatum(TL_DATUM);
@@ -1711,44 +1810,48 @@ void drawRecording(const char* filename, const MidiRecorder& recorder,
 void updateRecordingLive(const MidiRecorder& recorder) {
     // Only meaningful (and only called) while STATE_RECORDING, so the
     // fixed non-error layout offsets from drawRecording() apply here.
-    char buf[48];
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-
-    char timeStr[16];
+    char timeStr[16], elapsed[24], count[24];
     formatDuration(recorder.elapsedMs(), timeStr, sizeof(timeStr));
-    snprintf(buf, sizeof(buf), "Elapsed: %s", timeStr);
-    tft.fillRect(0, REC_ELAPSED_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    tft.drawString(buf, 8, REC_ELAPSED_Y);
-
-    snprintf(buf, sizeof(buf), "Events: %lu", (unsigned long)recorder.eventCount());
-    tft.fillRect(0, REC_EVENTS_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    tft.drawString(buf, 8, REC_EVENTS_Y);
-    drawActivityDot(tft.width() - 16, REC_EVENTS_Y + ROW_HEIGHT / 2,
-                     recorder.msSinceLastEvent() < RECORDING_ACTIVITY_MS);
+    snprintf(elapsed, sizeof(elapsed), "Elapsed: %s", timeStr);
+    snprintf(count, sizeof(count), "Events: %lu", (unsigned long)recorder.eventCount());
+    drawLiveRows(elapsed, count, recorder.msSinceLastEvent() < RECORDING_ACTIVITY_MS ? 1 : 0);
 }
 
 void updateRecordingLog(const MidiLogEntry* entries, int count) {
     int fy = tft.height() - FOOTER_HEIGHT;
     int rows = (fy - REC_LOG_Y) / ROW_HEIGHT;
     if (rows <= 0) return;
-    tft.fillRect(0, REC_LOG_Y, tft.width(), rows * ROW_HEIGHT, COLOR_BG);
-    if (count <= 0) return;
+    int maxRows = (int)(sizeof(g_logHash) / sizeof(g_logHash[0]));
+    if (rows > maxRows) rows = maxRows;
 
     tft.setTextColor(COLOR_DIM, COLOR_BG);
+    tft.setTextDatum(TL_DATUM);
     // entries[] is oldest-first; show only the most recent `shown`, newest
     // at the bottom, so it reads like a scrolling log rather than a
-    // shrinking one.
-    int shown = count < rows ? count : rows;
+    // shrinking one. Each row is repainted only if its text changed
+    // (g_logHash holds a hash of what it shows, 0 for blank).
+    int shown = count < 0 ? 0 : (count < rows ? count : rows);
     int startIdx = count - shown;
-    for (int i = 0; i < shown; i++) {
+    for (int i = 0; i < rows; i++) {
         char buf[40];
-        formatMidiLogLine(entries[startIdx + i], buf, sizeof(buf));
-        tft.drawString(buf, 8, REC_LOG_Y + i * ROW_HEIGHT);
+        buf[0] = '\0';
+        uint32_t h = 0;
+        if (i < shown) {
+            formatMidiLogLine(entries[startIdx + i], buf, sizeof(buf));
+            h = 2166136261u;
+            for (const char* c = buf; *c; c++) h = (h ^ (uint8_t)*c) * 16777619u;
+            if (h == 0) h = 1;
+        }
+        if (h == g_logHash[i]) continue;
+        g_logHash[i] = h;
+        tft.fillRect(0, REC_LOG_Y + i * ROW_HEIGHT, tft.width(), ROW_HEIGHT, COLOR_BG);
+        if (h) tft.drawString(buf, 8, REC_LOG_Y + i * ROW_HEIGHT);
     }
 }
 
 void drawSysExCapture(const char* filename, const SysExRecorder& recorder,
                        const MidiLogEntry* log, int logCount) {
+    resetLiveRows();
     tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
     tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
     tft.setTextDatum(TL_DATUM);
@@ -1806,23 +1909,15 @@ void drawSysExCapture(const char* filename, const SysExRecorder& recorder,
 void updateSysExCaptureLive(const SysExRecorder& recorder) {
     // Only meaningful (and only called) while STATE_RECORDING, so the
     // fixed non-error layout offsets from drawSysExCapture() apply here.
-    char buf[48];
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-
-    char timeStr[16];
+    char timeStr[16], elapsed[24], count[24];
     formatDuration(recorder.elapsedMs(), timeStr, sizeof(timeStr));
-    snprintf(buf, sizeof(buf), "Elapsed: %s", timeStr);
-    tft.fillRect(0, REC_ELAPSED_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    tft.drawString(buf, 8, REC_ELAPSED_Y);
-
-    snprintf(buf, sizeof(buf), "Messages: %lu", (unsigned long)recorder.messageCount());
-    tft.fillRect(0, REC_EVENTS_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    tft.drawString(buf, 8, REC_EVENTS_Y);
-    drawActivityDot(tft.width() - 16, REC_EVENTS_Y + ROW_HEIGHT / 2,
-                          recorder.msSinceLastMessage() < RECORDING_ACTIVITY_MS);
+    snprintf(elapsed, sizeof(elapsed), "Elapsed: %s", timeStr);
+    snprintf(count, sizeof(count), "Messages: %lu", (unsigned long)recorder.messageCount());
+    drawLiveRows(elapsed, count, recorder.msSinceLastMessage() < RECORDING_ACTIVITY_MS ? 1 : 0);
 }
 
 void drawSysExPlayer(const char* filename, const SysExPlayer& player) {
+    resetLiveRows();
     tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
     tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
     tft.setTextDatum(TL_DATUM);
@@ -1866,7 +1961,7 @@ void drawSysExPlayer(const char* filename, const SysExPlayer& player) {
         snprintf(buf, sizeof(buf), "Messages: %lu", (unsigned long)player.messagesSent());
         tft.drawString(buf, 8, REC_EVENTS_Y);
 
-        drawSysExProgress(player);
+        drawSysExProgress(player, true);
     }
 
     // No footer hint line -- NAV/LEFT (stop & back) is this screen's only
@@ -1877,20 +1972,13 @@ void drawSysExPlayer(const char* filename, const SysExPlayer& player) {
 void updateSysExPlayerLive(const SysExPlayer& player) {
     // Only meaningful (and only called) while STATE_SENDING, so the fixed
     // non-error layout offsets from drawSysExPlayer() apply here.
-    char buf[48];
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-
-    char timeStr[16];
+    char timeStr[16], elapsed[24], count[24];
     formatDuration(player.elapsedMs(), timeStr, sizeof(timeStr));
-    snprintf(buf, sizeof(buf), "Elapsed: %s", timeStr);
-    tft.fillRect(0, REC_ELAPSED_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    tft.drawString(buf, 8, REC_ELAPSED_Y);
+    snprintf(elapsed, sizeof(elapsed), "Elapsed: %s", timeStr);
+    snprintf(count, sizeof(count), "Messages: %lu", (unsigned long)player.messagesSent());
+    drawLiveRows(elapsed, count, -1);
 
-    snprintf(buf, sizeof(buf), "Messages: %lu", (unsigned long)player.messagesSent());
-    tft.fillRect(0, REC_EVENTS_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    tft.drawString(buf, 8, REC_EVENTS_Y);
-
-    drawSysExProgress(player);
+    drawSysExProgress(player, false);
 }
 
 // Looper screen layout: header, then 4 fixed-height track rows (label
@@ -2088,10 +2176,12 @@ void drawLooperTrackBarLength(const LoopTrackView& t, int idx, bool selected) {
 // row -- a dim background track the full row width, filled proportionally
 // to positionFrac. Always safe to call standalone (e.g. every ~100ms)
 // since it never touches the label line above it.
-void drawLooperTrackBar(const LoopTrackView& t, int idx) {
+int16_t g_looperBarFill[4] = {-1, -1, -1, -1};
+uint16_t g_looperBarColor[4] = {0, 0, 0, 0};
+
+void drawLooperTrackBar(const LoopTrackView& t, int idx, bool force) {
     int y = LOOPER_FIRST_ROW_Y + idx * LOOPER_ROW_HEIGHT + LOOPER_BAR_Y_OFFSET;
     int barW = tft.width() - 16;
-    tft.fillRect(8, y, barW, LOOPER_BAR_HEIGHT, COLOR_DIM);
     // No lengthMs==0 guard here: positionFrac() already reports 0 for
     // every state where there's genuinely nothing to show (empty, armed,
     // freeform recording with no target yet). But a bar-quantized track's
@@ -2100,7 +2190,17 @@ void drawLooperTrackBar(const LoopTrackView& t, int idx) {
     // toward its target length in that case -- bailing out here on
     // lengthMs alone would silently discard it.
     int fillW = (int)(barW * t.positionFrac);
-    if (fillW > 0) tft.fillRect(8, y, fillW, LOOPER_BAR_HEIGHT, loopStateColor(t.state));
+    uint16_t color = loopStateColor(t.state);
+    if (force) g_looperBarFill[idx] = -1;
+    if (fillW == g_looperBarFill[idx] && (fillW == 0 || color == g_looperBarColor[idx])) return;
+    paintBarDelta(8, y, LOOPER_BAR_HEIGHT, barW, fillW, g_looperBarFill[idx], color,
+                  color != g_looperBarColor[idx]);
+    g_looperBarFill[idx] = (int16_t)fillW;
+    g_looperBarColor[idx] = color;
+}
+
+void resetLooperBarCache() {
+    for (int i = 0; i < 4; i++) g_looperBarFill[i] = -1;
 }
 
 // Draws (or clears) track idx's two MIDI-activity dots -- record (red)
@@ -2159,6 +2259,11 @@ const char* LOOPER_METRONOME_LABEL = "Metro";
 const char* LOOPER_COUNTIN_LABEL = "Count";
 const int LOOPER_FIELD_GAP = 10;
 
+// x range of the focused field's box on the BPM row (empty when none), so
+// the beat flash can leave its edges alone.
+int g_bpmFocusX0 = 0;
+int g_bpmFocusX1 = 0;
+
 // A "value" field (not on/off) at x: BPM's own numeric readout, or the
 // time signature -- always shown in COLOR_TEXT (there's no dim/off state
 // for either), same inverted-box focus treatment as the on/off fields
@@ -2170,6 +2275,8 @@ int drawLooperBpmValueField(int x, const char* text, bool focused, uint16_t rowB
     int w = tft.textWidth(text) + 6;
     if (focused) {
         tft.fillRect(x - 3, LOOPER_STATUS_Y, w, ROW_HEIGHT, fieldBg);
+        g_bpmFocusX0 = x - 3;
+        g_bpmFocusX1 = x - 3 + w;
     }
     tft.setTextColor(fg, fieldBg);
     tft.setTextDatum(TL_DATUM);
@@ -2188,6 +2295,8 @@ int drawLooperBpmField(int x, const char* label, bool on, bool focused, uint16_t
     int w = tft.textWidth(label) + 6;
     if (focused) {
         tft.fillRect(x - 3, LOOPER_STATUS_Y, w, ROW_HEIGHT, fieldBg);
+        g_bpmFocusX0 = x - 3;
+        g_bpmFocusX1 = x - 3 + w;
     }
     tft.setTextColor(fg, fieldBg);
     tft.setTextDatum(TL_DATUM);
@@ -2210,6 +2319,7 @@ void drawLooperBpmRow(float bpm, int timeSigNum, int timeSigDen, bool syncMode, 
                        int countInBars, bool showCountInBars, int focusIndex, bool selected) {
     uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
     tft.fillRect(0, LOOPER_STATUS_Y, tft.width(), ROW_HEIGHT, bg);
+    g_bpmFocusX0 = g_bpmFocusX1 = 0;
 
     int x = 8;
     char bpmBuf[16];
@@ -2244,6 +2354,8 @@ void drawLooperBpmRow(float bpm, int timeSigNum, int timeSigDen, bool syncMode, 
     if (syncFocused) {
         int w = tft.textWidth(syncLabel) + 6;
         tft.fillRect(tft.width() - 8 - w, LOOPER_STATUS_Y, w, ROW_HEIGHT, syncBg);
+        g_bpmFocusX0 = tft.width() - 8 - w;
+        g_bpmFocusX1 = tft.width() - 8;
     }
     tft.setTextColor(syncFg, syncBg);
     tft.setTextDatum(TR_DATUM);
@@ -2277,7 +2389,7 @@ void drawLooper(const LoopTrackView tracksArg[4], int selectedTrack, bool onBpmR
     for (int i = 0; i < 4; i++) {
         bool selected = !onBpmRow && (i == selectedTrack);
         drawLooperTrackLabel(tracksArg[i], i, selected);
-        drawLooperTrackBar(tracksArg[i], i);
+        drawLooperTrackBar(tracksArg[i], i, true);
         drawLooperTrackActivity(tracksArg[i], i, selected);
     }
     drawLooperBpmRow(bpm, timeSigNum, timeSigDen, syncMode, metronomeOn, metronomeVolumePercent,
@@ -2316,7 +2428,7 @@ void drawLooper(const LoopTrackView tracksArg[4], int selectedTrack, bool onBpmR
 
 void updateLooperPositions(const LoopTrackView tracksArg[4], int selectedTrack) {
     for (int i = 0; i < 4; i++) {
-        drawLooperTrackBar(tracksArg[i], i);
+        drawLooperTrackBar(tracksArg[i], i, false);
         drawLooperTrackActivity(tracksArg[i], i, i == selectedTrack);
     }
 }
@@ -2364,7 +2476,25 @@ void updateLooperBpm(float bpm, int timeSigNum, int timeSigDen, bool syncMode, b
 void updateLooperBpmRowBeatFlash(bool active, bool downbeat, bool selected) {
     uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
     uint16_t color = active ? (downbeat ? COLOR_DOWNBEAT : COLOR_PULSE) : bg;
-    tft.drawRect(0, LOOPER_STATUS_Y, tft.width(), ROW_HEIGHT, color);
+    int w = tft.width();
+    int y0 = LOOPER_STATUS_Y, y1 = LOOPER_STATUS_Y + ROW_HEIGHT - 1;
+    tft.drawFastVLine(0, y0, ROW_HEIGHT, color);
+    tft.drawFastVLine(w - 1, y0, ROW_HEIGHT, color);
+    // Top and bottom edges skip the focused field's box.
+    int x0 = g_bpmFocusX0, x1 = g_bpmFocusX1;
+    if (x1 <= x0) {
+        tft.drawFastHLine(1, y0, w - 2, color);
+        tft.drawFastHLine(1, y1, w - 2, color);
+        return;
+    }
+    if (x0 > 1) {
+        tft.drawFastHLine(1, y0, x0 - 1, color);
+        tft.drawFastHLine(1, y1, x0 - 1, color);
+    }
+    if (x1 < w - 1) {
+        tft.drawFastHLine(x1, y0, w - 1 - x1, color);
+        tft.drawFastHLine(x1, y1, w - 1 - x1, color);
+    }
 }
 
 // -- count-in overlay -----------------------------------------------------
@@ -2395,6 +2525,7 @@ void drawLooperCountInBeat(int beatsRemaining) {
 }
 
 void drawLooperCountIn(int beatsRemaining) {
+    resetLooperBarCache();
     tft.fillRect(0, 0, tft.width(), HEADER_HEIGHT, COLOR_HILITE_BG);
     tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
     tft.setTextDatum(TL_DATUM);
@@ -2644,7 +2775,7 @@ void resetThemeColorsToDefault() {
 // without touching any other row, the BPM row, header, or footer.
 void updateLooperTrackRow(const LoopTrackView tracksArg[4], int trackIdx, bool selected) {
     drawLooperTrackLabel(tracksArg[trackIdx], trackIdx, selected);
-    drawLooperTrackBar(tracksArg[trackIdx], trackIdx);
+    drawLooperTrackBar(tracksArg[trackIdx], trackIdx, true);
     drawLooperTrackActivity(tracksArg[trackIdx], trackIdx, selected);
 }
 
@@ -2668,6 +2799,7 @@ void updateLooperSelection(const LoopTrackView tracksArg[4], int prevSelected, b
 }
 
 void drawMessage(const char* line1, const char* line2) {
+    resetLooperBarCache();
     tft.setTextColor(COLOR_TEXT, COLOR_BG);
     tft.setTextDatum(MC_DATUM);
     int cx = tft.width() / 2;

@@ -2041,16 +2041,14 @@ bool update() {
                     // while the file keeps playing underneath. Diffed
                     // against the mask from last tick so only the channels
                     // that actually changed get repainted, not all 16.
-                    static uint16_t lastSynthEditActiveMask = 0;
                     uint16_t activeMask = MidiOutput::activeChannelMask();
-                    if (activeMask != lastSynthEditActiveMask) {
-                        uint16_t changed = activeMask ^ lastSynthEditActiveMask;
+                    if (activeMask != Ui::pariSynthDrawnActiveMask()) {
+                        uint16_t changed = activeMask ^ Ui::pariSynthDrawnActiveMask();
                         for (int ch = 0; ch < 16; ch++) {
                             if (changed & (1u << ch)) {
                                 Ui::updatePariSynthChannelCell(ch, ch == PariSynthGrid::selectedChannel(), (activeMask & (1u << ch)) != 0);
                             }
                         }
-                        lastSynthEditActiveMask = activeMask;
                     }
                 }
             } else {

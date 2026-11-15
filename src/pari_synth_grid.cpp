@@ -36,12 +36,21 @@ bool editUsedAsModifier = false;
 
 bool volumeOverlayShown = false;
 uint32_t volumeOverlayUntilMs = 0;
+int volumeOverlayValue = 0;
+
+// Channel 9's cell shares its rect with the overlay; put the overlay back
+// after that cell is redrawn.
+void keepOverlay(int channel) {
+    if (volumeOverlayShown && channel == 8) Ui::updatePariSynthVolumeOverlay(volumeOverlayValue);
+}
 
 void moveChannel(int newChannel) {
     int prev = channelCursor;
     channelCursor = newChannel;
     Ui::updatePariSynthSelection(prev, channelCursor, MidiOutput::isChannelActive((uint8_t)prev),
                                   MidiOutput::isChannelActive((uint8_t)channelCursor));
+    keepOverlay(prev);
+    keepOverlay(channelCursor);
 }
 
 // Channel 10 (percussion) has no single "the" instrument to jump straight
@@ -60,6 +69,7 @@ void openEditorForSelectedChannel() {
 
 void showVolumeOverlay(int volume) {
     volumeOverlayShown = true;
+    volumeOverlayValue = volume;
     volumeOverlayUntilMs = millis() + 1500;
     Ui::updatePariSynthVolumeOverlay(volume);
 }
@@ -115,6 +125,7 @@ void handleEditHeld(int& volume) {
             if (family > 15) family = 15;
             Synth::programChange((uint8_t)channelCursor, (uint8_t)(family * 8));
             Ui::updatePariSynthChannelCell(channelCursor, true, MidiOutput::isChannelActive((uint8_t)channelCursor));
+            keepOverlay(channelCursor);
         }
     }
 

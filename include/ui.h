@@ -136,6 +136,9 @@ void drawPariSynthPlay(int selectedChannel, uint16_t activeMask = 0,
 // touch the channel grid.
 void updatePariSynthPlayLive();
 
+// Bit per channel: the active state each grid cell was last drawn with.
+uint16_t pariSynthDrawnActiveMask();
+
 // Cheap partial redraw of one channel's grid cell, e.g. after a Program
 // Change or a manual instrument assignment changes what it resolves to, or
 // a Note On/Off changes whether it should be glowing (see activeMask's
