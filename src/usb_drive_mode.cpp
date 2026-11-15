@@ -17,7 +17,6 @@ const uint32_t SECTOR_SIZE = 512;
 // The Pico's VBUS sense input, high while USB power is present. The RP2040
 // sees no disconnect when the cable is pulled, only a suspend, so this is
 // how an unplug shows up.
-const uint8_t VBUS_SENSE_PIN = 24;
 
 // How long USB has to stay gone before it counts as unplugged. Long enough
 // to ride out a host resetting and re-enumerating the device.
@@ -136,8 +135,10 @@ bool serviceIo() {
     return true;
 }
 
+// Mounted and not suspended. An unplugged cable shows as a suspend, since
+// the RP2040 forces VBUS detect on and not every board wires GPIO24 to VBUS.
 bool usbPresent() {
-    return TinyUSBDevice.mounted() && digitalRead(VBUS_SENSE_PIN);
+    return TinyUSBDevice.mounted() && !TinyUSBDevice.suspended();
 }
 
 void drawScreen() {
@@ -219,7 +220,6 @@ extern "C" int32_t tud_msc_request_sense_cb(uint8_t lun, void* buffer, uint16_t 
 namespace UsbDriveMode {
 
 void begin() {
-    pinMode(VBUS_SENSE_PIN, INPUT);
     usbMsc.setID("midiTrkr", "SD card", "1.0");
     usbMsc.setReadWriteCallback(onRead, onWrite, onFlush);
     usbMsc.setReadyCallback(onReady);
