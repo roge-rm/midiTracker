@@ -4,7 +4,7 @@
 // A single fixed-address static RAM block shared by LooperMode::tracks[]
 // and FilePlayerMode's ModPlayer/S3mPlayer/XmPlayer/ItPlayer -- the biggest
 // allocations in the firmware (tracks[] ~98KB; the tracker-format players
-// ~21KB/~47KB/~72KB/~98KB), never live at the same time. LooperMode's existing
+// ~73KB/~91KB/~99KB/~102KB), never live at the same time. LooperMode's existing
 // "free tracks[] before opening a tracker file" gate (see
 // FilePlayerMode::openSelected()'s FILE_MOD/S3M/XM/IT handling)
 // already guarantees tracks[] is down before any of the players
@@ -30,12 +30,12 @@
 // trying to out-guess it.
 namespace SharedRamArena {
 
-// Sized to ItPlayer (103812 bytes on this build), the largest user;
+// Sized to ItPlayer (104372 bytes on this build), the largest user;
 // LooperMode sizes its tracks to fill it. Each placement-new call site
 // carries its own static_assert against this, so a future growth in any
 // of these types past what fits here is a compile error, not a silent overlap.
 // The host test build has 8-byte pointers, so its players are a bit bigger.
-constexpr size_t SIZE = sizeof(void*) == 4 ? 103824 : 106496;
+constexpr size_t SIZE = sizeof(void*) == 4 ? 104384 : 106496;
 
 void* data();
 

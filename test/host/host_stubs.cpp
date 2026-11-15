@@ -5,6 +5,8 @@
 #include <chrono>
 #include <vector>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <string.h>
 #include "sd_card.h"
 
 HostSerial Serial;
@@ -30,7 +32,36 @@ bool FsFile::open(const char* path, int flags) {
     return true;
 }
 
+namespace {
+FsFile* g_rawFiles[16]; // contiguousRange() ids, sector >> 20 is the id + 1
+}
+
+bool FsFile::contiguousRange(uint32_t* bgnSector, uint32_t* endSector) {
+    if (!_f) return false;
+    int id = -1;
+    for (int i = 0; i < 16; i++) if (g_rawFiles[i] == this) id = i;
+    for (int i = 0; i < 16 && id < 0; i++) if (!g_rawFiles[i]) { g_rawFiles[i] = this; id = i; }
+    if (id < 0) return false;
+    fflush(_f);
+    if (bgnSector) *bgnSector = (uint32_t)(id + 1) << 20;
+    if (endSector) *endSector = ((uint32_t)(id + 1) << 20) + (uint32_t)(_size / 512);
+    return true;
+}
+
+int FsFile::fd() const { return _f ? fileno(_f) : -1; }
+
+bool SdCard::readSectors(uint32_t sector, uint8_t* dst, size_t ns) {
+    int id = (int)(sector >> 20) - 1;
+    if (id < 0 || id >= 16 || !g_rawFiles[id]) return false;
+    off_t at = (off_t)(sector & 0xFFFFF) * 512;
+    ssize_t got = pread(g_rawFiles[id]->fd(), dst, ns * 512, at);
+    if (got < 0) return false;
+    memset(dst + got, 0xA5, ns * 512 - (size_t)got); // past the end reads as junk, the player mustn't use it
+    return true;
+}
+
 void FsFile::close() {
+    for (int i = 0; i < 16; i++) if (g_rawFiles[i] == this) g_rawFiles[i] = nullptr;
     if (_f) fclose(_f);
     _f = nullptr;
     _pos = 0;

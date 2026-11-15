@@ -12,11 +12,18 @@
 // per-voice sample cache. A format keeps its parsing, cell decoding,
 // effect semantics and how sample data is decoded into the cache.
 //
+// Mixing is a block at a time per voice: linear interpolation, an optional
+// resonant filter (IT), then left and right gains that ramp over 16 frames
+// up and 42 down (OpenMPT's defaults at 44.1 kHz), so volume changes, cuts
+// and new notes don't click. MOD, S3M and XM get their gains from
+// mixVolume and mixPan after every tick, and a note that's cut or replaced
+// fades out in a tail made from its cached frames. IT sets its own gains.
+//
 // Voices are separate from pattern channels. MOD, S3M and XM use one voice
 // per channel (their channel struct derives from TrackerVoice); a format
 // with virtual voices (IT's NNA) can attach a larger pool of its own.
 //
-// Hot path (update(), mixOneSample() and the inlined voice reads) runs from
+// Hot path (update(), the mixer and the inlined voice reads) runs from
 // RAM via __not_in_flash_func. A cache miss calls the format's
 // refillChunk(), which may read SD.
 
@@ -48,6 +55,25 @@ struct TrackerVoice {
     uint32_t chunkStart = 0;                  // frame index of chunkBuf[0]
     uint32_t chunkLen = 0;                    // valid frames in chunkBuf
     int32_t chunkAccum = 0;                   // format decode state at chunkStart+chunkLen (XM delta)
+
+    // Mixer gains: curL/curR are the gain now << 12 (32640 is full volume
+    // on one side), moving by stepL/stepR for rampLeft more frames.
+    int32_t curL = 0, curR = 0, stepL = 0, stepR = 0;
+    uint16_t rampLeft = 0;
+};
+
+// Resonant filter coefficients (Q24) and state, see mixVoiceBlock().
+struct TrackerFilter {
+    int32_t a0 = 0, b0 = 0, b1 = 0, y1 = 0, y2 = 0;
+};
+
+// A cut or replaced note fading out over RAMP_DOWN frames, from a copy of
+// the frames it still needs. pos is 16.16 into buf.
+struct TrackerTail {
+    const int16_t* buf;
+    uint32_t pos, step;
+    int32_t curL, curR, stepL, stepR;
+    uint16_t len, left;
 };
 
 class TrackerPlayer {
@@ -92,7 +118,7 @@ public:
 #ifdef TRACKER_PROFILE
     // Profile build only (env:pico_profile): time spent in update() calls
     // that produced frames, and in sample cache refills (SD reads).
-    struct Profile { uint32_t updateUs, frames, worstUs, refillUs, refills; };
+    struct Profile { uint32_t updateUs, frames, worstUs, refillUs, refills, refillFrames, seekUs, readUs, reads, hist[6], histUs[6]; };
     static Profile profile;
 #endif
 
@@ -150,25 +176,54 @@ protected:
         int16_t r = refillChunk(v, index);
         profile.refillUs += micros() - t0;
         profile.refills++;
+        profile.refillFrames += v.chunkLen;
         return r;
 #else
         return refillChunk(v, index);
 #endif
     }
 
+    // Call once a file that sample data is read from is open. A file in one
+    // run of sectors is then read with raw multi-sector reads, which skip
+    // SdFat's cluster walk and one-sector cache.
+    void useSampleFile(FsFile& f);
+    // Reads len (<= rawSpan(pos)) sample bytes at pos of f into
+    // _rawScratch and returns where they start; got is the bytes read.
+    const uint8_t* readSampleBytes(FsFile& f, uint32_t pos, uint32_t len, int& got);
+    // Most bytes one readSampleBytes() at pos can take. Reading that much
+    // leaves the next read on a sector boundary, so a longer run read in
+    // pieces stays one multi-sector read on the card.
+    uint32_t rawSpan(uint32_t pos) const { return (uint32_t)sizeof(_rawScratch) - (pos & 511); }
+
     // Restarts v at frame `index` of its sample and primes the pair.
     void startVoiceAt(TrackerVoice& v, uint32_t index);
 
-    // A format can mix a block at a time with its own mixer: it sets
-    // _blockMix and overrides mixBlock(), which returns n interleaved
-    // stereo frames (n <= BLOCK_FRAMES, all inside one tick). The others
-    // use mixOneSample().
+    // Returns n interleaved stereo frames (n <= BLOCK_FRAMES, all inside
+    // one tick). The base mixes every voice and the tails; IT has its own.
     static const uint32_t BLOCK_FRAMES = 64;
-    bool _blockMix = false;
-    virtual const int16_t* mixBlock(uint32_t n) { (void)n; return nullptr; }
-    // Global volume, makeup gain and soft clamp on one channel's voice sum,
-    // the same last stage mixOneSample() uses.
+    virtual const int16_t* mixBlock(uint32_t n);
+    // Global volume, makeup gain and soft clamp on one channel's voice sum.
     static int16_t finishMix(int32_t mix, uint8_t globalVolume);
+    // Adds n frames of v into acc (interleaved stereo), through filter f
+    // if not null. With stopAfterRamp the voice is left once its ramp ends.
+    void mixVoiceBlock(TrackerVoice& v, TrackerFilter* f, int32_t* acc, uint32_t n, bool stopAfterRamp);
+    // Voice sums for one block, then the same memory as the output frames.
+    union { int32_t acc[BLOCK_FRAMES * 2]; int16_t out[BLOCK_FRAMES * 2]; } _mix;
+
+    // Ramp lengths in frames, OpenMPT's defaults at 44.1 kHz (363 and 952 us).
+    static const int RAMP_UP = 16;
+    static const int RAMP_DOWN = 42;
+    // Moves v's gains to the new ones over RAMP_UP or RAMP_DOWN frames.
+    static void setRamp(TrackerVoice& v, int32_t tgtL, int32_t tgtR);
+    // IT sets this and works out its own gains. Otherwise the base sets
+    // them from mixVolume and mixPan after every tick.
+    bool _formatGains = false;
+    // Where tails live, given by the format; none by default. All tails
+    // end within a tick, so the pool is reused from the start each tick.
+    void attachTails(TrackerTail* tails, int count, int16_t* pool, uint32_t poolFrames);
+    // Room for 32 tails at 1x pitch (about 45 frames each). Higher pitches
+    // get shorter tails once it runs out.
+    static const uint32_t TAIL_POOL_FRAMES = 1536;
 
     FsFile _file;        // header reads at load(), sample data while playing
     FsFile _patternFile; // pattern reads while playing, so they never share a position with sample reads
@@ -193,18 +248,32 @@ protected:
     bool _positionJumpPending = false;
     int _positionJumpTarget = 0;
 
-    // Raw file bytes for one refill, decoded into a voice's chunkBuf.
-    uint8_t _rawScratch[RAW_SCRATCH_BYTES];
+    // Raw file bytes for one read, decoded into a voice's chunkBuf. A
+    // sector over RAW_SCRATCH_BYTES, so a raw read that starts partway
+    // into a sector still gets at least that many.
+    alignas(4) uint8_t _rawScratch[RAW_SCRATCH_BYTES + 512];
 
 private:
     void advanceTick();
-    void mixOneSample(int16_t& outL, int16_t& outR);
-    int16_t readVoiceSample(TrackerVoice& v);
+    void applyGains();
+    void spawnTail(TrackerVoice& v);
+    void mixTail(TrackerTail& t, int32_t* acc, uint32_t n);
+    uint32_t resample(TrackerVoice& v, int32_t* out, uint32_t n);
+    template <bool FILTER, bool RAMP> void mixVoice(TrackerVoice& v, TrackerFilter* f, int32_t* acc, uint32_t n);
     TrackerVoice& voiceAt(int i) { return *(TrackerVoice*)((uint8_t*)_voices + (size_t)i * _voiceStride); }
 
     TrackerVoice* _voices = nullptr;
     size_t _voiceStride = sizeof(TrackerVoice);
     int _voiceCount = 0;
+
+    // Files read with raw sector reads: firstSector 0 == read through SdFat.
+    struct SampleFile { const FsFile* f; uint32_t firstSector; uint32_t size; };
+    SampleFile _sampleFiles[2] = {};
+
+    TrackerTail* _tails = nullptr;
+    int _maxTails = 0, _tailCount = 0;
+    int16_t* _tailPool = nullptr;
+    uint32_t _tailPoolFrames = 0, _tailPoolUsed = 0;
 
     uint32_t _elapsedMsFrozen = 0;
     uint32_t _lastResumeMicros = 0;

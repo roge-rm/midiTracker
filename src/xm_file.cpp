@@ -236,6 +236,8 @@ bool XmPlayer::load(const char* path) {
         c.smp = (c.sampleIndex < _numSamplesTotal) ? &_samples[c.sampleIndex] : nullptr;
     }
     attachVoices(&_channels[0], sizeof(XmChannel), _numChannels, &_chunks[0][0], CHUNK_FRAMES);
+    useSampleFile(_file);
+    attachTails(_tails, (int)(sizeof(_tails) / sizeof(_tails[0])), _tailPool, TAIL_POOL_FRAMES);
 
     _globalVolume = 64;
     _globalVolSlideParam = 0;
@@ -291,7 +293,8 @@ int32_t XmPlayer::decodeDeltaRun(uint32_t fileOffset, uint32_t frameCount, bool 
     int32_t accum = startAccum;
     uint32_t remaining = frameCount;
     while (remaining > 0) {
-        uint32_t chunkFrames = remaining > (uint32_t)CHUNK_FRAMES ? (uint32_t)CHUNK_FRAMES : remaining;
+        uint32_t most = RAW_SCRATCH_BYTES / bytesPerFrame;
+        uint32_t chunkFrames = remaining > most ? most : remaining;
         int n = _file.read(_rawScratch, chunkFrames * bytesPerFrame);
         if (n <= 0) break;
         uint32_t framesGot = (uint32_t)n / bytesPerFrame;
@@ -349,29 +352,34 @@ int16_t __not_in_flash_func(XmPlayer::refillChunk)(TrackerVoice& v, uint32_t ind
         }
     }
 
-    if (!_file.seekSet(s.fileOffset + readStart * bytesPerFrame)) { v.chunkLen = 0; return 0; }
     uint32_t skipFrames = index - readStart; // decoded and dropped when a small gap was folded in
     uint32_t totalFrames = windowFrames + skipFrames;
-    int n = _file.read(_rawScratch, totalFrames * bytesPerFrame);
-    if (n <= 0) { v.chunkLen = 0; return 0; }
-    uint32_t framesGot = (uint32_t)n / bytesPerFrame;
-    if (framesGot <= skipFrames) { v.chunkLen = 0; return 0; }
-
     int32_t accum = startAccum;
-    uint32_t stored = 0;
-    for (uint32_t i = 0; i < framesGot; i++) {
-        int16_t decoded;
-        if (s.is16Bit) {
-            int16_t delta = (int16_t)((uint16_t)_rawScratch[i * 2] | ((uint16_t)_rawScratch[i * 2 + 1] << 8));
-            accum = (int16_t)(accum + delta);
-            decoded = (int16_t)accum;
-        } else {
-            int8_t delta = (int8_t)_rawScratch[i];
-            accum = (int8_t)(accum + delta);
-            decoded = (int16_t)((int16_t)(int8_t)accum << 8);
+    uint32_t stored = 0, done = 0;
+    while (done < totalFrames) {
+        uint32_t at = s.fileOffset + (readStart + done) * bytesPerFrame;
+        uint32_t piece = (totalFrames - done) * bytesPerFrame;
+        if (piece > rawSpan(at)) piece = rawSpan(at) & ~(bytesPerFrame - 1);
+        int n = 0;
+        const uint8_t* raw = readSampleBytes(_file, at, piece, n);
+        uint32_t framesGot = n > 0 ? (uint32_t)n / bytesPerFrame : 0;
+        for (uint32_t i = 0; i < framesGot; i++) {
+            int16_t decoded;
+            if (s.is16Bit) {
+                int16_t delta = (int16_t)((uint16_t)raw[i * 2] | ((uint16_t)raw[i * 2 + 1] << 8));
+                accum = (int16_t)(accum + delta);
+                decoded = (int16_t)accum;
+            } else {
+                int8_t delta = (int8_t)raw[i];
+                accum = (int8_t)(accum + delta);
+                decoded = (int16_t)((int16_t)(int8_t)accum << 8);
+            }
+            if (done + i >= skipFrames) v.chunkBuf[stored++] = decoded;
         }
-        if (i >= skipFrames) v.chunkBuf[stored++] = decoded;
+        done += framesGot;
+        if (framesGot * bytesPerFrame < piece) break;
     }
+    if (stored == 0) { v.chunkLen = 0; return 0; }
     v.chunkStart = index;
     v.chunkLen = stored;
     v.chunkAccum = accum;

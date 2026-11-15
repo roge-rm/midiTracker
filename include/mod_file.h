@@ -56,8 +56,8 @@ private:
         bool glissando = false;       // E3y
     };
 
-    // 256 frames per voice cache.
-    static const int CHUNK_FRAMES = 256;
+    // Frames per voice cache, a power of two.
+    static const int CHUNK_FRAMES = 1024;
 
     ModSample _samples[MAX_SAMPLES];
     uint8_t _orderTable[128] = {0};
@@ -67,6 +67,8 @@ private:
 
     ModChannel _channels[MAX_MOD_CHANNELS];
     int16_t _chunks[MAX_MOD_CHANNELS][CHUNK_FRAMES];
+    TrackerTail _tails[MAX_MOD_CHANNELS];
+    int16_t _tailPool[TAIL_POOL_FRAMES];
 
     static uint16_t periodForNote(int noteIndex); // finetune-0 table, noteIndex 0..35
     static int nearestNoteIndexForPeriod(uint16_t period);

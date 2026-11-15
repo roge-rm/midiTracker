@@ -120,6 +120,8 @@ bool ModPlayer::load(const char* path) {
         c.mixPan = c.pan;
     }
     attachVoices(&_channels[0], sizeof(ModChannel), _numChannels, &_chunks[0][0], CHUNK_FRAMES);
+    useSampleFile(_file);
+    attachTails(_tails, (int)(sizeof(_tails) / sizeof(_tails[0])), _tailPool, TAIL_POOL_FRAMES);
 
     _globalVolume = 64;
     resetSequencer(6, 125);
@@ -158,20 +160,31 @@ void ModPlayer::recomputeStep(ModChannel& c, uint16_t period) {
 }
 
 // Reads the CHUNK_FRAMES-aligned block holding `index`.
-int16_t ModPlayer::refillChunk(TrackerVoice& v, uint32_t index) {
+int16_t __not_in_flash_func(ModPlayer::refillChunk)(TrackerVoice& v, uint32_t index) {
     const TrackerSample& s = *v.smp;
     uint32_t start = index & ~(uint32_t)(CHUNK_FRAMES - 1);
     uint32_t len = CHUNK_FRAMES;
+    // A loop that fits in the cache is cached whole, so a wrap doesn't refill.
+    if (v.looping && index >= s.loopStart && index < s.loopEnd && s.loopEnd - s.loopStart <= (uint32_t)CHUNK_FRAMES) {
+        start = s.loopStart;
+        len = s.loopEnd - s.loopStart;
+    }
     if (start + len > s.length) len = s.length - start;
     v.chunkSmp = v.smp;
     v.chunkStart = start;
     // Frames past a short read or a failed seek stay zero and cached, so a
     // truncated sample doesn't hit the SD card on every frame.
     v.chunkLen = len;
-    int n = 0;
-    if (_file.seekSet(s.fileOffset + start)) n = _file.read(_rawScratch, len);
-    uint32_t got = n > 0 ? (uint32_t)n : 0;
-    for (uint32_t i = 0; i < got; i++) v.chunkBuf[i] = (int16_t)((int8_t)_rawScratch[i]) << 8;
+    uint32_t got = 0;
+    while (got < len) {
+        uint32_t at = s.fileOffset + start + got, piece = len - got;
+        if (piece > rawSpan(at)) piece = rawSpan(at);
+        int n = 0;
+        const uint8_t* raw = readSampleBytes(_file, at, piece, n);
+        for (int i = 0; i < n; i++) v.chunkBuf[got + i] = (int16_t)((int8_t)raw[i]) << 8;
+        got += (uint32_t)n;
+        if ((uint32_t)n < piece) break;
+    }
     for (uint32_t i = got; i < len; i++) v.chunkBuf[i] = 0;
     return v.chunkBuf[index - start];
 }

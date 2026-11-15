@@ -73,8 +73,7 @@ private:
     };
 
     // Each refill reads 1024 bytes: 1024 frames of 8-bit or 512 of 16-bit.
-    static const int CHUNK_BYTES = 1024;
-    static const int CHUNK_FRAMES = 1024;
+    static const int CHUNK_FRAMES = 2048; // a power of two
 
     S3mSample _samples[MAX_INSTRUMENTS];
     uint32_t _patternOffsets[MAX_PATTERNS]; // absolute, from the parapointers
@@ -85,6 +84,8 @@ private:
 
     S3mChannel _channels[MAX_CHANNELS];
     int16_t _chunks[MAX_CHANNELS][CHUNK_FRAMES];
+    TrackerTail _tails[MAX_CHANNELS];
+    int16_t _tailPool[TAIL_POOL_FRAMES];
 
     // Pattern scan state: the open pattern, the start offset of each row
     // seen so far, and the read cursor for scanning forward.

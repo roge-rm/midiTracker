@@ -27,6 +27,11 @@ public:
     uint64_t fileSize() const { return _size; }
     size_t write(const void* buf, size_t n);
     bool sync() { return _f && fflush(_f) == 0; }
+    bool preAllocate(uint64_t) { return _f != nullptr; }
+    // Every file reads as contiguous: sectors map back to it through
+    // SdCard::readSectors(), so the players' raw read path runs on the host.
+    bool contiguousRange(uint32_t* bgnSector, uint32_t* endSector);
+    int fd() const;
 
     // Count of read() calls that had to hit the backing file, for the harness.
     static unsigned long readCalls;
@@ -37,9 +42,15 @@ private:
     uint64_t _size = 0;
 };
 
+class SdCard {
+public:
+    bool readSectors(uint32_t sector, uint8_t* dst, size_t ns);
+};
+
 // Card-level calls the players use, on host paths.
 class SdFs {
 public:
+    SdCard* card() { static SdCard c; return &c; }
     bool exists(const char* path);
     bool mkdir(const char* path);
     bool remove(const char* path);

@@ -178,12 +178,13 @@ private:
     uint8_t _globalVolSlideParam = 0; // H's own memory
     bool _globalVolSlideActiveRow = false;
 
-    // Decoded frames per voice cache. A refill reads up to 2 bytes per
-    // frame, so this must stay at or under RAW_SCRATCH_BYTES / 2.
-    static const int CHUNK_FRAMES = 512;
+    // Decoded frames per voice cache, sized to fill SharedRamArena.
+    static const int CHUNK_FRAMES = 896;
 
     XmChannel _channels[MAX_CHANNELS];
     int16_t _chunks[MAX_CHANNELS][CHUNK_FRAMES];
+    TrackerTail _tails[MAX_CHANNELS];
+    int16_t _tailPool[TAIL_POOL_FRAMES];
 
     // Pattern scan state, same as S3mPlayer's but for up to 256 rows.
     int _openPatternNum = -1;

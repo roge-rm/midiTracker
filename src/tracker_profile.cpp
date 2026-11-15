@@ -2,7 +2,8 @@
 // file named in PROFILE_FILES ('|' between name parts, matched against
 // file names on the card) for PROFILE_SECONDS and prints over serial how
 // much of real time core 0 spends in the player's update(), the time in
-// sample cache refills and the ring underruns. Then repeats.
+// sample cache refills and SD reads (raw sector reads by time taken) and
+// the ring underruns. Then repeats.
 #ifdef TRACKER_PROFILE
 #include <Arduino.h>
 #include <new>
@@ -71,6 +72,20 @@ void report(const char* tag, const char* name, const TrackerPlayer::Profile& p, 
     Serial.printf("PROFILE %s %s: core0 load %d.%d%% (refills %d.%d%%, %lu), worst update %lu us, underrun samples %lu\n",
                   tag, name, load / 10, load % 10, refill / 10, refill % 10, (unsigned long)p.refills,
                   (unsigned long)p.worstUs, (unsigned long)underruns);
+    Serial.printf("PROFILE %s %s: reads %lu, seek %lu ms, read %lu ms, frames per refill %lu\n", tag, name,
+                  (unsigned long)p.reads, (unsigned long)(p.seekUs / 1000), (unsigned long)(p.readUs / 1000),
+                  (unsigned long)(p.refills ? p.refillFrames / p.refills : 0));
+    Serial.printf("PROFILE %s %s: read times <200us %lu (%lu ms), <500 %lu (%lu), <1ms %lu (%lu), <2ms %lu (%lu), <5ms %lu (%lu), more %lu (%lu)\n", tag, name,
+                  (unsigned long)p.hist[0], (unsigned long)p.histUs[0] / 1000, (unsigned long)p.hist[1], (unsigned long)p.histUs[1] / 1000,
+                  (unsigned long)p.hist[2], (unsigned long)p.histUs[2] / 1000, (unsigned long)p.hist[3], (unsigned long)p.histUs[3] / 1000,
+                  (unsigned long)p.hist[4], (unsigned long)p.histUs[4] / 1000, (unsigned long)p.hist[5], (unsigned long)p.histUs[5] / 1000);
+}
+
+void addProfile(TrackerPlayer::Profile& t, const TrackerPlayer::Profile& c) {
+    t.updateUs += c.updateUs; t.frames += c.frames; t.refillUs += c.refillUs; t.refills += c.refills;
+    t.refillFrames += c.refillFrames; t.seekUs += c.seekUs; t.readUs += c.readUs; t.reads += c.reads;
+    for (int h = 0; h < 6; h++) { t.hist[h] += c.hist[h]; t.histUs[h] += c.histUs[h]; }
+    if (c.worstUs > t.worstUs) t.worstUs = c.worstUs;
 }
 
 } // namespace
@@ -100,7 +115,14 @@ void trackerProfileRun() {
                 p->~TrackerPlayer();
                 continue;
             }
-            Serial.printf("PROFILE playing %s\n", path);
+            {
+                FsFile f;
+                uint32_t b = 0, e = 0;
+                bool cont = f.open(path, O_RDONLY) && f.contiguousRange(&b, &e);
+                Serial.printf("PROFILE playing %s (fat %d, cluster %lu, contiguous %d)\n", path, sd.fatType(),
+                              (unsigned long)sd.bytesPerCluster(), cont ? 1 : 0);
+                f.close();
+            }
             p->play();
             // The first second (ring pre-fill, first reads) is left out.
             uint32_t start = millis();
@@ -114,15 +136,13 @@ void trackerProfileRun() {
                 if (millis() - win >= 5000) {
                     TrackerPlayer::Profile& c = TrackerPlayer::profile;
                     report("5s", want, c, Synth::wavStreamUnderrunSamples() - u0);
-                    total.updateUs += c.updateUs; total.frames += c.frames; total.refillUs += c.refillUs;
-                    total.refills += c.refills; if (c.worstUs > total.worstUs) total.worstUs = c.worstUs;
+                    addProfile(total, c);
                     c = {};
                     win = millis();
                 }
             }
             TrackerPlayer::Profile& c = TrackerPlayer::profile;
-            total.updateUs += c.updateUs; total.frames += c.frames; total.refillUs += c.refillUs;
-            total.refills += c.refills; if (c.worstUs > total.worstUs) total.worstUs = c.worstUs;
+            addProfile(total, c);
             report("RESULT", want, total, Synth::wavStreamUnderrunSamples() - u0);
             p->stop();
             p->~TrackerPlayer();

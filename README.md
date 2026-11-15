@@ -17,6 +17,7 @@ Dan
 - USB Drive, in Settings > MIDI/System, shows the SD card to your computer.
 - USB MIDI shows up on computers.
 - More accurate MOD, S3M and XM effects, and 15-sample MODs play.
+- MOD, S3M and XM volume changes and cuts don't click, and tracker files use less CPU and read the card less often.
 - Long and non-ASCII file names open from the browser.
 - Looper timing and MIDI input fixes.
 - Fixes for crashes and lost data, including settings, banks and looper sessions.
@@ -26,9 +27,9 @@ Dan
 
 midiTracker plays standard '.mid' MIDI files, type 0 or 1, out over TRS or USB MIDI. It will also play standard '.syx' SysEx files (eg patch backups from a synth). File are streamed from the SD card and MIDI files can be paused/resumed, scrubbed through forwards and backwards and played at an adjustable tempo. A piano-style display lights up with the played back notes to provide visual feedback while playing.
 
-It also plays .wav files, as well as a few tracker modules - .mod, .s3m, .xm and .it. These are experimental and not 100% tested, there may be slowdowns or audio glitches. Attempts have been made to make these sound as authentic as possible but of course there are hardware limitations that make this an interesting challenge.
+It also plays .wav files, as well as a few tracker modules - .mod, .s3m, .xm and .it. These are experimental and not 100% tested, there may be slowdowns or audio glitches. Attempts have been made to make these sound as authentic as possible but of course there are hardware limitations that make this an interesting challenge. Volume changes, cuts and new notes are ramped so they don't click.
 
-.it files play in sample or instrument mode, with envelopes, new note actions and up to 32 notes sounding at once. Compressed samples are unpacked the first time you open a file, which can take a few seconds, into a hidden `/.itcache` folder on the card, so the card needs to be writeable with some free space. The last 4 files are kept there and open quickly. Resonant filters (Zxx, instrument filters and filter envelopes), auto-vibrato, random volume and pan and surround are played, and volume changes and cut notes are ramped so they don't click. Stereo samples are mixed to mono and MIDI macros other than the filter ones are ignored. Very busy files may slow down.
+.it files play in sample or instrument mode, with envelopes, new note actions and up to 32 notes sounding at once. Compressed samples are unpacked the first time you open a file, which can take a few seconds, into a hidden `/.itcache` folder on the card, so the card needs to be writeable with some free space. The last 4 files are kept there and open quickly, though one unpacked by an older version may be unpacked again once. Resonant filters (Zxx, instrument filters and filter envelopes), auto-vibrato, random volume and pan and surround are played. Stereo samples are mixed to mono and MIDI macros other than the filter ones are ignored. Very busy files may slow down.
 
 Additionally there is a simple onboard synth, supporting 24 melodic notes and 8 drum notes simultaneously, that you can use to listen to MIDI files without driving external gear. This is intended as a way to verify the contents of recordings - and sounds very chiptuney - but it can be a lot of fun to play various MIDI files from the internet and enjoy the not-so-realistic sounds it makes. The synth's own voices can be run through a lo-fi/chiptune-flavored reverb, with a choice of three algorithms (Lo-fi, Lush, Shimmer) and adjustable wet/dry mix. Output level can also be matched to how you have the device hooked up (Headphone Low, Headphone High, or Line Level).
 

@@ -147,6 +147,8 @@ bool S3mPlayer::load(const char* path) {
         c.mixPan = c.pan;
     }
     attachVoices(&_channels[0], sizeof(S3mChannel), MAX_CHANNELS, &_chunks[0][0], CHUNK_FRAMES);
+    useSampleFile(_file);
+    attachTails(_tails, (int)(sizeof(_tails) / sizeof(_tails[0])), _tailPool, TAIL_POOL_FRAMES);
 
     _globalVolume = globalVol > 64 ? 64 : globalVol;
     _openPatternNum = -1;
@@ -174,36 +176,49 @@ void S3mPlayer::recomputeStep(S3mChannel& c, uint32_t period) {
     c.sampleStep16 = stepForHz(hz);
 }
 
-// Reads the aligned block of CHUNK_BYTES holding `index` and converts it
-// to signed 16-bit.
+// Reads the CHUNK_FRAMES-aligned block holding `index` and converts it to
+// signed 16-bit.
 int16_t __not_in_flash_func(S3mPlayer::refillChunk)(TrackerVoice& v, uint32_t index) {
     const S3mSample& s = static_cast<const S3mSample&>(*v.smp);
     uint32_t bytesPerSample = s.is16Bit ? 2 : 1;
-    uint32_t frames = CHUNK_BYTES / bytesPerSample;
-    uint32_t start = index & ~(frames - 1);
-    uint32_t len = frames;
+    uint32_t start = index & ~(uint32_t)(CHUNK_FRAMES - 1);
+    uint32_t len = CHUNK_FRAMES;
+    // A loop that fits in the cache is cached whole, so a wrap doesn't refill.
+    if (v.looping && index >= s.loopStart && index < s.loopEnd && s.loopEnd - s.loopStart <= (uint32_t)CHUNK_FRAMES) {
+        start = s.loopStart;
+        len = s.loopEnd - s.loopStart;
+    }
     if (start + len > s.length) len = s.length - start;
     v.chunkSmp = v.smp;
     v.chunkStart = start;
     // Frames past a short read or a failed seek stay zero and cached, so a
     // truncated sample doesn't hit the SD card on every frame.
     v.chunkLen = len;
-    int n = 0;
-    if (_file.seekSet(s.fileOffset + start * bytesPerSample)) n = _file.read(_rawScratch, len * bytesPerSample);
-    uint32_t got = n > 0 ? (uint32_t)n / bytesPerSample : 0;
     int16_t* out = v.chunkBuf;
-    if (s.is16Bit) {
-        for (uint32_t i = 0; i < got; i++) {
-            // Unbias in a wide type before narrowing.
-            uint16_t u = (uint16_t)_rawScratch[i * 2] | ((uint16_t)_rawScratch[i * 2 + 1] << 8);
-            out[i] = s.isSigned ? (int16_t)u : (int16_t)((int32_t)u - 32768);
+    uint32_t got = 0;
+    while (got < len) {
+        uint32_t at = s.fileOffset + (start + got) * bytesPerSample;
+        uint32_t piece = (len - got) * bytesPerSample;
+        if (piece > rawSpan(at)) piece = rawSpan(at) & ~(bytesPerSample - 1);
+        int n = 0;
+        const uint8_t* raw = readSampleBytes(_file, at, piece, n);
+        uint32_t frames = n > 0 ? (uint32_t)n / bytesPerSample : 0;
+        int16_t* o = out + got;
+        if (s.is16Bit) {
+            for (uint32_t i = 0; i < frames; i++) {
+                // Unbias in a wide type before narrowing.
+                uint16_t u = (uint16_t)raw[i * 2] | ((uint16_t)raw[i * 2 + 1] << 8);
+                o[i] = s.isSigned ? (int16_t)u : (int16_t)((int32_t)u - 32768);
+            }
+        } else {
+            for (uint32_t i = 0; i < frames; i++) {
+                uint8_t b = raw[i];
+                int16_t centred = s.isSigned ? (int8_t)b : (int16_t)((int)b - 128);
+                o[i] = (int16_t)(centred << 8);
+            }
         }
-    } else {
-        for (uint32_t i = 0; i < got; i++) {
-            uint8_t raw = _rawScratch[i];
-            int16_t centred = s.isSigned ? (int8_t)raw : (int16_t)((int)raw - 128);
-            out[i] = (int16_t)(centred << 8);
-        }
+        got += frames;
+        if (frames * bytesPerSample < piece) break;
     }
     for (uint32_t i = got; i < len; i++) out[i] = 0;
     return out[index - start];

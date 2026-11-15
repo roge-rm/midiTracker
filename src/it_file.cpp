@@ -1,10 +1,9 @@
 // Impulse Tracker .it player, see it_file.h.
 //
-// Mixing (mixBlock(), IT only): a block at a time per voice, linear
-// interpolation, then the resonant filter if the voice has one, then left
-// and right gains that ramp over 16 frames up and 42 down (OpenMPT's
-// defaults). A cut note (NNA cut, ^^^, SCx, DCA cut, S70) fades out in a
-// free voice with a copy of its cache, so the new note doesn't click.
+// Mixing: the base's block mixer (see tracker_base.h) with IT's own gains
+// and the resonant filter on voices that have one. A cut note (NNA cut,
+// ^^^, SCx, DCA cut, S70) fades out in a free voice with a copy of its
+// cache, so the new note doesn't click.
 // Surround plays the right side inverted, as OpenMPT does.
 //
 // Filters: instrument cutoff/resonance, filter envelopes and Zxx through
@@ -135,9 +134,6 @@ const float EXP2_FINE[96] = {
     1.0045229196548462f, 1.0045795440673828f, 1.0046361684799194f, 1.0046929121017456f, 1.0047495365142822f, 1.0048062801361084f, 1.004862904548645f, 1.0049196481704712f,
     1.0049762725830078f, 1.005033016204834f, 1.0050896406173706f, 1.0051463842391968f, 1.0052030086517334f, 1.0052597522735596f, 1.0053164958953857f, 1.005373239517212f,
 };
-// Ramp lengths in frames, OpenMPT's defaults at 44.1 kHz (363 and 952 us).
-const int RAMP_UP = 16;
-const int RAMP_DOWN = 42;
 
 // LFO value -64..64 for a 0-255 position.
 int waveValue(uint8_t wave, uint8_t pos) {
@@ -307,7 +303,9 @@ bool ItPlayer::load(const char* path) {
     }
     for (int i = 0; i < MAX_VOICES; i++) _voices[i] = ItVoice();
     attachVoices(&_voices[0], sizeof(ItVoice), MAX_VOICES, &_chunks[0][0], CHUNK_FRAMES);
-    _blockMix = true;
+    useSampleFile(_file);
+    if (_cacheFile) useSampleFile(_cacheFile);
+    _formatGains = true;
 
     _globalVolume = (uint8_t)(_globalVol >> 1);
     _openPattern = -1;
@@ -568,7 +566,7 @@ void ItPlayer::scanChannels() {
 // ---------------------------------------------------------------- sample cache
 
 bool ItPlayer::openCache(const char* path, uint32_t key) {
-    // Layout: 16-byte header ("ITC2", key, data bytes, use count), then
+    // Layout: 16-byte header ("ITC3", key, data bytes, use count), then
     // each cached sample in order as mono signed PCM. A packed stereo
     // sample is unpacked side by side and mixed down over its left half.
     uint32_t at = 16;
@@ -595,10 +593,16 @@ bool ItPlayer::openCache(const char* path, uint32_t key) {
         FsFile f;
         uint32_t use = 0;
         bool valid = false;
-        if (f.open(name, O_RDONLY) && f.read(hdr, 16) == 16 && memcmp(hdr, "ITC2", 4) == 0) {
+        if (f.open(name, O_RDONLY) && f.read(hdr, 16) == 16 && (memcmp(hdr, "ITC3", 4) == 0 || memcmp(hdr, "ITC2", 4) == 0)) {
             valid = true;
             use = rd32(hdr + 12);
-            if (rd32(hdr + 4) == key && rd32(hdr + 8) == dataBytes && f.fileSize() == 16 + (uint64_t)dataBytes) found = slot;
+            // An ITC3 file is kept even if fragmented (it reads through SdFat).
+            // An ITC2 file is rebuilt once unless it is already in one run of sectors.
+            uint32_t b = 0, e = 0;
+            if (rd32(hdr + 4) == key && rd32(hdr + 8) == dataBytes && f.fileSize() == 16 + (uint64_t)dataBytes) {
+                if (hdr[3] == '3' || f.contiguousRange(&b, &e)) found = slot;
+                else { valid = false; use = 0; }
+            }
         }
         f.close();
         if (use > highestUse) highestUse = use;
@@ -607,7 +611,7 @@ bool ItPlayer::openCache(const char* path, uint32_t key) {
     }
 
     uint8_t hdr[16];
-    memcpy(hdr, "ITC2", 4);
+    memcpy(hdr, "ITC3", 4);
     wr32(hdr + 4, key);
     wr32(hdr + 8, dataBytes);
     wr32(hdr + 12, highestUse + 1);
@@ -622,9 +626,10 @@ bool ItPlayer::openCache(const char* path, uint32_t key) {
         snprintf(name, sizeof(name), "%s/%d.bin", cacheDir, pick);
         FsFile f;
         if (!f.open(name, O_RDWR | O_CREAT | O_TRUNC)) return false;
+        f.preAllocate(16 + (uint64_t)dataBytes); // one run of sectors if the card has room for it
         uint8_t blank[16];
         memset(blank, 0, sizeof(blank));
-        bool ok = f.write(blank, 16) == 16;
+        bool ok = f.write(blank, 16) == 16 && f.sync();
         uint32_t written = 16, doneFrames = 0;
         for (int i = 0; ok && i < _numSamples; i++) {
             ItSample& s = _samples[i];
@@ -792,13 +797,10 @@ bool ItPlayer::unpackSample(FsFile& cache, ItSample& s, uint32_t srcOffset, bool
 // ---------------------------------------------------------------- streaming
 
 namespace {
-// Reads n frames from frame `start` of one side into dest as int16, or
+// Decodes the frames in `got` raw bytes of one side into dest as int16, or
 // adds them halved (mixing the right side into the left).
-inline __attribute__((always_inline)) int readSide(FsFile& f, uint8_t* raw, uint32_t offset, uint32_t start, uint32_t n,
-                                                   bool is16, bool isSigned, int16_t* dest, bool mixIn) {
+inline __attribute__((always_inline)) int decodeSide(const uint8_t* raw, int got, bool is16, bool isSigned, int16_t* dest, bool mixIn) {
     uint32_t bpf = is16 ? 2 : 1;
-    if (!f.seekSet(offset + start * bpf)) return 0;
-    int got = f.read(raw, n * bpf);
     if (got <= 0) return 0;
     uint32_t frames = (uint32_t)got / bpf;
     for (uint32_t i = 0; i < frames; i++) {
@@ -818,6 +820,26 @@ inline __attribute__((always_inline)) int readSide(FsFile& f, uint8_t* raw, uint
 }
 } // namespace
 
+// n frames from frame `start` of one side, read in pieces through _rawScratch.
+int __not_in_flash_func(ItPlayer::readFrames)(FsFile& f, uint32_t offset, uint32_t start, uint32_t n, bool is16, bool isSigned, int16_t* dest, bool mixIn) {
+    uint32_t bpf = is16 ? 2 : 1, done = 0;
+    while (done < n) {
+        uint32_t at = offset + (start + done) * bpf;
+        uint32_t piece = (n - done) * bpf;
+        if (piece > rawSpan(at)) piece = rawSpan(at) & ~(bpf - 1);
+        int got = 0;
+        const uint8_t* raw = readSampleBytes(f, at, piece, got);
+        int frames = decodeSide(raw, got, is16, isSigned, dest + done, mixIn);
+        done += (uint32_t)frames;
+        if ((uint32_t)frames * bpf < piece) break;
+    }
+    return (int)done;
+}
+
+// A refill fills the voice's slot and the free slots right above it (up to
+// MAX_RUN in all), so a voice with free neighbours reads less often. A
+// borrowed slot's own cache is dropped; claimSlot() shortens a borrower's
+// cache when the slot's voice starts.
 int16_t __not_in_flash_func(ItPlayer::refillChunk)(TrackerVoice& tv, uint32_t index) {
     const ItSampleView& view = static_cast<const ItSampleView&>(*tv.smp);
     const ItSample& s = _samples[view.sampleIndex];
@@ -827,14 +849,18 @@ int16_t __not_in_flash_func(ItPlayer::refillChunk)(TrackerVoice& tv, uint32_t in
     else if (tv.looping && view.loopEnd > view.loopStart && index < view.realLoopEnd) limit = view.realLoopEnd;
     else limit = s.length;
     if (index >= limit) { tv.chunkLen = 0; return 0; }
+    int k = (int)(static_cast<ItVoice*>(&tv) - &_voices[0]);
+    int run = 1;
+    while (run < MAX_RUN && k + run < MAX_VOICES && _voices[k + run].channel == -1) {
+        _voices[k + run].chunkSmp = nullptr;
+        run++;
+    }
     uint32_t frames = limit - index;
-    if (frames > (uint32_t)CHUNK_FRAMES) frames = CHUNK_FRAMES;
+    if (frames > (uint32_t)(CHUNK_FRAMES * run)) frames = (uint32_t)(CHUNK_FRAMES * run);
     uint32_t realStart = mirrored ? (2 * view.realLoopEnd - index - frames) : index;
     FsFile& f = s.inCache ? _cacheFile : _file;
-    int got = readSide(f, _rawScratch, s.dataOffset, realStart, frames, s.is16Bit, s.isSigned, tv.chunkBuf, false);
-    if (got > 0 && s.rightOffset) {
-        readSide(f, _rawScratch, s.rightOffset, realStart, (uint32_t)got, s.is16Bit, s.isSigned, tv.chunkBuf, true);
-    }
+    int got = readFrames(f, s.dataOffset, realStart, frames, s.is16Bit, s.isSigned, tv.chunkBuf, false);
+    if (got > 0 && s.rightOffset) readFrames(f, s.rightOffset, realStart, (uint32_t)got, s.is16Bit, s.isSigned, tv.chunkBuf, true);
     if (got <= 0) { tv.chunkLen = 0; return 0; }
     if (mirrored) {
         // Read forwards, played backwards. A short read keeps the frames
@@ -939,8 +965,27 @@ void ItPlayer::slidePitch(ItChannel& c, int32_t amount) {
 
 // ---------------------------------------------------------------- voices
 
+// Free voices in 5-bit bit-reversed order, so the voices in use sit apart
+// and each has free slots above it for its cache.
+static const uint8_t SPREAD[32] = {0, 16, 8, 24, 4, 20, 12, 28, 2, 18, 10, 26, 6, 22, 14, 30,
+                                   1, 17, 9, 25, 5, 21, 13, 29, 3, 19, 11, 27, 7, 23, 15, 31};
+static_assert(ItPlayer::MAX_VOICES == 32, "SPREAD is for 32 voices");
+
+// Voice k is starting: a lower voice's cache that ran into k's slot ends
+// where the slot starts.
+void ItPlayer::claimSlot(int k) {
+    for (int i = k - (MAX_RUN - 1); i < k; i++) {
+        if (i < 0) continue;
+        ItVoice& v = _voices[i];
+        if (v.chunkBuf + v.chunkLen > _voices[k].chunkBuf) v.chunkLen = (uint32_t)(_voices[k].chunkBuf - v.chunkBuf);
+    }
+}
+
 int ItPlayer::allocVoice(int forChannel) {
-    for (int i = 0; i < MAX_VOICES; i++) if (_voices[i].channel == -1) return i;
+    for (int n = 0; n < MAX_VOICES; n++) {
+        int i = SPREAD[n];
+        if (_voices[i].channel == -1) { claimSlot(i); return i; }
+    }
     // Then the cut note's tail nearest the end of its fade.
     int tail = -1;
     for (int i = 0; i < MAX_VOICES; i++) {
@@ -980,11 +1025,19 @@ void ItPlayer::cutVoice(ItVoice& v) {
         for (int i = 0; i < MAX_VOICES; i++) {
             ItVoice& g = _voices[i];
             if (g.channel != -1 || &g == &v) continue;
-            // The tail keeps v's position and cached frames, so it reads no SD.
+            // The tail keeps v's position and the cached frames from there on
+            // that fit its slot, so it reads no SD.
+            claimSlot(i);
             int16_t* buf = g.chunkBuf;
+            uint32_t off = v.srcIndex - v.chunkStart;
+            if (off >= v.chunkLen) off = 0;
+            uint32_t len = v.chunkLen - off;
+            if (len > (uint32_t)CHUNK_FRAMES) len = CHUNK_FRAMES;
             g = v;
             g.chunkBuf = buf;
-            memcpy(buf, v.chunkBuf, v.chunkLen * sizeof(int16_t));
+            g.chunkStart = v.chunkStart + off;
+            g.chunkLen = len;
+            memcpy(buf, v.chunkBuf + off, len * sizeof(int16_t));
             g.channel = -2;
             g.background = true;
             g.fadeOut = true;
@@ -1125,7 +1178,7 @@ void ItPlayer::triggerNote(int ch, uint8_t note, uint8_t instArg, bool tonePorta
     v.cutoff = c.cutoff;
     v.resonance = c.resonance;
     v.filterOn = false;
-    v.fy1 = v.fy2 = 0;
+    v.filt.y1 = v.filt.y2 = 0;
     setupFilter(v, 256, true);
     v.loudness = 64;
     v.smp = &s.sustain;
@@ -1272,10 +1325,10 @@ void ItPlayer::setupFilter(ItVoice& v, int envMod, bool noteRow) {
         if (y < -lim) y = -lim;
         return (int32_t)(y < 0 ? y - 0.5f : y + 0.5f);
     };
-    v.fa0 = q24(inv);
-    v.fb0 = q24((d + e + e) * inv);
-    v.fb1 = q24(-e * inv);
-    if (!v.filterOn) v.fy1 = v.fy2 = 0;
+    v.filt.a0 = q24(inv);
+    v.filt.b0 = q24((d + e + e) * inv);
+    v.filt.b1 = q24(-e * inv);
+    if (!v.filterOn) v.filt.y1 = v.filt.y2 = 0;
     v.filterOn = true;
     v.filterCut = (uint16_t)freq;
     v.filterReso = (uint8_t)reso;
@@ -1283,111 +1336,13 @@ void ItPlayer::setupFilter(ItVoice& v, int envMod, bool noteRow) {
 
 // ---------------------------------------------------------------- mixing
 
-// Moves v's gains to the new ones over RAMP_UP or RAMP_DOWN frames.
-void ItPlayer::setRamp(ItVoice& v, int32_t tgtL, int32_t tgtR) {
-    int32_t tl = tgtL << 12, tr = tgtR << 12;
-    int32_t dl = tl - v.curL, dr = tr - v.curR;
-    // Magnitudes: a surround voice's right gain is negative.
-    int len = (abs(tl) > abs(v.curL) || abs(tr) > abs(v.curR)) ? RAMP_UP : RAMP_DOWN;
-    if ((dl < len && dl > -len) && (dr < len && dr > -len)) {
-        v.curL = tl;
-        v.curR = tr;
-        v.rampLeft = 0;
-        return;
-    }
-    v.stepL = dl / len;
-    v.stepR = dr / len;
-    v.rampLeft = (uint16_t)len;
-}
-
-#if defined(__not_in_flash)
-#define IT_MIX_RAM __not_in_flash("itmix")
-#else
-#define IT_MIX_RAM
-#endif
-
-// n frames of one voice added into acc: linear interpolation as the base
-// mixer, then the filter if on, then the gains (ramping if RAMP). All
-// 32-bit: the filter's Q24 products are split into 12-bit halves.
-template <bool FILTER, bool RAMP>
-IT_MIX_RAM void ItPlayer::mixVoice(ItVoice& v, int32_t* acc, uint32_t n) {
-    const TrackerSample& smp = *v.smp;
-    uint32_t pos = v.samplePos16, step = v.sampleStep16;
-    int32_t last = v.lastSrcSample, next = v.nextSrcSample;
-    int32_t curL = v.curL, curR = v.curR, stepL = v.stepL, stepR = v.stepR;
-    int32_t gl = curL >> 12, gr = curR >> 12;
-    int32_t y1 = v.fy1, y2 = v.fy2;
-    const int32_t a0h = v.fa0 >> 12, a0l = v.fa0 & 4095, b0h = v.fb0 >> 12, b0l = v.fb0 & 4095;
-    const int32_t b1h = v.fb1 >> 12, b1l = v.fb1 & 4095;
-    uint32_t k = 0;
-    for (; k < n; k++) {
-        uint32_t frac = pos & 0xFFFF;
-        int32_t diff = next - last;
-        int32_t lerp = (diff >= -32768 && diff <= 32767) ? (diff * (int32_t)frac) >> 16
-                                                         : ((diff >> 1) * (int32_t)frac) >> 15;
-        int32_t smpl = last + lerp;
-        if (FILTER) {
-            int32_t hi = smpl * a0h + y1 * b0h + y2 * b1h;
-            int32_t lo = smpl * a0l + y1 * b0l + y2 * b1l;
-            int32_t val = (hi + (lo >> 12) + 2048) >> 12;
-            if (val > 65534) val = 65534;
-            if (val < -65536) val = -65536;
-            y2 = y1;
-            y1 = val;
-            smpl = val;
-        }
-        if (RAMP) {
-            curL += stepL;
-            curR += stepR;
-            gl = curL >> 12;
-            gr = curR >> 12;
-        }
-        acc[2 * k] += (smpl * gl) >> 15;
-        acc[2 * k + 1] += (smpl * gr) >> 15;
-
-        pos += step;
-        bool ended = false;
-        while (pos >= 0x10000) {
-            pos -= 0x10000;
-            v.srcIndex++;
-            if (v.looping && smp.loopEnd > smp.loopStart && v.srcIndex >= smp.loopEnd) {
-                v.srcIndex = smp.loopStart + ((v.srcIndex - smp.loopEnd) % (smp.loopEnd - smp.loopStart));
-            } else if (!v.looping && v.srcIndex >= smp.length) {
-                v.havePair = false;
-                ended = true;
-                break;
-            }
-            last = next;
-            next = readRawSample(v, v.srcIndex + 1);
-        }
-        if (ended) { k++; break; }
-    }
-    v.samplePos16 = pos;
-    v.lastSrcSample = (int16_t)last;
-    v.nextSrcSample = (int16_t)next;
-    if (FILTER) { v.fy1 = y1; v.fy2 = y2; }
-    if (RAMP) {
-        v.curL = curL;
-        v.curR = curR;
-        v.rampLeft = (uint16_t)(v.rampLeft > k ? v.rampLeft - k : 0);
-    }
-}
-
 const int16_t* __not_in_flash_func(ItPlayer::mixBlock)(uint32_t n) {
     int32_t* acc = _mix.acc;
     memset(acc, 0, n * 2 * sizeof(int32_t));
     for (int i = 0; i < MAX_VOICES; i++) {
         ItVoice& v = _voices[i];
         if (!v.havePair || v.sampleStep16 == 0 || !v.smp) continue;
-        uint32_t r = v.rampLeft < n ? v.rampLeft : n;
-        if (r) {
-            if (v.filterOn) mixVoice<true, true>(v, acc, r);
-            else mixVoice<false, true>(v, acc, r);
-        }
-        if (r < n && v.havePair) {
-            if (v.filterOn) mixVoice<true, false>(v, acc + 2 * r, n - r);
-            else mixVoice<false, false>(v, acc + 2 * r, n - r);
-        }
+        mixVoiceBlock(v, v.filterOn ? &v.filt : nullptr, acc, n, v.fadeOut);
         if (v.fadeOut && (v.rampLeft == 0 || !v.havePair)) releaseVoice(v);
     }
     // In place: out[i] only overwrites acc entries already read.

@@ -115,17 +115,12 @@ private:
         bool surround = false;
         bool fadeOut = false;     // a cut note's tail, freed when its ramp ends
 
-        // Mixer gains, see mixBlock(): curL/curR are the gain now << 12,
-        // moving by stepL/stepR for rampLeft more frames.
-        int32_t curL = 0, curR = 0, stepL = 0, stepR = 0;
-        uint16_t rampLeft = 0;
-
         // Resonant low-pass, coefficients Q24, state at sample scale.
         bool filterOn = false, filterEnvOn = false;
         uint8_t cutoff = 127, resonance = 0;
         uint8_t filterReso = 0xFF;  // resonance the coefficients were made for
         uint16_t filterCut = 0;     // cutoff in Hz they were made for
-        int32_t fa0 = 0, fb0 = 0, fb1 = 0, fy1 = 0, fy2 = 0;
+        TrackerFilter filt;
     };
 
     struct ItChannel {
@@ -196,7 +191,7 @@ private:
     int32_t noteToPeriod(int note, uint32_t c5) const;
     void slidePitch(ItChannel& c, int32_t amount); // amount in fine units, + is up
 
-    int allocVoice(int forChannel);
+    int allocVoice(int forChannel); // a free voice spread out from the others, else a tail or the quietest
     void releaseVoice(ItVoice& v);
     void voiceNoteOff(ItVoice& v);
     void applyNna(int ch, uint8_t newInst, uint8_t newSample, uint8_t newNote);
@@ -215,11 +210,7 @@ private:
 
     // Mixing (see it_file.cpp): ramps, filter, surround.
     const int16_t* mixBlock(uint32_t n) override;
-    template <bool FILTER, bool RAMP> void mixVoice(ItVoice& v, int32_t* acc, uint32_t n);
-    void setRamp(ItVoice& v, int32_t tgtL, int32_t tgtR);
     void cutVoice(ItVoice& v); // fades a sounding note out in a free voice, then frees v
-    // Voice sums for one block, then the same memory as the output frames.
-    union { int32_t acc[BLOCK_FRAMES * 2]; int16_t out[BLOCK_FRAMES * 2]; } _mix;
     bool _noteRow = false; // the cell being handled starts a note (not a portamento)
 
     // Filters and MIDI macros. Only F0F000xx (cutoff) and F0F001xx
@@ -263,8 +254,13 @@ private:
 
     ItChannel _channels[MAX_CHANNELS];
     ItVoice _voices[MAX_VOICES];
-    static const int CHUNK_FRAMES = 512; // a refill reads up to 2 bytes a frame per side into _rawScratch
+    // Each voice has a CHUNK_FRAMES slot. A refill also takes up to
+    // MAX_RUN - 1 free slots above its own, see refillChunk().
+    static const int CHUNK_FRAMES = 512;
+    static const int MAX_RUN = 4;
     int16_t _chunks[MAX_VOICES][CHUNK_FRAMES];
+    void claimSlot(int k);
+    int readFrames(FsFile& f, uint32_t offset, uint32_t start, uint32_t n, bool is16, bool isSigned, int16_t* dest, bool mixIn);
 
     FsFile _cacheFile;
 
