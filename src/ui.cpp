@@ -838,7 +838,9 @@ void drawBrowserHeaderPath(const SdBrowser& browser) {
     char note[16];
     browser.truncationNote(note, sizeof(note));
     char headerBuf[224];
-    snprintf(headerBuf, sizeof(headerBuf), "%s%s", browser.currentPath(), note);
+    char pathBuf[192];
+    browser.displayPath(pathBuf, sizeof(pathBuf));
+    snprintf(headerBuf, sizeof(headerBuf), "%s%s", pathBuf, note);
     // A long path shows its end, with "..." in front, so it stops short
     // of the brand label.
     int maxW = tft.width() - 4 - tft.textWidth("midiTracker") - 4 - 8;

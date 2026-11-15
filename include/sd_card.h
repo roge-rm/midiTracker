@@ -10,3 +10,14 @@ extern SdFs sd;
 // Returns true on success; on failure call sd.card()->errorCode() /
 // sd.sdErrorCode() for diagnostics.
 bool sdCardBegin();
+
+// Path helpers for paths built by SdBrowser. A path component of the form
+// "*<n>" (never a valid FAT name) stands for the entry with directory
+// index n in its folder, used for names that are too long or not plain
+// ASCII. Paths without one behave exactly like the plain SdFat calls.
+bool sdOpenPath(FsFile& f, const char* path, oflag_t flags = O_RDONLY);
+bool sdExists(const char* path);
+bool sdRemove(const char* path);
+bool sdRmdir(const char* path);
+bool sdMkdir(const char* path);
+bool sdRename(const char* oldPath, const char* newPath);

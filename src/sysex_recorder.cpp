@@ -17,7 +17,7 @@ bool SysExRecorder::arm(const char* path) {
     stop(); // finalize/discard any previous session first
     _error[0] = '\0';
 
-    if (sd.exists(path)) {
+    if (sdExists(path)) {
         strncpy(_error, "file already exists", sizeof(_error) - 1);
         _state = STATE_ERROR;
         return false;
@@ -35,7 +35,7 @@ void SysExRecorder::feed(const uint8_t* data, size_t len) {
     if (len < 2 || len > MIDI_SYSEX_MAX_LEN) return; // malformed, or bigger than this firmware buffers anywhere -- see config.h
 
     if (_state == STATE_ARMED) {
-        if (!_file.open(_path, O_RDWR | O_CREAT | O_TRUNC)) {
+        if (!sdOpenPath(_file, _path, O_RDWR | O_CREAT | O_TRUNC)) {
             strncpy(_error, "could not create file", sizeof(_error) - 1);
             _state = STATE_ERROR;
             return;
@@ -67,7 +67,7 @@ void SysExRecorder::stop() {
 void SysExRecorder::cancel() {
     if (_state == STATE_RECORDING) {
         _file.close();
-        sd.remove(_path);
+        sdRemove(_path);
     }
     _state = STATE_IDLE;
 }

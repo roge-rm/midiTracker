@@ -65,7 +65,7 @@ bool WavPlayer::load(const char* path) {
     close();
     _error[0] = '\0';
 
-    if (!_file.open(path, O_RDONLY)) {
+    if (!sdOpenPath(_file, path, O_RDONLY)) {
         strncpy(_error, "could not open file", sizeof(_error) - 1);
         _state = STATE_ERROR;
         return false;

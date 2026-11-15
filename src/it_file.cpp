@@ -118,8 +118,8 @@ bool ItPlayer::load(const char* path) {
     close();
     _cacheFile.close();
     _error[0] = '\0';
-    if (!_file.open(path, O_RDONLY)) return loadFail("could not open file");
-    if (!_patternFile.open(path, O_RDONLY)) return loadFail("could not open file");
+    if (!sdOpenPath(_file, path, O_RDONLY)) return loadFail("could not open file");
+    if (!sdOpenPath(_patternFile, path, O_RDONLY)) return loadFail("could not open file");
 
     uint8_t h[0xC0];
     if (_file.read(h, sizeof(h)) != (int)sizeof(h) || memcmp(h, "IMPM", 4) != 0) return loadFail("unsupported format");

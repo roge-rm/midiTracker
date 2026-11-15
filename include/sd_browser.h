@@ -9,7 +9,7 @@
 enum FileKind { FILE_MID, FILE_SYX, FILE_WAV, FILE_MOD, FILE_S3M, FILE_XM, FILE_IT };
 
 struct BrowserEntry {
-    char name[MAX_FILENAME_LEN];
+    char name[MAX_FILENAME_LEN]; // display name: ASCII, shortened to fit with its extension kept. Use buildFullPath() to open an entry
     bool isDir;
     FileKind kind;
     uint32_t size;
@@ -63,6 +63,15 @@ public:
     // does for an existing entry -- for a file that doesn't exist yet
     // (e.g. a new recording).
     void buildPath(const char* name, char* outPath, size_t outSize) const;
+
+    // The current path with "*<index>" components (see sd_card.h) replaced
+    // by the folders' display names, for showing on screen.
+    void displayPath(char* outBuf, size_t outSize) const;
+
+    // One past the highest REC<N> file / DUMP<N>.syx file seen by the last scan.
+    bool entryIsByIndex(int idx) const { return idx >= 0 && idx < _count && _index[idx].byIndex; }
+    int nextRecNumber() const { return _maxRec + 1; }
+    int nextDumpNumber() const { return _maxDump + 1; }
 
     // Drops the heap-allocated index/sort-key buffers, if any, without
     // touching _path -- entryCount() reports 0 until the next
@@ -145,6 +154,7 @@ private:
         uint32_t dirIndex; // SdFat's own dirIndex() -- the re-open key, see FsFile::open(dir, index, oflag)
         uint8_t isDir;     // 0/1
         uint8_t kind;      // FileKind, cached as a plain byte (avoids re-deriving it from the name on every materialize)
+        uint8_t byIndex;   // 1 if the name is too long or not plain ASCII: paths use "*<dirIndex>" instead of the name
     };
     struct SortKeyEntry {
         char key[SORT_KEY_LEN]; // uppercased, zero-padded name prefix -- see loadEntries()/sortIndex()
@@ -161,6 +171,9 @@ private:
 
     bool _buffersFreed = false; // see needsRebuild()
 
+    int _maxRec = 0;  // see nextRecNumber()
+    int _maxDump = 0;
+
     // On-demand materialization cache backing entry() -- see its
     // implementation. mutable: entry() is logically const (browsing
     // doesn't change what the browser conceptually holds), but still
@@ -176,6 +189,9 @@ private:
     void sortIndex();            // insertion sort _index (and _sortKeys in lockstep) -- only called when _sortKeys is non-null
     const BrowserEntry& materialize(int idx) const;
     static bool classifyEntry(FsFile& file, const char* name, bool& isDirOut, uint8_t& kindOut);
+    static void foldToAscii(char* s);
+    static void shortenForDisplay(char* s, char* out, size_t outSize);
+    static void displayNameOf(FsFile& f, char* out, size_t outSize);
     static bool isMidiFilename(const char* name);
     static bool isSysExFilename(const char* name);
     static bool isWavFilename(const char* name);

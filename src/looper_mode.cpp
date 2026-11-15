@@ -2456,7 +2456,7 @@ bool primeImportTrack(ImportTrackReader& t) {
 // -- see importFileIntoTrack() for the wrapper that fills those in.
 bool importMidiEvents(LoopTrack& t, const char* path) {
     FsFile hdr;
-    if (!hdr.open(path, O_RDONLY)) return false;
+    if (!sdOpenPath(hdr, path, O_RDONLY)) return false;
 
     char id[5];
     uint32_t len;
@@ -2499,7 +2499,7 @@ bool importMidiEvents(LoopTrack& t, const char* path) {
 
         ImportTrackReader& r = readers[numReaders];
         r = ImportTrackReader(); // reset in case this slot was used by a previous import
-        if (!r.file.open(path, O_RDONLY)) { hdr.seekCur(tlen); continue; }
+        if (!sdOpenPath(r.file, path, O_RDONLY)) { hdr.seekCur(tlen); continue; }
         r.file.seekSet(trackStart);
         r.chunkEnd = trackStart + tlen;
         hdr.seekSet(trackStart + tlen); // advance master cursor past this track
@@ -4083,7 +4083,7 @@ void updateLoadLoopDeleteConfirm() {
 
         char path[224];
         loopBrowser.buildFullPath(loopBrowseSelectedIndex, path, sizeof(path));
-        bool ok = sd.remove(path);
+        bool ok = sdRemove(path);
         if (ok) {
             loopBrowser.refresh();
             int count = loopBrowser.entryCount();

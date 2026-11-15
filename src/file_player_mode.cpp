@@ -480,7 +480,8 @@ void openSelected() {
 
     const BrowserEntry& e = browser.entry(selectedIndex);
     if (e.isDir) {
-        if (dirStackDepth < MAX_DIR_DEPTH) dirSelectionStack[dirStackDepth++] = selectedIndex;
+        if (dirStackDepth < MAX_DIR_DEPTH) dirSelectionStack[dirStackDepth] = selectedIndex;
+        dirStackDepth++; // counts every level; only the first MAX_DIR_DEPTH have a saved cursor
         browser.enterDir(selectedIndex);
         selectedIndex = 0;
         scrollOffset = 0;
@@ -622,29 +623,13 @@ void openSelected() {
 // REC<N>.mid in the current directory, so repeated recordings in the same
 // folder never collide without the user having to think about it.
 void generateDefaultRecordingName(char* out, size_t outSize) {
-    int nextNum = 1;
-    for (int i = 0; i < browser.entryCount(); i++) {
-        const BrowserEntry& e = browser.entry(i);
-        if (e.isDir) continue;
-        if (strncasecmp(e.name, "REC", 3) != 0) continue;
-        int num = atoi(e.name + 3);
-        if (num >= nextNum) nextNum = num + 1;
-    }
-    snprintf(out, outSize, "REC%03d", nextNum);
+    snprintf(out, outSize, "REC%03d", browser.nextRecNumber());
 }
 
 // Same idea as generateDefaultRecordingName(), "DUMP001", "DUMP002", etc.,
 // scanning existing .syx entries instead of .mid ones.
 void generateDefaultSysExName(char* out, size_t outSize) {
-    int nextNum = 1;
-    for (int i = 0; i < browser.entryCount(); i++) {
-        const BrowserEntry& e = browser.entry(i);
-        if (e.isDir || e.kind != FILE_SYX) continue;
-        if (strncasecmp(e.name, "DUMP", 4) != 0) continue;
-        int num = atoi(e.name + 4);
-        if (num >= nextNum) nextNum = num + 1;
-    }
-    snprintf(out, outSize, "DUMP%03d", nextNum);
+    snprintf(out, outSize, "DUMP%03d", browser.nextDumpNumber());
 }
 
 // Loads `initial` (truncated to NAME_ENTRY_MAX_LEN) into the shared
@@ -730,6 +715,9 @@ void beginRename() {
     if (baseLen > NAME_ENTRY_MAX_LEN) baseLen = NAME_ENTRY_MAX_LEN;
     memcpy(base, e.name, baseLen);
     base[baseLen] = '\0';
+    if (browser.entryIsByIndex(selectedIndex)) {
+        for (size_t i = 0; i < baseLen; i++) if (base[i] == '?') base[i] = '_'; // '?' stands for a character that can't be typed
+    }
     beginNameEntry(NAME_RENAME, base);
     strcpy(renameInitialName, nameEntryBuf);
 }
@@ -812,7 +800,7 @@ void performNameEntryAction(const char* trimmed) {
     if (namePurpose == NAME_NEW_FOLDER) {
         char path[224];
         browser.buildPath(trimmed, path, sizeof(path));
-        if (!sd.mkdir(path)) {
+        if (!sdMkdir(path)) {
             strncpy(nameEntryError, "could not create folder", sizeof(nameEntryError) - 1);
         } else {
             browser.refresh();
@@ -841,16 +829,16 @@ void performNameEntryAction(const char* trimmed) {
         // Case-only change: SdFat's rename() sees the new name as already existing, so go via a temp name.
         char tmpPath[232];
         snprintf(tmpPath, sizeof(tmpPath), "%s.rntmp", renameOldPath);
-        if (!sd.rename(renameOldPath, tmpPath)) {
+        if (!sdRename(renameOldPath, tmpPath)) {
             strncpy(nameEntryError, "rename failed", sizeof(nameEntryError) - 1);
-        } else if (!sd.rename(tmpPath, newPath)) {
-            sd.rename(tmpPath, renameOldPath);
+        } else if (!sdRename(tmpPath, newPath)) {
+            sdRename(tmpPath, renameOldPath);
             strncpy(nameEntryError, "rename failed", sizeof(nameEntryError) - 1);
         } else {
             browser.refresh();
             appState = APP_BROWSE;
         }
-    } else if (!sd.rename(renameOldPath, newPath)) {
+    } else if (!sdRename(renameOldPath, newPath)) {
         strncpy(nameEntryError, "rename failed", sizeof(nameEntryError) - 1);
     } else {
         browser.refresh();
@@ -915,7 +903,7 @@ void finishNameEntry() {
         browser.buildPath(filename, path, sizeof(path));
     }
 
-    if (sd.exists(path)) {
+    if (sdExists(path)) {
         strncpy(pendingName, trimmed, sizeof(pendingName) - 1);
         pendingName[sizeof(pendingName) - 1] = '\0';
         strncpy(pendingOverwritePath, path, sizeof(pendingOverwritePath) - 1);
@@ -940,7 +928,7 @@ void handleConfirmOverwriteInput() {
         return;
     }
     if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
-        bool ok = pendingOverwriteIsDir ? sd.rmdir(pendingOverwritePath) : sd.remove(pendingOverwritePath);
+        bool ok = pendingOverwriteIsDir ? sdRmdir(pendingOverwritePath) : sdRemove(pendingOverwritePath);
         if (!ok) {
             strncpy(nameEntryError, "overwrite failed", sizeof(nameEntryError) - 1);
             appState = APP_NAME_ENTRY;
@@ -1056,8 +1044,8 @@ bool handleBrowseInput() {
             // descending (see openSelected()'s push), rather than always
             // landing back on the first entry -- clamped in case the
             // directory's contents changed while we were inside.
-            if (dirStackDepth > 0) {
-                selectedIndex = dirSelectionStack[--dirStackDepth];
+            if (dirStackDepth > 0 && --dirStackDepth < MAX_DIR_DEPTH) {
+                selectedIndex = dirSelectionStack[dirStackDepth];
                 int count = browser.entryCount();
                 if (selectedIndex >= count) selectedIndex = count > 0 ? count - 1 : 0;
                 if (selectedIndex < 0) selectedIndex = 0;
@@ -1735,7 +1723,7 @@ void handleConfirmDeleteInput() {
         const BrowserEntry& e = browser.entry(selectedIndex);
         char path[224];
         browser.buildFullPath(selectedIndex, path, sizeof(path));
-        bool ok = e.isDir ? sd.rmdir(path) : sd.remove(path);
+        bool ok = e.isDir ? sdRmdir(path) : sdRemove(path);
 
         if (ok) {
             browser.refresh();

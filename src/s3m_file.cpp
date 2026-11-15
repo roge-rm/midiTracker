@@ -1,3 +1,4 @@
+#include "sd_card.h"
 #include "s3m_file.h"
 #include "pins.h" // SAMPLE_RATE
 #include <string.h>
@@ -20,8 +21,8 @@ bool S3mPlayer::load(const char* path) {
     close();
     _error[0] = '\0';
 
-    if (!_file.open(path, O_RDONLY)) return loadFail("could not open file");
-    if (!_patternFile.open(path, O_RDONLY)) return loadFail("could not open file");
+    if (!sdOpenPath(_file, path, O_RDONLY)) return loadFail("could not open file");
+    if (!sdOpenPath(_patternFile, path, O_RDONLY)) return loadFail("could not open file");
 
     // The fixed header is 96 bytes: name, type, counts and flags, "SCRM"
     // at 44, global volume/speed/tempo/default pan at 48-53, and the

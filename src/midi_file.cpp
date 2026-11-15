@@ -231,8 +231,8 @@ bool MidiPlayer::load(const char* path) {
         _path[sizeof(_path) - 1] = '\0';
     }
 
-    FsFile hdr = sd.open(path, O_RDONLY);
-    if (!hdr) {
+    FsFile hdr;
+    if (!sdOpenPath(hdr, path, O_RDONLY)) {
         strncpy(_error, "could not open file", sizeof(_error) - 1);
         _state = STATE_ERROR;
         return false;
@@ -309,7 +309,7 @@ bool MidiPlayer::load(const char* path) {
 
         TrackReader& t = _tracks[_numTracks];
         t = TrackReader(); // reset in case this slot was used previously
-        if (!t.file.open(path, O_RDONLY)) {
+        if (!sdOpenPath(t.file, path, O_RDONLY)) {
             hdr.seekCur(tlen);
             continue;
         }

@@ -95,3 +95,5 @@ void drain() { g_pending = 0; }
 size_t framesCaptured() { return g_out.size() / 2; }
 const int16_t* data() { return g_out.data(); }
 }
+
+bool sdOpenPath(FsFile& f, const char* path, int flags) { return f.open(path, flags); }

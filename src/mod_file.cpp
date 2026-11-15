@@ -1,3 +1,4 @@
+#include "sd_card.h"
 #include "mod_file.h"
 #include "pins.h" // SAMPLE_RATE
 #include <string.h>
@@ -47,7 +48,7 @@ bool ModPlayer::load(const char* path) {
     close();
     _error[0] = '\0';
 
-    if (!_file.open(path, O_RDONLY)) return loadFail("could not open file");
+    if (!sdOpenPath(_file, path, O_RDONLY)) return loadFail("could not open file");
 
     // A 31-sample MOD has a format tag at 1080. Without one it's read as
     // a 15-sample Soundtracker file: no tag, 4 channels, patterns at 600.

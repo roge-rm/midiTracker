@@ -1,3 +1,4 @@
+#include "sd_card.h"
 #include "xm_file.h"
 #include "pins.h" // SAMPLE_RATE
 #include <string.h>
@@ -14,8 +15,8 @@ bool XmPlayer::load(const char* path) {
     close();
     _error[0] = '\0';
 
-    if (!_file.open(path, O_RDONLY)) return loadFail("could not open file");
-    if (!_patternFile.open(path, O_RDONLY)) return loadFail("could not open file");
+    if (!sdOpenPath(_file, path, O_RDONLY)) return loadFail("could not open file");
+    if (!sdOpenPath(_patternFile, path, O_RDONLY)) return loadFail("could not open file");
 
     uint8_t hdr[60];
     if (_file.read(hdr, 60) != 60 || memcmp(hdr, "Extended Module: ", 17) != 0 || hdr[37] != 0x1A) return loadFail("unsupported format");

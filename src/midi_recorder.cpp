@@ -40,7 +40,7 @@ bool MidiRecorder::arm(const char* path) {
     stop(); // finalize/discard any previous session first
     _error[0] = '\0';
 
-    if (sd.exists(path)) {
+    if (sdExists(path)) {
         strncpy(_error, "file already exists", sizeof(_error) - 1);
         _state = STATE_ERROR;
         return false;
@@ -54,7 +54,7 @@ bool MidiRecorder::arm(const char* path) {
 }
 
 void MidiRecorder::writeHeader() {
-    if (!_file.open(_path, O_RDWR | O_CREAT | O_TRUNC)) {
+    if (!sdOpenPath(_file, _path, O_RDWR | O_CREAT | O_TRUNC)) {
         strncpy(_error, "could not create file", sizeof(_error) - 1);
         _state = STATE_ERROR;
         return;
@@ -171,7 +171,7 @@ void MidiRecorder::stop() {
 void MidiRecorder::cancel() {
     if (_state == STATE_RECORDING) {
         _file.close();
-        sd.remove(_path);
+        sdRemove(_path);
     }
     // STATE_ARMED: no file was ever created (still waiting for the first
     // event), so there's nothing on disk to remove.

@@ -3,6 +3,7 @@
 #include <string.h>
 #include <strings.h> // strcasecmp
 #include <ctype.h>   // toupper
+#include <stdlib.h>  // atoi, strtoul
 #include <new>       // std::nothrow
 
 bool SdBrowser::isMidiFilename(const char* name) {
@@ -52,6 +53,53 @@ bool SdBrowser::isItFilename(const char* name) {
     if (len < 3) return false;
     const char* ext = name + (len - 3);
     return strcasecmp(ext, ".it") == 0;
+}
+
+// Longest name (UTF-8 bytes, with the zero) either FAT or exFAT can hold.
+static const size_t NAME_FETCH_LEN = 768;
+
+// Replaces each non-ASCII character with one '?', in place.
+void SdBrowser::foldToAscii(char* s) {
+    char* w = s;
+    for (const char* r = s; *r; r++) {
+        unsigned char c = (unsigned char)*r;
+        if (c < 0x80) *w++ = (char)c;
+        else if (c >= 0xC0) *w++ = '?'; // lead byte; its continuation bytes (0x80-0xBF) are skipped
+    }
+    *w = '\0';
+}
+
+// Folds s to ASCII and copies it into out, cutting the middle of an
+// over-long name so a short extension stays at the end.
+void SdBrowser::shortenForDisplay(char* s, char* out, size_t outSize) {
+    foldToAscii(s);
+    size_t len = strlen(s);
+    if (len < outSize) {
+        memcpy(out, s, len + 1);
+        return;
+    }
+    const char* dot = strrchr(s, '.');
+    size_t extLen = (dot && (size_t)(s + len - dot) <= 5) ? (size_t)(s + len - dot) : 0;
+    size_t head = outSize - 1 - extLen;
+    memcpy(out, s, head);
+    memcpy(out + head, s + len - extLen, extLen);
+    out[head + extLen] = '\0';
+}
+
+// Display name of an open entry, whatever its length.
+void SdBrowser::displayNameOf(FsFile& f, char* out, size_t outSize) {
+    if (f.getName(out, outSize) > 0) {
+        foldToAscii(out);
+        return;
+    }
+    char* big = new (std::nothrow) char[NAME_FETCH_LEN];
+    if (big && f.getName(big, NAME_FETCH_LEN) > 0) {
+        shortenForDisplay(big, out, outSize);
+    } else {
+        strncpy(out, "?", outSize);
+        out[outSize - 1] = '\0';
+    }
+    delete[] big;
 }
 
 // Shared by both loadEntries() scan passes so they agree on exactly which
@@ -120,21 +168,43 @@ void SdBrowser::loadEntries() {
     for (int i = 0; i < WINDOW_SIZE; i++) _windowLogicalIndex[i] = -1;
     _windowNextSlot = 0;
 
-    FsFile dir = sd.open(_path);
+    _maxRec = 0;
+    _maxDump = 0;
+
+    FsFile dir;
+    sdOpenPath(dir, _path, O_RDONLY);
     if (!dir || !dir.isDir()) {
         if (dir) dir.close();
         return;
     }
 
+    // Full names are read into a transient buffer so extensions and the
+    // REC/DUMP numbers are seen whatever the name length.
+    // Falls back to a short stack buffer if the heap is short.
+    char smallBuf[MAX_FILENAME_LEN];
+    char* heapBuf = new (std::nothrow) char[NAME_FETCH_LEN];
+    char* nameBuf = heapBuf ? heapBuf : smallBuf;
+    const size_t nameCap = heapBuf ? NAME_FETCH_LEN : sizeof(smallBuf);
+
     int total = 0;
     {
         FsFile file;
-        char nameBuf[MAX_FILENAME_LEN];
         while (total < MAX_INDEX_ENTRIES && file.openNext(&dir, O_RDONLY)) {
             bool isDirEntry;
             uint8_t kind;
-            file.getName(nameBuf, sizeof(nameBuf));
-            if (classifyEntry(file, nameBuf, isDirEntry, kind)) total++;
+            if (file.getName(nameBuf, nameCap) == 0) nameBuf[0] = '\0';
+            if (classifyEntry(file, nameBuf, isDirEntry, kind)) {
+                total++;
+                if (!isDirEntry) {
+                    if (strncasecmp(nameBuf, "REC", 3) == 0) {
+                        int num = atoi(nameBuf + 3);
+                        if (num > _maxRec) _maxRec = num;
+                    } else if (kind == FILE_SYX && strncasecmp(nameBuf, "DUMP", 4) == 0) {
+                        int num = atoi(nameBuf + 4);
+                        if (num > _maxDump) _maxDump = num;
+                    }
+                }
+            }
             file.close();
         }
     }
@@ -142,6 +212,7 @@ void SdBrowser::loadEntries() {
     _scannedTotal = total;
 
     if (total == 0) {
+        delete[] heapBuf;
         dir.close();
         return;
     }
@@ -168,12 +239,14 @@ void SdBrowser::loadEntries() {
     if (allocCount < total) wantSortKeys = false;
 
     if (allocCount == 0) {
+        delete[] heapBuf;
         dir.close();
         return; // out of headroom -- browse as empty rather than crash; truncationNote() still reports what was scanned
     }
 
     _index = new (std::nothrow) DirIndexEntry[allocCount];
     if (!_index) {
+        delete[] heapBuf;
         dir.close();
         return;
     }
@@ -183,17 +256,21 @@ void SdBrowser::loadEntries() {
     }
 
     FsFile file;
-    char nameBuf[MAX_FILENAME_LEN];
     int filled = 0;
     while (filled < allocCount && file.openNext(&dir, O_RDONLY)) {
         bool isDirEntry;
         uint8_t kind;
-        file.getName(nameBuf, sizeof(nameBuf));
+        size_t nameLen = file.getName(nameBuf, nameCap);
+        if (nameLen == 0) nameBuf[0] = '\0';
         if (classifyEntry(file, nameBuf, isDirEntry, kind)) {
             DirIndexEntry& e = _index[filled];
             e.dirIndex = file.dirIndex();
             e.isDir = isDirEntry ? 1 : 0;
             e.kind = kind;
+            e.byIndex = (nameLen == 0 || nameLen >= MAX_FILENAME_LEN) ? 1 : 0;
+            for (const char* c = nameBuf; !e.byIndex && *c; c++) {
+                if ((unsigned char)*c >= 0x80) e.byIndex = 1;
+            }
             if (_sortKeys) {
                 char key[SORT_KEY_LEN];
                 size_t n = strlen(nameBuf);
@@ -208,6 +285,7 @@ void SdBrowser::loadEntries() {
         file.close();
     }
     dir.close();
+    delete[] heapBuf;
 
     _count = filled;
     if (_sortKeys) sortIndex();
@@ -265,11 +343,11 @@ const BrowserEntry& SdBrowser::materialize(int idx) const {
     e.size = 0;
     e.name[0] = '\0';
 
-    FsFile dirFile = sd.open(_path);
-    if (dirFile) {
+    FsFile dirFile;
+    if (sdOpenPath(dirFile, _path, O_RDONLY)) {
         FsFile file;
         if (file.open(&dirFile, idxEntry.dirIndex, O_RDONLY)) {
-            file.getName(e.name, sizeof(e.name));
+            displayNameOf(file, e.name, sizeof(e.name));
             e.size = e.isDir ? 0 : (uint32_t)file.fileSize();
             file.close();
         }
@@ -299,7 +377,57 @@ void SdBrowser::buildFullPath(int idx, char* outPath, size_t outSize) const {
         outPath[0] = '\0';
         return;
     }
+    if (_index[idx].byIndex) {
+        char token[16];
+        snprintf(token, sizeof(token), "*%lu", (unsigned long)_index[idx].dirIndex);
+        buildPath(token, outPath, outSize);
+        return;
+    }
     buildPath(entry(idx).name, outPath, outSize);
+}
+
+void SdBrowser::displayPath(char* outBuf, size_t outSize) const {
+    if (!strchr(_path, '*')) {
+        snprintf(outBuf, outSize, "%s", _path);
+        return;
+    }
+    FsFile a, b;
+    FsFile* cur = &a;
+    FsFile* nxt = &b;
+    bool open = a.openRoot(&sd);
+    size_t n = 0;
+    outBuf[0] = '\0';
+    const char* p = _path;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char* end = strchr(p, '/');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char comp[MAX_FILENAME_LEN + 16];
+        if (len >= sizeof(comp)) len = sizeof(comp) - 1;
+        memcpy(comp, p, len);
+        comp[len] = '\0';
+        if (comp[0] == '*') {
+            bool got = open && nxt->open(cur, (uint32_t)strtoul(comp + 1, nullptr, 10), O_RDONLY);
+            if (got) displayNameOf(*nxt, comp, sizeof(comp)); else strcpy(comp, "?");
+            if (got) {
+                cur->close();
+                FsFile* t = cur; cur = nxt; nxt = t;
+            } else {
+                open = false;
+            }
+        } else if (open) {
+            if (nxt->open(cur, comp, O_RDONLY)) {
+                cur->close();
+                FsFile* t = cur; cur = nxt; nxt = t;
+            } else {
+                open = false;
+            }
+        }
+        if (n + 1 < outSize) n += snprintf(outBuf + n, outSize - n, "/%s", comp);
+        p += len;
+    }
+    if (n == 0) snprintf(outBuf, outSize, "/");
 }
 
 void SdBrowser::buildPath(const char* name, char* outPath, size_t outSize) const {
@@ -312,7 +440,7 @@ void SdBrowser::buildPath(const char* name, char* outPath, size_t outSize) const
 }
 
 bool SdBrowser::enterDir(int idx) {
-    if (idx < 0 || idx >= _count || !entry(idx).isDir) return false;
+    if (idx < 0 || idx >= _count || !_index[idx].isDir) return false;
 
     char newPath[192];
     buildFullPath(idx, newPath, sizeof(newPath));
