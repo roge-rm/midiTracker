@@ -238,7 +238,7 @@ void sendNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
 
 void sendNoteOff(uint8_t channel, uint8_t note, uint8_t velocity) {
     if (note < 128) g_noteChannelMask[note] &= (uint16_t)~(1u << channel);
-    if (audioOutEnabled()) Synth::noteOff(note);
+    if (audioOutEnabled()) Synth::noteOff(channel, note);
     if (hwEnabled())  MIDIHW.sendNoteOff(note, velocity, channel + 1);
     if (usbEnabled()) MIDIUSB.sendNoteOff(note, velocity, channel + 1);
 }

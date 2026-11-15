@@ -3,6 +3,8 @@
 #include <I2S.h>
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
+#include <hardware/sync.h>
 
 namespace {
 
@@ -247,6 +249,8 @@ struct Voice {
     EnvStage stage = ENV_ATTACK;
     uint8_t note = 0;
     Waveform waveform = WAVE_SINE;
+    uint8_t channel = 0;   // MIDI channel 0-15 that started it, for note-off matching
+    uint32_t startOrder = 0; // g_voiceStartCounter at note-on, for oldest-voice stealing
 
     uint32_t phase = 0;    // 32-bit accumulator, one full cycle == 2^32
     uint32_t phaseInc = 0; // per-sample phase increment for this note's pitch
@@ -302,6 +306,9 @@ struct Voice {
 };
 
 Voice g_melodicVoices[NUM_MELODIC_VOICES];
+// Bumped per note-on. Age is the unsigned difference from this, so
+// wraparound is harmless.
+uint32_t g_voiceStartCounter = 0;
 Voice g_drumVoices[NUM_DRUM_VOICES];
 I2S g_i2s(OUTPUT, AUDIO_BCLK, AUDIO_SDATA); // LRCLK is implicitly AUDIO_BCLK+1, see pins.h
 
@@ -389,17 +396,25 @@ uint8_t g_outputLevelShift = OUTPUT_LEVEL_SHIFT[OUTPUT_LEVEL_HP_LOW]; // set fro
 // interleaved stereo int16 frames. head/tail are stored as ever-
 // increasing counts rather than pre-masked indices (mask only applied at
 // index time) so "empty" (head==tail) and "full" (head-tail==capacity)
-// are unambiguous -- the standard SPSC ring shape. Each is written by
-// exactly one core and only ever read by the other, same "plain volatile
-// is enough, no mutex needed" reasoning as g_readyForPioInit above (RP2040
-// shares plain SRAM between cores with no cache-coherency hazard, and
-// size_t is a single 32-bit word here, read/written atomically by the
-// hardware regardless of `volatile`).
+// are unambiguous -- the standard SPSC ring shape. head is only written by
+// core 0 and tail only by core 1 (32-bit words, so loads and stores are
+// atomic). Ordering uses __dmb():
+// - producer: write frame data, dmb, then publish head, so core 1 never
+//   sees a head that covers data not yet in SRAM;
+// - consumer: read head, dmb, read frame data, dmb, then publish tail, so
+//   the data reads finish before core 0 may reuse those slots;
+// - producer reads tail then dmb before writing into the freed slots.
+// A reset from core 0 never writes tail: it posts the head value to cut
+// back to and bumps g_wavResetSeq, and core 1 applies it at the top of
+// renderSample() (see wavStreamApplyReset()).
 const size_t WAV_RING_FRAMES = 8192; // power of two -- ~186ms at 44.1kHz, see synth.h
 const size_t WAV_RING_MASK = WAV_RING_FRAMES - 1;
 int16_t g_wavRing[WAV_RING_FRAMES * 2]; // interleaved L,R
 volatile size_t g_wavHead = 0; // producer-owned
 volatile size_t g_wavTail = 0; // consumer-owned
+volatile size_t g_wavResetTo = 0;    // core 0: head at the last reset; written before g_wavResetSeq
+volatile uint32_t g_wavResetSeq = 0; // core 0 bumps it per reset
+volatile uint32_t g_wavResetSeen = 0; // written by core 1 only, read by wavStreamProducerTail()
 volatile bool g_wavActive = false; // stream is live -- renderSample() should try to pop
 volatile bool g_wavEnded = false;  // no more source data -- empty means "done", not "underrun"
 volatile bool g_wavUnderrun = false;
@@ -423,12 +438,28 @@ volatile uint32_t g_wavUnderrunSamples = 0;
 // g_wavActive. Returns false on empty (caller decides whether that means
 // "done" or "underrun" via g_wavEnded).
 bool popWavFrame(int16_t& outL, int16_t& outR) {
-    if (g_wavHead == g_wavTail) return false;
-    size_t idx = g_wavTail & WAV_RING_MASK;
+    size_t tail = g_wavTail;
+    if (g_wavHead == tail) return false;
+    __dmb(); // acquire: head read before the frame data it covers
+    size_t idx = tail & WAV_RING_MASK;
     outL = g_wavRing[idx * 2 + 0];
     outR = g_wavRing[idx * 2 + 1];
-    g_wavTail++;
+    __dmb(); // release: data read before the slot is handed back
+    g_wavTail = tail + 1;
     return true;
+}
+
+// Core 1, once per sample: drops every frame written before core 0's last
+// wavStreamReset(). Frames written since then are kept. Never moves tail
+// backwards, in case it already got past the reset point.
+ALWAYS_INLINE void wavStreamApplyReset() {
+    uint32_t seq = g_wavResetSeq;
+    if (seq == g_wavResetSeen) return;
+    __dmb(); // acquire: seq read before g_wavResetTo
+    size_t to = g_wavResetTo;
+    if ((int32_t)(to - g_wavTail) > 0) g_wavTail = to;
+    __dmb(); // release: tail written before the ack core 0 waits on
+    g_wavResetSeen = seq;
 }
 
 int16_t nextNoise() {
@@ -572,7 +603,7 @@ const char* const INSTRUMENT_FAMILY_NAMES[16] = {
 
 // Live-editable copy of DEFAULT_PRESETS above -- what note-start actually
 // reads (startMelodicVoice(), unchanged by this addition). Initialized
-// from DEFAULT_PRESETS in setup1(); mutated only via
+// from DEFAULT_PRESETS in Synth::begin(); mutated only via
 // Synth::setInstrumentPreset()/resetInstrumentPresetToDefault(), both of
 // which write here directly from core 0 -- see synth.h's long comment on
 // why that's safe. Not const.
@@ -649,7 +680,12 @@ DrumPreset DRUM_PRESETS[DRUM_TYPE_COUNT];
 // function existed).
 void recomputeInstrumentPresetCache(int family) {
     g_presetFilterAlpha[family] = cutoffHzToAlphaQ14(PRESETS[family].cutoffHz);
-    g_presetVibratoDepthQ16[family] = (uint32_t)(PRESETS[family].vibratoDepthPercent / 100.0f * 65536.0f + 0.5f);
+    // Capped at 30% (the editor's own limit) so renderVoice()'s vibrato
+    // multiply can't overflow int32 at note 127.
+    float vib = PRESETS[family].vibratoDepthPercent;
+    if (vib > 30.0f) vib = 30.0f;
+    if (vib < 0.0f) vib = 0.0f;
+    g_presetVibratoDepthQ16[family] = (uint32_t)(vib / 100.0f * 65536.0f + 0.5f);
     g_presetTremoloDepthQ16[family] = (uint32_t)(PRESETS[family].tremoloDepthPercent / 100.0f * 65536.0f + 0.5f);
     g_presetPwmDepthQ16[family] = (uint32_t)(PRESETS[family].pwmDepthPercent / 100.0f * 65536.0f + 0.5f);
 }
@@ -728,6 +764,8 @@ void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity
 
     v.active = true;
     v.note = note;
+    v.channel = channel;
+    v.startOrder = ++g_voiceStartCounter;
     v.waveform = preset.waveform;
     if (!wasActive) { v.phase = 0; v.filterState = 0; }
     v.phaseInc = noteToPhaseInc(note);
@@ -793,18 +831,24 @@ void startPercussionVoice(Voice& v, uint8_t note, uint8_t velocity) {
     DrumType drumType = classifyDrum(note);
     const DrumPreset& p = DRUM_PRESETS[drumType];
 
+    // A retriggered or stolen voice keeps its phase and filter state and
+    // ramps from its current amplitude, so the cut-off hit doesn't click.
+    int32_t startAmplitude = v.active ? v.amplitude : 0;
+    if (!v.active) { v.phase = 0; v.filterState = 0; }
     v.active = true;
     v.note = note;
+    v.channel = PERCUSSION_CHANNEL;
+    v.startOrder = ++g_voiceStartCounter;
     v.waveform = p.waveform;
-    v.phase = 0; // drum hits are one-shot triggers, always a fresh start
-    v.filterState = 0;
     v.filterAlpha = g_drumFilterAlpha[drumType];
     v.pan = 128; // drums stay centered, matching how real kits are usually mixed
     v.phaseInc = (p.basePitchHz > 0.0f) ? hzToPhaseInc(p.basePitchHz) : 0;
 
-    v.pitchDrop = (p.pitchDropStartHz > 0.0f) ? (int32_t)hzToPhaseInc(p.pitchDropStartHz) : 0;
+    // Drop time 0 means no drop, whatever the amount.
+    v.pitchDrop = 0;
     v.pitchDropStep = 0;
-    if (v.pitchDrop != 0 && p.pitchDropSamples > 0) {
+    if (p.pitchDropStartHz > 0.0f && p.pitchDropSamples > 0) {
+        v.pitchDrop = (int32_t)hzToPhaseInc(p.pitchDropStartHz);
         v.pitchDropStep = -(v.pitchDrop / (int32_t)p.pitchDropSamples);
         if (v.pitchDropStep == 0) v.pitchDropStep = -1;
     }
@@ -850,13 +894,32 @@ void startPercussionVoice(Voice& v, uint8_t note, uint8_t velocity) {
     v.releaseSamples = 0; // unused -- see handleNoteOff()
 
     v.stage = ENV_ATTACK;
-    v.amplitude = 0;
+    v.amplitude = startAmplitude;
     // Fast but not instantaneous attack: real percussion transients are
     // near-instant, but a true single-sample jump to full amplitude is
     // exactly the kind of discontinuity that clicks, especially at high
-    // velocity. ~10 samples (0.2ms) is imperceptible as a ramp.
-    v.envStep = peak / 10;
-    if (v.envStep < 1) v.envStep = 1;
+    // velocity. ~10 samples (0.2ms) is imperceptible as a ramp. Can be a
+    // downward ramp when a loud hit is retriggered softer.
+    v.envStep = (peak - startAmplitude) / 10;
+    if (v.envStep == 0) v.envStep = (peak >= startAmplitude) ? 1 : -1;
+}
+
+// Voice to steal when a pool is full: the quietest voice already in
+// release, else the oldest. Note-on only, so a linear scan is fine.
+Voice& pickStealVoice(Voice* pool, int count) {
+    Voice* quietestRelease = nullptr;
+    Voice* oldest = &pool[0];
+    uint32_t oldestAge = 0;
+    for (int i = 0; i < count; i++) {
+        Voice& v = pool[i];
+        if (v.stage == ENV_RELEASE &&
+            (!quietestRelease || v.amplitude < quietestRelease->amplitude)) {
+            quietestRelease = &v;
+        }
+        uint32_t age = g_voiceStartCounter - v.startOrder;
+        if (age > oldestAge) { oldestAge = age; oldest = &v; }
+    }
+    return quietestRelease ? *quietestRelease : *oldest;
 }
 
 void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
@@ -873,16 +936,17 @@ void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
                 return;
             }
         }
-        startPercussionVoice(g_drumVoices[0], note, velocity);
+        // Drum voices never enter release, so this takes the oldest hit.
+        startPercussionVoice(pickStealVoice(g_drumVoices, NUM_DRUM_VOICES), note, velocity);
         return;
     }
 
-    // Retrigger if this note is already sounding, else take a free voice,
-    // else steal voice 0. No fancier voice-stealing heuristic (e.g.
-    // oldest/quietest) at this scope.
+    // Retrigger if this note is already sounding on this channel, else
+    // take a free voice, else steal one (see pickStealVoice()).
     for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
-        if (g_melodicVoices[i].active && g_melodicVoices[i].note == note) {
-            startMelodicVoice(g_melodicVoices[i], channel, note, velocity);
+        Voice& v = g_melodicVoices[i];
+        if (v.active && v.note == note && v.channel == channel) {
+            startMelodicVoice(v, channel, note, velocity);
             return;
         }
     }
@@ -892,20 +956,16 @@ void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
             return;
         }
     }
-    startMelodicVoice(g_melodicVoices[0], channel, note, velocity);
+    startMelodicVoice(pickStealVoice(g_melodicVoices, NUM_MELODIC_VOICES), channel, note, velocity);
 }
 
-// Channel-blind by design: MIDI channel isn't tracked per active voice
-// (only the note number), so a note-off can't distinguish "channel 1's
-// note 60" from "channel 2's note 60" if both happened to sound at once.
-// That's a rare, low-stakes edge case for a verification tool; tracking
-// channel per voice to close it isn't worth the added complexity here.
-// Percussion voices are never searched -- they ignore note-off entirely
-// (see startPercussionVoice()'s comment) and live in a separate pool.
-void handleNoteOff(uint8_t note) {
+// Releases `note` on `channel` only, so two parts sharing a pitch don't
+// cut each other off. Percussion voices are never searched: they ignore
+// note-off (see startPercussionVoice()) and live in a separate pool.
+void handleNoteOff(uint8_t channel, uint8_t note) {
     for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
         Voice& v = g_melodicVoices[i];
-        if (v.active && v.note == note && v.stage != ENV_RELEASE) {
+        if (v.active && v.note == note && v.channel == channel && v.stage != ENV_RELEASE) {
             v.stage = ENV_RELEASE;
             uint16_t rel = v.releaseSamples > 0 ? v.releaseSamples : 1;
             v.envStep = -(v.amplitude / rel);
@@ -941,17 +1001,12 @@ ALWAYS_INLINE void renderVoice(Voice& v, int16_t lfoValue, int32_t& outL, int32_
     int64_t phaseIncAdj = (int64_t)v.phaseInc;
     if (v.pitchDrop > 0) phaseIncAdj += v.pitchDrop;
     if (v.vibratoRange != 0) {
-        // lfoValue is g_sineTable's output, ~-32000..32000 (not a true
-        // Q15 -32768..32767) -- close enough for a musical modulation
-        // depth that a >>7 shift (instead of the "true" >>15 -- see
-        // vibratoRange's own >>24 note-start comment, 8 of the 15 bits
-        // already came off there) stands in for a /32768 divide (the
-        // Cortex-M0+ has no hardware divide); the ~2% resulting shortfall
-        // in actual vs. nominal depth is inaudible. Plain int32 multiply,
-        // not int64_t -- vibratoRange was pre-shrunk at note-start
-        // specifically so this per-sample multiply doesn't need it (see
-        // cutoffHzToAlphaQ14()'s comment for why that matters here).
-        phaseIncAdj += ((int32_t)v.vibratoRange * lfoValue) >> 7;
+        // lfoValue is g_sineTable's output, ~-32000..32000. vibratoRange
+        // already lost 8 bits at note-start, so the remaining >>7 is split
+        // into >>5 on lfoValue before the multiply and >>2 after, keeping
+        // it a plain int32 multiply: at note 127 and the editor's 30% cap
+        // vibratoRange is ~1.43e6, times |lfo>>5| <= 1000 is ~1.43e9.
+        phaseIncAdj += ((int32_t)v.vibratoRange * (lfoValue >> 5)) >> 2;
     }
     uint32_t effectivePhaseInc = (uint32_t)phaseIncAdj;
 
@@ -1211,10 +1266,8 @@ uint32_t g_reverbChorusLfoPhase = 0;
 
 const int REVERB_CHORUS_BUF_LEN = 512; // power of two, ample margin over the delay range below
 const int REVERB_CHORUS_BUF_MASK = REVERB_CHORUS_BUF_LEN - 1;
-// Allocated only while Reverb Type is actually Lush (see
-// reverbTypeChanged()), not a static array -- Lush and Shimmer are
-// mutually exclusive, so there's no reason to pay for both buffers'
-// worth of RAM at once when at most one is ever in use.
+// Points into g_reverbDelayBuf only while Reverb Type is Lush, nullptr
+// otherwise (see reverbTypeChanged()).
 int16_t* g_reverbChorusBuf = nullptr;
 size_t g_reverbChorusPos = 0;
 const int32_t REVERB_CHORUS_BASE_Q8 = 300 << 8;  // ~6.8ms center delay
@@ -1279,9 +1332,15 @@ const int32_t SHIMMER_PITCH_RATIO_Q16 = 2 << 16; // +1 octave (2x read speed vs 
 // worst-case +-32767 shimmerOut (32767 * 26214 =~ 8.6e8).
 const int32_t SHIMMER_FEEDBACK_Q16 = 26214;
 
-// Allocated only while Reverb Type is actually Shimmer -- see the same
-// reasoning on g_reverbChorusBuf above (Lush and Shimmer are mutually
-// exclusive, so only one of the two extra buffers is ever resident).
+// Lush and Shimmer never run together, so their delay lines share one
+// static buffer sized for the larger. Static so core 1 never allocates.
+union ReverbDelayBuf {
+    int16_t chorus[REVERB_CHORUS_BUF_LEN];
+    int16_t shimmer[SHIMMER_BUF_LEN];
+};
+ReverbDelayBuf g_reverbDelayBuf;
+
+// Points into g_reverbDelayBuf only while Reverb Type is Shimmer.
 int16_t* g_shimmerBuf = nullptr;
 size_t g_shimmerWritePos = 0;
 int32_t g_shimmerReadPosQ16[2] = {0, 0};
@@ -1341,34 +1400,21 @@ int32_t shimmerProcess(int32_t tankWet) {
     return sum;
 }
 
-// Frees whichever of g_reverbChorusBuf/g_shimmerBuf the *previous* type
-// owned (if any) and allocates+zeroes whichever the *new* type owns (if
-// not already allocated) -- called only from loop1()'s MSG_TYPE_REVERB_TYPE
-// handler, so this always runs on core 1, never racing renderSample()'s own
-// use of these pointers (both happen from the same core, and the FIFO-drain
-// loop that calls this always finishes before renderSample() runs for that
-// iteration). calloc, not malloc: a freshly allocated delay line must start
-// silent, not with whatever garbage happened to be in that RAM before --
-// stale content read back as audio would be an audible glitch, not just an
-// uninitialized-read footgun. Also resets that type's read/write cursors,
-// so switching back into a type later starts clean rather than referencing
-// positions from a since-freed, differently-sized allocation.
+// Points g_reverbChorusBuf/g_shimmerBuf at the shared g_reverbDelayBuf for
+// the new type and clears the buffer and that type's cursors, so it starts
+// silent. Called only from loop1()'s MSG_TYPE_REVERB_TYPE handler on core
+// 1, between samples, so it never races renderSample().
 void reverbTypeChanged(uint8_t newType) {
-    if (newType != REVERB_TYPE_LUSH && g_reverbChorusBuf) {
-        free(g_reverbChorusBuf);
-        g_reverbChorusBuf = nullptr;
-    }
-    if (newType != REVERB_TYPE_SHIMMER && g_shimmerBuf) {
-        free(g_shimmerBuf);
-        g_shimmerBuf = nullptr;
-    }
-    if (newType == REVERB_TYPE_LUSH && !g_reverbChorusBuf) {
-        g_reverbChorusBuf = (int16_t*)calloc(REVERB_CHORUS_BUF_LEN, sizeof(int16_t));
+    g_reverbChorusBuf = nullptr;
+    g_shimmerBuf = nullptr;
+    if (newType == REVERB_TYPE_LUSH) {
+        memset(g_reverbDelayBuf.chorus, 0, sizeof(g_reverbDelayBuf.chorus));
+        g_reverbChorusBuf = g_reverbDelayBuf.chorus;
         g_reverbChorusPos = 0;
         g_reverbChorusLfoPhase = 0;
-    }
-    if (newType == REVERB_TYPE_SHIMMER && !g_shimmerBuf) {
-        g_shimmerBuf = (int16_t*)calloc(SHIMMER_BUF_LEN, sizeof(int16_t));
+    } else if (newType == REVERB_TYPE_SHIMMER) {
+        memset(g_reverbDelayBuf.shimmer, 0, sizeof(g_reverbDelayBuf.shimmer));
+        g_shimmerBuf = g_reverbDelayBuf.shimmer;
         g_shimmerWritePos = 0;
         g_shimmerReadPosQ16[0] = 0;
         g_shimmerReadPosQ16[1] = 0;
@@ -1392,6 +1438,8 @@ void renderSample(int16_t& outLeft, int16_t& outRight) {
     // lfoValue at a constant 0 instead -- see g_lfoEnabled's own comment
     // for why that, not freezing the phase, is what actually disables
     // vibrato/tremolo/PWM.
+    wavStreamApplyReset();
+
     int16_t lfoValue = 0;
     if (g_lfoEnabled) {
         lfoValue = g_sineTable[(g_lfoPhase >> 24) & (SINE_TABLE_SIZE - 1)];
@@ -1496,8 +1544,11 @@ void renderSample(int16_t& outLeft, int16_t& outRight) {
             g_levelerGainQ16 = 65536; // unity -- never boosts past this
         }
     }
-    mixL = (int32_t)(((int64_t)mixL * g_levelerGainQ16) >> 16);
-    mixR = (int32_t)(((int64_t)mixR * g_levelerGainQ16) >> 16);
+    // Unity (the usual case) skips the two 64-bit multiplies.
+    if (g_levelerGainQ16 != 65536) {
+        mixL = (int32_t)(((int64_t)mixL * g_levelerGainQ16) >> 16);
+        mixR = (int32_t)(((int64_t)mixR * g_levelerGainQ16) >> 16);
+    }
 
     int32_t limitedL = softLimit(mixL);
     int32_t limitedR = softLimit(mixR);
@@ -1524,11 +1575,17 @@ void renderSample(int16_t& outLeft, int16_t& outRight) {
 } // namespace
 
 void Synth::begin() {
+    // Seed the live-editable preset tables here on core 0, before core 1
+    // starts, so a bank loaded right after begin() can't be overwritten by
+    // the defaults.
+    for (int i = 0; i < 16; i++) PRESETS[i] = DEFAULT_PRESETS[i];
+    for (int i = 0; i < DRUM_TYPE_COUNT; i++) DRUM_PRESETS[i] = DEFAULT_DRUM_PRESETS[i];
+    __dmb(); // tables written before core 1 sees the ready flag
     g_readyForPioInit = true;
 }
 
 void Synth::noteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
-    if (velocity == 0) { noteOff(note); return; }
+    if (velocity == 0) { noteOff(channel, note); return; }
     // Blocking, not push_nb(): a big chord landing on the same tick across
     // many tracks can generate more note-on messages than the hardware
     // FIFO's 8-word depth in one burst, and a dropped push here means a
@@ -1538,8 +1595,8 @@ void Synth::noteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     rp2040.fifo.push(packNoteMsg(channel, note, velocity));
 }
 
-void Synth::noteOff(uint8_t note) {
-    rp2040.fifo.push(packNoteMsg(0, note, 0));
+void Synth::noteOff(uint8_t channel, uint8_t note) {
+    rp2040.fifo.push(packNoteMsg(channel, note, 0));
 }
 
 void Synth::programChange(uint8_t channel, uint8_t program) {
@@ -1703,31 +1760,51 @@ uint8_t Synth::getChannelProgram(uint8_t channel) {
 // core 1, both cores sharing one address space/binary as usual on RP2040.
 
 void Synth::wavStreamReset() {
-    g_wavActive = false; // set first -- consumer stops looking before the buffer moves under it
-    g_wavHead = 0;
-    g_wavTail = 0;
+    g_wavActive = false; // consumer stops mixing before the reset lands
     g_wavEnded = false;
     g_wavUnderrun = false;
+    // Core 1 owns tail, so post where to cut back to and let it apply that
+    // at its next sample (see wavStreamApplyReset()). Until then
+    // wavStreamProducerTail() treats the tail as already cut back, so a
+    // prefill right after this sees the full free space.
+    g_wavResetTo = g_wavHead;
+    __dmb(); // release: g_wavResetTo written before the seq bump
+    g_wavResetSeq = g_wavResetSeq + 1;
 }
 
 void Synth::wavStreamSetActive(bool active) {
+    __dmb(); // any reset or frames written before this land first
     g_wavActive = active;
 }
 
+// Core 0's view of the tail. While a reset is pending, frames before
+// g_wavResetTo are already discarded, so their slots count as free. Core 1
+// isn't popping then (g_wavActive went false before the seq bump), and it
+// cuts its tail to g_wavResetTo before its next pop.
+static size_t wavStreamProducerTail() {
+    if (g_wavResetSeen != g_wavResetSeq) return g_wavResetTo;
+    __dmb(); // acquire: ack read before the tail core 1 wrote ahead of it
+    return g_wavTail;
+}
+
 size_t Synth::wavStreamWrite(const int16_t* frames, size_t count) {
-    size_t free = WAV_RING_FRAMES - (g_wavHead - g_wavTail);
+    size_t head = g_wavHead;
+    size_t free = WAV_RING_FRAMES - (head - wavStreamProducerTail());
     size_t n = count < free ? count : free;
+    if (n == 0) return 0;
+    __dmb(); // acquire: tail read before writing into the slots it freed
     for (size_t i = 0; i < n; i++) {
-        size_t idx = (g_wavHead + i) & WAV_RING_MASK;
+        size_t idx = (head + i) & WAV_RING_MASK;
         g_wavRing[idx * 2 + 0] = frames[i * 2 + 0];
         g_wavRing[idx * 2 + 1] = frames[i * 2 + 1];
     }
-    g_wavHead += n;
+    __dmb(); // release: frame data written before head covers it
+    g_wavHead = head + n;
     return n;
 }
 
 size_t Synth::wavStreamFree() {
-    return WAV_RING_FRAMES - (g_wavHead - g_wavTail);
+    return WAV_RING_FRAMES - (g_wavHead - wavStreamProducerTail());
 }
 
 void Synth::wavStreamEnd() {
@@ -1758,13 +1835,9 @@ void setup1() {
         g_sineTable[i] = (int16_t)(32000.0f * sinf(2.0f * (float)M_PI * i / SINE_TABLE_SIZE));
     }
 
-    // Seed the live-editable preset tables from their shipped defaults --
-    // see PRESETS[16]/DRUM_PRESETS[]'s comments just above their
-    // declarations. Must happen before the cache-fill loops right below,
-    // which read PRESETS[i]/DRUM_PRESETS[i].
-    for (int i = 0; i < 16; i++) PRESETS[i] = DEFAULT_PRESETS[i];
-    for (int i = 0; i < DRUM_TYPE_COUNT; i++) DRUM_PRESETS[i] = DEFAULT_DRUM_PRESETS[i];
-
+    // PRESETS/DRUM_PRESETS were seeded by Synth::begin() before the flag
+    // above. Core 0 may already be editing them; its dirty doorbells
+    // recompute any record these loops read mid-edit.
     for (int i = 0; i < 16; i++) recomputeInstrumentPresetCache(i);
     for (int i = 0; i < DRUM_TYPE_COUNT; i++) recomputeDrumPresetCache(i);
     g_lfoPhaseInc = hzToPhaseInc(LFO_RATE_HZ);
@@ -1859,7 +1932,7 @@ void loop1() {
         uint8_t note = msg & 0xFF;
         uint8_t velocity = (msg >> 8) & 0xFF;
         if (velocity > 0) handleNoteOn(channel, note, velocity);
-        else handleNoteOff(note);
+        else handleNoteOff(channel, note);
     }
 
     int16_t left, right;

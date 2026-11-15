@@ -44,7 +44,7 @@ void begin();
 // between the melodic instrument-preset path (via the program last set
 // on that channel, see programChange()) and the drum-kit path (channel 9).
 void noteOn(uint8_t channel, uint8_t note, uint8_t velocity);
-void noteOff(uint8_t note); // channel-blind by design, see synth.cpp
+void noteOff(uint8_t channel, uint8_t note); // releases `note` on `channel` only
 
 // Selects which of the 16 GM instrument-family presets `channel` uses for
 // subsequent noteOn() calls (program / 8 = family index). Percussion

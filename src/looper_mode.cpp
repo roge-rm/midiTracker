@@ -1849,6 +1849,9 @@ void adjustChannelOutOnSelected(int delta) {
     int ch = (int)t.channelOut + delta;
     if (ch < 0) ch = CHANNEL_AS_RECORDED;
     if (ch > CHANNEL_AS_RECORDED) ch = 0;
+    // Release what's sounding on the old channel first; its note-offs
+    // would otherwise go out on the new one and leave those notes stuck.
+    allNotesOffForTrack(t);
     t.channelOut = (uint8_t)ch;
 }
 

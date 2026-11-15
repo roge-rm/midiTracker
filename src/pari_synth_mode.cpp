@@ -107,7 +107,7 @@ void handleIncomingMidi(uint8_t status, uint8_t data1, uint8_t data2, uint8_t le
             redrawChannelCellIfPlaying(channel);
             break;
         case 0x80: // Note Off
-            Synth::noteOff(data1);
+            Synth::noteOff(channel, data1);
             MidiOutput::noteActivityIn(channel, data1, 0);
             redrawChannelCellIfPlaying(channel);
             break;
