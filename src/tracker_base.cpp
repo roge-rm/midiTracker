@@ -39,8 +39,10 @@ void TrackerPlayer::resetSequencer(uint8_t speed, uint16_t tempo) {
     _orderPos = 0;
     // -1 so the first advanceRow() lands on row 0.
     _row = -1;
-    _tick = 0;
-    _samplesUntilNextTick = ticksToSamples(_tempo);
+    // The first update() runs a tick at once and it ends the row cycle,
+    // so row 0 plays at time 0.
+    _tick = _speed - 1;
+    _samplesUntilNextTick = 0;
     _patternDelayRepeatsLeft = 0;
     _patternBreakPending = false;
     _positionJumpPending = false;

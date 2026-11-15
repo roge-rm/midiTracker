@@ -24,8 +24,8 @@ struct Sample {
 // Note helper: octave 0-7, semitone 0-11.
 int N(int oct, int semi) { return (oct << 4) | semi; }
 const int NO = -1;       // no note/instrument
-const int OFF = 0xFE;    // player treats 0xFE as a no-op
-const int CUT = 0xFF;    // player treats 0xFF as note off
+const int EMPTY = 0xFF;  // stored "no note", e.g. with an instrument
+const int CUT = 0xFE;    // note cut (^^)
 
 Sample square8(int period, uint32_t frames, uint32_t lb, uint32_t le) {
     Sample s;
@@ -191,7 +191,7 @@ bool genEffects(const std::string& dir) {
     add(a, 33, 3, N(4, 9), 4, -1, 'S', 0xD2);
     add(a, 34, 3, NO, 1, -1);                       // instrument change, no note
     add(a, 35, 3, CUT, NO, -1);
-    add(a, 36, 3, OFF, NO, -1);
+    add(a, 36, 3, EMPTY, NO, -1);
     add(a, 36, 0, NO, NO, -1, 'S', 0x83);
     add(a, 38, 1, NO, NO, -1, 'Y', 0x44);
     add(a, 40, 0, NO, NO, -1, 'V', 0x30);
@@ -255,11 +255,203 @@ bool genMany(const std::string& dir) {
     return writeS3m(dir + "/many.s3m", 16, 4, 140, {0}, p, basicSamples(), pans);
 }
 
+
+// Playback-fix checks, one channel each so a pitch or level trace of the
+// render shows what each row does.
+bool genS3mFixes(const std::string& dir) {
+    std::vector<Pattern> p(1);
+    Pattern& a = p[0];
+    add(a, 0, 0, N(4, 0), 2, -1);
+    add(a, 1, 0, CUT, NO, -1);                 // ^^ cuts the note
+    add(a, 2, 0, N(4, 0), 2, -1);
+    add(a, 3, 0, EMPTY, 2, -1);                // instrument only, keeps playing
+    add(a, 4, 0, N(4, 7), 2, 16, 'S', 0xD3);   // delayed note keeps its volume column
+    for (int ch = 1; ch <= 24; ch++) add(a, 6, ch, NO, NO, 10);
+    add(a, 6, 0, N(5, 0), 2, -1);              // 25th entry of the row
+    add(a, 8, 0, NO, NO, -1, 'W', 0x04);       // global volume slide down, one row only
+    add(a, 10, 0, NO, NO, -1, 'V', 0x40);
+    add(a, 12, 0, NO, NO, -1, 'I', 0x21);      // tremor, one row only
+    add(a, 16, 0, NO, NO, -1, 'Y', 0x48);      // panbrello, pan returns after
+    add(a, 20, 0, N(6, 0), 2, -1, 'E', 0xE8);  // extra fine down 8
+    for (int r = 21; r < 24; r++) add(a, r, 0, NO, NO, -1, 'E', 0xE8);
+    for (int r = 24; r < 28; r++) add(a, r, 0, NO, NO, -1, 'E', 0xF2); // fine down 2
+    for (int r = 28; r < 30; r++) add(a, r, 0, NO, NO, -1, 'F', 0x04); // porta up 4
+    add(a, 32, 0, N(6, 0), 2, -1, 'H', 0x48);
+    add(a, 33, 0, NO, NO, -1);                 // vibrato stops
+    add(a, 36, 0, NO, NO, -1, 'J', 0x47);
+    add(a, 37, 0, NO, NO, -1);                 // arpeggio stops
+    add(a, 40, 0, NO, NO, -1, 'C', 0x00);
+    return writeS3m(dir + "/fix.s3m", 1, 6, 125, {0}, p, basicSamples(), {7});
+}
+
+struct ModCell { int period, sample, fx, param; };
+struct ModPattern { ModCell c[64][4] = {}; };
+
+bool writeMod(const std::string& path, const std::vector<int>& orders, int songLen,
+              const std::vector<ModPattern>& pats, const std::vector<std::vector<int8_t>>& samples) {
+    std::vector<uint8_t> f(20, 0);
+    memcpy(&f[0], "host test", 9);
+    for (int i = 0; i < 31; i++) {
+        std::vector<uint8_t> h(30, 0);
+        if (i < (int)samples.size()) {
+            uint32_t words = (uint32_t)samples[i].size() / 2;
+            h[22] = words >> 8; h[23] = words & 0xFF;
+            h[25] = 64;
+            h[28] = words >> 8; h[29] = words & 0xFF; // loop the whole sample
+        }
+        f.insert(f.end(), h.begin(), h.end());
+    }
+    f.push_back(songLen);
+    f.push_back(127);
+    for (int i = 0; i < 128; i++) f.push_back(i < (int)orders.size() ? orders[i] : 0);
+    for (char ch : std::string("M.K.")) f.push_back(ch);
+    for (const ModPattern& p : pats)
+        for (int r = 0; r < 64; r++)
+            for (int ch = 0; ch < 4; ch++) {
+                const ModCell& c = p.c[r][ch];
+                f.push_back((c.sample & 0xF0) | ((c.period >> 8) & 0x0F));
+                f.push_back(c.period & 0xFF);
+                f.push_back(((c.sample & 0x0F) << 4) | (c.fx & 0x0F));
+                f.push_back(c.param);
+            }
+    for (const auto& s : samples) for (int8_t v : s) f.push_back((uint8_t)v);
+    FILE* o = fopen(path.c_str(), "wb");
+    if (!o) { perror(path.c_str()); return false; }
+    fwrite(f.data(), 1, f.size(), o);
+    fclose(o);
+    return true;
+}
+
+std::vector<int8_t> sineS8(int period, int frames) {
+    std::vector<int8_t> d;
+    for (int i = 0; i < frames; i++) d.push_back((int8_t)lround(sin(2 * M_PI * i / period) * 100));
+    return d;
+}
+
+// Continuing MOD effects stop when their row ends; pattern 1 is only in
+// the order table past the song length, so it moves where the samples start.
+bool genModFixes(const std::string& dir) {
+    std::vector<ModPattern> p(2);
+    ModCell (*a)[4] = p[0].c;
+    a[0][0] = {428, 1, 0x1, 0x04};
+    a[2][0] = {0, 0, 0x2, 0x04};
+    a[4][0] = {428, 1, 0, 0};
+    a[5][0] = {320, 0, 0x3, 0x08};
+    a[6][0] = {0, 0, 0x3, 0x00};
+    a[8][0] = {428, 1, 0xA, 0x04};
+    a[10][0] = {0, 0, 0xA, 0x00};              // A00 does nothing
+    a[12][0] = {0, 0, 0x4, 0x48};
+    a[16][0] = {0, 0, 0x7, 0x4C};
+    a[20][0] = {0, 0, 0x0, 0x37};
+    a[24][0] = {0, 0, 0x1, 0x00};              // 100 does nothing
+    a[28][0] = {0, 0, 0xD, 0x00};
+    p[1].c[0][0] = {214, 1, 0, 0};
+    return writeMod(dir + "/fix.mod", {0, 0, 0, 0, 0, 1}, 1, p, {sineS8(32, 3200)});
+}
+
+struct XmCell { int note, ins, vol, fx, param; };
+struct XmPattern { int rows = 64; std::vector<std::vector<XmCell>> c; };
+
+bool writeXm(const std::string& path, bool linear, int channels, const std::vector<int>& orders,
+             const std::vector<XmPattern>& pats, const std::vector<int8_t>& smp, bool volEnv) {
+    std::vector<uint8_t> f;
+    auto str = [&](const char* t, size_t n) { size_t l = strlen(t); for (size_t i = 0; i < n; i++) f.push_back(i < l ? t[i] : 0); };
+    auto u16 = [&](uint32_t v) { f.push_back(v & 0xFF); f.push_back((v >> 8) & 0xFF); };
+    auto u32 = [&](uint32_t v) { u16(v & 0xFFFF); u16(v >> 16); };
+    str("Extended Module: ", 17);
+    str("host test", 20);
+    f.push_back(0x1A);
+    str("gen", 20);
+    u16(0x0104);
+    u32(276);
+    u16((uint32_t)orders.size()); u16(0); u16(channels); u16((uint32_t)pats.size()); u16(1);
+    u16(linear ? 1 : 0); u16(6); u16(125);
+    for (int i = 0; i < 256; i++) f.push_back(i < (int)orders.size() ? orders[i] : 0);
+    for (const XmPattern& p : pats) {
+        std::vector<uint8_t> d;
+        for (int r = 0; r < p.rows; r++)
+            for (int ch = 0; ch < channels; ch++) {
+                XmCell c = {0, 0, 0, 0, 0};
+                if (r < (int)p.c.size() && ch < (int)p.c[r].size()) c = p.c[r][ch];
+                d.push_back(0x9F);
+                d.push_back(c.note); d.push_back(c.ins); d.push_back(c.vol); d.push_back(c.fx); d.push_back(c.param);
+            }
+        u32(9); f.push_back(0); u16(p.rows); u16((uint32_t)d.size());
+        f.insert(f.end(), d.begin(), d.end());
+    }
+    size_t ins = f.size();
+    u32(263); str("ins", 22); f.push_back(0); u16(1); u32(40);
+    for (int i = 0; i < 96; i++) f.push_back(0);
+    // Volume envelope: 64 for 4 ticks, sustain at point 1, down to 0 over 20 ticks.
+    int env[12][2] = {{0, 64}, {4, 64}, {24, 0}};
+    for (int i = 0; i < 12; i++) { u16(i < 3 ? env[i][0] : 0); u16(i < 3 ? env[i][1] : 0); }
+    for (int i = 0; i < 12; i++) { u16(0); u16(32); }
+    f.push_back(volEnv ? 3 : 0); f.push_back(0);
+    f.push_back(1); f.push_back(0); f.push_back(0); f.push_back(0); f.push_back(0); f.push_back(0);
+    f.push_back(volEnv ? 3 : 0); f.push_back(0);
+    f.push_back(0); f.push_back(0); f.push_back(0); f.push_back(0);
+    u16(volEnv ? 0x800 : 0);
+    while (f.size() < ins + 263) f.push_back(0);
+    u32((uint32_t)smp.size()); u32(0); u32((uint32_t)smp.size());
+    f.push_back(64); f.push_back(0); f.push_back(1); f.push_back(128); f.push_back(0); f.push_back(0);
+    str("smp", 22);
+    int8_t prev = 0;
+    for (int8_t v : smp) { f.push_back((uint8_t)(int8_t)(v - prev)); prev = v; }
+    FILE* o = fopen(path.c_str(), "wb");
+    if (!o) { perror(path.c_str()); return false; }
+    fwrite(f.data(), 1, f.size(), o);
+    fclose(o);
+    return true;
+}
+
+// XM slides, note delay, BCD pattern break and global volume/tremor gating.
+bool genXmFixes(const std::string& dir, bool linear) {
+    std::vector<XmPattern> p(2);
+    auto& a = p[0].c;
+    a.resize(64, std::vector<XmCell>(1, XmCell{0, 0, 0, 0, 0}));
+    const int C4 = 49, E4 = 53, G4 = 56;
+    a[0][0] = {C4, 1, 0, 0x1, 0x08};
+    a[2][0] = {0, 0, 0, 0x2, 0x08};
+    a[4][0] = {C4, 1, 0, 0xE, 0x14};
+    a[5][0] = {0, 0, 0, 0xE, 0x14};
+    a[6][0] = {0, 0, 0, 33, 0x18};
+    a[7][0] = {0, 0, 0, 33, 0x18};
+    a[8][0] = {C4, 1, 0, 0, 0};
+    a[9][0] = {E4, 0, 0, 0x3, 0x08};
+    a[10][0] = {0, 0, 0, 0x3, 0x00};
+    a[12][0] = {C4, 1, 0, 0x4, 0x48};
+    a[16][0] = {0, 0, 0, 0x0, 0x37};
+    a[20][0] = {0, 0, 0, 17, 0x04};            // H: global volume down, one row only
+    a[22][0] = {0, 0, 0, 16, 0x40};
+    a[24][0] = {0, 0, 0, 29, 0x21};            // T: tremor, one row only
+    a[28][0] = {G4, 1, 0x20, 0xE, 0xD3};       // delayed note keeps its volume column
+    a[30][0] = {97, 0, 0, 0xE, 0xD2};          // delayed key off
+    a[32][0] = {C4, 1, 0, 0xD, 0x12};          // break to row 12 (BCD), not 18
+    auto& b = p[1].c;
+    b.resize(64, std::vector<XmCell>(1, XmCell{0, 0, 0, 0, 0}));
+    b[12][0] = {G4, 1, 0, 0, 0};
+    b[18][0] = {E4, 1, 0, 0, 0};
+    b[24][0] = {0, 0, 0, 0xD, 0x00};
+    p.push_back(XmPattern());                  // empty, never played
+    return writeXm(dir + (linear ? "/fix-linear.xm" : "/fix-amiga.xm"), linear, 1, {0, 1}, p, sineS8(32, 3200), false);
+}
+
+// Key off with a volume envelope and fadeout: the voice fades and stops.
+bool genXmFade(const std::string& dir) {
+    std::vector<XmPattern> p(1);
+    auto& a = p[0].c;
+    a.resize(64, std::vector<XmCell>(1, XmCell{0, 0, 0, 0, 0}));
+    a[0][0] = {49, 1, 0, 0, 0};
+    a[4][0] = {97, 0, 0, 0, 0};
+    a[16][0] = {0, 0, 0, 0xD, 0x00};
+    return writeXm(dir + "/fade.xm", true, 1, {0}, p, sineS8(32, 3200), true);
+}
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc != 2) { fprintf(stderr, "usage: gen <outdir>\n"); return 2; }
     std::string dir = argv[1];
-    bool ok = genEffects(dir) && genFloor(dir) && genMany(dir);
+    bool ok = genEffects(dir) && genFloor(dir) && genMany(dir) && genS3mFixes(dir) && genModFixes(dir) &&
+              genXmFixes(dir, true) && genXmFixes(dir, false) && genXmFade(dir);
     return ok ? 0 : 1;
 }

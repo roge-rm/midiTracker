@@ -259,7 +259,9 @@ bool WavPlayer::readSrcFrame(int16_t& outL, int16_t& outR) {
 bool WavPlayer::readAdpcmFrame(int16_t& outL, int16_t& outR) {
     if (_srcFramesRead >= totalSrcFrames()) return false;
 
-    if (_adpcmBlockBytesLeft == 0) {
+    // A new block starts only once this one's bytes and its decoded but
+    // unplayed samples (the mono pending nibble, the stereo groups) are used.
+    if (_adpcmBlockBytesLeft == 0 && !_adpcmHavePendingMonoSample && _adpcmGroupPosL >= 8) {
         // Start of a new block: each channel's own 4-byte header (a raw
         // int16 predictor + step index + reserved byte) directly gives
         // this block's first sample and initial decode state -- no

@@ -97,7 +97,8 @@ private:
         uint8_t instrument = 0;  // 1-based into _instruments[], 0 == none
         uint8_t sampleIndex = 0; // into _samples[], from instrument+keymap at trigger time
         uint8_t volume = 64;     // what defaults, the volume column and slides set
-        uint16_t period = 0;     // 0 == silent, see xmNoteToPeriod()
+        uint16_t period = 0;     // FT2 period, 0 == silent, see xmNoteToPeriod()
+        uint16_t stepPeriod = 0; // period sampleStep16 was worked out from (base plus vibrato/arpeggio)
         uint8_t pan = 128;       // 0 (left) .. 255 (right); mixPan adds the panning envelope
 
         // Envelope playback position (elapsed ticks since trigger),
@@ -107,8 +108,9 @@ private:
         bool keyOff = false; // set by the Key Off note (97) or the Kxx effect
         // Full-scale at trigger, decremented by the instrument's
         // volFadeout rate every tick once keyOff is set, floors at 0
-        // (silence). 16.16-style fixed point (65536 == full scale).
-        uint32_t fadeoutVolume = 65536;
+        // (silence). FT2's scale, 32768 == full.
+        uint32_t fadeoutVolume = 32768;
+        uint8_t volEnvValue = 64; // volume envelope value this tick, 0-64
 
         // Per-effect "last used" memory -- same convention as
         // S3mChannel's equivalent fields (remembered PARAMETER VALUE for
@@ -124,9 +126,10 @@ private:
         uint8_t retrigVolChangeType = 0; // Rxy high nibble -- see processTickEffects()'s comment
         uint8_t arpeggioParam = 0;       // reset each row
         uint8_t tremorOnParam = 0, tremorOffParam = 0, tremorCounter = 0; // Txy
+        bool tremorMute = false; // in tremor's off phase, held after T ends until the volume is set, as FT2
         uint8_t patternLoopRow = 0, patternLoopCount = 0;
         uint8_t noteDelayParam = 0;      // reset each row
-        uint8_t pendingNote = 0xFF, pendingInstrument = 0; // for a delayed trigger (EDy)
+        uint8_t pendingNote = 0, pendingInstrument = 0, pendingVolume = 0; // the cell held by EDy, 0 == none
         uint8_t noteCutParam = 0xFF;     // reset each row
         uint8_t keyOffTickParam = 0xFF;  // reset each row -- Kxx's "fire at tick xx", same shape as note-delay
         bool glissando = false;
@@ -147,6 +150,7 @@ private:
         // XM-only continuing effect (Pxy / volume-column D0-E0) -- S3M
         // has no per-tick continuing panning effect, only one-shot Xxx.
         bool panSlideActiveRow = false;
+        bool tremorActiveRow = false;
     };
 
     // Selected once from the header's flags bit 0 at load(), never
@@ -172,6 +176,7 @@ private:
     // desyncs for every row of a file with more channels than we mix.
     int _fileNumChannels = 0;
     uint8_t _globalVolSlideParam = 0; // H's own memory
+    bool _globalVolSlideActiveRow = false;
 
     // Decoded frames per voice cache. A refill reads up to 2 bytes per
     // frame, so this must stay at or under RAW_SCRATCH_BYTES / 2.
@@ -194,7 +199,8 @@ private:
     uint16_t xmNoteToPeriod(int note, int8_t finetune) const;
     float periodToFreq(uint16_t period) const; // inverse of xmNoteToPeriod(), same mode selection
 
-    void recomputeStep(XmChannel& c); // sets sampleStep16 from c.period via periodToFreq()
+    void recomputeStep(XmChannel& c) { recomputeStep(c, c.period); }
+    void recomputeStep(XmChannel& c, uint16_t period); // sampleStep16 for `period`, leaves c.period alone
     // Decodes `frameCount` delta-encoded frames starting at `fileOffset`
     // (using `startAccum` as the carry-in accumulator), discarding the
     // decoded values and returning only the final accumulator. Used at
@@ -222,6 +228,12 @@ private:
     // Dispatches one decoded channel cell -- note/instrument trigger,
     // volume column, and effect command -- the XM analog of
     // S3mPlayer::applyCell().
+    // Instrument, note and volume column of one cell, on its row or on the
+    // EDy delay tick. note is the raw pattern byte (0 == none, 97 == key off),
+    // instrument and volume 0 == none.
+    void applyNoteColumns(int ch, uint8_t note, uint8_t instrument, uint8_t volume, bool isTonePorta);
+    void applyVolumeColumn(XmChannel& c, uint8_t volume);
+    void keyOff(XmChannel& c);
     void applyCell(int ch, uint8_t note, uint8_t instrument, bool hasNote, bool hasInstrument,
                     uint8_t volume, bool hasVolume, uint8_t effect, uint8_t param, bool hasEffect);
 
@@ -230,5 +242,10 @@ private:
     void processTickEffects() override;
     void tickStart() override { processEnvelopes(); } // envelopes run on every tick, row ticks included
     void processEnvelopes();
+    // mixVolume from volume, the envelope value and the fadeout, for a
+    // volume change after this tick's processEnvelopes().
+    void updateMixVolume(XmChannel& c) {
+        c.mixVolume = c.tremorMute ? 0 : (uint8_t)(((uint32_t)c.volume * c.volEnvValue / 64) * c.fadeoutVolume / 32768);
+    }
     int16_t refillChunk(TrackerVoice& v, uint32_t index) override;
 };

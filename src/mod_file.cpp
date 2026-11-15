@@ -49,12 +49,23 @@ bool ModPlayer::load(const char* path) {
 
     if (!_file.open(path, O_RDONLY)) return loadFail("could not open file");
 
+    // A 31-sample MOD has a format tag at 1080. Without one it's read as
+    // a 15-sample Soundtracker file: no tag, 4 channels, patterns at 600.
+    char tag[4];
+    bool tagged = _file.seekSet(1080) && _file.read(tag, 4) == 4 && matchesFormatTag(tag, _numChannels);
+    if (!tagged) _numChannels = 4;
+    int numSamples = tagged ? MAX_SAMPLES : 15;
+
     _numInstruments = 0;
     _file.seekSet(20); // skip song name
     for (int i = 0; i < MAX_SAMPLES; i++) {
+        ModSample& s = _samples[i];
+        if (i >= numSamples) {
+            s = ModSample();
+            continue;
+        }
         uint8_t hdr[30];
         if (_file.read(hdr, 30) != 30) return loadFail("invalid MOD file");
-        ModSample& s = _samples[i];
         s.length = (((uint32_t)hdr[22] << 8) | hdr[23]) * 2;
         int8_t rawFinetune = (int8_t)(hdr[24] & 0x0F) << 4; // low nibble, sign-extend via shift
         s.finetune = rawFinetune >> 4;
@@ -67,7 +78,7 @@ bool ModPlayer::load(const char* path) {
             s.loopStart = 0;
             s.loopEnd = 0;
         } else {
-            s.loopStart = (uint32_t)rawLoopStart * 2;
+            s.loopStart = tagged ? (uint32_t)rawLoopStart * 2 : rawLoopStart; // Soundtracker's is in bytes
             s.loopEnd = s.loopStart + (uint32_t)rawLoopLen * 2;
         }
         if (s.length > 0) _numInstruments++;
@@ -76,21 +87,24 @@ bool ModPlayer::load(const char* path) {
     uint8_t songLenByte, restartByte;
     if (_file.read(&songLenByte, 1) != 1 || _file.read(&restartByte, 1) != 1) return loadFail("invalid MOD file");
     _songLength = songLenByte > 128 ? 128 : songLenByte;
-    _restartPos = restartByte;
+    _restartPos = tagged ? restartByte : 0; // Soundtracker uses this byte for tempo
 
     if (_file.read(_orderTable, 128) != 128) return loadFail("invalid MOD file");
 
-    char tag[4];
-    if (_file.read(tag, 4) != 4 || !matchesFormatTag(tag, _numChannels)) return loadFail("unsupported format");
-
+    // Patterns past the song length are still stored, so the highest
+    // pattern in all 128 orders sets where the sample data starts.
     int maxPattern = 0;
-    for (int i = 0; i < _songLength; i++) {
+    for (int i = 0; i < 128; i++) {
         if (_orderTable[i] > maxPattern) maxPattern = _orderTable[i];
     }
     _numPatterns = maxPattern + 1;
 
-    _patternDataStart = 20 + (uint32_t)MAX_SAMPLES * 30 + 2 + 128 + 4;
+    _patternDataStart = 20 + (uint32_t)numSamples * 30 + 2 + 128 + (tagged ? 4 : 0);
     uint32_t sampleDataStart = _patternDataStart + (uint32_t)_numPatterns * _numChannels * 64 * 4;
+    // Checks an untagged file looks like Soundtracker before playing it.
+    if (!tagged && (songLenByte == 0 || songLenByte > 128 || maxPattern >= 64 || sampleDataStart > _file.fileSize())) {
+        return loadFail("unsupported format");
+    }
     uint32_t offset = sampleDataStart;
     for (int i = 0; i < MAX_SAMPLES; i++) {
         _samples[i].fileOffset = offset;
@@ -135,9 +149,10 @@ uint16_t ModPlayer::applyFinetune(uint16_t basePeriod, int8_t finetune) {
     return (uint16_t)(result + 0.5);
 }
 
-void ModPlayer::recomputeStep(ModChannel& c) {
-    if (c.period == 0) { c.sampleStep16 = 0; return; }
-    double hz = AMIGA_PAL_CLOCK / ((double)c.period * 2.0);
+void ModPlayer::recomputeStep(ModChannel& c, uint16_t period) {
+    c.stepPeriod = period;
+    if (period == 0) { c.sampleStep16 = 0; return; }
+    double hz = AMIGA_PAL_CLOCK / ((double)period * 2.0);
     c.sampleStep16 = limitStep((uint32_t)((hz / (double)SAMPLE_RATE) * 65536.0));
 }
 
@@ -175,7 +190,8 @@ void ModPlayer::triggerNote(int ch) {
 void ModPlayer::tickEnd() {
     for (int ch = 0; ch < _numChannels; ch++) {
         ModChannel& c = _channels[ch];
-        c.mixVolume = c.volume;
+        int v = (int)c.volume + c.tremoloDelta;
+        c.mixVolume = (uint8_t)(v < 0 ? 0 : v > 64 ? 64 : v);
         c.mixPan = c.pan;
     }
 }
@@ -185,7 +201,9 @@ void ModPlayer::advanceRow() {
     // slide speeds persist until changed.
     for (int ch = 0; ch < _numChannels; ch++) {
         ModChannel& c = _channels[ch];
-        c.arpeggioParam = 0;
+        c.fx = 0;
+        c.fxParam = 0;
+        c.tremoloDelta = 0;
         c.retrigParam = 0;
         c.noteDelayParam = 0;
         c.noteCutParam = 0xFF;
@@ -217,6 +235,9 @@ void ModPlayer::advanceRow() {
 
     for (int ch = 0; ch < _numChannels; ch++) {
         processCellTriggers(ch, &rowBuf[ch * 4]);
+        // A row starts at the base pitch, dropping last tick's vibrato or arpeggio.
+        ModChannel& c = _channels[ch];
+        if (c.stepPeriod != c.period) recomputeStep(c);
     }
 }
 
@@ -251,15 +272,13 @@ void ModPlayer::processCellTriggers(int ch, const uint8_t cell[4]) {
         }
     }
 
+    c.fx = effect;
+    c.fxParam = param;
     switch (effect) {
-        case 0x0: // Arpeggio (param 00 with a bare note is "no arpeggio")
-            c.arpeggioParam = param;
-            break;
-        case 0x1: // Portamento up
-            if (param != 0) c.portaUpSpeed = param;
-            break;
-        case 0x2: // Portamento down
-            if (param != 0) c.portaDownSpeed = param;
+        case 0x0: // Arpeggio, 1xx/2xx porta, Axy volume slide: ticks 1+ only, see processTickEffects()
+        case 0x1:
+        case 0x2:
+        case 0xA:
             break;
         case 0x3: // Tone portamento
             if (param != 0) c.tonePortaSpeed = param;
@@ -270,8 +289,6 @@ void ModPlayer::processCellTriggers(int ch, const uint8_t cell[4]) {
             break;
         case 0x5: // Tone portamento + volume slide
         case 0x6: // Vibrato + volume slide
-        case 0xA: // Volume slide
-            if (param != 0) c.volSlideParam = param;
             break;
         case 0x7: // Tremolo
             if (param >> 4) c.tremoloSpeed = param >> 4;
@@ -373,8 +390,11 @@ void ModPlayer::processTickEffects() {
         ModChannel& c = _channels[ch];
 
         if (c.noteDelayParam != 0 && _tick == c.noteDelayParam) {
-            if (c.noteDelayPeriod != 0) c.period = c.noteDelayPeriod;
-            triggerNote(ch);
+            // EDx with no note does nothing, as ProTracker.
+            if (c.noteDelayPeriod != 0) {
+                c.period = c.noteDelayPeriod;
+                triggerNote(ch);
+            }
             c.noteDelayParam = 0;
         }
         if (c.noteCutParam != 0xFF && _tick == c.noteCutParam) {
@@ -386,89 +406,62 @@ void ModPlayer::processTickEffects() {
         }
 
         if (c.period == 0) continue;
+        uint8_t fx = c.fx, param = c.fxParam;
 
-        // Volume slide (Axy, and the volume-slide half of 5xy/6xy) --
-        // x is slide-up amount, y is slide-down; only one is normally
-        // nonzero per ProTracker convention, but both are honored if set.
-        uint8_t slideUp = c.volSlideParam >> 4;
-        uint8_t slideDown = c.volSlideParam & 0x0F;
-        if (slideUp) c.volume = (uint8_t)min(64, c.volume + slideUp);
-        else if (slideDown) c.volume = (uint8_t)max(0, (int)c.volume - slideDown);
+        // Volume slide (Axy, 5xy, 6xy): up by x a tick, else down by y.
+        if (fx == 0xA || fx == 0x5 || fx == 0x6) {
+            uint8_t slideUp = param >> 4;
+            uint8_t slideDown = param & 0x0F;
+            if (slideUp) c.volume = (uint8_t)min(64, c.volume + slideUp);
+            else if (slideDown) c.volume = (uint8_t)max(0, (int)c.volume - slideDown);
+        }
 
-        // Portamento up/down (1xx/2xx) -- clamped to the table's own
-        // period range, same as real ProTracker (unlike tone portamento
-        // below, plain portamento has no target to stop it, so without a
-        // clamp it can slide arbitrarily far: up into silence/aliasing
-        // as the period approaches 0, or -- worse -- down past 65535 and
-        // wrap back around to a small (very high-pitched) period, both
-        // plausible causes of notes that seem to randomly go silent or
-        // squeal on files that lean on this effect).
-        if (c.portaUpSpeed) {
-            int p = (int)c.period - c.portaUpSpeed;
+        // Portamento up/down (1xx/2xx), clamped to the period table's range
+        // so a long slide can't run off either end.
+        if (fx == 0x1) {
+            int p = (int)c.period - param;
             if (p < BASE_PERIOD_TABLE[35]) p = BASE_PERIOD_TABLE[35];
             c.period = (uint16_t)p;
-            recomputeStep(c);
-        }
-        if (c.portaDownSpeed) {
-            int p = (int)c.period + c.portaDownSpeed;
+        } else if (fx == 0x2) {
+            int p = (int)c.period + param;
             if (p > BASE_PERIOD_TABLE[0]) p = BASE_PERIOD_TABLE[0];
             c.period = (uint16_t)p;
-            recomputeStep(c);
         }
 
-        // Tone portamento (3xx, and the portamento half of 5xy) -- slides
-        // the current period toward portaTarget at tonePortaSpeed/tick.
-        bool doTonePorta = (c.portaTarget != 0);
-        if (doTonePorta && c.tonePortaSpeed) {
+        // Tone portamento (3xx, 5xy) slides toward portaTarget.
+        if ((fx == 0x3 || fx == 0x5) && c.portaTarget != 0 && c.tonePortaSpeed) {
             if (c.period < c.portaTarget) {
                 c.period = (uint16_t)min((int)c.portaTarget, c.period + c.tonePortaSpeed);
             } else if (c.period > c.portaTarget) {
                 c.period = (uint16_t)max((int)c.portaTarget, c.period - c.tonePortaSpeed);
             }
-            recomputeStep(c);
         }
 
-        // Vibrato (4xy, and the vibrato half of 6xy) -- a transient period
-        // offset recomputed fresh each tick, not accumulated into c.period
-        // itself (so it doesn't drift the "real" pitch).
-        uint16_t effectivePeriod = c.period;
-        if (c.vibratoDepth) {
+        // Vibrato (4xy, 6xy) and arpeggio (0xy) only change the pitch that
+        // plays this tick, c.period stays the base.
+        uint16_t playPeriod = c.period;
+        if ((fx == 0x4 || fx == 0x6) && c.vibratoDepth) {
             float angle = 2.0f * (float)M_PI * (float)c.vibratoPos / 64.0f;
-            int16_t delta = (int16_t)(sinf(angle) * c.vibratoDepth * 4.0f);
-            effectivePeriod = (uint16_t)max(1, (int)c.period + delta);
+            int16_t delta = (int16_t)(sinf(angle) * c.vibratoDepth * 2.0f); // ProTracker's depth, 2 periods a step
+            playPeriod = (uint16_t)max(1, (int)c.period + delta);
             c.vibratoPos = (uint8_t)((c.vibratoPos + c.vibratoSpeed) & 0x3F);
         }
-        if (effectivePeriod != c.period) {
-            uint16_t savedPeriod = c.period;
-            c.period = effectivePeriod;
-            recomputeStep(c);
-            c.period = savedPeriod;
-        }
-
-        // Tremolo (7xy) -- same idea as vibrato, transient volume offset.
-        if (c.tremoloDepth) {
-            float angle = 2.0f * (float)M_PI * (float)c.tremoloPos / 64.0f;
-            int delta = (int)(sinf(angle) * c.tremoloDepth * 4.0f);
-            int v = (int)c.volume + delta;
-            if (v < 0) v = 0; else if (v > 64) v = 64;
-            c.volume = (uint8_t)v; // transient -- next tick recomputes from the same base c.volume plus slide, see note below
-            c.tremoloPos = (uint8_t)((c.tremoloPos + c.tremoloSpeed) & 0x3F);
-        }
-
-        // Arpeggio (0xy) -- cycles the sounding pitch between the base
-        // note, +x semitones, and +y semitones every tick within the row.
-        if (c.arpeggioParam != 0) {
+        if (fx == 0x0 && param != 0) {
+            // Cycles base note, +x semitones, +y semitones, one per tick.
             int cycle = _tick % 3;
-            int semis = (cycle == 1) ? (c.arpeggioParam >> 4) : (cycle == 2) ? (c.arpeggioParam & 0x0F) : 0;
+            int semis = (cycle == 1) ? (param >> 4) : (cycle == 2) ? (param & 0x0F) : 0;
             if (semis != 0) {
                 int baseNote = nearestNoteIndexForPeriod(c.period);
-                uint16_t arpPeriod = periodForNote(baseNote - semis); // higher pitch == lower period == earlier table index
-                uint16_t savedPeriod = c.period;
-                c.period = arpPeriod;
-                recomputeStep(c);
-                c.period = savedPeriod;
+                playPeriod = periodForNote(baseNote + semis); // the table runs low to high pitch
             }
+        }
+        if (playPeriod != c.stepPeriod) recomputeStep(c, playPeriod);
+
+        // Tremolo (7xy) offsets the mixed volume only, see tickEnd().
+        if (fx == 0x7 && c.tremoloDepth) {
+            float angle = 2.0f * (float)M_PI * (float)c.tremoloPos / 64.0f;
+            c.tremoloDelta = (int8_t)(sinf(angle) * c.tremoloDepth * 4.0f);
+            c.tremoloPos = (uint8_t)((c.tremoloPos + c.tremoloSpeed) & 0x3F);
         }
     }
 }
-

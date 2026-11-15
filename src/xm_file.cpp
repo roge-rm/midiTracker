@@ -56,7 +56,11 @@ bool XmPlayer::load(const char* path) {
 
     if (!_file.seekSet(60 + headerSize)) return loadFail("invalid XM file");
 
-    for (int i = 0; i < MAX_PATTERNS; i++) _patternEmpty[i] = true; // see its declaration -- safe default for unscanned/out-of-range slots
+    // Slots the scan below doesn't reach stay empty 64-row patterns.
+    for (int i = 0; i < MAX_PATTERNS; i++) {
+        _patternEmpty[i] = true;
+        _patternRowCounts[i] = 64;
+    }
 
     // Pattern headers: sequential walk, one time -- XM patterns aren't
     // parapointer-addressable (see this class's header comment).
@@ -131,11 +135,12 @@ bool XmPlayer::load(const char* path) {
 
                 XmEnvelope& ve = inst.volEnv;
                 XmEnvelope& pe = inst.panEnv;
+                // Values are 0-64; anything above would overflow the mix volume.
                 for (int p = 0; p < MAX_ENV_POINTS; p++) {
                     ve.pointX[p] = (uint16_t)volEnvRaw[p * 4] | ((uint16_t)volEnvRaw[p * 4 + 1] << 8);
-                    ve.pointY[p] = (uint16_t)volEnvRaw[p * 4 + 2] | ((uint16_t)volEnvRaw[p * 4 + 3] << 8);
+                    ve.pointY[p] = min((uint16_t)64, (uint16_t)((uint16_t)volEnvRaw[p * 4 + 2] | ((uint16_t)volEnvRaw[p * 4 + 3] << 8)));
                     pe.pointX[p] = (uint16_t)panEnvRaw[p * 4] | ((uint16_t)panEnvRaw[p * 4 + 1] << 8);
-                    pe.pointY[p] = (uint16_t)panEnvRaw[p * 4 + 2] | ((uint16_t)panEnvRaw[p * 4 + 3] << 8);
+                    pe.pointY[p] = min((uint16_t)64, (uint16_t)((uint16_t)panEnvRaw[p * 4 + 2] | ((uint16_t)panEnvRaw[p * 4 + 3] << 8)));
                 }
                 ve.numPoints = (singleBytes[0] <= MAX_ENV_POINTS) ? singleBytes[0] : (uint8_t)MAX_ENV_POINTS;
                 pe.numPoints = (singleBytes[1] <= MAX_ENV_POINTS) ? singleBytes[1] : (uint8_t)MAX_ENV_POINTS;
@@ -233,6 +238,7 @@ bool XmPlayer::load(const char* path) {
 
     _globalVolume = 64;
     _globalVolSlideParam = 0;
+    _globalVolSlideActiveRow = false;
     _openPatternNum = -1;
     _openPatternEmpty = false;
     _rowOffsetsValid = 0;
@@ -240,14 +246,12 @@ bool XmPlayer::load(const char* path) {
     return true;
 }
 
-// note is an absolute, 0-based semitone position (pattern note - 1, plus
-// the sample's own relativeNoteNumber -- see triggerNote()/applyCell()).
-// Both formulas are anchored at the same universal "C-4 (note 48),
-// finetune 0 => 8363 Hz" reference point, so a fixed note/finetune
-// produces the same pitch regardless of which mode is active -- only
-// portamento/vibrato/arpeggio (which operate on period deltas, not
-// absolute notes) sound different between modes, which is correct FT2
-// behavior, not a bug -- see this class's header comment.
+// note is an absolute, 0-based semitone position (pattern note - 1 plus
+// the sample's relativeNoteNumber). Periods are in FT2's units in both
+// modes, so slides move them by the same amounts FT2 does:
+//  - linear: 7680 - note*64 - finetune/2, 768 units an octave;
+//  - Amiga: 4x an Amiga period, anchored so C-4 (note 48) with finetune 0
+//    is 8363 Hz like linear mode.
 uint16_t XmPlayer::xmNoteToPeriod(int note, int8_t finetune) const {
     if (_linearFreqTable) {
         int period = 7680 - note * 64 - (int)finetune / 2;
@@ -255,24 +259,7 @@ uint16_t XmPlayer::xmNoteToPeriod(int note, int8_t finetune) const {
         if (period > 65535) period = 65535;
         return (uint16_t)period;
     } else {
-        // Anchor derived so that periodToFreq() below reproduces exactly
-        // 8363 Hz at this same (note=48, finetune=0) reference point --
-        // NOT ModPlayer::BASE_PERIOD_TABLE's raw C-2=428 Amiga-hardware
-        // period, which was this formula's original anchor until the
-        // cross-validation pass measured real output audio against
-        // libopenmpt (rendering a synthetic single-cycle-waveform sample
-        // through both modes and counting cycles in the output) and found
-        // XM's own "Amiga frequency table" mode is calibrated to the same
-        // 8363 Hz reference linear mode uses, not the raw 428/PAL-clock
-        // Amiga value (which measured ~8287 Hz, a consistent ~1.5%/~25
-        // cent error against every real note tested) -- i.e. FT2 itself
-        // doesn't actually use authentic Amiga hardware periods for this
-        // mode, despite the name. Kept as a separate formula/branch from
-        // linear mode anyway (not simply merged) since real FT2's actual
-        // amiga-table quantization is known to differ from this
-        // continuous approximation by a small amount away from octave
-        // points -- see this class's header comment.
-        const float AMIGA_ANCHOR_PERIOD = AMIGA_PAL_CLOCK / (2.0f * 8363.0f);
+        const float AMIGA_ANCHOR_PERIOD = AMIGA_PAL_CLOCK * 2.0f / 8363.0f;
         float exponent = -((float)note + (float)finetune / 128.0f - 48.0f) / 12.0f;
         float period = AMIGA_ANCHOR_PERIOD * powf(2.0f, exponent);
         if (period < 1.0f) period = 1.0f;
@@ -286,13 +273,14 @@ float XmPlayer::periodToFreq(uint16_t period) const {
     if (_linearFreqTable) {
         return 8363.0f * powf(2.0f, (4608.0f - (float)period) / 768.0f);
     } else {
-        return AMIGA_PAL_CLOCK / (2.0f * (float)period);
+        return AMIGA_PAL_CLOCK * 2.0f / (float)period;
     }
 }
 
-void XmPlayer::recomputeStep(XmChannel& c) {
-    if (c.period == 0) { c.sampleStep16 = 0; return; }
-    c.sampleStep16 = stepForHz(periodToFreq(c.period));
+void XmPlayer::recomputeStep(XmChannel& c, uint16_t period) {
+    c.stepPeriod = period;
+    if (period == 0) { c.sampleStep16 = 0; return; }
+    c.sampleStep16 = stepForHz(periodToFreq(period));
 }
 
 int32_t XmPlayer::decodeDeltaRun(uint32_t fileOffset, uint32_t frameCount, bool is16Bit, int32_t startAccum) {
@@ -427,6 +415,7 @@ void XmPlayer::triggerNote(int ch, int note) {
         pan = s.panning;
     }
     c.volume = vol;
+    c.tremorMute = false;
     c.mixVolume = vol;
     c.pan = pan;
     c.mixPan = pan;
@@ -436,7 +425,13 @@ void XmPlayer::triggerNote(int ch, int note) {
     c.volEnvTick = 0;
     c.panEnvTick = 0;
     c.keyOff = false;
-    c.fadeoutVolume = 65536;
+    c.fadeoutVolume = 32768;
+    c.volEnvValue = 64;
+    if (c.instrument >= 1 && c.instrument <= MAX_INSTRUMENTS) {
+        const XmEnvelope& ve = _instruments[c.instrument - 1].volEnv;
+        if (ve.enabled() && ve.numPoints > 0) c.volEnvValue = (uint8_t)ve.pointY[0];
+    }
+    updateMixVolume(c);
 
     restartSamplePosition(ch);
 }
@@ -518,84 +513,93 @@ void XmPlayer::decodeRow(bool apply) {
     }
 }
 
+void XmPlayer::keyOff(XmChannel& c) {
+    // Fades out through the volume envelope if there is one, else cuts.
+    c.keyOff = true;
+    bool envOn = (c.instrument >= 1 && c.instrument <= MAX_INSTRUMENTS) &&
+                 _instruments[c.instrument - 1].volEnv.enabled();
+    if (!envOn) c.havePair = false;
+}
+
+void XmPlayer::applyNoteColumns(int ch, uint8_t note, uint8_t instrument, uint8_t volume, bool isTonePorta) {
+    XmChannel& c = _channels[ch];
+    if (instrument != 0) c.instrument = instrument;
+
+    if (note == 97) {
+        keyOff(c);
+    } else if (note >= 1 && note <= 96) {
+        int noteAbs0 = note - 1;
+        if (isTonePorta) {
+            // Slides the sounding sample toward the new note, with that
+            // sample's finetune and relative note; no retrigger.
+            int8_t finetune = 0, relNote = 0;
+            if (c.sampleIndex < _numSamplesTotal) {
+                finetune = _samples[c.sampleIndex].finetune;
+                relNote = _samples[c.sampleIndex].relativeNoteNumber;
+            }
+            c.portaTarget = xmNoteToPeriod(noteAbs0 + relNote, finetune);
+        } else {
+            triggerNote(ch, noteAbs0);
+        }
+    }
+    // 98 and up are unused.
+
+    if (volume != 0) applyVolumeColumn(c, volume);
+}
+
+void XmPlayer::applyVolumeColumn(XmChannel& c, uint8_t volume) {
+    // Sets the same channel fields as the effect column.
+    if ((volume >= 0x10 && volume <= 0x50) || (volume >= 0x80 && volume <= 0x9F)) c.tremorMute = false;
+    if (volume >= 0x10 && volume <= 0x50) {
+        c.volume = volume - 0x10;
+    } else if (volume >= 0x60 && volume <= 0x6F) {
+        c.volSlideActiveRow = true;
+        c.volSlideParam = (uint8_t)(volume - 0x60);
+    } else if (volume >= 0x70 && volume <= 0x7F) {
+        c.volSlideActiveRow = true;
+        c.volSlideParam = (uint8_t)((volume - 0x70) << 4);
+    } else if (volume >= 0x80 && volume <= 0x8F) {
+        c.volume = (uint8_t)max(0, (int)c.volume - (int)(volume - 0x80)); // fine slide down, one-shot
+    } else if (volume >= 0x90 && volume <= 0x9F) {
+        c.volume = (uint8_t)min(64, (int)c.volume + (int)(volume - 0x90)); // fine slide up, one-shot
+    } else if (volume >= 0xA0 && volume <= 0xAF) {
+        c.vibratoSpeed = volume - 0xA0;
+    } else if (volume >= 0xB0 && volume <= 0xBF) {
+        c.vibratoActiveRow = true;
+        c.vibratoDepth = volume - 0xB0;
+    } else if (volume >= 0xC0 && volume <= 0xCF) {
+        c.pan = (uint8_t)((volume - 0xC0) * 17);
+    } else if (volume >= 0xD0 && volume <= 0xDF) {
+        c.panSlideActiveRow = true;
+        c.panSlideParam = (uint8_t)(volume - 0xD0);
+    } else if (volume >= 0xE0 && volume <= 0xEF) {
+        c.panSlideActiveRow = true;
+        c.panSlideParam = (uint8_t)((volume - 0xE0) << 4);
+    } else if (volume >= 0xF0) {
+        // Tone portamento, speed x*16 (times 4 when it's applied, as FT2).
+        c.tonePortaActiveRow = true;
+        c.tonePortaSpeed = (uint8_t)((volume - 0xF0) << 4);
+    }
+}
+
 void XmPlayer::applyCell(int ch, uint8_t note, uint8_t instrument, bool hasNote, bool hasInstrument,
                             uint8_t volume, bool hasVolume, uint8_t effect, uint8_t param, bool hasEffect) {
     XmChannel& c = _channels[ch];
 
-    bool isTonePorta = hasEffect && (effect == 3 || effect == 5);
+    bool isTonePorta = (hasEffect && (effect == 3 || effect == 5)) || (hasVolume && volume >= 0xF0);
     bool isNoteDelay = hasEffect && effect == 14 /* E */ && (param >> 4) == 0xD && (param & 0x0F) != 0;
 
-    if (hasInstrument && instrument >= 1 && instrument <= MAX_INSTRUMENTS) {
-        c.instrument = instrument;
-    }
-
+    uint8_t cellNote = hasNote ? note : 0;
+    uint8_t cellInstrument = (hasInstrument && instrument >= 1 && instrument <= MAX_INSTRUMENTS) ? instrument : 0;
+    uint8_t cellVolume = hasVolume ? volume : 0;
     if (isNoteDelay) {
+        // EDy holds the whole cell (instrument, note and volume column) until tick y.
         c.noteDelayParam = param & 0x0F;
-        c.pendingNote = hasNote ? note : 0xFF;
-        c.pendingInstrument = hasInstrument ? instrument : 0;
-    } else if (hasNote) {
-        if (note == 97) {
-            // Key Off -- see this class's header comment: fades out via
-            // the volume envelope if one is enabled, else cuts immediately.
-            c.keyOff = true;
-            bool envOn = (c.instrument >= 1 && c.instrument <= MAX_INSTRUMENTS) &&
-                         _instruments[c.instrument - 1].volEnv.enabled();
-            if (!envOn) c.havePair = false;
-        } else if (note >= 1 && note <= 96) {
-            int noteAbs0 = note - 1;
-            if (isTonePorta) {
-                // Slides the CURRENTLY sounding sample toward the new
-                // note -- uses the already-playing sample's own
-                // finetune/relativeNoteNumber, not a newly-resolved one
-                // (tone portamento never retriggers).
-                int8_t finetune = 0, relNote = 0;
-                if (c.sampleIndex < _numSamplesTotal) {
-                    finetune = _samples[c.sampleIndex].finetune;
-                    relNote = _samples[c.sampleIndex].relativeNoteNumber;
-                }
-                c.portaTarget = xmNoteToPeriod(noteAbs0 + relNote, finetune);
-            } else {
-                triggerNote(ch, noteAbs0);
-            }
-        }
-        // note==98..255: reserved/undefined, treated as a no-op defensively.
-    }
-
-    if (hasVolume) {
-        // XM's volume-column mini-language -- writes into the SAME
-        // per-channel fields the effect column uses (see this class's
-        // header comment), not a parallel system.
-        if (volume >= 0x10 && volume <= 0x50) {
-            c.volume = volume - 0x10;
-        } else if (volume >= 0x60 && volume <= 0x6F) {
-            c.volSlideActiveRow = true;
-            c.volSlideParam = (uint8_t)(volume - 0x60);
-        } else if (volume >= 0x70 && volume <= 0x7F) {
-            c.volSlideActiveRow = true;
-            c.volSlideParam = (uint8_t)((volume - 0x70) << 4);
-        } else if (volume >= 0x80 && volume <= 0x8F) {
-            c.volume = (uint8_t)max(0, (int)c.volume - (int)(volume - 0x80)); // fine slide down, one-shot
-        } else if (volume >= 0x90 && volume <= 0x9F) {
-            c.volume = (uint8_t)min(64, (int)c.volume + (int)(volume - 0x90)); // fine slide up, one-shot
-        } else if (volume >= 0xA0 && volume <= 0xAF) {
-            c.vibratoSpeed = volume - 0xA0;
-        } else if (volume >= 0xB0 && volume <= 0xBF) {
-            c.vibratoActiveRow = true;
-            c.vibratoDepth = volume - 0xB0;
-        } else if (volume >= 0xC0 && volume <= 0xCF) {
-            c.pan = (uint8_t)((volume - 0xC0) * 17);
-        } else if (volume >= 0xD0 && volume <= 0xDF) {
-            c.panSlideActiveRow = true;
-            c.panSlideParam = (uint8_t)(volume - 0xD0);
-        } else if (volume >= 0xE0 && volume <= 0xEF) {
-            c.panSlideActiveRow = true;
-            c.panSlideParam = (uint8_t)((volume - 0xE0) << 4);
-        } else if (volume >= 0xF0) {
-            // Coarse tone-portamento speed -- approximate scaling, see
-            // this class's header comment (flagged for libopenmpt tuning).
-            c.tonePortaActiveRow = true;
-            c.tonePortaSpeed = (uint8_t)((volume - 0xF0) << 4);
-        }
+        c.pendingNote = cellNote;
+        c.pendingInstrument = cellInstrument;
+        c.pendingVolume = cellVolume;
+    } else {
+        applyNoteColumns(ch, cellNote, cellInstrument, cellVolume, isTonePorta);
     }
 
     if (!hasEffect) return;
@@ -658,11 +662,11 @@ void XmPlayer::applyCell(int ch, uint8_t note, uint8_t instrument, bool hasNote,
             break;
         case 12: // C - Set volume
             c.volume = (param > 64) ? 64 : param;
+            c.tremorMute = false;
             break;
-        case 13: // D - Pattern break -- plain decimal row number, unlike
-                 // MOD's BCD Dxx (flagged for libopenmpt verification)
+        case 13: // D - Pattern break, row in BCD like MOD's
             _patternBreakPending = true;
-            _patternBreakRow = param;
+            _patternBreakRow = (param >> 4) * 10 + (param & 0x0F);
             break;
         case 14: // E - Extended (sub-commands; EDy note-delay already handled above)
             if (!isNoteDelay) processExtendedCommand(ch, param);
@@ -677,14 +681,12 @@ void XmPlayer::applyCell(int ch, uint8_t note, uint8_t instrument, bool hasNote,
             _globalVolume = (param > 64) ? 64 : param;
             break;
         case 17: // H - Global volume slide -- own memory (_globalVolSlideParam)
+            _globalVolSlideActiveRow = true;
             if (param != 0) _globalVolSlideParam = param;
             break;
         case 20: // K - Key off at tick `param` (0 == immediate, same tick)
             if (param == 0) {
-                c.keyOff = true;
-                bool envOn = (c.instrument >= 1 && c.instrument <= MAX_INSTRUMENTS) &&
-                             _instruments[c.instrument - 1].volEnv.enabled();
-                if (!envOn) c.havePair = false;
+                keyOff(c);
             } else {
                 c.keyOffTickParam = param;
             }
@@ -705,12 +707,13 @@ void XmPlayer::applyCell(int ch, uint8_t note, uint8_t instrument, bool hasNote,
             }
             break;
         case 29: // T - Tremor (same on/off tick-cycle shape as S3M's I)
+            c.tremorActiveRow = true;
             if (param != 0) {
                 c.tremorOnParam = (param >> 4) + 1;
                 c.tremorOffParam = (param & 0x0F) + 1;
             }
             break;
-        case 33: // X - Extra-fine portamento: sub-command via param's high nibble
+        case 33: // X - Extra-fine portamento, one period unit a step (E1y/E2y move 4)
             if ((param >> 4) == 1) { // X1 - extra-fine porta up
                 int p = (int)c.period - (int)(param & 0x0F);
                 if (p < 1) p = 1;
@@ -733,14 +736,14 @@ void XmPlayer::processExtendedCommand(int ch, uint8_t param) {
 
     switch (sub) {
         case 0x1: { // E1y - Fine porta up, one-shot
-            int p = (int)c.period - val;
+            int p = (int)c.period - val * 4;
             if (p < 1) p = 1;
             c.period = (uint16_t)p;
             recomputeStep(c);
             break;
         }
         case 0x2: // E2y - Fine porta down, one-shot
-            c.period = (uint16_t)((int)c.period + val);
+            c.period = (uint16_t)min(65535, (int)c.period + val * 4);
             recomputeStep(c);
             break;
         case 0x3: // E3y - Glissando control
@@ -770,9 +773,11 @@ void XmPlayer::processExtendedCommand(int ch, uint8_t param) {
             break;
         case 0xA: // EAy - Fine volume slide up, one-shot
             c.volume = (uint8_t)min(64, (int)c.volume + val);
+            c.tremorMute = false;
             break;
         case 0xB: // EBy - Fine volume slide down, one-shot
             c.volume = (uint8_t)max(0, (int)c.volume - val);
+            c.tremorMute = false;
             break;
         case 0xC: // ECy - Note cut at tick y
             c.noteCutParam = val;
@@ -789,6 +794,7 @@ void XmPlayer::processExtendedCommand(int ch, uint8_t param) {
 }
 
 void XmPlayer::advanceRow() {
+    _globalVolSlideActiveRow = false;
     for (int ch = 0; ch < _numChannels; ch++) {
         XmChannel& c = _channels[ch];
         c.arpeggioParam = 0;
@@ -805,6 +811,7 @@ void XmPlayer::advanceRow() {
         c.tremoloActiveRow = false;
         c.retrigActiveRow = false;
         c.panSlideActiveRow = false;
+        c.tremorActiveRow = false;
     }
 
     int openRows = (_openPatternNum >= 0 && _openPatternNum < MAX_PATTERNS) ? _patternRowCounts[_openPatternNum] : 64;
@@ -838,6 +845,15 @@ void XmPlayer::advanceRow() {
 
     if (patternNum != _openPatternNum) openPatternForScan(patternNum);
     advanceToRow(_row);
+
+    // A row starts at the base pitch, dropping last tick's vibrato or
+    // arpeggio, and plays this row's volume from its first tick.
+    for (int ch = 0; ch < _numChannels; ch++) {
+        XmChannel& c = _channels[ch];
+        if (c.period == 0) continue;
+        if (c.stepPeriod != c.period) recomputeStep(c);
+        updateMixVolume(c);
+    }
 }
 
 void XmPlayer::processEnvelopes() {
@@ -851,6 +867,7 @@ void XmPlayer::processEnvelopes() {
         // see this class's header comment.
         c.mixVolume = c.volume;
         c.mixPan = c.pan;
+        c.volEnvValue = 64;
         if (c.instrument < 1 || c.instrument > MAX_INSTRUMENTS) continue;
         const XmInstrument& inst = _instruments[c.instrument - 1];
 
@@ -882,6 +899,7 @@ void XmPlayer::processEnvelopes() {
         if (c.keyOff) {
             uint32_t fade = inst.volFadeout > 0 ? inst.volFadeout : 1;
             c.fadeoutVolume = (c.fadeoutVolume > fade) ? c.fadeoutVolume - fade : 0;
+            if (c.fadeoutVolume == 0) c.havePair = false; // faded out, stop the voice
         }
 
         uint8_t panEnvValue = 32;
@@ -909,7 +927,8 @@ void XmPlayer::processEnvelopes() {
             }
         }
 
-        c.mixVolume = (uint8_t)(((uint32_t)c.volume * volEnvValue / 64) * c.fadeoutVolume / 65536);
+        c.volEnvValue = volEnvValue;
+        updateMixVolume(c);
         // Deliberately simplified pan/envelope blend, not FT2's own
         // extremes-pulling formula -- see this class's header comment.
         int panOffset = ((int)panEnvValue - 32) * 2;
@@ -920,33 +939,28 @@ void XmPlayer::processEnvelopes() {
 }
 
 void XmPlayer::processTickEffects() {
-    // Global volume slide (H) -- same regular-slide shape as a
-    // per-channel A, applied to _globalVolume once per tick.
-    {
+    // Global volume slide (H), on the rows that give it.
+    if (_globalVolSlideActiveRow) {
         uint8_t hi = _globalVolSlideParam >> 4, lo = _globalVolSlideParam & 0x0F;
-        if (hi != 0x0F && lo != 0x0F) {
-            if (hi) _globalVolume = (uint8_t)min(64, (int)_globalVolume + hi);
-            else if (lo) _globalVolume = (uint8_t)max(0, (int)_globalVolume - lo);
-        }
+        if (hi) _globalVolume = (uint8_t)min(64, (int)_globalVolume + hi);
+        else if (lo) _globalVolume = (uint8_t)max(0, (int)_globalVolume - lo);
     }
 
     for (int ch = 0; ch < _numChannels; ch++) {
         XmChannel& c = _channels[ch];
 
         if (c.noteDelayParam != 0 && _tick == c.noteDelayParam) {
-            if (c.pendingInstrument != 0) c.instrument = c.pendingInstrument;
-            if (c.pendingNote != 0xFF) triggerNote(ch, c.pendingNote);
+            applyNoteColumns(ch, c.pendingNote, c.pendingInstrument, c.pendingVolume, false);
+            updateMixVolume(c);
             c.noteDelayParam = 0;
         }
         if (c.noteCutParam != 0xFF && _tick == c.noteCutParam) {
             c.volume = 0;
+            c.tremorMute = false;
             c.noteCutParam = 0xFF;
         }
         if (c.keyOffTickParam != 0xFF && _tick == c.keyOffTickParam) {
-            c.keyOff = true;
-            bool envOn = (c.instrument >= 1 && c.instrument <= MAX_INSTRUMENTS) &&
-                         _instruments[c.instrument - 1].volEnv.enabled();
-            if (!envOn) c.havePair = false;
+            keyOff(c);
             c.keyOffTickParam = 0xFF;
         }
         if (c.retrigActiveRow && c.retrigParam > 0 && (_tick % c.retrigParam) == 0) {
@@ -959,64 +973,78 @@ void XmPlayer::processTickEffects() {
             else if (t == 7) c.volume = (uint8_t)(c.volume / 2);
             else if (t >= 9 && t <= 14) c.volume = (uint8_t)min(64, (int)c.volume + (int)(t - 8));
             else if (t == 15) c.volume = (uint8_t)min(64, (int)c.volume * 2);
+            if (t != 0 && t != 8) c.tremorMute = false;
         }
 
         if (c.period == 0) continue;
-
-        // Tremor (T) -- see S3mPlayer::processTickEffects()'s identical comment.
-        bool tremorMuted = false;
-        if (c.tremorOnParam > 0 || c.tremorOffParam > 0) {
-            uint8_t cycleLen = c.tremorOnParam + c.tremorOffParam;
-            if (cycleLen > 0) {
-                uint8_t pos = c.tremorCounter % cycleLen;
-                tremorMuted = (pos >= c.tremorOnParam);
-                c.tremorCounter++;
-            }
-        }
 
         if (c.volSlideActiveRow) {
             uint8_t up = c.volSlideParam >> 4, down = c.volSlideParam & 0x0F;
             if (up) c.volume = (uint8_t)min(64, (int)c.volume + up);
             else if (down) c.volume = (uint8_t)max(0, (int)c.volume - down);
+            c.tremorMute = false;
         }
+        // Tremor (T), on the rows that give it. Runs after the slides, so
+        // the off phase wins, and stays muted if T ends in it.
+        if (c.tremorActiveRow && (c.tremorOnParam > 0 || c.tremorOffParam > 0)) {
+            uint8_t cycleLen = c.tremorOnParam + c.tremorOffParam;
+            if (cycleLen > 0) {
+                uint8_t pos = c.tremorCounter % cycleLen;
+                c.tremorMute = (pos >= c.tremorOnParam);
+                c.tremorCounter++;
+            }
+        }
+        // Volume changes on this tick show up now, not a tick later.
+        updateMixVolume(c);
         if (c.panSlideActiveRow) {
             uint8_t left = c.panSlideParam >> 4, right = c.panSlideParam & 0x0F;
             if (right) c.pan = (uint8_t)min(255, (int)c.pan + right * 2);
             else if (left) c.pan = (uint8_t)max(0, (int)c.pan - left * 2);
         }
 
+        // Porta and tone porta speeds are 4 period units a step, as FT2.
         if (c.portaDownActiveRow && c.portaDownSpeed) {
-            int p = (int)c.period + c.portaDownSpeed;
+            int p = (int)c.period + c.portaDownSpeed * 4;
             if (p > 32000) p = 32000;
             c.period = (uint16_t)p;
-            recomputeStep(c);
         }
         if (c.portaUpActiveRow && c.portaUpSpeed) {
-            int p = (int)c.period - c.portaUpSpeed;
+            int p = (int)c.period - c.portaUpSpeed * 4;
             if (p < 1) p = 1;
             c.period = (uint16_t)p;
-            recomputeStep(c);
         }
-
         if (c.tonePortaActiveRow && c.portaTarget != 0 && c.tonePortaSpeed) {
-            if (c.period < c.portaTarget) c.period = (uint16_t)min((int)c.portaTarget, (int)c.period + c.tonePortaSpeed);
-            else if (c.period > c.portaTarget) c.period = (uint16_t)max((int)c.portaTarget, (int)c.period - c.tonePortaSpeed);
-            recomputeStep(c);
+            int speed = c.tonePortaSpeed * 4;
+            if (c.period < c.portaTarget) c.period = (uint16_t)min((int)c.portaTarget, (int)c.period + speed);
+            else if (c.period > c.portaTarget) c.period = (uint16_t)max((int)c.portaTarget, (int)c.period - speed);
         }
 
-        uint16_t effectivePeriod = c.period;
+        // Vibrato and arpeggio only change the pitch that plays this tick,
+        // c.period stays the base.
+        uint16_t playPeriod = c.period;
         if (c.vibratoActiveRow && c.vibratoDepth) {
             float angle = 2.0f * (float)M_PI * (float)c.vibratoPos / 64.0f;
-            int16_t delta = (int16_t)(sinf(angle) * c.vibratoDepth * 4.0f);
-            effectivePeriod = (uint16_t)max(1, (int)c.period + delta);
+            int delta = (int16_t)(sinf(angle) * c.vibratoDepth * 8.0f); // FT2's depth, 8 period units a step
+            playPeriod = (uint16_t)max(1, (int)c.period + delta);
             c.vibratoPos = (uint8_t)((c.vibratoPos + c.vibratoSpeed) & 0x3F);
         }
-        if (effectivePeriod != c.period) {
-            uint16_t saved = c.period;
-            c.period = effectivePeriod;
-            recomputeStep(c);
-            c.period = saved;
+        // Arpeggio: base note, +x semitones, +y semitones, counted the way
+        // FT2 does from the end of the row, so tick 1 at speed 6 is +y. A
+        // semitone is 64 units in linear mode, a 2^(1/12) ratio in Amiga mode.
+        if (c.arpeggioParam != 0) {
+            int cyclePos = (_speed - _tick) % 3;
+            int semis = (cyclePos == 1) ? (c.arpeggioParam >> 4) : (cyclePos == 2) ? (c.arpeggioParam & 0x0F) : 0;
+            if (semis != 0) {
+                if (_linearFreqTable) {
+                    int p = (int)c.period - semis * 64;
+                    playPeriod = (uint16_t)(p < 1 ? 1 : p);
+                } else {
+                    float factor = powf(2.0f, -(float)semis / 12.0f);
+                    playPeriod = (uint16_t)max(1.0f, (float)c.period * factor);
+                }
+            }
         }
+        if (playPeriod != c.stepPeriod) recomputeStep(c, playPeriod);
 
         if (c.tremoloActiveRow && c.tremoloDepth) {
             float angle = 2.0f * (float)M_PI * (float)c.tremoloPos / 64.0f;
@@ -1026,33 +1054,6 @@ void XmPlayer::processTickEffects() {
             c.mixVolume = (uint8_t)v;
             c.tremoloPos = (uint8_t)((c.tremoloPos + c.tremoloSpeed) & 0x3F);
         }
-        if (tremorMuted) c.mixVolume = 0;
-
-        // Arpeggio -- cycles the sounding pitch between the base note,
-        // +x semitones, and +y semitones every tick within the row. In
-        // linear mode a semitone is a fixed 64-unit period step; in Amiga
-        // mode it's the same exponential period scale S3M/MOD use --
-        // this IS the "same effect parameter, different musical interval
-        // per mode" behavior flagged in this class's header comment, not
-        // a bug.
-        if (c.arpeggioParam != 0) {
-            int cyclePos = _tick % 3;
-            int semis = (cyclePos == 1) ? (c.arpeggioParam >> 4) : (cyclePos == 2) ? (c.arpeggioParam & 0x0F) : 0;
-            if (semis != 0) {
-                uint16_t arpPeriod;
-                if (_linearFreqTable) {
-                    int p = (int)c.period - semis * 64;
-                    if (p < 1) p = 1;
-                    arpPeriod = (uint16_t)p;
-                } else {
-                    float factor = powf(2.0f, -(float)semis / 12.0f);
-                    arpPeriod = (uint16_t)max(1.0f, (float)c.period * factor);
-                }
-                uint16_t saved = c.period;
-                c.period = arpPeriod;
-                recomputeStep(c);
-                c.period = saved;
-            }
-        }
+        if (c.tremorMute) c.mixVolume = 0;
     }
 }

@@ -5,9 +5,11 @@
 
 namespace {
 
-// Same Amiga clock MOD uses; S3M pitch goes through a pseudo-period.
+// Same Amiga clock MOD uses. ST3 periods are 4x Amiga periods, so a
+// period p plays at AMIGA_PAL_CLOCK * 2 / p Hz.
 // float, not double: the M0+ has no FPU and this runs on every trigger and slide tick.
 const float AMIGA_PAL_CLOCK = 7093789.2f;
+const uint32_t MAX_PERIOD = 65535 * 4; // highest period notes and slides reach, about 54 Hz
 
 // S3M file pointers are stored as offset/16.
 inline uint32_t paraToOffset(uint32_t para) { return para * 16; }
@@ -152,21 +154,22 @@ bool S3mPlayer::load(const char* path) {
     return true;
 }
 
-uint16_t S3mPlayer::s3mNoteToPeriod(uint8_t note, uint32_t c2spd) {
+uint32_t S3mPlayer::s3mNoteToPeriod(uint8_t note, uint32_t c2spd) {
     int octave = note >> 4;
     int noteInOctave = note & 0x0F;
     int semitoneFromRef = (octave - 4) * 12 + noteInOctave; // reference: octave 4, note C
     float hz = (float)c2spd * powf(2.0f, (float)semitoneFromRef / 12.0f);
     if (hz < 1.0f) hz = 1.0f;
-    float period = AMIGA_PAL_CLOCK / (2.0f * hz);
+    float period = AMIGA_PAL_CLOCK * 2.0f / hz;
     if (period < 1.0f) period = 1.0f;
-    if (period > 65535.0f) period = 65535.0f;
-    return (uint16_t)(period + 0.5f);
+    if (period > (float)MAX_PERIOD) period = (float)MAX_PERIOD;
+    return (uint32_t)(period + 0.5f);
 }
 
-void S3mPlayer::recomputeStep(S3mChannel& c) {
-    if (c.period == 0) { c.sampleStep16 = 0; return; }
-    float hz = AMIGA_PAL_CLOCK / ((float)c.period * 2.0f);
+void S3mPlayer::recomputeStep(S3mChannel& c, uint32_t period) {
+    c.stepPeriod = period;
+    if (period == 0) { c.sampleStep16 = 0; return; }
+    float hz = AMIGA_PAL_CLOCK * 2.0f / (float)period;
     c.sampleStep16 = stepForHz(hz);
 }
 
@@ -257,12 +260,9 @@ void S3mPlayer::decodeRow(bool apply) {
     if (_openPatternNum < 0 || _openPatternNum >= MAX_PATTERNS || _patternOffsets[_openPatternNum] == 0) {
         return; // empty/missing pattern slot -- a silent row, nothing to decode
     }
-    // A real row has at most one entry per channel (MAX_CHANNELS) before
-    // its terminator -- bounding the loop by that guards against ever
-    // scanning far into a corrupt/mismatched file (e.g. a bad parapointer
-    // pointing at non-pattern data) for an unbounded number of slow SD
-    // reads if a stray 0x00 terminator byte is never encountered.
-    for (int guard = 0; guard <= MAX_CHANNELS; guard++) {
+    // A row has at most one entry per channel (32) before its terminator,
+    // so a corrupt file without a 0x00 can't make this read on and on.
+    for (int guard = 0; guard <= 32; guard++) {
         uint8_t flag;
         if (_patternFile.read(&flag, 1) != 1) return; // truncated/EOF -- stop
         if (flag == 0) return; // row terminator
@@ -302,6 +302,30 @@ void S3mPlayer::decodeRow(bool apply) {
     }
 }
 
+void S3mPlayer::applyNoteColumns(int ch, uint8_t note, uint8_t sample, uint8_t volume, bool isTonePorta) {
+    S3mChannel& c = _channels[ch];
+    if (sample != 0) {
+        setSample(c, sample);
+        c.volume = _samples[sample - 1].volume;
+        c.mixVolume = c.volume;
+    }
+    if (volume != 0xFF) {
+        c.volume = (volume > 64) ? 64 : volume;
+        c.mixVolume = c.volume;
+    }
+    // 0xFF is no note, 0xFE is note cut (^^), 0xFD and notes 12-15 of an
+    // octave are invalid and ignored.
+    if (note == 0xFE) {
+        c.havePair = false;
+    } else if (note < 0xFE && (note & 0x0F) <= 11) {
+        if (isTonePorta) {
+            c.portaTarget = s3mNoteToPeriod(note, c.c2spd);
+        } else {
+            triggerNote(ch, note);
+        }
+    }
+}
+
 void S3mPlayer::applyCell(int ch, uint8_t note, uint8_t sample, bool hasNote,
                             uint8_t volume, bool hasVolume, uint8_t command, uint8_t param, bool hasCommand) {
     S3mChannel& c = _channels[ch];
@@ -313,40 +337,17 @@ void S3mPlayer::applyCell(int ch, uint8_t note, uint8_t sample, bool hasNote,
     bool isTonePorta = hasCommand && (command == 7 /* G */ || command == 12 /* L */);
     bool isNoteDelay = hasCommand && command == 19 /* S */ && (param >> 4) == 0xD && (param & 0x0F) != 0;
 
-    // Instrument change applies immediately regardless of a pending note
-    // delay -- only the note trigger itself is deferred, same as
-    // ModPlayer's identical EDy handling.
-    if (hasNote && sample >= 1 && sample <= MAX_INSTRUMENTS) {
-        setSample(c, sample);
-        c.volume = _samples[sample - 1].volume;
-        c.mixVolume = c.volume;
-    }
-
-    // The volume column is S3M's own first-class per-row volume
-    // override -- independent of any effect command in the same cell.
-    if (hasVolume) {
-        c.volume = (volume > 64) ? 64 : volume;
-        c.mixVolume = c.volume;
-    }
-
+    uint8_t cellNote = hasNote ? note : 0xFF;
+    uint8_t cellSample = (hasNote && sample >= 1 && sample <= MAX_INSTRUMENTS) ? sample : 0;
+    uint8_t cellVolume = hasVolume ? volume : 0xFF;
     if (isNoteDelay) {
+        // SDy holds the whole cell (instrument, volume and note) until tick y.
         c.noteDelayParam = param & 0x0F;
-        c.pendingNote = hasNote ? note : 0xFF;
-        c.pendingSample = (hasNote && sample >= 1 && sample <= MAX_INSTRUMENTS) ? sample : 0;
-    } else if (hasNote) {
-        if (note == 0xFF) {
-            // Note Off -- immediate silence; no envelope release to
-            // model for a plain PCM instrument (S3M has none; envelopes
-            // are an XM feature).
-            c.havePair = false;
-        } else if (note < 0xFE) {
-            if (isTonePorta) {
-                c.portaTarget = s3mNoteToPeriod(note, c.c2spd);
-            } else {
-                triggerNote(ch, note);
-            }
-        }
-        // note == 0xFE: uncertain/rare marker, treated as a no-op defensively.
+        c.pendingNote = cellNote;
+        c.pendingSample = cellSample;
+        c.pendingVolume = cellVolume;
+    } else {
+        applyNoteColumns(ch, cellNote, cellSample, cellVolume, isTonePorta);
     }
 
     if (!hasCommand) return;
@@ -379,27 +380,22 @@ void S3mPlayer::applyCell(int ch, uint8_t note, uint8_t sample, bool hasNote,
             }
             break;
         }
-        case 5: // E - Portamento down: regular (per-tick, gated by
-                // portaDownActiveRow), or one-shot fine/extra-fine via a
-                // high-nibble range, applied once here (no gating needed).
+        case 5: // E - Portamento down: Exx slides xx*4 period units a tick
+                // (ticks 1+), EFx slides x*4 once and EEx (extra fine) x once.
             c.portaDownActiveRow = true;
             if (param != 0) c.portaDownSpeed = param;
-            if ((c.portaDownSpeed & 0xF0) == 0xE0) {
-                c.period = (uint16_t)min(65535, (int)c.period + (int)(c.portaDownSpeed & 0x0F) * 4);
-                recomputeStep(c);
-            } else if ((c.portaDownSpeed & 0xF0) == 0xF0) {
-                c.period = (uint16_t)min(65535, (int)c.period + (int)(c.portaDownSpeed & 0x0F));
+            if (c.period != 0 && (c.portaDownSpeed & 0xF0) >= 0xE0) {
+                uint32_t amount = (c.portaDownSpeed & 0x0F) * ((c.portaDownSpeed & 0xF0) == 0xF0 ? 4u : 1u);
+                c.period = min(MAX_PERIOD, c.period + amount);
                 recomputeStep(c);
             }
             break;
         case 6: // F - Portamento up (mirror of E)
             c.portaUpActiveRow = true;
             if (param != 0) c.portaUpSpeed = param;
-            if ((c.portaUpSpeed & 0xF0) == 0xE0) {
-                c.period = (uint16_t)max(1, (int)c.period - (int)(c.portaUpSpeed & 0x0F) * 4);
-                recomputeStep(c);
-            } else if ((c.portaUpSpeed & 0xF0) == 0xF0) {
-                c.period = (uint16_t)max(1, (int)c.period - (int)(c.portaUpSpeed & 0x0F));
+            if (c.period != 0 && (c.portaUpSpeed & 0xF0) >= 0xE0) {
+                uint32_t amount = (c.portaUpSpeed & 0x0F) * ((c.portaUpSpeed & 0xF0) == 0xF0 ? 4u : 1u);
+                c.period = c.period > amount + 1 ? c.period - amount : 1;
                 recomputeStep(c);
             }
             break;
@@ -413,6 +409,7 @@ void S3mPlayer::applyCell(int ch, uint8_t note, uint8_t sample, bool hasNote,
             if (param & 0x0F) c.vibratoDepth = param & 0x0F;
             break;
         case 9: // I - Tremor: on for (high nibble + 1) ticks, off for (low nibble + 1) ticks, repeating
+            c.tremorActiveRow = true;
             if (param != 0) {
                 c.tremorOnParam = (param >> 4) + 1;
                 c.tremorOffParam = (param & 0x0F) + 1;
@@ -459,12 +456,14 @@ void S3mPlayer::applyCell(int ch, uint8_t note, uint8_t sample, bool hasNote,
             break;
         case 23: // W - Global volume slide -- own memory (_globalVolSlideParam),
                  // not a per-channel effect despite being attached to one channel's row slot
+            _globalVolSlideActiveRow = true;
             if (param != 0) _globalVolSlideParam = param;
             break;
         case 24: // X - Set panning
             c.pan = param;
             break;
         case 25: // Y - Panbrello
+            c.panbrelloActiveRow = true;
             if (param >> 4) c.panbrelloSpeed = param >> 4;
             if (param & 0x0F) c.panbrelloDepth = param & 0x0F;
             break;
@@ -504,6 +503,7 @@ void S3mPlayer::processExtendedTickZero(int ch, uint8_t command, uint8_t param) 
 }
 
 void S3mPlayer::advanceRow() {
+    _globalVolSlideActiveRow = false;
     for (int ch = 0; ch < MAX_CHANNELS; ch++) {
         if (!_channelEnabled[ch]) continue;
         S3mChannel& c = _channels[ch];
@@ -521,6 +521,9 @@ void S3mPlayer::advanceRow() {
         c.vibratoActiveRow = false;
         c.tremoloActiveRow = false;
         c.retrigActiveRow = false;
+        c.tremorActiveRow = false;
+        c.panbrelloActiveRow = false;
+        c.panbrelloOffset = 0;
     }
 
     stepPosition(64, 63);
@@ -551,14 +554,34 @@ void S3mPlayer::advanceRow() {
     int patternNum = _orderTable[_orderPos];
     if (patternNum != _openPatternNum) openPatternForScan(patternNum);
     advanceToRow(_row);
+
+    // A row starts at the base pitch and volume, dropping last tick's
+    // vibrato, arpeggio, tremolo or tremor; tremor counts this tick too.
+    for (int ch = 0; ch < MAX_CHANNELS; ch++) {
+        if (!_channelEnabled[ch]) continue;
+        S3mChannel& c = _channels[ch];
+        if (c.period == 0) continue;
+        if (c.stepPeriod != c.period) recomputeStep(c);
+        c.mixVolume = tremorStep(c) ? 0 : c.volume;
+    }
+}
+
+// Tremor (I), on the rows that give it, row tick included: true for the
+// off part of each on/off cycle, where mixVolume is muted. The sample keeps
+// playing underneath.
+bool S3mPlayer::tremorStep(S3mChannel& c) {
+    if (!c.tremorActiveRow) return false;
+    uint8_t cycleLen = c.tremorOnParam + c.tremorOffParam;
+    if (cycleLen == 0) return false;
+    bool muted = (c.tremorCounter % cycleLen) >= c.tremorOnParam;
+    c.tremorCounter++;
+    return muted;
 }
 
 void S3mPlayer::processTickEffects() {
-    // Global volume slide (W) -- same regular-slide shape as a
-    // per-channel D, applied to _globalVolume once per tick. Fine
-    // variants aren't offered for W in the classic format, so no
-    // 0xF-nibble special-case is needed here.
-    {
+    // Global volume slide (W), on the rows that give it. Same shape as a
+    // channel's D without the fine variants.
+    if (_globalVolSlideActiveRow) {
         uint8_t hi = _globalVolSlideParam >> 4, lo = _globalVolSlideParam & 0x0F;
         if (hi != 0x0F && lo != 0x0F) {
             if (hi) _globalVolume = (uint8_t)min(64, (int)_globalVolume + hi);
@@ -571,11 +594,7 @@ void S3mPlayer::processTickEffects() {
         S3mChannel& c = _channels[ch];
 
         if (c.noteDelayParam != 0 && _tick == c.noteDelayParam) {
-            if (c.pendingSample != 0) {
-                setSample(c, c.pendingSample);
-                c.volume = _samples[c.pendingSample - 1].volume;
-            }
-            if (c.pendingNote != 0xFF) triggerNote(ch, c.pendingNote);
+            applyNoteColumns(ch, c.pendingNote, c.pendingSample, c.pendingVolume, false);
             c.noteDelayParam = 0;
         }
         if (c.noteCutParam != 0xFF && _tick == c.noteCutParam) {
@@ -599,20 +618,7 @@ void S3mPlayer::processTickEffects() {
 
         if (c.period == 0) continue;
 
-        // Tremor (I): cycles the channel between audible and silent
-        // every tremorOnParam/tremorOffParam ticks -- implemented as a
-        // volume gate (0 while "off") rather than touching havePair, so
-        // the sample position keeps advancing silently through the off
-        // phase, same as real tremor (it doesn't restart on re-entry).
-        bool tremorMuted = false;
-        if (c.tremorOnParam > 0 || c.tremorOffParam > 0) {
-            uint8_t cycleLen = c.tremorOnParam + c.tremorOffParam;
-            if (cycleLen > 0) {
-                uint8_t pos = c.tremorCounter % cycleLen;
-                tremorMuted = (pos >= c.tremorOnParam);
-                c.tremorCounter++;
-            }
-        }
+        bool tremorMuted = tremorStep(c);
 
         // Volume slide (D, and the volslide half of K/L) -- regular
         // per-tick, gated by volSlideActiveRow (see its declaration --
@@ -632,22 +638,17 @@ void S3mPlayer::processTickEffects() {
         // adjust mixVolume, never the persistent volume.
         c.mixVolume = c.volume;
 
-        // Portamento up/down (E/F), gated by their ActiveRow flags (see
-        // their declarations), clamped to the same period range
-        // ModPlayer uses -- see its own comment on why an unclamped
-        // slide is a real bug, not just a cosmetic one.
-        if (c.portaDownActiveRow && c.portaDownSpeed &&
-            (c.portaDownSpeed & 0xF0) != 0xE0 && (c.portaDownSpeed & 0xF0) != 0xF0) {
-            int p = (int)c.period + c.portaDownSpeed;
-            if (p > 27392) p = 27392; // ~113 Hz floor at the widest realistic C2SPD -- generous upper period bound
-            c.period = (uint16_t)p;
+        // Portamento up/down (E/F) on the rows that give them, xx*4 period
+        // units a tick, clamped so a long slide can't run off either end.
+        if (c.portaDownActiveRow && c.portaDownSpeed && (c.portaDownSpeed & 0xF0) < 0xE0) {
+            uint32_t p = c.period + (uint32_t)c.portaDownSpeed * 4;
+            if (p > MAX_PERIOD) p = MAX_PERIOD;
+            c.period = p;
             recomputeStep(c);
         }
-        if (c.portaUpActiveRow && c.portaUpSpeed &&
-            (c.portaUpSpeed & 0xF0) != 0xE0 && (c.portaUpSpeed & 0xF0) != 0xF0) {
-            int p = (int)c.period - c.portaUpSpeed;
-            if (p < 1) p = 1;
-            c.period = (uint16_t)p;
+        if (c.portaUpActiveRow && c.portaUpSpeed && (c.portaUpSpeed & 0xF0) < 0xE0) {
+            uint32_t amount = (uint32_t)c.portaUpSpeed * 4;
+            c.period = c.period > amount + 1 ? c.period - amount : 1;
             recomputeStep(c);
         }
 
@@ -655,35 +656,38 @@ void S3mPlayer::processTickEffects() {
         // toward portaTarget at tonePortaSpeed/tick, gated by
         // tonePortaActiveRow.
         if (c.tonePortaActiveRow && c.portaTarget != 0 && c.tonePortaSpeed) {
+            uint32_t speed = (uint32_t)c.tonePortaSpeed * 4;
             if (c.period < c.portaTarget) {
-                c.period = (uint16_t)min((int)c.portaTarget, (int)c.period + c.tonePortaSpeed);
+                c.period = min(c.portaTarget, c.period + speed);
             } else if (c.period > c.portaTarget) {
-                c.period = (uint16_t)max((int)c.portaTarget, (int)c.period - c.tonePortaSpeed);
+                c.period = c.period > c.portaTarget + speed ? c.period - speed : c.portaTarget;
             }
             recomputeStep(c);
         }
 
-        // Vibrato (H/U, and the vibrato half of K) -- transient period
-        // offset recomputed fresh each tick, not accumulated into
-        // c.period itself, gated by vibratoActiveRow. U (fine vibrato)
-        // reuses this with a quarter depth, flagged via vibratoDepth's
-        // high bit (see applyCell()).
-        uint16_t effectivePeriod = c.period;
+        // Vibrato (H/U, and the vibrato half of K) and arpeggio (J) only
+        // change the pitch that plays this tick, c.period stays the base.
+        // U is H at a quarter of the depth, flagged by vibratoDepth's high bit.
+        uint32_t playPeriod = c.period;
         bool fineVibrato = (c.vibratoDepth & 0x80) != 0;
         uint8_t vibDepth = c.vibratoDepth & 0x7F;
         if (c.vibratoActiveRow && vibDepth) {
             float angle = 2.0f * (float)M_PI * (float)c.vibratoPos / 64.0f;
-            float depthScale = fineVibrato ? 1.0f : 4.0f;
-            int16_t delta = (int16_t)(sinf(angle) * vibDepth * depthScale);
-            effectivePeriod = (uint16_t)max(1, (int)c.period + delta);
+            // 8 period units a depth step at the peak (2 for U), as OpenMPT plays ST3.
+            int delta = (int)(sinf(angle) * vibDepth * (fineVibrato ? 2.0f : 8.0f));
+            playPeriod = (uint32_t)max(1, (int)c.period + delta);
             c.vibratoPos = (uint8_t)((c.vibratoPos + c.vibratoSpeed) & 0x3F);
         }
-        if (effectivePeriod != c.period) {
-            uint16_t savedPeriod = c.period;
-            c.period = effectivePeriod;
-            recomputeStep(c);
-            c.period = savedPeriod;
+        // Arpeggio: base note, +x semitones, +y semitones, one per tick.
+        if (c.arpeggioParam != 0) {
+            int cyclePos = _tick % 3;
+            int semis = (cyclePos == 1) ? (c.arpeggioParam >> 4) : (cyclePos == 2) ? (c.arpeggioParam & 0x0F) : 0;
+            if (semis != 0) {
+                float factor = powf(2.0f, -(float)semis / 12.0f);
+                playPeriod = (uint32_t)max(1.0f, (float)c.period * factor);
+            }
         }
+        if (playPeriod != c.stepPeriod) recomputeStep(c, playPeriod);
 
         // Tremolo (R) -- same idea as vibrato, transient volume offset,
         // gated by tremoloActiveRow -- and tremor's mute gate, both
@@ -700,33 +704,21 @@ void S3mPlayer::processTickEffects() {
         }
         if (tremorMuted) c.mixVolume = 0;
 
-        // Arpeggio (J) -- cycles the sounding pitch between the base
-        // note, +x semitones, and +y semitones every tick within the row.
-        if (c.arpeggioParam != 0) {
-            int cyclePos = _tick % 3;
-            int semis = (cyclePos == 1) ? (c.arpeggioParam >> 4) : (cyclePos == 2) ? (c.arpeggioParam & 0x0F) : 0;
-            if (semis != 0) {
-                float factor = powf(2.0f, -(float)semis / 12.0f);
-                uint16_t arpPeriod = (uint16_t)max(1.0f, (float)c.period * factor);
-                uint16_t savedPeriod = c.period;
-                c.period = arpPeriod;
-                recomputeStep(c);
-                c.period = savedPeriod;
-            }
-        }
-
-        // Panbrello (Y) -- same idea as vibrato/tremolo, transient pan offset.
-        if (c.panbrelloDepth) {
-            float angle = 2.0f * (float)M_PI * (float)c.panbrelloPos / 32.0f;
-            int delta = (int)(sinf(angle) * c.panbrelloDepth * 4.0f);
-            int p = (int)c.pan + delta;
-            if (p < 0) p = 0; else if (p > 255) p = 255;
-            c.pan = (uint8_t)p; // drifts the stored pan
-            c.panbrelloPos = (uint8_t)((c.panbrelloPos + c.panbrelloSpeed) & 0x1F);
+        // Panbrello (Y), on the rows that give it: an offset tickEnd() adds
+        // to pan for the mix, pan itself stays put.
+        // OpenMPT's shape: 64 steps a cycle, up to 8*depth either side.
+        if (c.panbrelloActiveRow && c.panbrelloDepth) {
+            float angle = 2.0f * (float)M_PI * (float)c.panbrelloPos / 64.0f;
+            c.panbrelloOffset = (int8_t)(sinf(angle) * c.panbrelloDepth * 8.0f);
+            c.panbrelloPos = (uint8_t)((c.panbrelloPos + c.panbrelloSpeed) & 0x3F);
         }
     }
 }
 
 void S3mPlayer::tickEnd() {
-    for (int ch = 0; ch < MAX_CHANNELS; ch++) _channels[ch].mixPan = _channels[ch].pan;
+    for (int ch = 0; ch < MAX_CHANNELS; ch++) {
+        S3mChannel& c = _channels[ch];
+        int p = (int)c.pan + c.panbrelloOffset;
+        c.mixPan = (uint8_t)(p < 0 ? 0 : p > 255 ? 255 : p);
+    }
 }
