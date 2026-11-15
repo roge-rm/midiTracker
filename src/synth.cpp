@@ -418,8 +418,8 @@ volatile uint32_t g_wavResetSeen = 0; // written by core 1 only, read by wavStre
 volatile bool g_wavActive = false; // stream is live -- renderSample() should try to pop
 volatile bool g_wavEnded = false;  // no more source data -- empty means "done", not "underrun"
 volatile bool g_wavUnderrun = false;
-// Temporary real-hardware diagnostic (see xm_file.cpp's own g_xmDiag*
-// block, and Synth::wavStreamUnderrunSamples() below) -- g_wavUnderrun
+// Real-hardware diagnostic (see Synth::wavStreamUnderrunSamples()
+// below) -- g_wavUnderrun
 // alone is a check-and-clear boolean, polled once per producer update()
 // call; a SUSTAINED drought spanning many consecutive renderSample()
 // calls (core 1 runs at a fixed 44.1kHz, hardware-paced by g_i2s.write16()

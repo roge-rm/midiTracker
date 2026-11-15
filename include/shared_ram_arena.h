@@ -4,7 +4,7 @@
 // A single fixed-address static RAM block shared by LooperMode::tracks[]
 // and FilePlayerMode's ModPlayer/S3mPlayer/XmPlayer -- the four biggest
 // allocations in the firmware (tracks[] ~131KB; the tracker-format players
-// 11KB/25.5KB/~64KB), never live at the same time. LooperMode's existing
+// ~21KB/~47KB/~72KB), never live at the same time. LooperMode's existing
 // "free tracks[] before opening a tracker file" gate (see
 // FilePlayerMode::openSelected()'s FILE_MOD/FILE_S3M/FILE_XM handling)
 // already guarantees tracks[] is down before any of the three players

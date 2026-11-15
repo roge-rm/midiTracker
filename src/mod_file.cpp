@@ -1,27 +1,19 @@
 #include "mod_file.h"
-#include "sd_card.h"
-#include "synth.h"
 #include "pins.h" // SAMPLE_RATE
 #include <string.h>
 #include <math.h>
 
 namespace {
 
-// Amiga period table, finetune 0, 3 octaves (36 notes) -- the standard
-// ProTracker constants. Other finetune values are derived from this base
-// row via the exponential pitch formula (see ModPlayer::applyFinetune())
-// rather than a second historical lookup table per finetune step --
-// musically equivalent, just not bit-for-bit identical to original Amiga
-// hardware period rounding.
+// Amiga period table, finetune 0, 3 octaves (36 notes). Other finetunes
+// are derived with the exponential pitch formula, see applyFinetune().
 const uint16_t BASE_PERIOD_TABLE[36] = {
     856, 808, 762, 720, 678, 640, 604, 570, 538, 508, 480, 453,
     428, 404, 381, 360, 339, 320, 302, 285, 269, 254, 240, 226,
     214, 202, 190, 180, 170, 160, 151, 143, 135, 127, 120, 113,
 };
 
-// Amiga hardware clock constant used to convert a period into a playback
-// rate -- the PAL value, the conventional choice essentially every MOD
-// player/tool uses regardless of the file's own origin.
+// PAL Amiga clock, period -> playback rate.
 const double AMIGA_PAL_CLOCK = 7093789.2;
 
 bool matchesFormatTag(const char* tag, int& outChannels) {
@@ -49,121 +41,47 @@ bool matchesFormatTag(const char* tag, int& outChannels) {
     return false;
 }
 
-// _mixShift budgets headroom for this many simultaneous full-volume
-// channels, capped well below MAX_MOD_CHANNELS (32, reachable via the
-// numeric "xxCH"/"xCHN" tag convention above) -- see _mixShift's own
-// comment for why a literal all-channels-at-once budget was needlessly
-// quiet for real music, and softClampMix() below for what absorbs the
-// (rare) moments actual content exceeds this budget. Same cap, same
-// reasoning, duplicated in S3mPlayer::load()/XmPlayer::load().
-//
-// No longer actually used to compute _mixShift (see load()) -- capping at
-// 8 channels only ever reduced the shift for files with *more* than 8
-// channels, so a classic 4-channel MOD (or any <=8-channel file) got zero
-// benefit from it and stayed shifted by its full literal channel count.
-// Real-hardware listening found tracker playback still noticeably quieter
-// than WAV/MIDI even after that fix -- by roughly the same factor a
-// 4-channel MOD's unchanged shift=2 (divide by 4) would predict. Kept
-// here only as a reminder of that dead end; _mixShift is unconditionally
-// 0 now, relying entirely on softClampMix() for safety (see its own
-// comment -- it hard-caps output regardless of how large the pre-clamp
-// sum gets, so this is safe at any channel count, just a tradeoff between
-// baseline loudness and how often busy/high-channel files lean on that
-// compression).
-const int MIX_SHIFT_TYPICAL_CHANNELS = 8;
-
-// Soft knee above SOFT_KNEE_START, hard ceiling at HARD_LIMIT -- same
-// shape and same constants as Synth's own softLimit() in synth.cpp (kept
-// independent here rather than shared/exported, matching this file's
-// existing convention of parallel, cross-referenced per-engine mixing
-// code rather than a shared utility). Replaces mixOneSample()'s previous
-// bare +-32767 clamp -- now that MIX_SHIFT_TYPICAL_CHANNELS budgets less
-// headroom than a literal all-channels-at-once bound, that clamp is more
-// likely to actually trigger, so it needs to compress gracefully instead
-// of cutting off flat.
-int32_t softClampMix(int32_t mix) {
-    int32_t sign = (mix < 0) ? -1 : 1;
-    int32_t mag = mix * sign;
-    if (mag > 24576) mag = 24576 + (mag - 24576) / 4;
-    if (mag > 32000) mag = 32000;
-    return mag * sign;
-}
-
 } // namespace
 
 bool ModPlayer::load(const char* path) {
     close();
     _error[0] = '\0';
 
-    if (!_file.open(path, O_RDONLY)) {
-        strncpy(_error, "could not open file", sizeof(_error) - 1);
-        _state = STATE_ERROR;
-        return false;
-    }
+    if (!_file.open(path, O_RDONLY)) return loadFail("could not open file");
 
+    _numInstruments = 0;
     _file.seekSet(20); // skip song name
     for (int i = 0; i < MAX_SAMPLES; i++) {
         uint8_t hdr[30];
-        if (_file.read(hdr, 30) != 30) {
-            strncpy(_error, "invalid MOD file", sizeof(_error) - 1);
-            _file.close();
-            _state = STATE_ERROR;
-            return false;
-        }
+        if (_file.read(hdr, 30) != 30) return loadFail("invalid MOD file");
         ModSample& s = _samples[i];
         s.length = (((uint32_t)hdr[22] << 8) | hdr[23]) * 2;
         int8_t rawFinetune = (int8_t)(hdr[24] & 0x0F) << 4; // low nibble, sign-extend via shift
         s.finetune = rawFinetune >> 4;
         s.volume = hdr[25] > 64 ? 64 : hdr[25];
-        // "No loop" is conventionally encoded as a loop length of 1 WORD
-        // (not 0), essentially universal in real files -- must be checked
-        // against the raw word value, before the *2 byte conversion.
-        // Checking the already-converted byte value (<=1) missed this
-        // near-every-file case entirely (word 1 -> byte 2, which passed
-        // the check), silently turning every such sample into an
-        // infinite 2-byte loop -- a stuck, near-silent buzz instead of
-        // the actual sample content on essentially any real-world file.
+        // "No loop" is a loop length of 1 word (or 0), checked on the raw
+        // word value before the *2 byte conversion.
         uint16_t rawLoopStart = ((uint16_t)hdr[26] << 8) | hdr[27];
         uint16_t rawLoopLen = ((uint16_t)hdr[28] << 8) | hdr[29];
         if (rawLoopLen <= 1) {
             s.loopStart = 0;
-            s.loopLength = 0;
+            s.loopEnd = 0;
         } else {
             s.loopStart = (uint32_t)rawLoopStart * 2;
-            s.loopLength = (uint32_t)rawLoopLen * 2;
+            s.loopEnd = s.loopStart + (uint32_t)rawLoopLen * 2;
         }
         if (s.length > 0) _numInstruments++;
     }
 
     uint8_t songLenByte, restartByte;
-    if (_file.read(&songLenByte, 1) != 1 || _file.read(&restartByte, 1) != 1) {
-        strncpy(_error, "invalid MOD file", sizeof(_error) - 1);
-        _file.close();
-        _state = STATE_ERROR;
-        return false;
-    }
+    if (_file.read(&songLenByte, 1) != 1 || _file.read(&restartByte, 1) != 1) return loadFail("invalid MOD file");
     _songLength = songLenByte > 128 ? 128 : songLenByte;
     _restartPos = restartByte;
 
-    if (_file.read(_orderTable, 128) != 128) {
-        strncpy(_error, "invalid MOD file", sizeof(_error) - 1);
-        _file.close();
-        _state = STATE_ERROR;
-        return false;
-    }
+    if (_file.read(_orderTable, 128) != 128) return loadFail("invalid MOD file");
 
     char tag[4];
-    if (_file.read(tag, 4) != 4 || !matchesFormatTag(tag, _numChannels)) {
-        strncpy(_error, "unsupported format", sizeof(_error) - 1);
-        _file.close();
-        _state = STATE_ERROR;
-        return false;
-    }
-
-    // See _mixShift's declaration and MIX_SHIFT_TYPICAL_CHANNELS's comment --
-    // no channel-count-based headroom shift at all anymore, relying
-    // entirely on softClampMix() for safety.
-    _mixShift = 0;
+    if (_file.read(tag, 4) != 4 || !matchesFormatTag(tag, _numChannels)) return loadFail("unsupported format");
 
     int maxPattern = 0;
     for (int i = 0; i < _songLength; i++) {
@@ -182,69 +100,15 @@ bool ModPlayer::load(const char* path) {
     for (int ch = 0; ch < _numChannels; ch++) {
         ModChannel& c = _channels[ch];
         c = ModChannel();
-        // Classic hard-panned Amiga convention: channels alternate
-        // L,R,R,L (indices 0,3,4,7,... hard left; 1,2,5,6,... hard right).
+        // Amiga hard panning: channels go L,R,R,L.
         c.pan = ((ch & 3) == 0 || (ch & 3) == 3) ? 0 : 255;
+        c.mixPan = c.pan;
     }
+    attachVoices(&_channels[0], sizeof(ModChannel), _numChannels, &_chunks[0][0], CHUNK_FRAMES);
 
-    _orderPos = 0;
-    // -1, not 0: advanceRow() (see its own comment) only ever reaches row
-    // 0 via `_row++` from -1 on the very first call -- starting at 0
-    // meant that first call incremented straight past it to row 1,
-    // silently skipping row 0 of the whole song every time it's freshly
-    // opened (though not on subsequent loop-arounds, which set _row=0
-    // directly). Root cause of reported "missing"/"no sound" files where
-    // the skipped row happened to carry volume/instrument setup.
-    _row = -1;
-    _tick = 0;
-    _speed = 6;
-    _tempo = 125;
-    _samplesUntilNextTick = ticksToSamples(_tempo);
-    _patternBreakPending = false;
-    _positionJumpPending = false;
-
-    _elapsedMsFrozen = 0;
-    _lastResumeMicros = micros();
-    _state = STATE_PAUSED;
+    _globalVolume = 64;
+    resetSequencer(6, 125);
     return true;
-}
-
-void ModPlayer::close() {
-    if (_file) _file.close();
-    Synth::wavStreamReset();
-    _state = STATE_IDLE;
-}
-
-void ModPlayer::play() {
-    if (_state != STATE_PAUSED) return;
-    _lastResumeMicros = micros();
-    _state = STATE_PLAYING;
-    // Pre-fill the ring buffer before the I2S consumer starts pulling
-    // from it -- same fix XmPlayer::play()/S3mPlayer::play() already
-    // needed (see S3mPlayer::play()'s comment for the full reasoning).
-    for (int i = 0; i < 128 && Synth::wavStreamFree() > 0; i++) update();
-    Synth::wavStreamSetActive(true);
-}
-
-void ModPlayer::pause() {
-    if (_state != STATE_PLAYING) return;
-    _elapsedMsFrozen += (micros() - _lastResumeMicros) / 1000;
-    _state = STATE_PAUSED;
-    Synth::wavStreamSetActive(false);
-}
-
-void ModPlayer::stop() {
-    close();
-}
-
-uint32_t ModPlayer::elapsedMs() const {
-    uint32_t extra = (_state == STATE_PLAYING) ? (micros() - _lastResumeMicros) / 1000 : 0;
-    return _elapsedMsFrozen + extra;
-}
-
-uint32_t ModPlayer::ticksToSamples(uint16_t tempo) {
-    if (tempo == 0) tempo = 125;
-    return (uint32_t)((double)SAMPLE_RATE * 2.5 / (double)tempo);
 }
 
 uint16_t ModPlayer::periodForNote(int noteIndex) {
@@ -265,7 +129,7 @@ int ModPlayer::nearestNoteIndexForPeriod(uint16_t period) {
 
 uint16_t ModPlayer::applyFinetune(uint16_t basePeriod, int8_t finetune) {
     if (finetune == 0) return basePeriod;
-    double factor = pow(2.0, -(double)finetune / 96.0); // finetune is in 1/8-semitone units, 96 == 12*8
+    double factor = pow(2.0, -(double)finetune / 96.0); // finetune is in 1/8 semitones, 96 == 12*8
     double result = (double)basePeriod * factor;
     if (result < 1.0) result = 1.0;
     return (uint16_t)(result + 0.5);
@@ -274,109 +138,51 @@ uint16_t ModPlayer::applyFinetune(uint16_t basePeriod, int8_t finetune) {
 void ModPlayer::recomputeStep(ModChannel& c) {
     if (c.period == 0) { c.sampleStep16 = 0; return; }
     double hz = AMIGA_PAL_CLOCK / ((double)c.period * 2.0);
-    c.sampleStep16 = (uint32_t)((hz / (double)SAMPLE_RATE) * 65536.0);
+    c.sampleStep16 = limitStep((uint32_t)((hz / (double)SAMPLE_RATE) * 65536.0));
 }
 
-int16_t ModPlayer::readRawSample(ModChannel& c, const ModSample& s, uint32_t index) {
-    if (c.looping && index >= s.loopStart + s.loopLength && s.loopLength > 0) {
-        index = s.loopStart + ((index - s.loopStart) % s.loopLength);
-    }
-    if (index >= s.length) return 0; // ran off the end of a non-looping sample -- silence
+// Reads the CHUNK_FRAMES-aligned block holding `index`.
+int16_t ModPlayer::refillChunk(TrackerVoice& v, uint32_t index) {
+    const TrackerSample& s = *v.smp;
+    uint32_t start = index & ~(uint32_t)(CHUNK_FRAMES - 1);
+    uint32_t len = CHUNK_FRAMES;
+    if (start + len > s.length) len = s.length - start;
+    v.chunkSmp = v.smp;
+    v.chunkStart = start;
+    // Frames past a short read or a failed seek stay zero and cached, so a
+    // truncated sample doesn't hit the SD card on every frame.
+    v.chunkLen = len;
+    int n = 0;
+    if (_file.seekSet(s.fileOffset + start)) n = _file.read(_rawScratch, len);
+    uint32_t got = n > 0 ? (uint32_t)n : 0;
+    for (uint32_t i = 0; i < got; i++) v.chunkBuf[i] = (int16_t)((int8_t)_rawScratch[i]) << 8;
+    for (uint32_t i = got; i < len; i++) v.chunkBuf[i] = 0;
+    return v.chunkBuf[index - start];
+}
 
-    if (c.chunkLen == 0 || index < c.chunkStart || index >= c.chunkStart + c.chunkLen) {
-        uint32_t readLen = ModChannel::CHUNK_SIZE;
-        if (index + readLen > s.length) readLen = s.length - index;
-        _file.seekSet(s.fileOffset + index);
-        int n = _file.read(c.chunkBuf, readLen);
-        c.chunkStart = index;
-        c.chunkLen = (n > 0) ? (uint32_t)n : 0;
-        if (c.chunkLen == 0) return 0;
-    }
-    return (int16_t)((int8_t)c.chunkBuf[index - c.chunkStart]) << 8;
+void ModPlayer::setSample(ModChannel& c, uint8_t sampleNum) {
+    c.sample = sampleNum;
+    c.smp = &_samples[sampleNum - 1];
 }
 
 void ModPlayer::triggerNote(int ch) {
     ModChannel& c = _channels[ch];
-    c.samplePos16 = 0;
-    c.srcIndex = 0;
-    c.chunkLen = 0; // invalidate the read-ahead cache -- new position
-    c.havePair = false;
     recomputeStep(c);
-
-    if (c.sample >= 1 && c.sample <= MAX_SAMPLES) {
-        const ModSample& s = _samples[c.sample - 1];
-        c.looping = s.loopLength > 1;
-        if (s.length > 0) {
-            c.lastSrcSample = readRawSample(c, s, 0);
-            c.nextSrcSample = readRawSample(c, s, 1);
-            c.havePair = true;
-        }
-    }
+    if (c.smp) c.looping = (c.smp->loopEnd - c.smp->loopStart) > 1;
+    startVoiceAt(c, 0);
 }
 
-int16_t ModPlayer::readChannelSample(ModChannel& c) {
-    if (!c.havePair || c.sampleStep16 == 0 || c.sample < 1) return 0;
-    const ModSample& s = _samples[c.sample - 1];
-
-    uint16_t frac16 = (uint16_t)(c.samplePos16 & 0xFFFF);
-    int32_t diff = (int32_t)c.nextSrcSample - (int32_t)c.lastSrcSample;
-    int16_t interpolated = (int16_t)(c.lastSrcSample + ((diff * (int32_t)frac16) >> 16));
-
-    c.samplePos16 += c.sampleStep16;
-    while (c.havePair && c.samplePos16 >= 0x10000) {
-        c.samplePos16 -= 0x10000;
-        c.srcIndex++;
-        if (c.looping && s.loopLength > 0 && c.srcIndex >= s.loopStart + s.loopLength) {
-            c.srcIndex = s.loopStart + ((c.srcIndex - (s.loopStart + s.loopLength)) % s.loopLength);
-        } else if (!c.looping && c.srcIndex >= s.length) {
-            c.havePair = false; // ran off the end -- channel goes silent until re-triggered
-            break;
-        }
-        c.lastSrcSample = c.nextSrcSample;
-        c.nextSrcSample = readRawSample(c, s, c.srcIndex + 1);
-    }
-
-    // >>6 instead of /64 -- volume is always clamped to 0-64, same
-    // real-hardware-motivated fix as S3mPlayer::readChannelSample() (see
-    // its comment) -- a genuine signed division at the hottest call site
-    // in the whole player, on hardware with no divide instruction at all.
-    return (int16_t)(((int32_t)interpolated * (int32_t)c.volume) >> 6);
-}
-
-void ModPlayer::mixOneSample(int16_t& outL, int16_t& outR) {
-    int32_t mixL = 0, mixR = 0;
+void ModPlayer::tickEnd() {
     for (int ch = 0; ch < _numChannels; ch++) {
         ModChannel& c = _channels[ch];
-        if (c.period == 0 || !c.havePair) continue;
-        int16_t s = readChannelSample(c);
-        // >>8 instead of /255 -- see S3mPlayer::mixOneSample()'s identical
-        // comment (no hardware divide on the Cortex-M0+, and /255 isn't
-        // even a power of 2 -- a genuine full software division routine,
-        // twice, every active channel, every sample).
-        mixL += (s * (int32_t)(255 - c.pan)) >> 8;
-        mixR += (s * (int32_t)c.pan) >> 8;
+        c.mixVolume = c.volume;
+        c.mixPan = c.pan;
     }
-    // _mixShift is always 0 now (see its declaration) -- this shift is a
-    // no-op, kept only so the field still does something if a future
-    // channel-count-based case ever needs it back. Even with the shift
-    // removed entirely, real-hardware A/B listening against WAV/MIDI still
-    // found tracker playback a bit quiet, so a further +25% makeup gain
-    // here closes most of that remaining gap. softClampMix() below absorbs
-    // the rare moments this pushes things over budget.
-    mixL = mixL >> _mixShift;
-    mixR = mixR >> _mixShift;
-    mixL += mixL >> 2;
-    mixR += mixR >> 2;
-    mixL = softClampMix(mixL);
-    mixR = softClampMix(mixR);
-    outL = (int16_t)mixL;
-    outR = (int16_t)mixR;
 }
 
 void ModPlayer::advanceRow() {
-    // Per-row-only effect memory resets before reprocessing this row's
-    // cells -- these are scoped to the row that specifies them, unlike
-    // porta/vibrato/volume-slide speed, which persist until changed.
+    // Per-row effect state resets before this row's cells; porta/vibrato/
+    // slide speeds persist until changed.
     for (int ch = 0; ch < _numChannels; ch++) {
         ModChannel& c = _channels[ch];
         c.arpeggioParam = 0;
@@ -385,21 +191,7 @@ void ModPlayer::advanceRow() {
         c.noteCutParam = 0xFF;
     }
 
-    if (_patternBreakPending || _positionJumpPending) {
-        int nextOrderPos = _positionJumpPending ? _positionJumpTarget : (_orderPos + 1);
-        int nextRow = _patternBreakPending ? _patternBreakRow : 0;
-        if (nextRow < 0 || nextRow > 63) nextRow = 0;
-        _orderPos = nextOrderPos;
-        _row = nextRow;
-        _patternBreakPending = false;
-        _positionJumpPending = false;
-    } else {
-        _row++;
-        if (_row >= 64) {
-            _row = 0;
-            _orderPos++;
-        }
-    }
+    stepPosition(64, 63);
 
     if (_orderPos >= _songLength || _orderPos < 0) {
         if (_restartPos >= 0 && _restartPos < _songLength) {
@@ -412,14 +204,14 @@ void ModPlayer::advanceRow() {
     }
 
     int patternNum = _orderTable[_orderPos];
-    if (patternNum >= _numPatterns) patternNum = 0; // defensive -- shouldn't happen for a valid file
+    if (patternNum >= _numPatterns) patternNum = 0;
 
     uint8_t rowBuf[MAX_MOD_CHANNELS * 4];
     uint32_t rowOffset = _patternDataStart + (uint32_t)patternNum * _numChannels * 64 * 4 + (uint32_t)_row * _numChannels * 4;
     _file.seekSet(rowOffset);
     int need = _numChannels * 4;
     if (_file.read(rowBuf, need) != need) {
-        _state = STATE_DONE; // truncated/corrupt file mid-song -- stop cleanly rather than mis-play garbage
+        _state = STATE_DONE; // truncated file mid-song
         return;
     }
 
@@ -443,7 +235,7 @@ void ModPlayer::processCellTriggers(int ch, const uint8_t cell[4]) {
     // regardless of a pending note delay -- only the note trigger itself
     // is deferred.
     if (sampleNum >= 1 && sampleNum <= MAX_SAMPLES) {
-        c.sample = sampleNum;
+        setSample(c, sampleNum);
         c.volume = _samples[sampleNum - 1].volume;
     }
 
@@ -492,15 +284,7 @@ void ModPlayer::processCellTriggers(int ch, const uint8_t cell[4]) {
             if (param != 0) c.sampleOffsetParam = param;
             if (period != 0 && !isTonePorta && c.sample >= 1 && c.sample <= MAX_SAMPLES) {
                 uint32_t off = (uint32_t)c.sampleOffsetParam << 8;
-                const ModSample& s = _samples[c.sample - 1];
-                if (off < s.length) {
-                    c.srcIndex = off;
-                    c.samplePos16 = 0;
-                    c.chunkLen = 0;
-                    c.lastSrcSample = readRawSample(c, s, off);
-                    c.nextSrcSample = readRawSample(c, s, off + 1);
-                    c.havePair = true;
-                }
+                if (off < c.smp->length) startVoiceAt(c, off);
             }
             break;
         }
@@ -555,22 +339,7 @@ void ModPlayer::processExtendedTickZero(int ch, uint8_t param) {
             }
             break;
         case 0x6: // Pattern loop
-            if (val == 0) {
-                c.patternLoopRow = (uint8_t)_row;
-            } else {
-                if (c.patternLoopCount == 0) c.patternLoopCount = val;
-                else c.patternLoopCount--;
-                if (c.patternLoopCount > 0) {
-                    _patternBreakPending = true;
-                    _patternBreakRow = c.patternLoopRow;
-                    // Stay on the current pattern -- a loop-back is a row
-                    // jump within THIS pattern, not a position advance,
-                    // so cancel the implicit "advance to next order
-                    // position" pattern break would otherwise imply.
-                    _positionJumpPending = true;
-                    _positionJumpTarget = _orderPos;
-                }
-            }
+            patternLoop(c.patternLoopRow, c.patternLoopCount, val);
             break;
         case 0x8: // Set panning, coarse (0-15 -> 0-255)
             c.pan = (uint8_t)(val * 17);
@@ -703,46 +472,3 @@ void ModPlayer::processTickEffects() {
     }
 }
 
-void ModPlayer::advanceTick() {
-    _tick++;
-    if (_tick >= _speed) {
-        _tick = 0;
-        if (_patternDelayRepeatsLeft > 0) {
-            // EEy: hold on the current row for one more full tick-cycle
-            // instead of advancing -- per-tick effects (vibrato/
-            // portamento/etc, via processTickEffects()) keep applying
-            // through these extra cycles same as any other row, notes
-            // just don't re-trigger.
-            _patternDelayRepeatsLeft--;
-        } else {
-            advanceRow();
-        }
-    } else {
-        processTickEffects();
-    }
-}
-
-void ModPlayer::update() {
-    if (_state == STATE_IDLE || _state == STATE_ERROR || _state == STATE_DONE) return;
-
-    // Was 512 -- lowered to match XmPlayer/S3mPlayer::update()'s identical
-    // fix (see S3mPlayer::update()'s comment for the full real-hardware
-    // reasoning: bounds the worst-case single-call latency a burst of
-    // several channels needing a refill at once can cost).
-    const size_t MAX_FRAMES_PER_TICK_CALL = 128;
-    size_t produced = 0;
-    while (produced < MAX_FRAMES_PER_TICK_CALL) {
-        if (Synth::wavStreamFree() == 0) break;
-        if (_samplesUntilNextTick == 0) {
-            advanceTick();
-            if (_state == STATE_DONE) break;
-            _samplesUntilNextTick = ticksToSamples(_tempo); // recompute in case Fxx just changed tempo
-        }
-        int16_t l, r;
-        mixOneSample(l, r);
-        int16_t frame[2] = { l, r };
-        if (Synth::wavStreamWrite(frame, 1) == 0) break;
-        _samplesUntilNextTick--;
-        produced++;
-    }
-}

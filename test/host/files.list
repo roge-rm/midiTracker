@@ -1,0 +1,17 @@
+# Test files for the render harness, one path per line (read-only, not in the repo).
+# trackertunes/ is relative to the project root; generated files are added by make.
+/home/dan/.platformio/packages/framework-arduinopico/pico-sdk/lib/btstack/3rd-party/hxcmod-player/mods/AXELF.MOD
+/home/dan/.platformio/packages/framework-arduinopico/pico-sdk/lib/btstack/3rd-party/hxcmod-player/mods/IRONMAN.MOD
+/home/dan/.platformio/packages/framework-arduinopico/pico-sdk/lib/btstack/3rd-party/hxcmod-player/mods/cartoon-dreams_n_fantasies.mod
+/home/dan/.platformio/packages/framework-arduinopico/pico-sdk/lib/btstack/3rd-party/hxcmod-player/mods/nao-deceased_by_disease.mod
+/home/dan/sync/music/qy100/MidiPlayer6/STRANGLE.XM
+trackertunes/various/Ronny Pries - Ping Pong.mod
+trackertunes/artists/randall/Randall - Move Your Body.mod
+trackertunes/artists/dune/Dune - White Plastic.s3m
+trackertunes/artists/cmd/CMD - The Reflex.s3m
+trackertunes/netlabels/five musicians/Necros - Point Of Departure.s3m
+trackertunes/artists/madwreck/Madwreck - Can't Wait.xm
+trackertunes/various/Spatulaman - Fungus.xm
+trackertunes/various/Kenetic & Seenix - Our Little Fantasy.xm
+trackertunes/netlabels/shit wank records/Pandemonium - Society's Enemy.mod
+trackertunes/artists/noxw/Noxw & Svl - Anchorage 4.9.mod

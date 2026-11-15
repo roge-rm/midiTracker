@@ -1,130 +1,32 @@
 #include "s3m_file.h"
-#include "sd_card.h"
-#include "synth.h"
 #include "pins.h" // SAMPLE_RATE
 #include <string.h>
 #include <math.h>
 
 namespace {
 
-// Same Amiga hardware clock constant ModPlayer uses -- see this class's
-// header comment on why S3M's C2SPD-based pitch is converted through an
-// equivalent pseudo-period rather than handled with its own parallel
-// semitone-based math.
-// float, not double -- this feeds s3mNoteToPeriod()/recomputeStep(), both
-// called on every note trigger (and recomputeStep() again on every active
-// portamento/vibrato/arpeggio tick). The RP2040's Cortex-M0+ has no
-// hardware FPU at all, so double-precision math here is fully software-
-// emulated and meaningfully slower than single-precision float would be
-// for the same operations -- on a file with many simultaneous triggers
-// (S3M's usual 12-16 channels vs MOD's 4, several of which can retrigger
-// on the very same row), that cost concentrates right at the busiest
-// musical moments, which is exactly when audible glitches showed up.
-// Periods are integers 0-65535 either way, so float's ~7 significant
-// digits are already far more precision than the result needs.
+// Same Amiga clock MOD uses; S3M pitch goes through a pseudo-period.
+// float, not double: the M0+ has no FPU and this runs on every trigger and slide tick.
 const float AMIGA_PAL_CLOCK = 7093789.2f;
 
-// All S3M file-position pointers (instrument/pattern parapointers, and
-// the sample-data pointer within an instrument header) are stored as
-// actualOffset/16 -- multiply back by 16 to recover the real position.
+// S3M file pointers are stored as offset/16.
 inline uint32_t paraToOffset(uint32_t para) { return para * 16; }
 
-// _mixShift budgets headroom for this many simultaneous full-volume
-// channels, capped well below MAX_CHANNELS (20) -- see _mixShift's own
-// comment for why a literal all-channels-at-once budget was needlessly
-// quiet for real music, and softClampMix() below for what absorbs the
-// (rare) moments actual content exceeds this budget. Same cap, same
-// reasoning, duplicated in ModPlayer::load()/XmPlayer::load().
-//
-// No longer actually used to compute _mixShift (see load()) -- capping at
-// 8 channels only ever reduced the shift for files with *more* than 8
-// channels, so an <=8-channel file got zero benefit and stayed shifted by
-// its full literal channel count. Real-hardware listening found tracker
-// playback still noticeably quieter than WAV/MIDI even after that fix.
-// Kept here only as a reminder of that dead end; _mixShift is
-// unconditionally 0 now, relying entirely on softClampMix() for safety.
-const int MIX_SHIFT_TYPICAL_CHANNELS = 8;
-
-// Soft knee above SOFT_KNEE_START, hard ceiling at HARD_LIMIT -- same
-// shape and same constants as Synth's own softLimit() in synth.cpp (kept
-// independent here rather than shared/exported, matching this file's
-// existing convention of parallel, cross-referenced per-engine mixing
-// code rather than a shared utility). Replaces mixOneSample()'s previous
-// bare +-32767 clamp -- now that MIX_SHIFT_TYPICAL_CHANNELS budgets less
-// headroom than a literal all-channels-at-once bound, that clamp is more
-// likely to actually trigger, so it needs to compress gracefully instead
-// of cutting off flat.
-int32_t softClampMix(int32_t mix) {
-    int32_t sign = (mix < 0) ? -1 : 1;
-    int32_t mag = mix * sign;
-    if (mag > 24576) mag = 24576 + (mag - 24576) / 4;
-    if (mag > 32000) mag = 32000;
-    return mag * sign;
-}
-
 } // namespace
-
-// -- Temporary real-hardware diagnostics --------------------------------
-// See update()'s own comment further down for the full story -- added to
-// test "The Reflex.s3m"'s audible slowdown+crackling in a busy passage.
-// Removed once no longer needed.
-//
-// Silenced (not deleted) for now -- flip back to true to get the once/sec
-// Serial print back; the counters themselves keep accumulating either way
-// (cheap, harmless), only the print+reset is skipped while this is false.
-const bool DIAG_PRINT_ENABLED = false;
-uint32_t g_s3mDiagCalls = 0, g_s3mDiagBusyUs = 0, g_s3mDiagMaxUs = 0;
-uint32_t g_s3mDiagMinFree = 0xFFFFFFFF;
-uint32_t g_s3mDiagLastUnderrunSamples = 0;
-uint32_t g_s3mDiagChunkHits = 0, g_s3mDiagChunkMisses = 0, g_s3mDiagChunkUs = 0;
-uint32_t g_s3mDiagMixUs = 0;
-uint32_t g_s3mDiagActiveChSum = 0, g_s3mDiagActiveChSamples = 0;
 
 bool S3mPlayer::load(const char* path) {
     close();
     _error[0] = '\0';
 
-    if (!_file.open(path, O_RDONLY)) {
-        strncpy(_error, "could not open file", sizeof(_error) - 1);
-        _state = STATE_ERROR;
-        return false;
-    }
-    // See _patternFile's declaration -- a second, independent handle to
-    // the same file, dedicated to pattern-data reads during playback.
-    if (!_patternFile.open(path, O_RDONLY)) {
-        strncpy(_error, "could not open file", sizeof(_error) - 1);
-        _file.close();
-        _state = STATE_ERROR;
-        return false;
-    }
+    if (!_file.open(path, O_RDONLY)) return loadFail("could not open file");
+    if (!_patternFile.open(path, O_RDONLY)) return loadFail("could not open file");
 
-    // The fixed header is 96 bytes (offsets 0-95): 28-byte name, 1-byte
-    // DOS EOF marker, 1-byte type, 2 reserved, then OrdNum/InsNum/PatNum/
-    // Flags/Cwtv/Ffi (2 bytes each) through offset 44, "SCRM" (4 bytes)
-    // through 48, 6 single-byte fields (globalVol/speed/tempo/master
-    // vol/ultra-click/default-pan) through 54, 8 reserved bytes, a
-    // 2-byte "special" pointer (unused here) through 64, and finally the
-    // 32-byte channel settings table at 64-95. The order table begins
-    // immediately after, at offset 96 -- reading any more or less here
-    // shifts every subsequent parapointer/order-table read by that same
-    // amount, corrupting pattern offsets (this was originally miscounted
-    // as 98 bytes with channels at 66, which desynced everything after
-    // it and sent decodeRow() scanning garbage pattern data).
+    // The fixed header is 96 bytes: name, type, counts and flags, "SCRM"
+    // at 44, global volume/speed/tempo/default pan at 48-53, and the
+    // 32-byte channel settings at 64-95. The order table follows at 96.
     uint8_t hdr[96];
-    if (_file.read(hdr, 96) != 96) {
-        strncpy(_error, "invalid S3M file", sizeof(_error) - 1);
-        _file.close();
-        _patternFile.close();
-        _state = STATE_ERROR;
-        return false;
-    }
-    if (hdr[29] != 16 || memcmp(hdr + 44, "SCRM", 4) != 0) {
-        strncpy(_error, "unsupported format", sizeof(_error) - 1);
-        _file.close();
-        _patternFile.close();
-        _state = STATE_ERROR;
-        return false;
-    }
+    if (_file.read(hdr, 96) != 96) return loadFail("invalid S3M file");
+    if (hdr[29] != 16 || memcmp(hdr + 44, "SCRM", 4) != 0) return loadFail("unsupported format");
 
     uint16_t ordNumReal = (uint16_t)hdr[32] | ((uint16_t)hdr[33] << 8);
     uint16_t insNumReal = (uint16_t)hdr[34] | ((uint16_t)hdr[35] << 8);
@@ -140,36 +42,20 @@ bool S3mPlayer::load(const char* path) {
     // Sanity bound against a corrupt file claiming an absurd count --
     // real .s3m files are always far under this (Scream Tracker 3 itself
     // caps instruments at 99, patterns at 100).
-    if (ordNumReal > 4096 || insNumReal > 4096 || patNumReal > 4096) {
-        strncpy(_error, "invalid S3M file", sizeof(_error) - 1);
-        _file.close();
-        _patternFile.close();
-        _state = STATE_ERROR;
-        return false;
-    }
+    if (ordNumReal > 4096 || insNumReal > 4096 || patNumReal > 4096) return loadFail("invalid S3M file");
 
     _numChannels = 0;
     for (int i = 0; i < MAX_CHANNELS; i++) {
         _channelEnabled[i] = (hdr[64 + i] != 0xFF);
         if (_channelEnabled[i]) _numChannels++;
     }
-    // See _mixShift's declaration and MIX_SHIFT_TYPICAL_CHANNELS's comment --
-    // no channel-count-based headroom shift at all anymore, relying
-    // entirely on softClampMix() for safety.
-    _mixShift = 0;
 
     // Order table: bulk-read what fits in _orderTable, skip the rest
     // (still needed to keep the file position correct for what follows).
     int ordNum = (int)(ordNumReal < (uint16_t)MAX_ORDERS ? ordNumReal : (uint16_t)MAX_ORDERS);
-    if (_file.read(_orderTable, ordNum) != ordNum) {
-        strncpy(_error, "invalid S3M file", sizeof(_error) - 1);
-        _file.close();
-        _patternFile.close();
-        _state = STATE_ERROR;
-        return false;
-    }
+    if (_file.read(_orderTable, ordNum) != ordNum) return loadFail("invalid S3M file");
     if (ordNumReal > ordNum) _file.seekCur(ordNumReal - ordNum);
-    _orderCount = ordNum;
+    _songLength = ordNum;
 
     // Instrument parapointers (2 bytes each, LE).
     uint16_t insParapointers[MAX_INSTRUMENTS] = {0};
@@ -253,73 +139,17 @@ bool S3mPlayer::load(const char* path) {
         if (havePanTable && (panTable[ch] & 0x20)) {
             c.pan = (uint8_t)((panTable[ch] & 0x0F) * 17);
         } else {
-            c.pan = 128; // center by default -- S3M's own panning effects are first-class,
-                         // unlike MOD's convention-based hard-panning, so there's less need
-                         // to guess at a per-channel-type default here
+            c.pan = 128; // centre
         }
+        c.mixPan = c.pan;
     }
+    attachVoices(&_channels[0], sizeof(S3mChannel), MAX_CHANNELS, &_chunks[0][0], CHUNK_FRAMES);
 
     _globalVolume = globalVol > 64 ? 64 : globalVol;
-    _speed = initialSpeed > 0 ? initialSpeed : 6;
-    _tempo = initialTempo > 0 ? initialTempo : 125;
-
-    _orderPos = 0;
-    _row = -1; // see currentRow()'s comment -- avoids skipping row 0 of the first pattern, same ModPlayer fix
-    _tick = 0;
-    _samplesUntilNextTick = ticksToSamples(_tempo);
-    _patternDelayRepeatsLeft = 0;
-    _patternBreakPending = false;
-    _positionJumpPending = false;
     _openPatternNum = -1;
     _rowOffsetsValid = 0;
-
-    _elapsedMsFrozen = 0;
-    _lastResumeMicros = micros();
-    _state = STATE_PAUSED;
+    resetSequencer(initialSpeed > 0 ? initialSpeed : 6, initialTempo > 0 ? initialTempo : 125);
     return true;
-}
-
-void S3mPlayer::close() {
-    if (_file) _file.close();
-    if (_patternFile) _patternFile.close();
-    Synth::wavStreamReset();
-    _state = STATE_IDLE;
-}
-
-void S3mPlayer::play() {
-    if (_state != STATE_PAUSED) return;
-    _lastResumeMicros = micros();
-    _state = STATE_PLAYING;
-    // Pre-fill the ring buffer before the I2S consumer starts pulling
-    // from it -- same fix XmPlayer::play() already needed tonight, for
-    // the same reason: without this, the consumer can start draining a
-    // completely empty ring before this class's own next update() call
-    // even happens (the caller's next main-loop iteration, itself often
-    // delayed further by a synchronous screen redraw), a guaranteed
-    // underrun window. update() safely no-ops once the ring is full.
-    for (int i = 0; i < 128 && Synth::wavStreamFree() > 0; i++) update();
-    Synth::wavStreamSetActive(true);
-}
-
-void S3mPlayer::pause() {
-    if (_state != STATE_PLAYING) return;
-    _elapsedMsFrozen += (micros() - _lastResumeMicros) / 1000;
-    _state = STATE_PAUSED;
-    Synth::wavStreamSetActive(false);
-}
-
-void S3mPlayer::stop() {
-    close();
-}
-
-uint32_t S3mPlayer::elapsedMs() const {
-    uint32_t extra = (_state == STATE_PLAYING) ? (micros() - _lastResumeMicros) / 1000 : 0;
-    return _elapsedMsFrozen + extra;
-}
-
-uint32_t S3mPlayer::ticksToSamples(uint16_t tempo) {
-    if (tempo == 0) tempo = 125;
-    return (uint32_t)((double)SAMPLE_RATE * 2.5 / (double)tempo);
 }
 
 uint16_t S3mPlayer::s3mNoteToPeriod(uint8_t note, uint32_t c2spd) {
@@ -337,83 +167,54 @@ uint16_t S3mPlayer::s3mNoteToPeriod(uint8_t note, uint32_t c2spd) {
 void S3mPlayer::recomputeStep(S3mChannel& c) {
     if (c.period == 0) { c.sampleStep16 = 0; return; }
     float hz = AMIGA_PAL_CLOCK / ((float)c.period * 2.0f);
-    c.sampleStep16 = (uint32_t)((hz / (float)SAMPLE_RATE) * 65536.0f);
+    c.sampleStep16 = stepForHz(hz);
 }
 
-// __not_in_flash_func: places this function's code in RAM instead of
-// flash. RP2040 executes flash code through a small (16KB) XIP cache;
-// this is one of the three hottest functions in the mix pipeline (called
-// up to ~10-20 times per output sample under full polyphony), so cache
-// misses there are paid on every call. RAM headroom is tight, but these
-// are small functions -- worth the trade given the diagnostic data
-// showed ~72% of per-sample time going to unexplained "pure compute"
-// cost that -O2 alone barely touched.
-int16_t __not_in_flash_func(S3mPlayer::readRawSample)(S3mChannel& c, const S3mSample& s, uint32_t index) {
-    // c.looping is only ever set true when s.loopEnd > s.loopStart (see
-    // restartSamplePosition()), so re-checking that here on every call is
-    // redundant -- trimmed since this runs in the hottest per-sample path.
-    if (c.looping && index >= s.loopEnd) {
-        index = s.loopStart + ((index - s.loopEnd) % (s.loopEnd - s.loopStart));
-    }
-    if (index >= s.length) return 0;
-
+// Reads the aligned block of CHUNK_BYTES holding `index` and converts it
+// to signed 16-bit.
+int16_t __not_in_flash_func(S3mPlayer::refillChunk)(TrackerVoice& v, uint32_t index) {
+    const S3mSample& s = static_cast<const S3mSample&>(*v.smp);
     uint32_t bytesPerSample = s.is16Bit ? 2 : 1;
-    if (c.chunkLen == 0 || c.chunkSample != c.sample ||
-        index < c.chunkStart || index >= c.chunkStart + c.chunkLen) {
-        g_s3mDiagChunkMisses++;
-        uint32_t __diagStart = micros();
-        uint32_t readFrames = S3mChannel::CHUNK_SIZE / bytesPerSample;
-        if (index + readFrames > s.length) readFrames = s.length - index;
-        _file.seekSet(s.fileOffset + index * bytesPerSample);
-        int n = _file.read(c.chunkBuf, readFrames * bytesPerSample);
-        c.chunkStart = index;
-        c.chunkLen = (n > 0) ? ((uint32_t)n / bytesPerSample) : 0;
-        c.chunkSample = c.sample;
-        g_s3mDiagChunkUs += micros() - __diagStart;
-        if (c.chunkLen == 0) return 0;
-    } else {
-        g_s3mDiagChunkHits++;
-    }
-
-    uint32_t pos = (index - c.chunkStart) * bytesPerSample;
+    uint32_t frames = CHUNK_BYTES / bytesPerSample;
+    uint32_t start = index & ~(frames - 1);
+    uint32_t len = frames;
+    if (start + len > s.length) len = s.length - start;
+    v.chunkSmp = v.smp;
+    v.chunkStart = start;
+    // Frames past a short read or a failed seek stay zero and cached, so a
+    // truncated sample doesn't hit the SD card on every frame.
+    v.chunkLen = len;
+    int n = 0;
+    if (_file.seekSet(s.fileOffset + start * bytesPerSample)) n = _file.read(_rawScratch, len * bytesPerSample);
+    uint32_t got = n > 0 ? (uint32_t)n / bytesPerSample : 0;
+    int16_t* out = v.chunkBuf;
     if (s.is16Bit) {
-        // Read as unsigned first -- subtracting the bias must happen in
-        // a wide-enough type before narrowing to int16_t, not after
-        // already reinterpreting the bits as signed (which wraps values
-        // >= 32768 the wrong way for the unsigned/"new format" case).
-        uint16_t u = (uint16_t)(uint8_t)c.chunkBuf[pos] | ((uint16_t)(uint8_t)c.chunkBuf[pos + 1] << 8);
-        return s.isSigned ? (int16_t)u : (int16_t)((int32_t)u - 32768);
+        for (uint32_t i = 0; i < got; i++) {
+            // Unbias in a wide type before narrowing.
+            uint16_t u = (uint16_t)_rawScratch[i * 2] | ((uint16_t)_rawScratch[i * 2 + 1] << 8);
+            out[i] = s.isSigned ? (int16_t)u : (int16_t)((int32_t)u - 32768);
+        }
     } else {
-        uint8_t raw = (uint8_t)c.chunkBuf[pos];
-        // Unsigned 8-bit (the common, "new format" case): center then
-        // scale up, same convention WavPlayer already uses for unsigned
-        // WAV PCM. Signed 8-bit (old format, rare): already centered,
-        // just scale up.
-        int16_t centered = s.isSigned ? (int8_t)raw : (int16_t)((int)raw - 128);
-        return (int16_t)(centered << 8);
+        for (uint32_t i = 0; i < got; i++) {
+            uint8_t raw = _rawScratch[i];
+            int16_t centred = s.isSigned ? (int8_t)raw : (int16_t)((int)raw - 128);
+            out[i] = (int16_t)(centred << 8);
+        }
     }
+    for (uint32_t i = got; i < len; i++) out[i] = 0;
+    return out[index - start];
+}
+
+void S3mPlayer::setSample(S3mChannel& c, uint8_t sample) {
+    c.sample = sample;
+    c.smp = &_samples[sample - 1];
 }
 
 void S3mPlayer::restartSamplePosition(int ch) {
     S3mChannel& c = _channels[ch];
-    c.samplePos16 = 0;
-    c.srcIndex = 0;
-    // Deliberately does NOT clear chunkLen/chunkBuf here -- see
-    // S3mChannel::chunkSample's comment. readRawSample() re-validates the
-    // cache against c.sample itself, so a same-sample retrigger reuses
-    // the existing cache for free, while a genuine sample change still
-    // invalidates correctly.
-    c.havePair = false;
-
-    if (c.sample >= 1 && c.sample <= MAX_INSTRUMENTS) {
-        const S3mSample& s = _samples[c.sample - 1];
-        c.looping = s.loopEnd > s.loopStart;
-        if (s.length > 0) {
-            c.lastSrcSample = readRawSample(c, s, 0);
-            c.nextSrcSample = readRawSample(c, s, 1);
-            c.havePair = true;
-        }
-    }
+    // The cache is kept: a retrigger of the same sample reuses it.
+    if (c.smp) c.looping = c.smp->loopEnd > c.smp->loopStart;
+    startVoiceAt(c, 0);
 }
 
 void S3mPlayer::triggerNote(int ch, uint8_t note) {
@@ -424,88 +225,6 @@ void S3mPlayer::triggerNote(int ch, uint8_t note) {
     c.period = s3mNoteToPeriod(note, c.c2spd);
     recomputeStep(c);
     restartSamplePosition(ch);
-}
-
-int16_t __not_in_flash_func(S3mPlayer::readChannelSample)(S3mChannel& c) { // see readRawSample()'s comment
-    if (!c.havePair || c.sampleStep16 == 0 || c.sample < 1) return 0;
-    const S3mSample& s = _samples[c.sample - 1];
-
-    uint16_t frac16 = (uint16_t)(c.samplePos16 & 0xFFFF);
-    int32_t diff = (int32_t)c.nextSrcSample - (int32_t)c.lastSrcSample;
-    int16_t interpolated = (int16_t)(c.lastSrcSample + ((diff * (int32_t)frac16) >> 16));
-
-    c.samplePos16 += c.sampleStep16;
-    while (c.havePair && c.samplePos16 >= 0x10000) {
-        c.samplePos16 -= 0x10000;
-        c.srcIndex++;
-        if (c.looping && c.srcIndex >= s.loopEnd) { // see readRawSample()'s comment on this redundant-check trim
-            c.srcIndex = s.loopStart + ((c.srcIndex - s.loopEnd) % (s.loopEnd - s.loopStart));
-        } else if (!c.looping && c.srcIndex >= s.length) {
-            c.havePair = false;
-            break;
-        }
-        c.lastSrcSample = c.nextSrcSample;
-        c.nextSrcSample = readRawSample(c, s, c.srcIndex + 1);
-    }
-
-    // >>6 instead of /64 -- mixVolume is always clamped to 0-64 by
-    // construction. Real-hardware diagnostics (on "The Reflex.s3m", a
-    // busy passage) found update() calls slowing to ~80-90/sec, ~11-19ms
-    // each -- close enough to saturating the 1-second budget that a
-    // little extra load tips it into a sustained, audible ring-buffer
-    // drought (thousands of dropped samples/sec, not just a blip). This
-    // is the same fix XmPlayer::readChannelSample() already got tonight
-    // for the identical reason -- a genuine signed integer division, on
-    // hardware with no divide instruction, at the single hottest call
-    // site in the whole player (every active channel, every sample).
-    return (int16_t)(((int32_t)interpolated * (int32_t)c.mixVolume) >> 6);
-}
-
-void __not_in_flash_func(S3mPlayer::mixOneSample)(int16_t& outL, int16_t& outR) { // see readRawSample()'s comment
-    int32_t mixL = 0, mixR = 0;
-    // _channelEnabled is fixed for the whole song (set once in load()),
-    // so which/how-many channels are enabled never changes here -- no
-    // need to (re-)count it every sample the way an earlier version did.
-    uint32_t __diagActive = 0;
-    for (int ch = 0; ch < MAX_CHANNELS; ch++) {
-        if (!_channelEnabled[ch]) continue;
-        S3mChannel& c = _channels[ch];
-        if (c.period == 0 || !c.havePair) continue;
-        __diagActive++;
-        int16_t s = readChannelSample(c);
-        // >>8 (divide by 256) instead of /255 -- the RP2040's Cortex-M0+
-        // has no hardware integer divide, so /255 here is a genuine
-        // software-division call, times two, times every active channel,
-        // every single output sample. The 256-vs-255 error is far below
-        // audible (<0.4%); see _mixShift's comment for why this matters
-        // more for S3M's usual 12-16 channels than it would for MOD's 4.
-        mixL += (s * (int32_t)(255 - c.pan)) >> 8;
-        mixR += (s * (int32_t)c.pan) >> 8;
-    }
-    // Same fixed-headroom-by-channel-count intent as ModPlayer::mixOneSample(),
-    // approximated to a shift (see _mixShift's comment) instead of a
-    // runtime division, plus global volume (V/W effects) as an additional
-    // final scale. This final /64 was NOT actually a free compiler-emitted
-    // shift despite the constant being a power of 2 -- a SIGNED dividend
-    // needs a rounding correction a plain arithmetic shift doesn't provide,
-    // so GCC emits a short correction sequence instead of one instruction.
-    // >>6 directly (same real-hardware-motivated fix as
-    // readChannelSample()'s identical change just above).
-    mixL = ((mixL >> _mixShift) * (int32_t)_globalVolume) >> 6;
-    mixR = ((mixR >> _mixShift) * (int32_t)_globalVolume) >> 6;
-    // Even with _mixShift's channel-count-based headroom removed entirely
-    // (see its declaration), real-hardware A/B listening against WAV/MIDI
-    // still found tracker playback a bit quiet, so a further +25% makeup
-    // gain here closes most of that remaining gap. softClampMix() below
-    // absorbs the rare moments this pushes things over budget.
-    mixL += mixL >> 2;
-    mixR += mixR >> 2;
-    mixL = softClampMix(mixL);
-    mixR = softClampMix(mixR);
-    outL = (int16_t)mixL;
-    outR = (int16_t)mixR;
-    g_s3mDiagActiveChSum += __diagActive;
-    g_s3mDiagActiveChSamples++;
 }
 
 void S3mPlayer::openPatternForScan(int num) {
@@ -598,10 +317,9 @@ void S3mPlayer::applyCell(int ch, uint8_t note, uint8_t sample, bool hasNote,
     // delay -- only the note trigger itself is deferred, same as
     // ModPlayer's identical EDy handling.
     if (hasNote && sample >= 1 && sample <= MAX_INSTRUMENTS) {
-        c.sample = sample;
+        setSample(c, sample);
         c.volume = _samples[sample - 1].volume;
-        c.mixVolume = c.volume; // see S3mChannel::mixVolume's comment -- keeps mixing correct
-                                 // even for the handful of samples before the next tick resyncs it
+        c.mixVolume = c.volume;
     }
 
     // The volume column is S3M's own first-class per-row volume
@@ -769,18 +487,7 @@ void S3mPlayer::processExtendedTickZero(int ch, uint8_t command, uint8_t param) 
             c.pan = (uint8_t)(val * 17);
             break;
         case 0xB: // SBy - Pattern loop
-            if (val == 0) {
-                c.patternLoopRow = (uint8_t)_row;
-            } else {
-                if (c.patternLoopCount == 0) c.patternLoopCount = val;
-                else c.patternLoopCount--;
-                if (c.patternLoopCount > 0) {
-                    _patternBreakPending = true;
-                    _patternBreakRow = c.patternLoopRow;
-                    _positionJumpPending = true;
-                    _positionJumpTarget = _orderPos; // stay on the current pattern
-                }
-            }
+            patternLoop(c.patternLoopRow, c.patternLoopCount, val);
             break;
         case 0xC: // SCy - Note cut
             c.noteCutParam = val;
@@ -816,21 +523,7 @@ void S3mPlayer::advanceRow() {
         c.retrigActiveRow = false;
     }
 
-    if (_patternBreakPending || _positionJumpPending) {
-        int nextOrderPos = _positionJumpPending ? _positionJumpTarget : (_orderPos + 1);
-        int nextRow = _patternBreakPending ? _patternBreakRow : 0;
-        if (nextRow < 0 || nextRow > 63) nextRow = 0;
-        _orderPos = nextOrderPos;
-        _row = nextRow;
-        _patternBreakPending = false;
-        _positionJumpPending = false;
-    } else {
-        _row++;
-        if (_row >= 64) {
-            _row = 0;
-            _orderPos++;
-        }
-    }
+    stepPosition(64, 63);
 
     // Order table: 0xFF ends the song outright. 0xFE marks a skipped
     // position -- silently advance past it. S3M has no dedicated
@@ -838,7 +531,7 @@ void S3mPlayer::advanceRow() {
     // (B) effect serves the identical looping purpose in practice, and
     // is already handled generically above (it's just another jump).
     while (true) {
-        if (_orderPos < 0 || _orderPos >= _orderCount) {
+        if (_orderPos < 0 || _orderPos >= _songLength) {
             _state = STATE_DONE;
             return;
         }
@@ -860,23 +553,6 @@ void S3mPlayer::advanceRow() {
     advanceToRow(_row);
 }
 
-void S3mPlayer::advanceTick() {
-    _tick++;
-    if (_tick >= _speed) {
-        _tick = 0;
-        if (_patternDelayRepeatsLeft > 0) {
-            // SEy: hold on the current row for one more full tick-cycle
-            // instead of advancing -- per-tick effects keep applying
-            // through these extra cycles, notes just don't re-trigger.
-            _patternDelayRepeatsLeft--;
-        } else {
-            advanceRow();
-        }
-    } else {
-        processTickEffects();
-    }
-}
-
 void S3mPlayer::processTickEffects() {
     // Global volume slide (W) -- same regular-slide shape as a
     // per-channel D, applied to _globalVolume once per tick. Fine
@@ -896,7 +572,7 @@ void S3mPlayer::processTickEffects() {
 
         if (c.noteDelayParam != 0 && _tick == c.noteDelayParam) {
             if (c.pendingSample != 0) {
-                c.sample = c.pendingSample;
+                setSample(c, c.pendingSample);
                 c.volume = _samples[c.pendingSample - 1].volume;
             }
             if (c.pendingNote != 0xFF) triggerNote(ch, c.pendingNote);
@@ -952,11 +628,8 @@ void S3mPlayer::processTickEffects() {
                 else if (slideDown) c.volume = (uint8_t)max(0, (int)c.volume - slideDown);
             }
         }
-        // Resync the mixing volume to the (possibly just-slid) true
-        // volume before any transient effect below adjusts it further --
-        // see S3mChannel::mixVolume's comment. Unconditional regardless
-        // of volSlideActiveRow, since tremolo/tremor still need a fresh
-        // baseline every tick even on rows with no active slide.
+        // Fresh mix volume each tick; tremolo and tremor below only
+        // adjust mixVolume, never the persistent volume.
         c.mixVolume = c.volume;
 
         // Portamento up/down (E/F), gated by their ActiveRow flags (see
@@ -1048,72 +721,12 @@ void S3mPlayer::processTickEffects() {
             int delta = (int)(sinf(angle) * c.panbrelloDepth * 4.0f);
             int p = (int)c.pan + delta;
             if (p < 0) p = 0; else if (p > 255) p = 255;
-            c.pan = (uint8_t)p; // panbrello is rare enough that a small permanent drift is an acceptable simplification vs. threading a second "effective pan" through mixOneSample()
+            c.pan = (uint8_t)p; // drifts the stored pan
             c.panbrelloPos = (uint8_t)((c.panbrelloPos + c.panbrelloSpeed) & 0x1F);
         }
     }
 }
 
-void __not_in_flash_func(S3mPlayer::update)() { // see readRawSample()'s comment on __not_in_flash_func
-    if (_state == STATE_IDLE || _state == STATE_ERROR || _state == STATE_DONE) return;
-
-    uint32_t __diagCallStart = micros();
-    g_s3mDiagCalls++;
-
-    // Was 512 -- lowered to match XmPlayer::update()'s identical fix.
-    // Real-hardware diagnostics on "The Reflex.s3m"'s busy passage showed
-    // maxUs reaching 12-19ms per call with only ~80-90 calls/sec even
-    // BEFORE a sustained underrun started -- capping how many output
-    // frames (and therefore how many channel-refill "boundary crossings")
-    // one call can produce bounds the worst case a burst of several
-    // channels needing a refill at once can cost, in exchange for
-    // update() being called more often, which the caller's main loop()
-    // already does every iteration, for free.
-    const size_t MAX_FRAMES_PER_TICK_CALL = 128;
-    size_t produced = 0;
-    while (produced < MAX_FRAMES_PER_TICK_CALL) {
-        size_t free = Synth::wavStreamFree();
-        if (free < g_s3mDiagMinFree) g_s3mDiagMinFree = (uint32_t)free;
-        if (free == 0) break;
-        if (_samplesUntilNextTick == 0) {
-            advanceTick();
-            if (_state == STATE_DONE) break;
-            _samplesUntilNextTick = ticksToSamples(_tempo);
-        }
-        int16_t l, r;
-        uint32_t __diagMixStart = micros();
-        mixOneSample(l, r);
-        g_s3mDiagMixUs += micros() - __diagMixStart;
-        int16_t frame[2] = { l, r };
-        if (Synth::wavStreamWrite(frame, 1) == 0) break;
-        _samplesUntilNextTick--;
-        produced++;
-    }
-
-    uint32_t callUs = micros() - __diagCallStart;
-    g_s3mDiagBusyUs += callUs;
-    if (callUs > g_s3mDiagMaxUs) g_s3mDiagMaxUs = callUs;
-
-    static uint32_t lastPrintMs = 0;
-    uint32_t nowMs = millis();
-    if (DIAG_PRINT_ENABLED && nowMs - lastPrintMs >= 1000) {
-        lastPrintMs = nowMs;
-        uint32_t nowUnderrunSamples = Synth::wavStreamUnderrunSamples();
-        uint32_t underrunSamplesThisWindow = nowUnderrunSamples - g_s3mDiagLastUnderrunSamples;
-        g_s3mDiagLastUnderrunSamples = nowUnderrunSamples;
-        uint32_t avgActiveCh100 = g_s3mDiagActiveChSamples ? (g_s3mDiagActiveChSum * 100 / g_s3mDiagActiveChSamples) : 0;
-        Serial.printf("S3M diag: calls=%lu busyUs=%lu maxUs=%lu minFree=%lu underrunSamples=%lu "
-                       "chunkHits=%lu chunkMiss=%lu chunkUs=%lu mixUs=%lu avgActiveCh=%lu.%02lu\n",
-                       (unsigned long)g_s3mDiagCalls, (unsigned long)g_s3mDiagBusyUs, (unsigned long)g_s3mDiagMaxUs,
-                       (unsigned long)(g_s3mDiagMinFree == 0xFFFFFFFF ? 0 : g_s3mDiagMinFree),
-                       (unsigned long)underrunSamplesThisWindow,
-                       (unsigned long)g_s3mDiagChunkHits, (unsigned long)g_s3mDiagChunkMisses,
-                       (unsigned long)g_s3mDiagChunkUs, (unsigned long)g_s3mDiagMixUs,
-                       (unsigned long)(avgActiveCh100 / 100), (unsigned long)(avgActiveCh100 % 100));
-        g_s3mDiagCalls = 0; g_s3mDiagBusyUs = 0; g_s3mDiagMaxUs = 0;
-        g_s3mDiagMinFree = 0xFFFFFFFF;
-        g_s3mDiagChunkHits = 0; g_s3mDiagChunkMisses = 0; g_s3mDiagChunkUs = 0;
-        g_s3mDiagMixUs = 0;
-        g_s3mDiagActiveChSum = 0; g_s3mDiagActiveChSamples = 0;
-    }
+void S3mPlayer::tickEnd() {
+    for (int ch = 0; ch < MAX_CHANNELS; ch++) _channels[ch].mixPan = _channels[ch].pan;
 }

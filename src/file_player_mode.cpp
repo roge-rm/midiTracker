@@ -84,7 +84,7 @@ const int NAME_ENTRY_MAX_LEN = 16;
 
 SdBrowser browser;
 // player/modPlayer/s3mPlayer/xmPlayer are the four big format players
-// (MidiPlayer 8KB, ModPlayer 11KB, S3mPlayer 25.5KB, XmPlayer ~64KB) --
+// (MidiPlayer 8KB, ModPlayer ~21KB, S3mPlayer ~47KB, XmPlayer ~72KB) --
 // allocated on demand in openSelected() when a file of that type is
 // actually opened, freed on the existing "LEFT -> back to browser"
 // handlers each already has (see
@@ -484,8 +484,8 @@ void openSelected() {
 
     // nowPlayingName is shared by APP_PLAY/APP_PLAY_SYSEX/APP_PLAY_WAV/
     // APP_PLAY_MOD/APP_PLAY_S3M/APP_PLAY_XM (Ui::drawPlayer()/
-    // Ui::drawSysExPlayer()/Ui::drawWavPlayer()/Ui::drawModPlayer()/
-    // Ui::drawS3mPlayer()/Ui::drawXmPlayer() respectively) -- the six
+    // Ui::drawSysExPlayer()/Ui::drawWavPlayer()/Ui::drawTrackerPlayer()
+    // respectively) -- the six
     // states are mutually exclusive, so there's no risk of one clobbering
     // another's in-use name.
     strncpy(nowPlayingName, e.name, sizeof(nowPlayingName) - 1);
@@ -561,11 +561,7 @@ void openSelected() {
     }
 
     if (e.kind == FILE_XM) {
-        // See modPlayer's identical comment just above -- this also
-        // resolves the heap-fragmentation crash the g_xmDiag*/Serial
-        // diagnostics in xm_file.cpp were added to chase (a same-session
-        // CHUNK_SIZE increase crashing on real hardware): XmPlayer no
-        // longer competes with the general heap at all.
+        // See modPlayer's identical comment just above.
         static_assert(sizeof(XmPlayer) <= SharedRamArena::SIZE,
                       "XmPlayer no longer fits SharedRamArena -- see shared_ram_arena.h");
         if (!xmPlayer) xmPlayer = new (SharedRamArena::data()) XmPlayer();
@@ -1324,11 +1320,11 @@ void handlePlayModInput() {
         if (modPlayer->state() == ModPlayer::STATE_PLAYING) {
             modPlayer->pause();
             stoppedViaNav = false;
-            Ui::updateModPlayerState(modPlayer->state(), stoppedViaNav);
+            Ui::updateTrackerPlayerState(modPlayer->state(), stoppedViaNav);
         } else if (modPlayer->state() == ModPlayer::STATE_PAUSED) {
             modPlayer->play();
             stoppedViaNav = false;
-            Ui::updateModPlayerState(modPlayer->state(), stoppedViaNav);
+            Ui::updateTrackerPlayerState(modPlayer->state(), stoppedViaNav);
         } else if (modPlayer->state() == ModPlayer::STATE_DONE) {
             if (restartModFromTop()) modPlayer->play();
             stoppedViaNav = false;
@@ -1377,11 +1373,11 @@ void handlePlayS3mInput() {
         if (s3mPlayer->state() == S3mPlayer::STATE_PLAYING) {
             s3mPlayer->pause();
             stoppedViaNav = false;
-            Ui::updateS3mPlayerState(s3mPlayer->state(), stoppedViaNav);
+            Ui::updateTrackerPlayerState(s3mPlayer->state(), stoppedViaNav);
         } else if (s3mPlayer->state() == S3mPlayer::STATE_PAUSED) {
             s3mPlayer->play();
             stoppedViaNav = false;
-            Ui::updateS3mPlayerState(s3mPlayer->state(), stoppedViaNav);
+            Ui::updateTrackerPlayerState(s3mPlayer->state(), stoppedViaNav);
         } else if (s3mPlayer->state() == S3mPlayer::STATE_DONE) {
             if (restartS3mFromTop()) s3mPlayer->play();
             stoppedViaNav = false;
@@ -1429,11 +1425,11 @@ void handlePlayXmInput() {
         if (xmPlayer->state() == XmPlayer::STATE_PLAYING) {
             xmPlayer->pause();
             stoppedViaNav = false;
-            Ui::updateXmPlayerState(xmPlayer->state(), stoppedViaNav);
+            Ui::updateTrackerPlayerState(xmPlayer->state(), stoppedViaNav);
         } else if (xmPlayer->state() == XmPlayer::STATE_PAUSED) {
             xmPlayer->play();
             stoppedViaNav = false;
-            Ui::updateXmPlayerState(xmPlayer->state(), stoppedViaNav);
+            Ui::updateTrackerPlayerState(xmPlayer->state(), stoppedViaNav);
         } else if (xmPlayer->state() == XmPlayer::STATE_DONE) {
             if (restartXmFromTop()) xmPlayer->play();
             stoppedViaNav = false;
@@ -2051,7 +2047,7 @@ bool update() {
             uint32_t now = millis();
             if (modPlayer->state() == ModPlayer::STATE_PLAYING && now - lastModPlayTick >= 200) {
                 lastModPlayTick = now;
-                Ui::updateModPlayerLive(*modPlayer);
+                Ui::updateTrackerPlayerLive(*modPlayer);
             }
             break;
         }
@@ -2069,7 +2065,7 @@ bool update() {
             uint32_t now = millis();
             if (s3mPlayer->state() == S3mPlayer::STATE_PLAYING && now - lastS3mPlayTick >= 200) {
                 lastS3mPlayTick = now;
-                Ui::updateS3mPlayerLive(*s3mPlayer);
+                Ui::updateTrackerPlayerLive(*s3mPlayer);
             }
             break;
         }
@@ -2085,7 +2081,7 @@ bool update() {
             uint32_t now = millis();
             if (xmPlayer->state() == XmPlayer::STATE_PLAYING && now - lastXmPlayTick >= 200) {
                 lastXmPlayTick = now;
-                Ui::updateXmPlayerLive(*xmPlayer);
+                Ui::updateTrackerPlayerLive(*xmPlayer);
             }
             break;
         }
@@ -2251,15 +2247,15 @@ bool update() {
                 break;
 
             case APP_PLAY_MOD:
-                Ui::drawModPlayer(nowPlayingName, *modPlayer, volume, stoppedViaNav);
+                Ui::drawTrackerPlayer(nowPlayingName, *modPlayer, volume, stoppedViaNav);
                 break;
 
             case APP_PLAY_S3M:
-                Ui::drawS3mPlayer(nowPlayingName, *s3mPlayer, volume, stoppedViaNav);
+                Ui::drawTrackerPlayer(nowPlayingName, *s3mPlayer, volume, stoppedViaNav);
                 break;
 
             case APP_PLAY_XM:
-                Ui::drawXmPlayer(nowPlayingName, *xmPlayer, volume, stoppedViaNav);
+                Ui::drawTrackerPlayer(nowPlayingName, *xmPlayer, volume, stoppedViaNav);
                 break;
 
             case APP_ENTRY_MENU: {
