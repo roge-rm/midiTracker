@@ -100,6 +100,7 @@ bool MidiPlayer::primeTrack(int idx) {
             t.pendingTick = t.absoluteTick;
             t.pendingIsTempo = false;
             t.pendingIsSysEx = true;
+            t.pendingSysExHasF0 = (status == 0xF0);
             t.pendingSysExPos = t.file.curPosition();
             t.pendingSysExLen = len;
             if (len > 0) t.file.seekCur(len);
@@ -155,11 +156,12 @@ void MidiPlayer::sendPendingSysEx(TrackReader& t) {
     t.file.seekSet(t.pendingSysExPos);
 
     static uint8_t buf[MIDI_SYSEX_MAX_LEN + 1]; // +1 for the F0 this reconstructs below
+    const uint32_t off = t.pendingSysExHasF0 ? 1 : 0;
     buf[0] = 0xF0;
-    bool ok = t.file.read(buf + 1, len) == (int)len;
+    bool ok = t.file.read(buf + off, len) == (int)len;
 
     t.file.seekSet(savedPos); // restore, so the next primeTrack(idx) continues from the right place
-    if (ok) MidiOutput::sendSysExRaw(buf, len + 1);
+    if (ok) MidiOutput::sendSysExRaw(buf, len + off);
 }
 
 int MidiPlayer::findNextTrack() const {
@@ -213,6 +215,12 @@ bool MidiPlayer::load(const char* path) {
     uint16_t ntrks = ((uint16_t)hb[2] << 8) | hb[3];
     _division = ((uint16_t)hb[4] << 8) | hb[5];
 
+    if (_division == 0) {
+        strncpy(_error, "invalid time division", sizeof(_error) - 1);
+        hdr.close();
+        _state = STATE_ERROR;
+        return false;
+    }
     if (_division & 0x8000) {
         strncpy(_error, "SMPTE time division not supported", sizeof(_error) - 1);
         hdr.close();

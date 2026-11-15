@@ -235,6 +235,7 @@ int nameEntryKeyCol = 0;      // keystroke, only when a new name-entry session b
 char nameEntryError[40] = {0};
 char renameOldPath[224] = {0}; // NAME_RENAME only: absolute path being renamed
 bool renameIsDir = false;      // NAME_RENAME only
+char renameInitialName[NAME_ENTRY_MAX_LEN + 1] = {0}; // NAME_RENAME only: the name as first shown, OK on it unchanged cancels
 FileKind renameKind = FILE_MID; // NAME_RENAME only, meaningless if renameIsDir -- which extension to re-append
 
 // -- APP_CONFIRM_OVERWRITE state -- see finishNameEntry()/
@@ -686,6 +687,7 @@ const char* extensionForKind(FileKind kind) {
         case FILE_WAV: return ".wav";
         case FILE_MOD: return ".mod";
         case FILE_S3M: return ".s3m";
+        case FILE_XM:  return ".xm";
         default:        return ".mid";
     }
 }
@@ -698,15 +700,17 @@ void beginRename() {
     renameKind = e.kind;
 
     char base[NAME_ENTRY_MAX_LEN + 1];
-    strncpy(base, e.name, sizeof(base) - 1);
-    base[sizeof(base) - 1] = '\0';
+    size_t baseLen = strlen(e.name);
     if (!e.isDir) {
-        // Strip the extension for editing; re-appended on save.
-        size_t nlen = strlen(base);
-        const char* ext = extensionForKind(renameKind);
-        if (nlen > 4 && strcasecmp(base + nlen - 4, ext) == 0) base[nlen - 4] = '\0';
+        // Strip the actual extension before cutting to the editable length; re-appended on save.
+        size_t extLen = strlen(extensionForKind(renameKind));
+        if (baseLen > extLen && strcasecmp(e.name + baseLen - extLen, extensionForKind(renameKind)) == 0) baseLen -= extLen;
     }
+    if (baseLen > NAME_ENTRY_MAX_LEN) baseLen = NAME_ENTRY_MAX_LEN;
+    memcpy(base, e.name, baseLen);
+    base[baseLen] = '\0';
     beginNameEntry(NAME_RENAME, base);
+    strcpy(renameInitialName, nameEntryBuf);
 }
 
 // Moves the on-screen keyboard cursor by (dRow, dCol). Rows have
@@ -812,6 +816,19 @@ void performNameEntryAction(const char* trimmed) {
     }
     if (strcmp(newPath, renameOldPath) == 0) {
         appState = APP_BROWSE; // unchanged -- nothing to do
+    } else if (strcasecmp(newPath, renameOldPath) == 0) {
+        // Case-only change: SdFat's rename() sees the new name as already existing, so go via a temp name.
+        char tmpPath[232];
+        snprintf(tmpPath, sizeof(tmpPath), "%s.rntmp", renameOldPath);
+        if (!sd.rename(renameOldPath, tmpPath)) {
+            strncpy(nameEntryError, "rename failed", sizeof(nameEntryError) - 1);
+        } else if (!sd.rename(tmpPath, newPath)) {
+            sd.rename(tmpPath, renameOldPath);
+            strncpy(nameEntryError, "rename failed", sizeof(nameEntryError) - 1);
+        } else {
+            browser.refresh();
+            appState = APP_BROWSE;
+        }
     } else if (!sd.rename(renameOldPath, newPath)) {
         strncpy(nameEntryError, "rename failed", sizeof(nameEntryError) - 1);
     } else {
@@ -861,8 +878,14 @@ void finishNameEntry() {
             snprintf(filename, sizeof(filename), "%s%s", trimmed, extensionForKind(renameKind));
             browser.buildPath(filename, path, sizeof(path));
         }
-        if (strcmp(path, renameOldPath) == 0) {
-            performNameEntryAction(trimmed); // unchanged name -- its own no-op path handles this
+        if (strcmp(trimmed, renameInitialName) == 0) {
+            appState = APP_BROWSE; // untouched name: cancel
+            needsRedraw = true;
+            return;
+        }
+        // Differs from the old path only by case: sd.exists() is case-insensitive, so it's a plain rename, not a collision.
+        if (strcasecmp(path, renameOldPath) == 0) {
+            performNameEntryAction(trimmed);
             return;
         }
     } else {
@@ -985,6 +1008,7 @@ bool handleBrowseInput() {
     if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_RIGHT) ||
         Input::justPressed(BTN_PLAY)) {
         openSelected();
+        if (appState != APP_BROWSE) return false;
     }
     // ALT means "cycle output target" here, decided on release and
     // suppressed if it was just used as the page-jump modifier above (see
@@ -1000,6 +1024,7 @@ bool handleBrowseInput() {
     }
     if (Input::justPressed(BTN_EDIT)) {
         beginEntryMenu();
+        if (appState != APP_BROWSE) return false;
     }
     // LEFT and NAV both mean "back" here, same as everywhere else in this
     // mode -- at the root there's nowhere further to go up, so that's the
@@ -1256,6 +1281,7 @@ void handlePlayWavInput() {
         wavPlayer.stop();
         appState = APP_BROWSE;
         needsRedraw = true;
+        return;
     }
     // NAV stops playback: resets to the start and pauses there, shown as
     // "Stopped" -- same stoppedViaNav convention as the MIDI player's NAV
@@ -1318,6 +1344,7 @@ void handlePlayModInput() {
         modPlayer = nullptr;
         appState = APP_BROWSE;
         needsRedraw = true;
+        return;
     }
     // NAV stops playback: reloads to the start and pauses there, shown as
     // "Stopped" -- same stoppedViaNav convention as the other two players.
@@ -1370,6 +1397,7 @@ void handlePlayS3mInput() {
         s3mPlayer = nullptr;
         appState = APP_BROWSE;
         needsRedraw = true;
+        return;
     }
     // NAV stops playback: reloads to the start and pauses there, shown as
     // "Stopped" -- same stoppedViaNav convention as the other players.
@@ -1421,6 +1449,7 @@ void handlePlayXmInput() {
         xmPlayer = nullptr;
         appState = APP_BROWSE;
         needsRedraw = true;
+        return;
     }
     // NAV stops playback: reloads to the start and pauses there, shown as
     // "Stopped" -- same stoppedViaNav convention as the other players.
@@ -1494,6 +1523,7 @@ void handlePlayInput() {
         player = nullptr;
         appState = APP_BROWSE;
         needsRedraw = true;
+        return;
     }
     // NAV stops playback: resets straight to the start and pauses there
     // (shown as "Stopped", not "Paused" -- see stoppedViaNav), rather
@@ -1558,6 +1588,7 @@ void handlePlayInput() {
             synthEditShowingGrid = true;
             PariSynthGrid::enter();
             needsRedraw = true;
+            return;
         }
     }
     // ALT held + EDIT (tap): toggles Audio on/off, replacing EDIT's own
@@ -1923,6 +1954,7 @@ bool update() {
             // Once the file finishes, keep showing the final "Finished"
             // screen until the user presses a button to go back.
             handlePlayInput();
+            if (appState != APP_PLAY) break;
 
             // Elapsed time and the note-activity strip change continuously
             // while playing. Rather than trigger a full-screen needsRedraw,
@@ -1997,6 +2029,7 @@ bool update() {
         case APP_PLAY_WAV: {
             wavPlayer.update();
             handlePlayWavInput();
+            if (appState != APP_PLAY_WAV) break;
 
             static uint32_t lastWavPlayTick = 0;
             uint32_t now = millis();
@@ -2010,6 +2043,7 @@ bool update() {
         case APP_PLAY_MOD: {
             modPlayer->update();
             handlePlayModInput();
+            if (appState != APP_PLAY_MOD) break;
 
             // 200ms, not 50ms -- see the identical change (and the
             // real-hardware measurement behind it) on APP_PLAY_S3M below.
@@ -2025,6 +2059,7 @@ bool update() {
         case APP_PLAY_S3M: {
             s3mPlayer->update();
             handlePlayS3mInput();
+            if (appState != APP_PLAY_S3M) break;
 
             // 200ms, not 50ms -- a busy S3M passage's own mixing cost
             // leaves little headroom for a frequent SPI redraw on top of
@@ -2042,6 +2077,7 @@ bool update() {
         case APP_PLAY_XM: {
             xmPlayer->update();
             handlePlayXmInput();
+            if (appState != APP_PLAY_XM) break;
 
             // 200ms, not 50ms -- see the identical change (and the
             // real-hardware measurement behind it) on APP_PLAY_S3M above.

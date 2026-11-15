@@ -611,14 +611,37 @@ namespace SettingsMode
             }
         }
 
+        // Closes a file written to tmpPath and moves it over finalPath, only if
+        // nothing failed to write. Otherwise the temp file is deleted and the old
+        // file stays. Returns true if finalPath now holds the new data.
+        bool commitTmpFile(FsFile &file, const char *tmpPath, const char *finalPath)
+        {
+            bool ok = !file.getWriteError() && file.sync();
+            file.close();
+            if (!ok)
+            {
+                sd.remove(tmpPath);
+                return false;
+            }
+            if (sd.exists(finalPath) && !sd.remove(finalPath))
+            {
+                sd.remove(tmpPath);
+                return false;
+            }
+            return sd.rename(tmpPath, finalPath); // on failure the complete temp file stays for the load fallback
+        }
+
         // Persists every value to /settings.txt, overwriting it whole -- called
         // once on the way out of this screen (see handleInput()), not after each
         // individual change, so adjusting a value (especially a hold-repeated
         // numeric one) never waits on SD I/O.
         void saveSettings()
         {
+            // Written to a temp file and renamed over the real one, so a failed
+            // write leaves the old settings alone.
+            const char *tmpPath = "/settings.tmp";
             FsFile file;
-            if (!file.open(SETTINGS_PATH, O_RDWR | O_CREAT | O_TRUNC))
+            if (!file.open(tmpPath, O_RDWR | O_CREAT | O_TRUNC))
                 return;
 
             char line[48];
@@ -670,8 +693,7 @@ namespace SettingsMode
             n = snprintf(line, sizeof(line), "activeTheme=%s\n", g_activeThemeName);
             file.write((const uint8_t *)line, n);
 
-            file.sync();
-            file.close();
+            commitTmpFile(file, tmpPath, SETTINGS_PATH);
         }
 
         void parseSettingsLine(const char *line)
@@ -749,12 +771,17 @@ namespace SettingsMode
             }
             if (strncmp(line, "bpm=", 4) == 0)
             {
-                g_defaultBpm = (float)atoi(line + 4);
+                int v = atoi(line + 4);
+                if (v < 20)
+                    v = 20;
+                if (v > 300)
+                    v = 300;
+                g_defaultBpm = (float)v;
                 return;
             }
             if (strncmp(line, "timeSigNum=", 11) == 0)
             {
-                g_defaultTimeSigNum = atoi(line + 11);
+                g_defaultTimeSigNum = atoi(line + 11); // pair checked against the presets after the whole file is read
                 return;
             }
             if (strncmp(line, "timeSigDen=", 11) == 0)
@@ -764,7 +791,11 @@ namespace SettingsMode
             }
             if (strncmp(line, "barLength=", 10) == 0)
             {
-                g_defaultBarLength = atoi(line + 10);
+                int v = atoi(line + 10);
+                g_defaultBarLength = 0;
+                for (int i = 0; i < BAR_PRESET_COUNT; i++)
+                    if (BAR_PRESETS[i] == v)
+                        g_defaultBarLength = v;
                 return;
             }
             if (strncmp(line, "sync=", 5) == 0)
@@ -785,11 +816,19 @@ namespace SettingsMode
             if (strncmp(line, "countInBars=", 12) == 0)
             {
                 g_defaultCountInBars = atoi(line + 12);
+                if (g_defaultCountInBars < 1)
+                    g_defaultCountInBars = 1;
+                if (g_defaultCountInBars > 8)
+                    g_defaultCountInBars = 8;
                 return;
             }
             if (strncmp(line, "metroVolume=", 12) == 0)
             {
                 g_metronomeVolume = atoi(line + 12);
+                if (g_metronomeVolume < 0)
+                    g_metronomeVolume = 0;
+                if (g_metronomeVolume > 100)
+                    g_metronomeVolume = 100;
                 return;
             }
             if (strncmp(line, "midiThru=", 9) == 0)
@@ -835,7 +874,8 @@ namespace SettingsMode
         void loadSettings()
         {
             FsFile file;
-            if (!file.open(SETTINGS_PATH, O_RDONLY))
+            // A complete /settings.tmp is left behind if power failed between removing the old file and renaming.
+            if (!file.open(SETTINGS_PATH, O_RDONLY) && !file.open("/settings.tmp", O_RDONLY))
                 return;
 
             char line[32];
@@ -861,6 +901,16 @@ namespace SettingsMode
                 parseSettingsLine(line);
             }
             file.close();
+
+            bool sigOk = false;
+            for (int i = 0; i < TIME_SIG_PRESET_COUNT; i++)
+                if (TIME_SIG_PRESETS[i].num == g_defaultTimeSigNum && TIME_SIG_PRESETS[i].den == g_defaultTimeSigDen)
+                    sigOk = true;
+            if (!sigOk)
+            {
+                g_defaultTimeSigNum = TIME_SIG_PRESETS[0].num;
+                g_defaultTimeSigDen = TIME_SIG_PRESETS[0].den;
+            }
         }
 
         void refreshValue()
@@ -1176,8 +1226,10 @@ namespace SettingsMode
         // matching-by-label, not position).
         bool saveThemeToFile(const char *path)
         {
+            char tmpPath[72];
+            snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path);
             FsFile file;
-            if (!file.open(path, O_RDWR | O_CREAT | O_TRUNC))
+            if (!file.open(tmpPath, O_RDWR | O_CREAT | O_TRUNC))
                 return false;
             char line[48];
             for (int i = 0; i < Ui::themeColorCount(); i++)
@@ -1187,9 +1239,7 @@ namespace SettingsMode
                 int n = snprintf(line, sizeof(line), "%s=%d,%d,%d\n", Ui::themeColorLabel(i), r, g, b);
                 file.write((const uint8_t *)line, n);
             }
-            file.sync();
-            file.close();
-            return true;
+            return commitTmpFile(file, tmpPath, path);
         }
 
         // Reverses saveThemeToFile() -- unrecognized labels (an older/newer
@@ -1200,7 +1250,9 @@ namespace SettingsMode
         bool loadThemeFromFile(const char *path)
         {
             FsFile file;
-            if (!file.open(path, O_RDONLY))
+            char tmpPath[72];
+            snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path);
+            if (!file.open(path, O_RDONLY) && !file.open(tmpPath, O_RDONLY))
                 return false;
 
             char line[48];
@@ -1329,6 +1381,8 @@ namespace SettingsMode
                 trimmed[--len] = '\0';
             if (len == 0)
                 return; // nothing typed -- stay on the naming screen
+            strcpy(themeNameBuf, trimmed); // later saves use the trimmed name
+            themeNameLen = len;
 
             if (!sd.exists(THEMES_ROOT))
                 sd.mkdir(THEMES_ROOT);
@@ -1440,7 +1494,6 @@ namespace SettingsMode
             }
             if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY))
             {
-                sd.remove(themePendingOverwritePath);
                 if (saveThemeToFile(themePendingOverwritePath))
                 {
                     strncpy(g_activeThemeName, themeNameBuf, THEME_NAME_MAX_LEN);

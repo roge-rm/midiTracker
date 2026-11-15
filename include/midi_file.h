@@ -91,6 +91,7 @@ private:
         // bytes themselves, since a SysEx payload can be arbitrarily long.
         // Re-read from disk on dispatch (see sendPendingSysEx()).
         bool pendingIsSysEx = false;
+        bool pendingSysExHasF0 = false; // false for an F7 escape: its bytes go out as they are
         uint32_t pendingSysExPos = 0;
         uint32_t pendingSysExLen = 0;
     };

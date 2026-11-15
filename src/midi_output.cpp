@@ -66,7 +66,15 @@ void routeThruChannelVoice(bool fromHw, uint8_t status, uint8_t data1, uint8_t d
 }
 
 void routeThruSysEx(bool fromHw, const uint8_t* data, size_t len) {
-    if (len < 2) return; // smaller than a bare F0 F7 -- not a real message
+    if (len == 1) {
+        // A one-byte F7 escape can carry a real-time byte (e.g. F8).
+        if (data[0] >= 0xF8) {
+            if (hwEnabled())  MIDIHW.sendRealTime((midi::MidiType)data[0]);
+            if (usbEnabled()) MIDIUSB.sendRealTime((midi::MidiType)data[0]);
+        }
+        return;
+    }
+    if (len < 2) return; // empty
     bool toHw, toUsb;
     thruDestinations(fromHw, toHw, toUsb);
     if (toHw)  MIDIHW.sendSysEx((unsigned)len, data, true);

@@ -123,12 +123,14 @@ bool WavPlayer::load(const char* path) {
             haveFmt = true;
         } else if (strncmp(cid, "data", 4) == 0) {
             _dataChunkStart = chunkDataStart;
-            _dataChunkLen = clen;
+            uint32_t avail = _file.fileSize() > chunkDataStart ? (uint32_t)_file.fileSize() - chunkDataStart : 0;
+            _dataChunkLen = clen > avail ? avail : clen; // a bogus length can't run past the file
             if (haveFmt) break; // have both -- no need to keep scanning trailing chunks
         }
 
-        uint32_t next = chunkDataStart + clen + (clen & 1); // chunks are word-padded
-        if (!_file.seekSet(next)) break;
+        uint64_t next64 = (uint64_t)chunkDataStart + clen + (clen & 1); // chunks are word-padded
+        if (next64 > _file.fileSize()) break; // past the end (also catches a length that would wrap)
+        if (!_file.seekSet((uint32_t)next64)) break;
     }
 
     if (!haveFmt || _dataChunkLen == 0) {

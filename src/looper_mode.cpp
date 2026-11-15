@@ -1099,6 +1099,7 @@ void startArmedTracksTogether() {
 void handleIncomingMidi(uint8_t status, uint8_t data1, uint8_t data2, uint8_t len) {
     uint8_t channel = status & 0x0F;
     (void)len;
+    if (!tracks) return;
 
     // When metronome+count-in are both active, arming a track already
     // triggers a timed count-in instead (see maybeStartCountIn(), called
@@ -1587,6 +1588,7 @@ void onMidiClockTick() {
 // otherwise external transport messages are just thru'd (if Thru is on)
 // without this app reacting to them.
 void handleMidiRealtime(MidiRealtimeEvent event) {
+    if (!tracks) return;
     switch (event) {
         case MIDI_RT_CLOCK:
             onMidiClockTick();
@@ -1692,7 +1694,8 @@ void toggleSyncMode() {
 
 // -- SD persistence -------------------------------------------------
 
-void writeVarLen(FsFile& file, uint32_t value, uint32_t& bytesWritten) {
+bool writeVarLen(FsFile& file, uint32_t value, uint32_t& bytesWritten) {
+    bool ok = true;
     uint32_t buffer = value & 0x7F;
     while ((value >>= 7) > 0) {
         buffer <<= 8;
@@ -1700,11 +1703,12 @@ void writeVarLen(FsFile& file, uint32_t value, uint32_t& bytesWritten) {
     }
     for (;;) {
         uint8_t b = (uint8_t)(buffer & 0xFF);
-        file.write(&b, 1);
+        if (file.write(&b, 1) != 1) ok = false;
         bytesWritten++;
         if (buffer & 0x80) buffer >>= 8;
         else break;
     }
+    return ok;
 }
 
 // Serializes one track's event buffer as a standalone format-0 SMF.
@@ -1728,39 +1732,40 @@ bool saveTrackToFile(const LoopTrack& t, const char* path) {
         0, 1, // ntrks = 1
         (uint8_t)(division >> 8), (uint8_t)(division & 0xFF),
     };
-    file.write(mthd, sizeof(mthd));
+    bool ok = true;
+    if (file.write(mthd, sizeof(mthd)) != sizeof(mthd)) ok = false;
 
-    file.write((const uint8_t*)"MTrk", 4);
+    if (file.write((const uint8_t*)"MTrk", 4) != 4) ok = false;
     uint32_t mtrkLenPos = file.curPosition();
     const uint8_t zero[4] = {0, 0, 0, 0};
-    file.write(zero, 4);
+    if (file.write(zero, 4) != 4) ok = false;
     uint32_t bytesWritten = 0;
 
     const uint8_t tempoEvt[6] = {
         0xFF, 0x51, 0x03,
         (uint8_t)(usPerQuarter >> 16), (uint8_t)(usPerQuarter >> 8), (uint8_t)usPerQuarter,
     };
-    writeVarLen(file, 0, bytesWritten);
-    file.write(tempoEvt, sizeof(tempoEvt));
+    if (!writeVarLen(file, 0, bytesWritten)) ok = false;
+    if (file.write(tempoEvt, sizeof(tempoEvt)) != sizeof(tempoEvt)) ok = false;
     bytesWritten += sizeof(tempoEvt);
 
     uint32_t lastTick = 0;
     for (int i = 0; i < t.eventCount; i++) {
         const LoopEvent& e = t.events[i];
         uint32_t tick = (uint32_t)(((uint64_t)e.offsetMs * 1000 * division) / usPerQuarter);
-        writeVarLen(file, tick - lastTick, bytesWritten);
+        if (!writeVarLen(file, tick - lastTick, bytesWritten)) ok = false;
         lastTick = tick;
         uint8_t len = dataBytesForStatus(e.status);
         const uint8_t evt[3] = {e.status, e.data1, e.data2};
-        file.write(evt, 1 + len);
+        if (file.write(evt, 1 + len) != (size_t)(1 + len)) ok = false;
         bytesWritten += 1 + len;
     }
 
     uint32_t endTick = (uint32_t)(((uint64_t)t.lengthMs * 1000 * division) / usPerQuarter);
     if (endTick < lastTick) endTick = lastTick;
-    writeVarLen(file, endTick - lastTick, bytesWritten);
+    if (!writeVarLen(file, endTick - lastTick, bytesWritten)) ok = false;
     const uint8_t eot[3] = {0xFF, 0x2F, 0x00};
-    file.write(eot, sizeof(eot));
+    if (file.write(eot, sizeof(eot)) != sizeof(eot)) ok = false;
     bytesWritten += sizeof(eot);
 
     uint32_t endPos = file.curPosition();
@@ -1768,13 +1773,13 @@ bool saveTrackToFile(const LoopTrack& t, const char* path) {
         (uint8_t)(bytesWritten >> 24), (uint8_t)(bytesWritten >> 16),
         (uint8_t)(bytesWritten >> 8), (uint8_t)bytesWritten,
     };
-    file.seekSet(mtrkLenPos);
-    file.write(lenBytes, 4);
-    file.seekSet(endPos);
+    if (!file.seekSet(mtrkLenPos)) ok = false;
+    if (file.write(lenBytes, 4) != 4) ok = false;
+    if (!file.seekSet(endPos)) ok = false;
 
-    file.sync();
+    if (!file.sync()) ok = false;
     file.close();
-    return true;
+    return ok;
 }
 
 // Picks "LOOP001", "LOOP002", etc. under BUNDLES_ROOT -- same pattern as
@@ -1840,7 +1845,7 @@ bool saveSelectedLoop(const char* name) {
     return saveTrackToFile(tracks[selectedTrack], path);
 }
 
-void saveSession() {
+bool saveSession() {
     if (!sd.exists(LOOPS_ROOT)) sd.mkdir(LOOPS_ROOT);
     if (!sd.exists(BUNDLES_ROOT)) sd.mkdir(BUNDLES_ROOT);
 
@@ -1851,18 +1856,19 @@ void saveSession() {
 
     if (!sd.mkdir(sessionPath)) {
         showFlashMessage("Save failed", "could not create folder", 1500);
-        return;
+        return false;
     }
 
     char metaPath[96];
     snprintf(metaPath, sizeof(metaPath), "%s/session.txt", sessionPath);
     FsFile meta;
     bool metaOk = meta.open(metaPath, O_RDWR | O_CREAT | O_TRUNC);
+    bool allOk = metaOk;
     if (metaOk) {
         char line[64];
         int n = snprintf(line, sizeof(line), "sync=%d\nbpm=%d\ntimeSigNum=%d\ntimeSigDen=%d\n",
                           syncMode ? 1 : 0, (int)manualBpm, timeSigNum, timeSigDen);
-        meta.write((const uint8_t*)line, n);
+        if (meta.write((const uint8_t*)line, n) != (size_t)n) allOk = false;
     }
 
     bool anySaved = false;
@@ -1873,6 +1879,7 @@ void saveSession() {
         char trackPath[112];
         snprintf(trackPath, sizeof(trackPath), "%s/track%d.mid", sessionPath, i + 1);
         if (saveTrackToFile(t, trackPath)) anySaved = true;
+        else allOk = false;
 
         if (metaOk) {
             char inStr[8];
@@ -1890,14 +1897,32 @@ void saveSession() {
             int n = snprintf(line, sizeof(line),
                               "track%d.channelIn=%s\ntrack%d.channelOut=%s\ntrack%d.barLength=%d\ntrack%d.lengthMs=%lu\n",
                               i + 1, inStr, i + 1, outStr, i + 1, t.barLength, i + 1, (unsigned long)t.lengthMs);
-            meta.write((const uint8_t*)line, n);
+            if (meta.write((const uint8_t*)line, n) != (size_t)n) allOk = false;
         }
     }
-    if (metaOk) { meta.sync(); meta.close(); }
+    if (metaOk) {
+        if (!meta.sync()) allOk = false;
+        meta.close();
+    }
+
+    if (!allOk) {
+        // Remove the half-written folder (it was created above, so nothing else is in it).
+        char rmPath[112];
+        snprintf(rmPath, sizeof(rmPath), "%s/session.txt", sessionPath);
+        sd.remove(rmPath);
+        for (int i = 0; i < NUM_TRACKS; i++) {
+            snprintf(rmPath, sizeof(rmPath), "%s/track%d.mid", sessionPath, i + 1);
+            sd.remove(rmPath);
+        }
+        sd.rmdir(sessionPath);
+        showFlashMessage("Save failed", "could not write files", 1500);
+        return false;
+    }
 
     char msg[32];
     snprintf(msg, sizeof(msg), "Saved as %s", sessionName);
     showFlashMessage(msg, anySaved ? nullptr : "(no tracks had content)", 1200);
+    return true;
 }
 
 // Scans BUNDLES_ROOT for saved session folders into savedSessionNames[],
@@ -2384,7 +2409,8 @@ void parseSessionMetaLine(const char* line, SessionMeta& meta) {
         return;
     }
     if (strncmp(line, "bpm=", 4) == 0) {
-        meta.bpm = (float)atoi(line + 4);
+        int v = atoi(line + 4);
+        meta.bpm = (float)(v < 20 ? 20 : (v > 300 ? 300 : v)); // same range as the Settings BPM
         return;
     }
     if (strncmp(line, "timeSigNum=", 11) == 0) {
@@ -2403,7 +2429,8 @@ void parseSessionMetaLine(const char* line, SessionMeta& meta) {
         plen = strlen(prefix);
         if (strncmp(line, prefix, plen) == 0) {
             const char* v = line + plen;
-            meta.channelIn[i] = (strcasecmp(v, "OMNI") == 0) ? OMNI_CHANNEL : (uint8_t)(atoi(v) - 1);
+            int ch = atoi(v) - 1;
+            meta.channelIn[i] = (strcasecmp(v, "OMNI") == 0 || ch < 0 || ch > 15) ? OMNI_CHANNEL : (uint8_t)ch;
             return;
         }
 
@@ -2411,14 +2438,18 @@ void parseSessionMetaLine(const char* line, SessionMeta& meta) {
         plen = strlen(prefix);
         if (strncmp(line, prefix, plen) == 0) {
             const char* v = line + plen;
-            meta.channelOut[i] = (strcasecmp(v, "REC") == 0) ? CHANNEL_AS_RECORDED : (uint8_t)(atoi(v) - 1);
+            int ch = atoi(v) - 1;
+            meta.channelOut[i] = (strcasecmp(v, "REC") == 0) ? CHANNEL_AS_RECORDED : (uint8_t)(ch < 0 ? 0 : (ch > 15 ? 15 : ch));
             return;
         }
 
         snprintf(prefix, sizeof(prefix), "track%d.barLength=", i + 1);
         plen = strlen(prefix);
         if (strncmp(line, prefix, plen) == 0) {
-            meta.barLength[i] = atoi(line + plen);
+            int v = atoi(line + plen);
+            meta.barLength[i] = 0;
+            for (int k = 0; k < BAR_PRESET_COUNT; k++)
+                if (BAR_PRESETS[k] == v) meta.barLength[i] = v;
             return;
         }
     }
@@ -2449,6 +2480,14 @@ void readSessionMeta(const char* sessionPath, SessionMeta& meta) {
         parseSessionMetaLine(line, meta);
     }
     file.close();
+
+    bool sigOk = false;
+    for (int i = 0; i < TIME_SIG_PRESET_COUNT; i++)
+        if (TIME_SIG_PRESETS[i].num == meta.timeSigNum && TIME_SIG_PRESETS[i].den == meta.timeSigDen) sigOk = true;
+    if (!sigOk) {
+        meta.timeSigNum = TIME_SIG_PRESETS[0].num;
+        meta.timeSigDen = TIME_SIG_PRESETS[0].den;
+    }
 }
 
 // Wipes any existing content from t (see resetTrack()), loads new
@@ -4025,6 +4064,7 @@ void applySettingsIfFresh() {
 const char* const FREE_GATE_LABELS[] = { "Save & Continue", "Discard & Continue", "Cancel" };
 const int FREE_GATE_COUNT = 3;
 int freeGateCursor = 0;
+bool freeGateErrorShown = false; // a save-failed message is up; the menu comes back once flashUntilMs passes
 
 } // namespace
 
@@ -4042,6 +4082,8 @@ void freeTracksIfAllocated() {
         for (int i = 0; i < NUM_TRACKS; i++) tracks[i].~LoopTrack();
     }
     tracks = nullptr;
+    MidiOutput::setInputHandler(nullptr);
+    MidiOutput::setRealtimeHandler(nullptr);
 }
 
 void beginFreeTracksForFilePlayer() {
@@ -4050,6 +4092,14 @@ void beginFreeTracksForFilePlayer() {
 }
 
 FreeTracksResult updateFreeTracksForFilePlayer() {
+    if (freeGateErrorShown) {
+        if ((int32_t)(millis() - flashUntilMs) >= 0) {
+            freeGateErrorShown = false;
+            screen = SCREEN_MAIN;
+            beginFreeTracksForFilePlayer();
+        }
+        return FREE_TRACKS_PENDING;
+    }
     if (Input::justPressed(BTN_UP) && freeGateCursor > 0) {
         int prev = freeGateCursor--;
         Ui::updateEntryMenuSelection(FREE_GATE_LABELS, FREE_GATE_COUNT, prev, freeGateCursor);
@@ -4062,7 +4112,11 @@ FreeTracksResult updateFreeTracksForFilePlayer() {
         return FREE_TRACKS_CANCELLED; // tracks left exactly as it was
     }
     if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
-        if (freeGateCursor == 0) saveSession(); // "Save & Continue" -- reuses existing SD-write machinery unmodified
+        if (freeGateCursor == 0 && !saveSession()) {
+            // Save failed: keep the tracks; the menu is drawn again after the message.
+            freeGateErrorShown = true;
+            return FREE_TRACKS_PENDING;
+        }
         freeTracksIfAllocated();                // "Discard & Continue": nothing to do first -- just free
         return FREE_TRACKS_DONE;
     }
@@ -4159,7 +4213,11 @@ bool update() {
         case SCREEN_IMPORT_CONFIRM: updateImportConfirm(); break;
         case SCREEN_FLASH_MESSAGE:  updateFlashMessage(); break;
     }
-    if (exitRequested) return true;
+    if (exitRequested) {
+        MidiOutput::setInputHandler(nullptr); // enter() registers both again
+        MidiOutput::setRealtimeHandler(nullptr);
+        return true;
+    }
 
     // Every sub-screen draws itself at the moment it's entered (see each
     // update*() above); only SCREEN_MAIN has its own periodic redraw here.

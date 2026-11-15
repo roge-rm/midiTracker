@@ -442,8 +442,10 @@ float hundredthsToFloat(long h) {
 // position, so a future field addition/reorder doesn't corrupt old banks
 // (same reasoning SettingsMode's saveThemeToFile() documents).
 bool saveBankToFile(const char* path) {
+    char tmpPath[72];
+    snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path);
     FsFile file;
-    if (!file.open(path, O_RDWR | O_CREAT | O_TRUNC)) return false;
+    if (!file.open(tmpPath, O_RDWR | O_CREAT | O_TRUNC)) return false;
     char line[96];
     for (int i = 0; i < Synth::INSTRUMENT_FAMILY_COUNT; i++) {
         Synth::InstrumentPresetParams p;
@@ -465,9 +467,14 @@ bool saveBankToFile(const char* path) {
                           floatToHundredths(p.pitchDropStartHz), (int)p.pitchDropSamples, floatToHundredths(p.cutoffHz));
         file.write((const uint8_t*)line, n);
     }
-    file.sync();
+    // Moved over the real file only if every write worked; otherwise the old bank stays.
+    bool ok = !file.getWriteError() && file.sync();
     file.close();
-    return true;
+    if (!ok || (sd.exists(path) && !sd.remove(path))) {
+        sd.remove(tmpPath);
+        return false;
+    }
+    return sd.rename(tmpPath, path); // on failure the complete temp file stays for the load fallback
 }
 
 // Reverses saveBankToFile() -- unrecognized labels (older/newer firmware,
@@ -476,7 +483,9 @@ bool saveBankToFile(const char* path) {
 // uses for its own text files.
 bool loadBankFromFile(const char* path) {
     FsFile file;
-    if (!file.open(path, O_RDONLY)) return false;
+    char tmpPath[72];
+    snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path);
+    if (!file.open(path, O_RDONLY) && !file.open(tmpPath, O_RDONLY)) return false;
 
     char line[96];
     int lineLen = 0;
@@ -498,15 +507,16 @@ bool loadBankFromFile(const char* path) {
                         long cf, vib, trem, pwm;
                         if (sscanf(rest, "%d,%d,%d,%d,%d,%ld,%ld,%ld,%ld", &wf, &a, &d, &s, &r, &cf, &vib, &trem, &pwm) == 9) {
                             Synth::InstrumentPresetParams p;
-                            p.waveform = (Synth::SynthWaveform)wf;
-                            p.attackSamples = (uint16_t)a;
-                            p.decaySamples = (uint16_t)d;
-                            p.sustainPercent = (uint8_t)s;
-                            p.releaseSamples = (uint16_t)r;
-                            p.cutoffHz = hundredthsToFloat(cf);
-                            p.vibratoDepthPercent = hundredthsToFloat(vib);
-                            p.tremoloDepthPercent = hundredthsToFloat(trem);
-                            p.pwmDepthPercent = hundredthsToFloat(pwm);
+                            // Same ranges adjustField() allows.
+                            p.waveform = (Synth::SynthWaveform)clampL(wf, 0, (long)Synth::SYNTH_WAVE_NOISE);
+                            p.attackSamples = (uint16_t)clampL(a, 0, 65535);
+                            p.decaySamples = (uint16_t)clampL(d, 0, 65535);
+                            p.sustainPercent = (uint8_t)clampL(s, 0, 100);
+                            p.releaseSamples = (uint16_t)clampL(r, 0, 65535);
+                            p.cutoffHz = clampF(hundredthsToFloat(cf), 100.0f, 20000.0f);
+                            p.vibratoDepthPercent = clampF(hundredthsToFloat(vib), 0.0f, 30.0f);
+                            p.tremoloDepthPercent = clampF(hundredthsToFloat(trem), 0.0f, 30.0f);
+                            p.pwmDepthPercent = clampF(hundredthsToFloat(pwm), 0.0f, 30.0f);
                             Synth::setInstrumentPreset((uint8_t)i, p);
                             any = true;
                         }
@@ -521,12 +531,12 @@ bool loadBankFromFile(const char* path) {
                         long bp, pds, cf;
                         if (sscanf(rest, "%d,%ld,%d,%ld,%d,%ld", &wf, &bp, &dec, &pds, &pdt, &cf) == 6) {
                             Synth::DrumPresetParams p;
-                            p.waveform = (Synth::SynthWaveform)wf;
-                            p.basePitchHz = hundredthsToFloat(bp);
-                            p.decaySamples = (uint16_t)dec;
-                            p.pitchDropStartHz = hundredthsToFloat(pds);
-                            p.pitchDropSamples = (uint16_t)pdt;
-                            p.cutoffHz = hundredthsToFloat(cf);
+                            p.waveform = (Synth::SynthWaveform)clampL(wf, 0, (long)Synth::SYNTH_WAVE_NOISE);
+                            p.basePitchHz = clampF(hundredthsToFloat(bp), 0.0f, 4000.0f);
+                            p.decaySamples = (uint16_t)clampL(dec, 0, 65535);
+                            p.pitchDropStartHz = clampF(hundredthsToFloat(pds), 0.0f, 4000.0f);
+                            p.pitchDropSamples = (uint16_t)clampL(pdt, 0, 65535);
+                            p.cutoffHz = clampF(hundredthsToFloat(cf), 100.0f, 20000.0f);
                             Synth::setDrumPreset((uint8_t)i, p);
                             any = true;
                         }
@@ -615,6 +625,8 @@ void finishBankSaveName() {
     int len = (int)strlen(trimmed);
     while (len > 0 && trimmed[len - 1] == ' ') trimmed[--len] = '\0';
     if (len == 0) return; // nothing typed -- stay on the naming screen
+    strcpy(bankNameBuf, trimmed); // later saves use the trimmed name
+    bankNameLen = len;
 
     if (!sd.exists(SYNTH_BANKS_ROOT)) sd.mkdir(SYNTH_BANKS_ROOT);
 
@@ -701,7 +713,6 @@ void handleBankSaveOverwriteInput() {
         return;
     }
     if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
-        sd.remove(pendingOverwritePath);
         if (saveBankToFile(pendingOverwritePath)) {
             strncpy(activeBankName, bankNameBuf, BANK_NAME_MAX_LEN);
             activeBankName[BANK_NAME_MAX_LEN] = '\0';
