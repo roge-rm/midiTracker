@@ -8,6 +8,7 @@
 #include "ui.h"
 #include "sd_card.h"
 #include "synth.h"
+#include "shared_ram_arena.h"
 #include "keyboard_layout.h" // bank-name save screen's on-screen keyboard -- see handleBankSaveNameInput()
 
 namespace SynthEditor {
@@ -381,7 +382,9 @@ char bankNameError[40] = {0};
 char pendingOverwritePath[64] = {0}; // SCREEN_SAVE_OVERWRITE only
 
 const int MAX_SAVED_BANKS = 64; // comfortably above realistic use -- same "bump the constant" precedent MIDI_MAX_TRACKS documents
-char bankLoadNames[MAX_SAVED_BANKS][BANK_NAME_MAX_LEN + 1];
+static_assert(MAX_SAVED_BANKS <= SharedRamArena::NAME_LIST_COUNT && BANK_NAME_MAX_LEN + 1 <= SharedRamArena::NAME_LIST_LEN,
+              "bank names no longer fit SharedRamArena::scratch");
+char (&bankLoadNames)[SharedRamArena::NAME_LIST_COUNT][SharedRamArena::NAME_LIST_LEN] = SharedRamArena::scratch.nameList;
 int bankLoadCount = 0;
 int bankLoadCursor = 0;
 int bankLoadScrollOffset = 0; // see ensureBankLoadVisible()

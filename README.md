@@ -31,7 +31,7 @@ SysEx recording is similar and can be used to back up memory banks, individual p
 
 ### Looper
 
-midiTracker has a 4 track MIDI looper. Each loop can be freeform in length or set to a certain number of bars. There is a hard limit of 4096 events per loop as loops are held in the Pico's limited RAM until you choose to save them. You can mute, overdub, pause/resume, and stop/restart each loop.
+midiTracker has a 4 track MIDI looper. Each loop can be freeform in length or set to a certain number of bars. There is a hard limit of 4144 events per loop as loops are held in the Pico's limited RAM until you choose to save them. A loop can be up to about 37 minutes long: a freeform recording ends there on its own, and a longer imported file is cut off there. You can mute, overdub, pause/resume, and stop/restart each loop.
 
 Each track has independent input and output MIDI channels. The input channel filters which incoming channel gets recorded while the output channel controls playback - either remapped to a fixed channel or sent back out on whichever channel each event was originally recorded on.
 
@@ -88,7 +88,7 @@ See `include/pins.h` for the exact pin map.
   `SdBrowser::MAX_INDEX_ENTRIES` (4096) is a safety ceiling past which a
   folder stops indexing further entries; real available RAM (checked at
   scan time, since e.g. the looper's `tracks[]` can already be using
-  128KB) can cap it lower still. Either way, a folder past what got
+  about 98KB) can cap it lower still. Either way, a folder past what got
   indexed shows a "(+N)"/"(4096+)" note in the header rather than silently
   dropping entries. Folders past `SdBrowser::SORT_KEY_CEILING` (512
   entries) are listed in on-disk order instead of alphabetized, to avoid

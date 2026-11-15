@@ -17,6 +17,7 @@
 #include "synth.h"
 #include "settings_mode.h"
 #include "shared_ram_arena.h"
+#include "smf.h"
 
 // A 4-track MIDI looper. Each track is filtered to one MIDI channel: any
 // channel-voice message arriving on that channel gets captured into that
@@ -36,11 +37,9 @@ namespace LooperMode {
 namespace {
 
 const int NUM_TRACKS = 4;
-// 4096 * 8 bytes/event = 32KB/track, 128KB total for 4 tracks -- chosen to
-// leave a comfortable ~34% RAM margin for stack/heap/USB-audio-SD runtime
-// overhead at 4 tracks specifically; an 8-track future would need this
-// revisited rather than assumed to still fit.
-const int MAX_EVENTS_PER_TRACK = 4096;
+// 4144 * 6 bytes/event, about 24KB/track: as many as fit in SharedRamArena,
+// which is sized for ItPlayer (see shared_ram_arena.h).
+const int MAX_EVENTS_PER_TRACK = 4144;
 const char* LOOPS_ROOT = "/loops";
 // Bundle (whole-session) saves live one level down from individual loop
 // saves -- LOOPS_ROOT itself holds loose single-track .mid files (see
@@ -62,10 +61,35 @@ const int MAX_DROPPED_NOTES = 4;
 // one (see allNotesOffForTrack()).
 const int MAX_SOUNDING_NOTES = 32;
 
+// One captured event in 6 bytes: offsetMs in bits 0-26 (up to about 37
+// minutes, later offsets are held at the maximum), then status, data1 and
+// data2 at 7 bits each. Status always has its top bit set, so it isn't stored.
 struct LoopEvent {
-    uint32_t offsetMs; // position within the loop cycle, 0..baseLengthMs-1
-    uint8_t status, data1, data2;
+    static const uint32_t MAX_OFFSET_MS = (1u << 27) - 1;
+    uint16_t w[3];
+
+    // Position within the loop cycle, 0..baseLengthMs-1.
+    uint32_t offsetMs() const { return (w[0] | ((uint32_t)w[1] << 16)) & MAX_OFFSET_MS; }
+    uint8_t status() const { return (uint8_t)(0x80 | (w[1] >> 11) | ((w[2] >> 14) << 5)); }
+    uint8_t data1() const { return (uint8_t)(w[2] & 0x7F); }
+    uint8_t data2() const { return (uint8_t)((w[2] >> 7) & 0x7F); }
+
+    void set(uint32_t offset, uint8_t status, uint8_t data1, uint8_t data2) {
+        uint32_t s = status & 0x7F;
+        w[2] = (uint16_t)((data1 & 0x7F) | ((data2 & 0x7F) << 7) | ((s >> 5) << 14));
+        w[1] = (uint16_t)((s & 0x1F) << 11);
+        setOffsetMs(offset);
+    }
+    void setOffsetMs(uint32_t offset) {
+        if (offset > MAX_OFFSET_MS) offset = MAX_OFFSET_MS;
+        w[0] = (uint16_t)offset;
+        w[1] = (uint16_t)((w[1] & 0xF800) | (offset >> 16));
+    }
 };
+static_assert(sizeof(LoopEvent) == 6, "LoopEvent should pack to 6 bytes");
+// Longest loop, about 37 minutes: a freeform first pass ends here on its
+// own, and imports are cut off here.
+const uint32_t MAX_LOOP_MS = LoopEvent::MAX_OFFSET_MS + 1;
 
 struct LoopTrack {
     uint8_t channelIn = OMNI_CHANNEL; // 0-15, or OMNI_CHANNEL (default: record from any incoming channel)
@@ -146,7 +170,7 @@ struct LoopTrack {
 };
 
 // Allocated lazily by enter() (see below), not a permanent static global
-// -- at 131KB+ this is by far the single largest RAM consumer in the
+// -- at about 98KB this is by far the single largest RAM consumer in the
 // firmware, and stays resident through ordinary trips to Settings/Mode
 // Select rather than being freed on every exit. Only freed via
 // freeTracksIfAllocated() (see looper_mode.h), which main.cpp calls at
@@ -375,7 +399,10 @@ const int BAR_PRESET_COUNT = 9;
 const int BAR_PRESETS[BAR_PRESET_COUNT] = {0, 1, 2, 4, 8, 16, 32, 64, 128};
 
 const int MAX_SAVED_SESSIONS = 32; // cap on how many saved loop folders the delete/load browsers list
-char savedSessionNames[MAX_SAVED_SESSIONS][16];
+const int SESSION_NAME_LEN = 16; // buffer size per name, terminator included
+static_assert(MAX_SAVED_SESSIONS <= SharedRamArena::NAME_LIST_COUNT && SESSION_NAME_LEN <= SharedRamArena::NAME_LIST_LEN,
+              "session names no longer fit SharedRamArena::scratch");
+char (&savedSessionNames)[SharedRamArena::NAME_LIST_COUNT][SharedRamArena::NAME_LIST_LEN] = SharedRamArena::scratch.nameList;
 int savedSessionCount = 0;
 int deleteCursor = 0;
 
@@ -558,11 +585,6 @@ float positionFrac(const LoopTrack& t) {
     return (float)(elapsedRunMs(t) % t.lengthMs) / (float)t.lengthMs;
 }
 
-uint8_t dataBytesForStatus(uint8_t status) {
-    uint8_t type = status & 0xF0;
-    return (type == 0xC0 || type == 0xD0) ? 1 : 2; // Program Change / Channel Aftertouch
-}
-
 // Recomputes prevPos/playCursor from the current position -- used both
 // when flipping Sync/Independent (the epoch driving epochFor() changes
 // for every track at once) and when resuming a stopped track (elapsedRunMs()
@@ -575,7 +597,7 @@ uint8_t dataBytesForStatus(uint8_t status) {
 void clampEventOffsets(LoopTrack& t) {
     if (t.baseLengthMs == 0) return;
     uint32_t last = t.baseLengthMs - 1;
-    for (int i = t.eventCount - 1; i >= 0 && t.events[i].offsetMs > last; i--) t.events[i].offsetMs = last;
+    for (int i = t.eventCount - 1; i >= 0 && t.events[i].offsetMs() > last; i--) t.events[i].setOffsetMs(last);
 }
 
 // Current position in the loop, in the track's offset scale
@@ -590,7 +612,7 @@ void resyncCursor(LoopTrack& t) {
     uint32_t pos = loopPos(t);
     t.prevPos = pos;
     int idx = 0;
-    while (idx < t.eventCount && t.events[idx].offsetMs <= pos) idx++;
+    while (idx < t.eventCount && t.events[idx].offsetMs() <= pos) idx++;
     t.playCursor = idx;
 }
 
@@ -653,7 +675,7 @@ void trackSounding(LoopTrack& t, uint8_t status, uint8_t data1, uint8_t data2) {
 
 // Sends every not-yet-fired event this cycle with offset <= limit.
 void fireEventsUpTo(LoopTrack& t, uint32_t limit) {
-    while (t.playCursor < t.eventCount && t.events[t.playCursor].offsetMs <= limit) {
+    while (t.playCursor < t.eventCount && t.events[t.playCursor].offsetMs() <= limit) {
         const LoopEvent& e = t.events[t.playCursor];
         if (t.state != TRACK_MUTED) {
             // channelOut == CHANNEL_AS_RECORDED sends the event exactly
@@ -664,9 +686,9 @@ void fireEventsUpTo(LoopTrack& t, uint32_t limit) {
             // can drive several pieces of outboard gear on different
             // channels without ever touching that device's own channel.
             uint8_t outStatus = (t.channelOut == CHANNEL_AS_RECORDED)
-                ? e.status : (uint8_t)((e.status & 0xF0) | t.channelOut);
-            MidiOutput::sendRaw(outStatus, e.data1, e.data2, dataBytesForStatus(e.status));
-            trackSounding(t, outStatus, e.data1, e.data2);
+                ? e.status() : (uint8_t)((e.status() & 0xF0) | t.channelOut);
+            MidiOutput::sendRaw(outStatus, e.data1(), e.data2(), Smf::channelMessageDataBytes(e.status()));
+            trackSounding(t, outStatus, e.data1(), e.data2());
             // Separate from recordEvent()'s lastRecordActivityMs: a
             // track mid-overdub is simultaneously capturing new events
             // AND playing back its existing content, so these need
@@ -1051,18 +1073,20 @@ void updateBpmRowBeatFlash() {
 // recording pass, auto-commits it once the target duration has elapsed --
 // no manual PLAY press needed, which is the whole point of quantizing: the
 // loop lands on an exact bar boundary rather than whatever length the
-// user happened to stop it at. Freeform tracks (barLength == 0) and
-// tracks past their first pass (lengthMs != 0, so overdub applies
-// instead) are untouched. Sets lengthMs to the exact computed target
+// user happened to stop it at. A freeform track (barLength == 0) is
+// committed the same way when it reaches MAX_LOOP_MS. Tracks past their
+// first pass (lengthMs != 0, so overdub applies instead) are untouched. Sets lengthMs to the exact computed target
 // rather than measured elapsed time, so it's precisely on the BPM grid
 // even though this is only checked once per tick (a few ms of drift would
 // otherwise creep in from tick granularity).
 void updateBarQuantizedRecording() {
     for (int i = 0; i < NUM_TRACKS; i++) {
         LoopTrack& t = tracks[i];
-        if (t.state != TRACK_RECORDING || t.lengthMs != 0 || t.barLength == 0) continue;
+        if (t.state != TRACK_RECORDING || t.lengthMs != 0) continue;
 
-        uint32_t target = barsToMs(t.barLength);
+        // A freeform pass ends at MAX_LOOP_MS.
+        uint32_t target = t.barLength == 0 ? MAX_LOOP_MS : barsToMs(t.barLength);
+        if (target > MAX_LOOP_MS) target = MAX_LOOP_MS;
         if (millis() - t.recordStartMs >= target) {
             setCommittedLength(t, target);
             closeRecordingPass(t);
@@ -1090,9 +1114,9 @@ void insertEvent(LoopTrack& t, uint32_t offset, uint8_t status, uint8_t data1, u
         return;
     }
     int idx = t.eventCount;
-    while (idx > 0 && t.events[idx - 1].offsetMs > offset) idx--;
+    while (idx > 0 && t.events[idx - 1].offsetMs() > offset) idx--;
     for (int j = t.eventCount; j > idx; j--) t.events[j] = t.events[j - 1];
-    t.events[idx] = {offset, status, data1, data2};
+    t.events[idx].set(offset, status, data1, data2);
     t.eventCount++;
 
     // Inserting at/before the playback cursor shifts every event from
@@ -1162,6 +1186,7 @@ void recordEvent(LoopTrack& t, uint8_t status, uint8_t data1, uint8_t data2) {
 // landed at or past the end back to the last millisecond so it still
 // plays (a bar-quantized commit lands a tick after its target).
 void setCommittedLength(LoopTrack& t, uint32_t lengthMs) {
+    if (lengthMs > MAX_LOOP_MS) lengthMs = MAX_LOOP_MS;
     t.lengthMs = lengthMs;
     t.baseLengthMs = lengthMs;
     clampEventOffsets(t);
@@ -1789,7 +1814,7 @@ void handleMidiRealtime(MidiRealtimeEvent event) {
 }
 
 // Reset fields individually rather than `t = LoopTrack()` -- each track
-// holds a MAX_EVENTS_PER_TRACK-sized buffer (~16KB), so constructing a
+// holds a MAX_EVENTS_PER_TRACK-sized buffer (~24KB), so constructing a
 // whole temporary LoopTrack on the stack here would be a large, avoidable
 // stack spike. channelIn/channelOut and barLength are deliberately
 // untouched -- all are per-track setup that callers either want preserved
@@ -1886,20 +1911,10 @@ void toggleSyncMode() {
 // -- SD persistence -------------------------------------------------
 
 bool writeVarLen(FsFile& file, uint32_t value, uint32_t& bytesWritten) {
-    bool ok = true;
-    uint32_t buffer = value & 0x7F;
-    while ((value >>= 7) > 0) {
-        buffer <<= 8;
-        buffer |= 0x80 | (value & 0x7F);
-    }
-    for (;;) {
-        uint8_t b = (uint8_t)(buffer & 0xFF);
-        if (file.write(&b, 1) != 1) ok = false;
-        bytesWritten++;
-        if (buffer & 0x80) buffer >>= 8;
-        else break;
-    }
-    return ok;
+    uint8_t buf[5];
+    uint8_t n = Smf::encodeVarLen(value, buf);
+    bytesWritten += n;
+    return file.write(buf, n) == n;
 }
 
 // Serializes one track's event buffer as a standalone format-0 SMF.
@@ -1944,13 +1959,13 @@ bool saveTrackToFile(const LoopTrack& t, const char* path) {
     for (int i = 0; i < t.eventCount; i++) {
         const LoopEvent& e = t.events[i];
         // Offsets are in baseLengthMs scale; the file holds real time.
-        uint64_t ms = e.offsetMs;
+        uint64_t ms = e.offsetMs();
         if (t.baseLengthMs > 0 && t.baseLengthMs != t.lengthMs) ms = ms * t.lengthMs / t.baseLengthMs;
         uint32_t tick = (uint32_t)((ms * 1000 * division) / usPerQuarter);
         if (!writeVarLen(file, tick - lastTick, bytesWritten)) ok = false;
         lastTick = tick;
-        uint8_t len = dataBytesForStatus(e.status);
-        const uint8_t evt[3] = {e.status, e.data1, e.data2};
+        uint8_t len = Smf::channelMessageDataBytes(e.status());
+        const uint8_t evt[3] = {e.status(), e.data1(), e.data2()};
         if (file.write(evt, 1 + len) != (size_t)(1 + len)) ok = false;
         bytesWritten += 1 + len;
     }
@@ -2129,7 +2144,7 @@ void loadSavedSessions() {
         FsFile entry;
         while (savedSessionCount < MAX_SAVED_SESSIONS && entry.openNext(&dir, O_RDONLY)) {
             if (entry.isDir()) {
-                entry.getName(savedSessionNames[savedSessionCount], sizeof(savedSessionNames[0]));
+                entry.getName(savedSessionNames[savedSessionCount], SESSION_NAME_LEN);
                 savedSessionCount++;
             }
             entry.close();
@@ -2143,10 +2158,10 @@ void loadSavedSessions() {
         key[sizeof(key) - 1] = '\0';
         int j = i - 1;
         while (j >= 0 && strcasecmp(savedSessionNames[j], key) > 0) {
-            strncpy(savedSessionNames[j + 1], savedSessionNames[j], sizeof(savedSessionNames[0]));
+            strncpy(savedSessionNames[j + 1], savedSessionNames[j], SESSION_NAME_LEN);
             j--;
         }
-        strncpy(savedSessionNames[j + 1], key, sizeof(savedSessionNames[0]));
+        strncpy(savedSessionNames[j + 1], key, SESSION_NAME_LEN);
     }
 }
 
@@ -2177,136 +2192,6 @@ bool deleteSavedSession(const char* name) {
 
 // -- SD loading -----------------------------------------------------------
 
-bool readChunkHeaderLocal(FsFile& f, char id[5], uint32_t& length) {
-    uint8_t buf[8];
-    if (f.read(buf, 8) != 8) return false;
-    id[0] = buf[0]; id[1] = buf[1]; id[2] = buf[2]; id[3] = buf[3]; id[4] = '\0';
-    length = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) |
-             ((uint32_t)buf[6] << 8) | buf[7];
-    return true;
-}
-
-bool readVarLen(FsFile& f, uint32_t& value) {
-    value = 0;
-    for (int i = 0; i < 4; i++) {
-        int b = f.read();
-        if (b < 0) return false;
-        value = (value << 7) | (uint32_t)(b & 0x7F);
-        if (!(b & 0x80)) return true;
-    }
-    return true; // malformed (>4 continuation bytes) -- accept what we have
-}
-
-// Reverses saveTrackToFile(): reads a format-0 single-track SMF this same
-// firmware wrote and rebuilds t.events[]/eventCount/lengthMs from it.
-// Not a general SMF loader -- saveTrackToFile() always writes an explicit
-// status byte per event (no running status) and a fixed synthetic
-// division/tempo, so this only needs to reverse exactly that, not handle
-// arbitrary files. lengthMs comes from the End-of-Track event's own tick,
-// not the last note event -- see saveTrackToFile()'s comment on why that
-// was written that way. Leaves t.channelIn/channelOut/barLength untouched
-// -- none is recoverable from the file itself, callers fill them in from
-// the session's metadata (see readSessionMeta()) afterward.
-bool loadTrackFromFile(LoopTrack& t, const char* path) {
-    FsFile file;
-    if (!file.open(path, O_RDONLY)) return false;
-
-    char id[5];
-    uint32_t chunkLen;
-    if (!readChunkHeaderLocal(file, id, chunkLen) || strcmp(id, "MThd") != 0 || chunkLen < 6) {
-        file.close();
-        return false;
-    }
-    uint8_t hdr[6];
-    if (file.read(hdr, 6) != 6) { file.close(); return false; }
-    uint16_t division = ((uint16_t)hdr[4] << 8) | hdr[5];
-    if (division == 0) division = 480;
-    if (chunkLen > 6) file.seekCur(chunkLen - 6);
-
-    if (!readChunkHeaderLocal(file, id, chunkLen) || strcmp(id, "MTrk") != 0) {
-        file.close();
-        return false;
-    }
-    uint32_t chunkEnd = file.curPosition() + chunkLen;
-
-    const uint32_t usPerQuarter = 500000; // must match saveTrackToFile()'s synthetic tempo
-
-    t.eventCount = 0;
-    t.bufferFull = false;
-    t.lengthMs = 0;
-    uint32_t absTick = 0;
-    uint8_t runningStatus = 0;
-    bool ok = true;
-
-    while (file.curPosition() < chunkEnd) {
-        uint32_t delta;
-        if (!readVarLen(file, delta)) { ok = false; break; }
-        absTick += delta;
-
-        int b0i = file.read();
-        if (b0i < 0) { ok = false; break; }
-        uint8_t b0 = (uint8_t)b0i;
-        uint8_t status, firstData = 0;
-        bool haveFirst = false;
-        if (b0 & 0x80) {
-            status = b0;
-            if (status < 0xF0) runningStatus = status;
-        } else {
-            status = runningStatus;
-            firstData = b0;
-            haveFirst = true;
-            if (status == 0) { ok = false; break; }
-        }
-
-        if (status == 0xFF) {
-            int metaTypeI = file.read();
-            if (metaTypeI < 0) { ok = false; break; }
-            uint8_t metaType = (uint8_t)metaTypeI;
-            uint32_t metaLen;
-            if (!readVarLen(file, metaLen)) { ok = false; break; }
-            if (metaType == 0x2F) { // End of Track -- its tick IS the loop length
-                t.lengthMs = (uint32_t)(((uint64_t)absTick * usPerQuarter) / ((uint64_t)division * 1000));
-                break;
-            }
-            if (metaLen > 0) file.seekCur(metaLen); // e.g. the leading tempo meta -- already known
-        } else if (status == 0xF0 || status == 0xF7) {
-            uint32_t sysExLen;
-            if (!readVarLen(file, sysExLen)) { ok = false; break; }
-            if (sysExLen > 0) file.seekCur(sysExLen);
-        } else if (status >= 0x80 && status < 0xF0) {
-            uint8_t need = dataBytesForStatus(status);
-            uint8_t d1, d2 = 0;
-            if (haveFirst) {
-                d1 = firstData;
-            } else {
-                int r = file.read();
-                if (r < 0) { ok = false; break; }
-                d1 = (uint8_t)r;
-            }
-            if (need >= 2) {
-                int r = file.read();
-                if (r < 0) { ok = false; break; }
-                d2 = (uint8_t)r;
-            }
-            if (t.eventCount < MAX_EVENTS_PER_TRACK) {
-                LoopEvent& e = t.events[t.eventCount++];
-                e.offsetMs = (uint32_t)(((uint64_t)absTick * usPerQuarter) / ((uint64_t)division * 1000));
-                e.status = status;
-                e.data1 = d1;
-                e.data2 = d2;
-            } else {
-                t.bufferFull = true;
-            }
-        } else {
-            ok = false; // unexpected system message -- not something this writer ever emits
-            break;
-        }
-    }
-
-    file.close();
-    return ok && t.lengthMs > 0;
-}
-
 // Common finish-up for any freshly loaded/imported track (whole-session
 // load, single saved-track load, or an arbitrary file import): parks it
 // TRACK_STOPPED with its own position-zero pinned to right now, so it
@@ -2333,9 +2218,9 @@ void parkLoadedTrack(LoopTrack& t) {
 
 // -- SD loading: arbitrary MIDI files (not just this firmware's own) -----
 //
-// loadTrackFromFile() above only needs to reverse the exact fixed-tempo,
-// single-track, no-running-status format saveTrackToFile() writes. A file
-// dropped in from the file browser could be anything a DAW exports:
+// The reader below is shared with loadTrackFromFile(), which only
+// reverses the fixed-tempo single-track format saveTrackToFile() writes. A
+// file dropped in from the file browser could be anything a DAW exports:
 // format 0 or 1, multiple tracks, running status, real tempo changes
 // mid-file. Rather than duplicate MidiPlayer's already-correct multi-
 // track-merge/tempo-map logic by reaching into its private internals,
@@ -2372,7 +2257,7 @@ bool primeImportTrack(ImportTrackReader& t) {
         if (!t.file || t.file.curPosition() >= t.chunkEnd) { t.ended = true; return false; }
 
         uint32_t delta;
-        if (!readVarLen(t.file, delta)) { t.ended = true; return false; }
+        if (!Smf::readVarLen(t.file, delta)) { t.ended = true; return false; }
         t.absoluteTick += delta;
 
         int b0i = t.file.read();
@@ -2395,7 +2280,7 @@ bool primeImportTrack(ImportTrackReader& t) {
             if (metaTypeI < 0) { t.ended = true; return false; }
             uint8_t metaType = (uint8_t)metaTypeI;
             uint32_t metaLen;
-            if (!readVarLen(t.file, metaLen)) { t.ended = true; return false; }
+            if (!Smf::readVarLen(t.file, metaLen)) { t.ended = true; return false; }
 
             if (metaType == 0x51 && metaLen == 3) { // Set Tempo
                 uint8_t d[3];
@@ -2416,11 +2301,11 @@ bool primeImportTrack(ImportTrackReader& t) {
             }
         } else if (status == 0xF0 || status == 0xF7) {
             uint32_t sysExLen;
-            if (!readVarLen(t.file, sysExLen)) { t.ended = true; return false; }
+            if (!Smf::readVarLen(t.file, sysExLen)) { t.ended = true; return false; }
             if (sysExLen > 0) t.file.seekCur(sysExLen);
             continue;
         } else if (status >= 0x80 && status < 0xF0) {
-            uint8_t need = dataBytesForStatus(status);
+            uint8_t need = Smf::channelMessageDataBytes(status);
             uint8_t d1, d2 = 0;
             if (haveFirst) {
                 d1 = firstData;
@@ -2448,6 +2333,63 @@ bool primeImportTrack(ImportTrackReader& t) {
     }
 }
 
+// Reverses saveTrackToFile(): reads a format-0 single-track SMF this same
+// firmware wrote and rebuilds t.events[]/eventCount/lengthMs from it.
+// Not a general SMF loader: it reads the first track only and times it at
+// saveTrackToFile()'s fixed tempo, ignoring tempo events. lengthMs comes
+// from the End-of-Track event's own tick, not the last note event -- see
+// saveTrackToFile()'s comment on why that was written that way. Fails
+// without an End-of-Track. Leaves t.channelIn/channelOut/barLength
+// untouched -- none is recoverable from the file itself, callers fill them
+// in from the session's metadata (see readSessionMeta()) afterward.
+bool loadTrackFromFile(LoopTrack& t, const char* path) {
+    ImportTrackReader r;
+    if (!r.file.open(path, O_RDONLY)) return false;
+
+    char id[5];
+    uint32_t chunkLen;
+    if (!Smf::readChunkHeader(r.file, id, chunkLen) || strcmp(id, "MThd") != 0 || chunkLen < 6) {
+        r.file.close();
+        return false;
+    }
+    uint8_t hdr[6];
+    if (r.file.read(hdr, 6) != 6) { r.file.close(); return false; }
+    uint16_t division = ((uint16_t)hdr[4] << 8) | hdr[5];
+    if (division == 0) division = 480;
+    if (chunkLen > 6) r.file.seekCur(chunkLen - 6);
+
+    if (!Smf::readChunkHeader(r.file, id, chunkLen) || strcmp(id, "MTrk") != 0) {
+        r.file.close();
+        return false;
+    }
+    r.chunkEnd = r.file.curPosition() + chunkLen;
+
+    const uint32_t usPerQuarter = 500000; // must match saveTrackToFile()'s synthetic tempo
+
+    t.eventCount = 0;
+    t.bufferFull = false;
+    t.lengthMs = 0;
+
+    while (primeImportTrack(r)) {
+        uint32_t ms = (uint32_t)(((uint64_t)r.pendingTick * usPerQuarter) / ((uint64_t)division * 1000));
+        if (r.pendingIsEnd) { // its tick is the loop length
+            t.lengthMs = ms > MAX_LOOP_MS ? MAX_LOOP_MS : ms;
+            break;
+        }
+        if (r.pendingIsTempo) continue;
+        if (ms >= MAX_LOOP_MS) {
+            t.bufferFull = true; // past the longest loop, left out
+        } else if (t.eventCount < MAX_EVENTS_PER_TRACK) {
+            t.events[t.eventCount++].set(ms, r.pendingStatus, r.pendingData1, r.pendingData2);
+        } else {
+            t.bufferFull = true;
+        }
+    }
+
+    r.file.close();
+    return t.lengthMs > 0;
+}
+
 // Parses an arbitrary Standard MIDI File at `path` (format 0 or 1; format
 // 2 and SMPTE division are rejected, same limitations MidiPlayer states)
 // and rebuilds t.events[]/eventCount/lengthMs from the merged, time-
@@ -2460,7 +2402,7 @@ bool importMidiEvents(LoopTrack& t, const char* path) {
 
     char id[5];
     uint32_t len;
-    if (!readChunkHeaderLocal(hdr, id, len) || strcmp(id, "MThd") != 0 || len < 6) {
+    if (!Smf::readChunkHeader(hdr, id, len) || strcmp(id, "MThd") != 0 || len < 6) {
         hdr.close();
         return false;
     }
@@ -2477,19 +2419,34 @@ bool importMidiEvents(LoopTrack& t, const char* path) {
     }
     // A smaller cap than MidiPlayer's own MIDI_MAX_TRACKS (64) -- real-
     // world files needing that many simultaneous track readers are rare,
-    // and each reader holds a whole open FsFile, so this is a meaningful
-    // static RAM cost (unlike MidiPlayer's, this array is only alive
-    // during import, but "static" avoids a one-off stack spike for it).
+    // and each reader holds a whole open FsFile. The readers live in
+    // SharedRamArena::scratch for the length of this call (too big for
+    // core 0's stack).
     const int IMPORT_MAX_TRACKS = 16;
+    static_assert(sizeof(ImportTrackReader) * IMPORT_MAX_TRACKS <= SharedRamArena::SCRATCH_SIZE &&
+                  alignof(ImportTrackReader) <= 16,
+                  "import readers no longer fit SharedRamArena::scratch");
     if (ntrks > IMPORT_MAX_TRACKS) ntrks = IMPORT_MAX_TRACKS; // best-effort: import what we can open
 
-    static ImportTrackReader readers[IMPORT_MAX_TRACKS];
+    // Constructs the readers on entry and destroys them on every return.
+    struct ReaderSlots {
+        ImportTrackReader* r;
+        int n;
+        explicit ReaderSlots(int count)
+            : r(reinterpret_cast<ImportTrackReader*>(SharedRamArena::scratch.bytes)), n(count) {
+            for (int i = 0; i < n; i++) new (&r[i]) ImportTrackReader();
+        }
+        ~ReaderSlots() {
+            for (int i = 0; i < n; i++) r[i].~ImportTrackReader();
+        }
+    } slots(ntrks);
+    ImportTrackReader* readers = slots.r;
     int numReaders = 0;
 
     for (uint16_t i = 0; i < ntrks; i++) {
         char tid[5];
         uint32_t tlen;
-        if (!readChunkHeaderLocal(hdr, tid, tlen)) break;
+        if (!Smf::readChunkHeader(hdr, tid, tlen)) break;
         uint32_t trackStart = hdr.curPosition();
 
         if (strcmp(tid, "MTrk") != 0) {
@@ -2498,7 +2455,7 @@ bool importMidiEvents(LoopTrack& t, const char* path) {
         }
 
         ImportTrackReader& r = readers[numReaders];
-        r = ImportTrackReader(); // reset in case this slot was used by a previous import
+        r = ImportTrackReader(); // reset in case a failed track used this slot
         if (!sdOpenPath(r.file, path, O_RDONLY)) { hdr.seekCur(tlen); continue; }
         r.file.seekSet(trackStart);
         r.chunkEnd = trackStart + tlen;
@@ -2543,12 +2500,12 @@ bool importMidiEvents(LoopTrack& t, const char* path) {
             usPerQuarter = r.pendingTempoUsPerQuarter;
             primeImportTrack(r);
         } else {
-            if (t.eventCount < MAX_EVENTS_PER_TRACK) {
+            uint64_t ms = elapsedUs / 1000;
+            if (ms >= MAX_LOOP_MS) {
+                t.bufferFull = true; // past the longest loop, left out
+            } else if (t.eventCount < MAX_EVENTS_PER_TRACK) {
                 LoopEvent& e = t.events[t.eventCount++];
-                e.offsetMs = (uint32_t)(elapsedUs / 1000);
-                e.status = r.pendingStatus;
-                e.data1 = r.pendingData1;
-                e.data2 = r.pendingData2;
+                e.set((uint32_t)ms, r.pendingStatus, r.pendingData1, r.pendingData2);
             } else {
                 t.bufferFull = true;
             }
@@ -2560,7 +2517,8 @@ bool importMidiEvents(LoopTrack& t, const char* path) {
         if (readers[i].file) readers[i].file.close();
     }
 
-    t.lengthMs = (uint32_t)(elapsedUs / 1000);
+    uint64_t lengthMs = elapsedUs / 1000;
+    t.lengthMs = lengthMs > MAX_LOOP_MS ? MAX_LOOP_MS : (uint32_t)lengthMs;
     if (t.lengthMs == 0) t.lengthMs = 1; // guard against a degenerate all-zero-length file
     return true;
 }
@@ -4035,7 +3993,7 @@ void updateLoadLoopBrowse() {
         if (strcmp(loopBrowser.currentPath(), LOOPS_ROOT) == 0) {
             // Leaving the screen -- drop the buffers rather than holding
             // them resident for the rest of the looping session (this
-            // mode's tracks[] is already 128KB; no reason to also carry a
+            // mode's tracks[] is already about 98KB; no reason to also carry a
             // large folder's index around while just recording/playing).
             // Cheap to rebuild: beginLoadLoopBrowse() always refreshes
             // unconditionally next time this screen opens.

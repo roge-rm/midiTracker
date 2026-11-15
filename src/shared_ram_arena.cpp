@@ -12,4 +12,6 @@ namespace SharedRamArena {
 
 void* data() { return g_storage; }
 
+Scratch scratch;
+
 } // namespace SharedRamArena

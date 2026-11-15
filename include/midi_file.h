@@ -136,7 +136,6 @@ private:
     char _error[64] = {0};
     char _path[192] = {0}; // set by load(); lets seekTo() reopen without the caller re-supplying it
 
-    static bool readChunkHeader(FsFile& f, char id[5], uint32_t& length);
     static bool readVarLen(TrackReader& t, uint32_t& value);
 
     // Buffered reads on a track (see TrackReader's buf).
@@ -145,7 +144,6 @@ private:
     static void skipBytes(TrackReader& t, uint32_t n);
     static void seekTrack(TrackReader& t, uint32_t pos);
     static uint32_t trackPos(const TrackReader& t) { return t.bufFilePos + t.bufPos; }
-    static uint8_t channelMessageDataBytes(uint8_t status);
 
     // Reads events for track idx until one worth stopping on (a channel
     // voice message or a tempo meta) is staged in `pending*`, or the

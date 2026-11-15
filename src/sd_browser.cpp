@@ -158,7 +158,7 @@ void SdBrowser::freeBuffers() {
 // pass can ask for a heap buffer sized to what THIS folder really has
 // instead of always reserving the worst case. See this class's header
 // comment and the SdBrowser sizing plan for why a fixed eager reservation
-// doesn't work here (LooperMode::tracks[], 128KB, can already be
+// doesn't work here (LooperMode::tracks[], about 98KB, can already be
 // resident, and isn't visible in the linker's static RAM report).
 void SdBrowser::loadEntries() {
     freeIndexAndSortKeys();

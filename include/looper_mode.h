@@ -34,7 +34,7 @@ void requestImport(const char* path, int trackIndex);
 
 // -- On-demand RAM for the track event buffers --------------------------
 //
-// tracks[] (4 tracks x up to 4096 events each) is the single largest
+// tracks[] (4 tracks x up to 4144 events each) is the single largest
 // static allocation in the whole firmware -- over half of the RP2040's
 // 256KB. It's allocated lazily by enter() (see looper_mode.cpp) rather
 // than existing as a permanent global, and stays resident through

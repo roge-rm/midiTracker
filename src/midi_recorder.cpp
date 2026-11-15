@@ -1,5 +1,6 @@
 #include "midi_recorder.h"
 #include "sd_card.h"
+#include "smf.h"
 #include <string.h>
 #include <hardware/timer.h>
 
@@ -19,21 +20,9 @@ void MidiRecorder::writeBytes(const uint8_t* buf, size_t n) {
     _bytesWritten += n;
 }
 
-// Standard MIDI file variable-length quantity: 7 bits per byte,
-// most-significant group first, continuation bit set on every byte but
-// the last.
 void MidiRecorder::writeVarLen(uint32_t value) {
-    uint32_t buffer = value & 0x7F;
-    while ((value >>= 7) > 0) {
-        buffer <<= 8;
-        buffer |= 0x80 | (value & 0x7F);
-    }
-    for (;;) {
-        uint8_t b = (uint8_t)(buffer & 0xFF);
-        writeBytes(&b, 1);
-        if (buffer & 0x80) buffer >>= 8;
-        else break;
-    }
+    uint8_t buf[5];
+    writeBytes(buf, Smf::encodeVarLen(value, buf));
 }
 
 bool MidiRecorder::arm(const char* path) {

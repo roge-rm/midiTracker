@@ -1,17 +1,9 @@
 #include "midi_file.h"
 #include "sd_card.h"
 #include "midi_output.h"
+#include "smf.h"
 #include <string.h>
 #include <new>
-
-bool MidiPlayer::readChunkHeader(FsFile& f, char id[5], uint32_t& length) {
-    uint8_t buf[8];
-    if (f.read(buf, 8) != 8) return false;
-    id[0] = buf[0]; id[1] = buf[1]; id[2] = buf[2]; id[3] = buf[3]; id[4] = '\0';
-    length = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) |
-             ((uint32_t)buf[6] << 8) | buf[7];
-    return true;
-}
 
 int MidiPlayer::readByte(TrackReader& t) {
     if (t.bufPos >= t.bufLen) {
@@ -49,24 +41,7 @@ void MidiPlayer::seekTrack(TrackReader& t, uint32_t pos) {
 }
 
 bool MidiPlayer::readVarLen(TrackReader& t, uint32_t& value) {
-    value = 0;
-    for (int i = 0; i < 4; i++) {
-        int b = readByte(t);
-        if (b < 0) return false;
-        value = (value << 7) | (uint32_t)(b & 0x7F);
-        if (!(b & 0x80)) return true;
-    }
-    return true; // malformed (>4 continuation bytes) -- accept what we have
-}
-
-uint8_t MidiPlayer::channelMessageDataBytes(uint8_t status) {
-    switch (status & 0xF0) {
-        case 0xC0: // Program Change
-        case 0xD0: // Channel Pressure
-            return 1;
-        default: // Note Off/On, Poly Pressure, Control Change, Pitch Bend
-            return 2;
-    }
+    return Smf::readVarLen([&t]() { return readByte(t); }, value);
 }
 
 bool MidiPlayer::primeTrack(int idx) {
@@ -143,7 +118,7 @@ bool MidiPlayer::primeTrack(int idx) {
             return true;
         } else if (status >= 0x80 && status < 0xF0) {
             // Channel voice/mode message.
-            uint8_t need = channelMessageDataBytes(status);
+            uint8_t need = Smf::channelMessageDataBytes(status);
             uint8_t d1 = 0, d2 = 0;
 
             if (haveFirstDataByte) {
@@ -240,7 +215,7 @@ bool MidiPlayer::load(const char* path) {
 
     char id[5];
     uint32_t len;
-    if (!readChunkHeader(hdr, id, len) || strncmp(id, "MThd", 4) != 0 || len < 6) {
+    if (!Smf::readChunkHeader(hdr, id, len) || strncmp(id, "MThd", 4) != 0 || len < 6) {
         strncpy(_error, "not a MIDI file", sizeof(_error) - 1);
         hdr.close();
         _state = STATE_ERROR;
@@ -299,7 +274,7 @@ bool MidiPlayer::load(const char* path) {
     for (uint16_t i = 0; i < ntrks; i++) {
         char tid[5];
         uint32_t tlen;
-        if (!readChunkHeader(hdr, tid, tlen)) break;
+        if (!Smf::readChunkHeader(hdr, tid, tlen)) break;
         uint32_t trackStart = hdr.curPosition();
 
         if (strncmp(tid, "MTrk", 4) != 0) {

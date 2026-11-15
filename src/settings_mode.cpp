@@ -10,6 +10,7 @@
 #include "ui.h"
 #include "sd_card.h"
 #include "midi_output.h"
+#include "shared_ram_arena.h"
 #include "keyboard_layout.h" // Theme page's "Save Theme" name entry -- see handleThemeSaveNameInput()
 
 namespace SettingsMode
@@ -114,7 +115,9 @@ namespace SettingsMode
         int themeMenuCursor = 0;
 
         const int MAX_SAVED_THEMES = 64; // comfortably above realistic use -- same "bump the constant" precedent MIDI_MAX_TRACKS documents
-        char themeLoadNames[MAX_SAVED_THEMES][THEME_NAME_MAX_LEN + 1];
+        static_assert(MAX_SAVED_THEMES <= SharedRamArena::NAME_LIST_COUNT && THEME_NAME_MAX_LEN + 1 <= SharedRamArena::NAME_LIST_LEN,
+                      "theme names no longer fit SharedRamArena::scratch");
+        char (&themeLoadNames)[SharedRamArena::NAME_LIST_COUNT][SharedRamArena::NAME_LIST_LEN] = SharedRamArena::scratch.nameList;
         int themeLoadCount = 0;
         int themeLoadCursor = 0;
         int themeLoadScrollOffset = 0; // see ensureThemeLoadVisible()

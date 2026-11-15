@@ -81,7 +81,7 @@ public:
     // LooperMode::tracks[]'s unsaved recordings) -- so, unlike that
     // RAM-reclaim path, this one needs no interactive confirmation.
     // Called from main.cpp/LooperMode right before LooperMode::tracks[]
-    // (128KB) allocates, so a browser that happens to be sitting on a
+    // (about 98KB) allocates, so a browser that happens to be sitting on a
     // huge folder doesn't compete with it for RAM. See needsRebuild().
     void freeBuffers();
 
@@ -122,15 +122,14 @@ private:
     static const int SORT_KEY_LEN = 12;
 
     // How many fully-materialized entries (name/size/isDir/kind) are kept
-    // ready for display at once -- comfortably more than Ui::visibleRows()
-    // (10 today) so a full screen plus some scroll slack never needs to
-    // re-open anything already visible.
-    static const int WINDOW_SIZE = 32;
+    // ready for display at once: Ui::visibleRows() (10) plus some scroll
+    // slack, so redrawing a full screen never re-opens anything still visible.
+    static const int WINDOW_SIZE = 16;
 
     // Reserved, never allocated into, so a big index/sort-key allocation
     // never eats into what the stack or other transient allocations need
     // right after -- especially important for LooperMode's own
-    // loopBrowser, which can only ever scan while tracks[] (128KB) is
+    // loopBrowser, which can only ever scan while tracks[] (about 98KB) is
     // already resident, unlike FilePlayerMode's browser... except
     // FilePlayerMode's own `browser` can ALSO end up scanning while
     // tracks[] is resident, since tracks[] deliberately stays allocated
