@@ -17,6 +17,10 @@ inline int32_t softClampMix(int32_t mix) {
 
 } // namespace
 
+#ifdef TRACKER_PROFILE
+TrackerPlayer::Profile TrackerPlayer::profile = {};
+#endif
+
 void TrackerPlayer::attachVoices(TrackerVoice* first, size_t stride, int count, int16_t* chunkStore, uint32_t chunkFrames) {
     _voices = first;
     _voiceStride = stride;
@@ -200,8 +204,17 @@ void __not_in_flash_func(TrackerPlayer::mixOneSample)(int16_t& outL, int16_t& ou
     outR = (int16_t)softClampMix(mixR);
 }
 
+int16_t __not_in_flash_func(TrackerPlayer::finishMix)(int32_t mix, uint8_t globalVolume) {
+    mix = (mix * (int32_t)globalVolume) >> 6;
+    mix += mix >> 2;
+    return (int16_t)softClampMix(mix);
+}
+
 void __not_in_flash_func(TrackerPlayer::update)() {
     if (_state == STATE_IDLE || _state == STATE_ERROR || _state == STATE_DONE) return;
+#ifdef TRACKER_PROFILE
+    uint32_t profStart = micros();
+#endif
     size_t produced = 0;
     while (produced < MAX_FRAMES_PER_UPDATE) {
         if (Synth::wavStreamFree() == 0) break;
@@ -210,10 +223,31 @@ void __not_in_flash_func(TrackerPlayer::update)() {
             if (_state == STATE_DONE) break;
             _samplesUntilNextTick = tickLength(); // tempo may have just changed
         }
+        if (_blockMix) {
+            uint32_t n = (uint32_t)(MAX_FRAMES_PER_UPDATE - produced);
+            uint32_t space = (uint32_t)Synth::wavStreamFree();
+            if (n > space) n = space;
+            if (n > _samplesUntilNextTick) n = _samplesUntilNextTick;
+            if (n > BLOCK_FRAMES) n = BLOCK_FRAMES;
+            const int16_t* frames = mixBlock(n);
+            uint32_t wrote = (uint32_t)Synth::wavStreamWrite(frames, n);
+            _samplesUntilNextTick -= wrote;
+            produced += wrote;
+            if (wrote < n) break;
+            continue;
+        }
         int16_t frame[2];
         mixOneSample(frame[0], frame[1]);
         if (Synth::wavStreamWrite(frame, 1) == 0) break;
         _samplesUntilNextTick--;
         produced++;
     }
+#ifdef TRACKER_PROFILE
+    if (produced) {
+        uint32_t d = micros() - profStart;
+        profile.updateUs += d;
+        profile.frames += produced;
+        if (d > profile.worstUs) profile.worstUs = d;
+    }
+#endif
 }

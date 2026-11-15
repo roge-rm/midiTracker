@@ -56,6 +56,9 @@ private:
         bool usePan = false;
         int8_t pitchPanSep = 0;
         uint8_t pitchPanCentre = 60;
+        uint8_t randVol = 0;     // RV, 0-100 % of the instrument volume
+        uint8_t randPan = 0;     // RP, 0-64
+        uint8_t filterCutoff = 0, filterReso = 0; // IFC/IFR, bit 7 == set the channel's on a new note
     };
 
     struct ItSample;
@@ -82,6 +85,7 @@ private:
         uint8_t defaultPan = 32;   // 0-64
         bool usePan = false;
         bool hasSustain = false;
+        uint8_t vibSpeed = 0, vibDepth = 0, vibRate = 0, vibType = 0; // auto-vibrato
         ItSampleView normal;       // plays with the normal loop (or none)
         ItSampleView sustain;      // plays with the sustain loop while the note is held, else same as normal
     };
@@ -104,6 +108,24 @@ private:
         float baseHz = 0;         // pitch before the pitch envelope
         float lastHz = -1;        // hz the step was worked out from
         uint16_t loudness = 0;    // last mix volume before envelopes ran out, for stealing
+        uint16_t insVol = 8192;   // sample * instrument global volume (0-8192), with RV applied
+        int16_t panSwing = 0;     // RP, added to the pan
+        uint16_t autoVibDepth = 0; // auto-vibrato depth so far, 1/256 units
+        uint8_t autoVibPos = 0;
+        bool surround = false;
+        bool fadeOut = false;     // a cut note's tail, freed when its ramp ends
+
+        // Mixer gains, see mixBlock(): curL/curR are the gain now << 12,
+        // moving by stepL/stepR for rampLeft more frames.
+        int32_t curL = 0, curR = 0, stepL = 0, stepR = 0;
+        uint16_t rampLeft = 0;
+
+        // Resonant low-pass, coefficients Q24, state at sample scale.
+        bool filterOn = false, filterEnvOn = false;
+        uint8_t cutoff = 127, resonance = 0;
+        uint8_t filterReso = 0xFF;  // resonance the coefficients were made for
+        uint16_t filterCut = 0;     // cutoff in Hz they were made for
+        int32_t fa0 = 0, fb0 = 0, fb1 = 0, fy1 = 0, fy2 = 0;
     };
 
     struct ItChannel {
@@ -124,6 +146,8 @@ private:
         int16_t panbrelloDelta = 0;
         bool tremorMute = false;
         uint8_t nnaOverride = 0xFF; // S73-S76 for the current note
+        uint8_t cutoff = 127, resonance = 0; // filter, 0-127
+        uint8_t macro = 0;          // SFx: parametric macro Z00-Z7F runs
 
         // Effect memory.
         uint8_t volSlide = 0, chanVolSlide = 0, panSlide = 0, globalSlide = 0;
@@ -188,6 +212,26 @@ private:
     void doVolSlide(uint8_t& v, uint8_t param, uint8_t max, bool firstTick);
     void updateChannelVoice(int ch);
     void processVoices();
+
+    // Mixing (see it_file.cpp): ramps, filter, surround.
+    const int16_t* mixBlock(uint32_t n) override;
+    template <bool FILTER, bool RAMP> void mixVoice(ItVoice& v, int32_t* acc, uint32_t n);
+    void setRamp(ItVoice& v, int32_t tgtL, int32_t tgtR);
+    void cutVoice(ItVoice& v); // fades a sounding note out in a free voice, then frees v
+    // Voice sums for one block, then the same memory as the output frames.
+    union { int32_t acc[BLOCK_FRAMES * 2]; int16_t out[BLOCK_FRAMES * 2]; } _mix;
+    bool _noteRow = false; // the cell being handled starts a note (not a portamento)
+
+    // Filters and MIDI macros. Only F0F000xx (cutoff) and F0F001xx
+    // (resonance) macros do anything.
+    struct FilterMacro { uint8_t kind = 0; uint8_t value = 0; }; // kind 1 cutoff, 2 resonance; value 0xFF == the Zxx param
+    FilterMacro _sfxMacro[16];
+    FilterMacro _zxxMacro[128];
+    bool _extFilterRange = false;
+    void loadMacros(uint8_t special, uint32_t afterTables);
+    static FilterMacro parseMacro(const uint8_t* text);
+    void runMacro(int ch, uint8_t param, bool noteRow);
+    void setupFilter(ItVoice& v, int envMod, bool noteRow);
 
     void advanceRow() override;
     void processTickEffects() override;

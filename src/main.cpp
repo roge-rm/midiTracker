@@ -142,6 +142,10 @@ void setup() {
         while (true) { delay(1000); }
     }
 
+#ifdef TRACKER_PROFILE
+    // Profile build: plays PROFILE_FILES and never returns, see tracker_profile.cpp.
+    { extern void trackerProfileRun(); trackerProfileRun(); }
+#endif
     FilePlayerMode::begin();
     SettingsMode::begin();
     LooperMode::begin(); // no ordering requirement on SettingsMode anymore -- see its own comment

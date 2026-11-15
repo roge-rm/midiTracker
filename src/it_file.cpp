@@ -1,16 +1,27 @@
 // Impulse Tracker .it player, see it_file.h.
 //
+// Mixing (mixBlock(), IT only): a block at a time per voice, linear
+// interpolation, then the resonant filter if the voice has one, then left
+// and right gains that ramp over 16 frames up and 42 down (OpenMPT's
+// defaults). A cut note (NNA cut, ^^^, SCx, DCA cut, S70) fades out in a
+// free voice with a copy of its cache, so the new note doesn't click.
+// Surround plays the right side inverted, as OpenMPT does.
+//
+// Filters: instrument cutoff/resonance, filter envelopes and Zxx through
+// the file's MIDI macros (or OpenMPT's defaults: SF0 cutoff, Z80-Z8F
+// resonance). Only the F0F000xx and F0F001xx macros do anything.
+// Coefficients are worked out in float when they change, the filter itself
+// is 32-bit fixed point, about 6 multiplies a frame per filtered voice.
+//
 // Left out (each plays as noted):
-//  - Resonant filters (Zxx, instrument filter cutoff/resonance, filter
-//    envelopes) and MIDI macros: ignored, notes play unfiltered.
-//  - Sample auto-vibrato, random volume/pan variation (RV/RP): not played.
+//  - MIDI macros other than filter cutoff and resonance, smooth Zxx (\xx)
+//    and the high-pass filter mode: ignored.
 //  - Stereo samples are mixed down to mono (in the cache, so they stream
-//    like mono ones); surround plays centred.
-//  - Glissando (S1x), finetune (S2x), S9x other than surround, SFx: ignored.
-//  - Volume ramping and the IT interpolation: plain linear interpolation,
-//    no ramp, so hard volume changes can click a little.
-//  - Mix volume is 0-64 per voice (the base's resolution), so very quiet
-//    voices round down to silence a little early.
+//    like mono ones).
+//  - Glissando (S1x), finetune (S2x), S9x other than surround: ignored.
+//  - IT's cubic interpolation: plain linear.
+//  - Random volume and pan (RV/RP) use their own random numbers, so they
+//    vary like IT's but not the same way.
 //  - The song stops at the end of the order list, it doesn't loop.
 //
 // Pitch is held as a period in one of two units, chosen per file:
@@ -21,8 +32,8 @@
 // extra fine x), which is how IT scales its slides in both modes.
 //
 // Voices: MAX_VOICES (32) is the same count XM mixes at its busiest, which
-// runs on the device. Each costs about 1.1 KB (struct plus a 512-frame
-// cache), the whole player fits SharedRamArena with room to spare.
+// runs on the device. Each costs about 1.2 KB (struct plus a 512-frame
+// cache), the whole player sets SharedRamArena's size.
 //
 // Compressed samples are unpacked into a cache file on the card the first
 // time a song is opened (progress through progressCallback), then streamed
@@ -32,6 +43,7 @@
 #include "pins.h" // SAMPLE_RATE
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 #include "sd_card.h"
 
 const char* ItPlayer::cacheDir = "/.itcache";
@@ -58,6 +70,74 @@ const uint8_t SINE_HALF[32] = {0, 24, 49, 74, 97, 120, 141, 161, 180, 197, 212, 
                                255, 253, 250, 244, 235, 224, 212, 197, 180, 161, 141, 120, 97, 74, 49, 24};
 
 uint32_t g_rand = 0x1234567;
+inline uint32_t nextRand() { g_rand = g_rand * 1103515245u + 12345u; return g_rand >> 16; }
+
+// Quarter of IT's 256-step sine, 0-64.
+const uint8_t IT_SINE_QUARTER[65] = {0, 2, 3, 5, 6, 8, 9, 11, 12, 14, 16, 17, 19, 20, 22, 23, 24, 26, 27, 29, 30, 32,
+    33, 34, 36, 37, 38, 39, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 56, 57, 58, 59, 59, 60,
+    60, 61, 61, 62, 62, 62, 63, 63, 63, 64, 64, 64, 64, 64, 64};
+
+int itSine(uint8_t pos) {
+    int q = pos & 63;
+    int v = (pos & 64) ? IT_SINE_QUARTER[64 - q] : IT_SINE_QUARTER[q];
+    return (pos & 128) ? -v : v;
+}
+
+// IT's resonance damping, 10^(-r * 24 / 128 / 20), as OpenMPT's ITResonanceTable.
+const float RESO_DAMP[128] = {
+    1.0f, 0.978644609451294f, 0.9577452540397644f, 0.937292218208313f, 0.9172759056091309f, 0.8976871371269226f, 0.878516674041748f, 0.8597555756568909f,
+    0.8413951396942139f, 0.8234267830848694f, 0.8058421611785889f, 0.7886331081390381f, 0.7717915177345276f, 0.7553095817565918f, 0.7391796708106995f, 0.7233941555023193f,
+    0.7079457640647888f, 0.6928272843360901f, 0.6780316829681396f, 0.6635520458221436f, 0.6493816375732422f, 0.6355138421058655f, 0.6219421625137329f, 0.6086603403091431f,
+    0.5956621170043945f, 0.5829415321350098f, 0.5704925656318665f, 0.5583094954490662f, 0.5463865399360657f, 0.5347182154655457f, 0.5232990980148315f, 0.5121238231658936f,
+    0.5011872053146362f, 0.49048417806625366f, 0.48000967502593994f, 0.46975886821746826f, 0.4597269892692566f, 0.4499093294143677f, 0.4403013288974762f, 0.430898517370224f,
+    0.4216965138912201f, 0.41269099712371826f, 0.4038778245449066f, 0.39525285363197327f, 0.3868120610713959f, 0.37855151295661926f, 0.3704673945903778f, 0.36255592107772827f,
+    0.3548133969306946f, 0.3472362160682678f, 0.33982083201408386f, 0.3325638175010681f, 0.3254617750644684f, 0.318511426448822f, 0.311709463596344f, 0.305052787065506f,
+    0.2985382676124573f, 0.29216286540031433f, 0.2859236001968384f, 0.2798175811767578f, 0.2738419771194458f, 0.2679939568042755f, 0.26227083802223206f, 0.25666993856430054f,
+    0.25118863582611084f, 0.2458244115114212f, 0.24057473242282867f, 0.23543715476989746f, 0.23040929436683655f, 0.2254888117313385f, 0.22067341208457947f, 0.21596083045005798f,
+    0.21134890615940094f, 0.20683546364307404f, 0.20241840183734894f, 0.1980956792831421f, 0.19386526942253113f, 0.18972519040107727f, 0.1856735348701477f, 0.18170839548110962f,
+    0.17782793939113617f, 0.1740303486585617f, 0.17031386494636536f, 0.16667674481868744f, 0.16311728954315186f, 0.15963385999202728f, 0.1562248021364212f, 0.15288856625556946f,
+    0.1496235728263855f, 0.14642828702926636f, 0.14330126345157623f, 0.14024099707603455f, 0.13724610209465027f, 0.1343151479959488f, 0.13144679367542267f, 0.12863969802856445f,
+    0.1258925348520279f, 0.1232040524482727f, 0.12057298421859741f, 0.11799809336662292f, 0.11547819525003433f, 0.11301211267709732f, 0.11059869080781937f, 0.10823681205511093f,
+    0.10592537373304367f, 0.10366329550743103f, 0.10144951939582825f, 0.09928302466869354f, 0.09716279804706573f, 0.09508784115314484f, 0.09305720776319504f, 0.09106992930173874f,
+    0.08912509679794312f, 0.08722179383039474f, 0.0853591337800026f, 0.08353625237941742f, 0.08175230026245117f, 0.08000645041465759f, 0.07829787582159042f, 0.07662579417228699f,
+    0.0749894231557846f, 0.0733879879117012f, 0.07182075828313828f, 0.07028699666261673f, 0.06878598779439926f, 0.06731703877449036f, 0.0658794566988945f, 0.06447257101535797f,
+};
+// 2^(x / 12288) for x = c * 96 + f, so the filter cutoff needs no powf.
+const float EXP2_COARSE[128] = {
+    1.0f, 1.0054298639297485f, 1.0108892917633057f, 1.0163782835006714f, 1.0218971967697144f, 1.027445912361145f, 1.0330249071121216f, 1.0386340618133545f,
+    1.0442737340927124f, 1.0499440431594849f, 1.055645227432251f, 1.0613771677017212f, 1.0671404600143433f, 1.072934865951538f, 1.0787607431411743f, 1.084618330001831f,
+    1.0905077457427979f, 1.0964291095733643f, 1.1023825407028198f, 1.1083683967590332f, 1.114386796951294f, 1.120437741279602f, 1.1265215873718262f, 1.1326385736465454f,
+    1.1387885808944702f, 1.1449720859527588f, 1.1511892080307007f, 1.1574400663375854f, 1.1637248992919922f, 1.1700438261032104f, 1.1763969659805298f, 1.1827846765518188f,
+    1.1892070770263672f, 1.195664405822754f, 1.2021567821502686f, 1.2086843252182007f, 1.215247392654419f, 1.2218459844589233f, 1.228480577468872f, 1.2351510524749756f,
+    1.2418577671051025f, 1.248600959777832f, 1.2553807497024536f, 1.2621973752975464f, 1.2690509557724f, 1.2759417295455933f, 1.2828700542449951f, 1.2898359298706055f,
+    1.2968395948410034f, 1.303881287574768f, 1.3109612464904785f, 1.3180795907974243f, 1.3252366781234741f, 1.332432508468628f, 1.339667558670044f, 1.3469418287277222f,
+    1.3542555570602417f, 1.3616089820861816f, 1.3690024614334106f, 1.3764359951019287f, 1.3839099407196045f, 1.3914244174957275f, 1.398979663848877f, 1.4065760374069214f,
+    1.4142135381698608f, 1.4218926429748535f, 1.4296133518218994f, 1.4373760223388672f, 1.4451807737350464f, 1.4530279636383057f, 1.4609178304672241f, 1.4688503742218018f,
+    1.4768261909484863f, 1.4848451614379883f, 1.4929077625274658f, 1.5010141134262085f, 1.5091644525527954f, 1.5173590183258057f, 1.525598168373108f, 1.5338820219039917f,
+    1.5422108173370361f, 1.5505849123001099f, 1.5590044260025024f, 1.567469596862793f, 1.5759809017181396f, 1.584538221359253f, 1.5931421518325806f, 1.601792812347412f,
+    1.610490322113037f, 1.6192351579666138f, 1.6280274391174316f, 1.6368674039840698f, 1.6457555294036865f, 1.6546918153762817f, 1.6636766195297241f, 1.6727101802825928f,
+    1.6817928552627563f, 1.6909247636795044f, 1.7001063823699951f, 1.7093377113342285f, 1.7186193466186523f, 1.7279512882232666f, 1.73733389377594f, 1.7467674016952515f,
+    1.7562521696090698f, 1.7657884359359741f, 1.7753764390945435f, 1.785016655921936f, 1.7947090864181519f, 1.8044542074203491f, 1.8142521381378174f, 1.8241033554077148f,
+    1.8340080976486206f, 1.8439666032791138f, 1.8539791107177734f, 1.8640460968017578f, 1.8741676807403564f, 1.884344220161438f, 1.8945759534835815f, 1.9048633575439453f,
+    1.9152065515518188f, 1.9256058931350708f, 1.9360617399215698f, 1.9465744495391846f, 1.9571441411972046f, 1.9677711725234985f, 1.9784560203552246f, 1.9891988039016724f,
+};
+const float EXP2_FINE[96] = {
+    1.0f, 1.0000563859939575f, 1.000112771987915f, 1.000169277191162f, 1.0002256631851196f, 1.0002820491790771f, 1.0003385543823242f, 1.0003949403762817f,
+    1.0004513263702393f, 1.0005078315734863f, 1.0005642175674438f, 1.000620722770691f, 1.0006771087646484f, 1.0007336139678955f, 1.000789999961853f, 1.0008465051651f,
+    1.0009028911590576f, 1.0009593963623047f, 1.0010159015655518f, 1.0010722875595093f, 1.0011287927627563f, 1.0011852979660034f, 1.0012418031692505f, 1.001298189163208f,
+    1.001354694366455f, 1.0014111995697021f, 1.0014677047729492f, 1.0015242099761963f, 1.0015807151794434f, 1.0016372203826904f, 1.0016937255859375f, 1.0017502307891846f,
+    1.0018067359924316f, 1.0018632411956787f, 1.0019197463989258f, 1.0019762516021729f, 1.00203275680542f, 1.002089262008667f, 1.002145767211914f, 1.0022023916244507f,
+    1.0022588968276978f, 1.0023154020309448f, 1.002371907234192f, 1.0024285316467285f, 1.0024850368499756f, 1.0025416612625122f, 1.0025981664657593f, 1.0026546716690063f,
+    1.002711296081543f, 1.00276780128479f, 1.0028244256973267f, 1.0028809309005737f, 1.0029375553131104f, 1.002994179725647f, 1.003050684928894f, 1.0031073093414307f,
+    1.0031638145446777f, 1.0032204389572144f, 1.003277063369751f, 1.0033336877822876f, 1.0033901929855347f, 1.0034468173980713f, 1.003503441810608f, 1.0035600662231445f,
+    1.0036166906356812f, 1.0036733150482178f, 1.0037299394607544f, 1.003786563873291f, 1.0038431882858276f, 1.0038998126983643f, 1.0039564371109009f, 1.0040130615234375f,
+    1.0040696859359741f, 1.0041263103485107f, 1.0041829347610474f, 1.004239559173584f, 1.0042963027954102f, 1.0043529272079468f, 1.0044095516204834f, 1.00446617603302f,
+    1.0045229196548462f, 1.0045795440673828f, 1.0046361684799194f, 1.0046929121017456f, 1.0047495365142822f, 1.0048062801361084f, 1.004862904548645f, 1.0049196481704712f,
+    1.0049762725830078f, 1.005033016204834f, 1.0050896406173706f, 1.0051463842391968f, 1.0052030086517334f, 1.0052597522735596f, 1.0053164958953857f, 1.005373239517212f,
+};
+// Ramp lengths in frames, OpenMPT's defaults at 44.1 kHz (363 and 952 us).
+const int RAMP_UP = 16;
+const int RAMP_DOWN = 42;
 
 // LFO value -64..64 for a 0-255 position.
 int waveValue(uint8_t wave, uint8_t pos) {
@@ -131,6 +211,7 @@ bool ItPlayer::load(const char* path) {
     _linear = (flags & 8) != 0;
     _oldEffects = (flags & 16) != 0;
     _linkG = (flags & 32) != 0;
+    _extFilterRange = (flags & 0x1000) != 0; // OpenMPT's extended filter range
     _globalVol = h[0x30] > 128 ? 128 : h[0x30];
     _mixVolume = h[0x31] > 128 ? 128 : h[0x31];
     uint8_t initSpeed = h[0x32] ? h[0x32] : 6;
@@ -207,6 +288,12 @@ bool ItPlayer::load(const char* path) {
     }
 
     scanChannels();
+    loadMacros(h[0x2E], tableAt + (insNum + smpNum + patNum) * 4u);
+    if (rd16(h + 0x28) < 0x214 && !(h[0x2E] & 8)) {
+        // Older IT versions had no filters, as OpenMPT: Zxx does nothing.
+        for (FilterMacro& m : _sfxMacro) m = FilterMacro();
+        for (FilterMacro& m : _zxxMacro) m = FilterMacro();
+    }
 
     for (int ch = 0; ch < MAX_CHANNELS; ch++) {
         ItChannel& c = _channels[ch];
@@ -220,6 +307,7 @@ bool ItPlayer::load(const char* path) {
     }
     for (int i = 0; i < MAX_VOICES; i++) _voices[i] = ItVoice();
     attachVoices(&_voices[0], sizeof(ItVoice), MAX_VOICES, &_chunks[0][0], CHUNK_FRAMES);
+    _blockMix = true;
 
     _globalVolume = (uint8_t)(_globalVol >> 1);
     _openPattern = -1;
@@ -248,6 +336,10 @@ bool ItPlayer::loadSample(int i, uint32_t offset) {
     if (s.c5speed == 0) s.c5speed = 8363;
     if (s.c5speed > 9999999) s.c5speed = 9999999;
     s.is16Bit = (flg & 2) != 0;
+    s.vibSpeed = b[0x4C] > 64 ? 64 : b[0x4C];
+    s.vibDepth = b[0x4D] > 64 ? 64 : b[0x4D];
+    s.vibRate = b[0x4E];
+    s.vibType = b[0x4F] & 7;
     bool stereo = (flg & 4) != 0;
     bool compressed = (flg & 8) != 0;
     uint32_t ptr = rd32(b + 0x48);
@@ -338,6 +430,10 @@ bool ItPlayer::loadInstrument(int i, uint32_t offset, bool oldFormat) {
         in.globalVolume = b[0x18] > 128 ? 128 : b[0x18];
         in.defaultPan = (b[0x19] & 127) > 64 ? 64 : (b[0x19] & 127);
         in.usePan = (b[0x19] & 128) == 0;
+        in.randVol = b[0x1A] > 100 ? 100 : b[0x1A];
+        in.randPan = b[0x1B] > 64 ? 64 : b[0x1B];
+        in.filterCutoff = b[0x3A];
+        in.filterReso = b[0x3B];
         ItEnvelope* envs[3] = {&in.volEnv, &in.panEnv, &in.pitchEnv};
         for (int k = 0; k < 3; k++) {
             const uint8_t* r = b + 0x130 + k * 82;
@@ -844,7 +940,13 @@ void ItPlayer::slidePitch(ItChannel& c, int32_t amount) {
 // ---------------------------------------------------------------- voices
 
 int ItPlayer::allocVoice(int forChannel) {
-    for (int i = 0; i < MAX_VOICES; i++) if (_voices[i].channel < 0) return i;
+    for (int i = 0; i < MAX_VOICES; i++) if (_voices[i].channel == -1) return i;
+    // Then the cut note's tail nearest the end of its fade.
+    int tail = -1;
+    for (int i = 0; i < MAX_VOICES; i++) {
+        if (_voices[i].channel < 0 && (tail < 0 || _voices[i].rampLeft < _voices[tail].rampLeft)) tail = i;
+    }
+    if (tail >= 0) { releaseVoice(_voices[tail]); return tail; }
     // Steal the quietest background voice, else the quietest other channel's.
     int best = -1;
     for (int pass = 0; pass < 2 && best < 0; pass++) {
@@ -868,6 +970,32 @@ void ItPlayer::releaseVoice(ItVoice& v) {
     v.background = false;
     v.havePair = false;
     v.loudness = 0;
+    v.fadeOut = false;
+    v.rampLeft = 0;
+    v.curL = v.curR = 0;
+}
+
+void ItPlayer::cutVoice(ItVoice& v) {
+    if (v.havePair && v.smp && v.sampleStep16 && (v.curL || v.curR || v.rampLeft)) {
+        for (int i = 0; i < MAX_VOICES; i++) {
+            ItVoice& g = _voices[i];
+            if (g.channel != -1 || &g == &v) continue;
+            // The tail keeps v's position and cached frames, so it reads no SD.
+            int16_t* buf = g.chunkBuf;
+            g = v;
+            g.chunkBuf = buf;
+            memcpy(buf, v.chunkBuf, v.chunkLen * sizeof(int16_t));
+            g.channel = -2;
+            g.background = true;
+            g.fadeOut = true;
+            g.loudness = 0;
+            g.stepL = -g.curL / RAMP_DOWN;
+            g.stepR = -g.curR / RAMP_DOWN;
+            g.rampLeft = RAMP_DOWN;
+            break;
+        }
+    }
+    releaseVoice(v);
 }
 
 void ItPlayer::voiceNoteOff(ItVoice& v) {
@@ -906,7 +1034,7 @@ void ItPlayer::applyNna(int ch, uint8_t newInst, uint8_t newSample, uint8_t newN
                 if (v.channel != ch || v.instrument != newInst) continue;
                 bool dup = (in.dct == 1 && v.note == newNote) || (in.dct == 2 && v.sampleIndex == newSample) || in.dct == 3;
                 if (!dup) continue;
-                if (in.dca == 0) releaseVoice(v);
+                if (in.dca == 0) cutVoice(v);
                 else if (in.dca == 1) voiceNoteOff(v);
                 else v.fading = true;
             }
@@ -948,7 +1076,14 @@ void ItPlayer::triggerNote(int ch, uint8_t note, uint8_t instArg, bool tonePorta
     }
 
     applyNna(ch, c.instrument, si, note);
-    if (c.voice < 0) c.voice = (int8_t)allocVoice(ch);
+    if (c.voice >= 0) {
+        // NNA cut: the old note fades out in another voice.
+        int8_t keep = c.voice;
+        cutVoice(_voices[keep]);
+        c.voice = keep;
+    } else {
+        c.voice = (int8_t)allocVoice(ch);
+    }
     ItVoice& v = _voices[c.voice];
     v.channel = (int8_t)ch;
     v.background = false;
@@ -963,7 +1098,35 @@ void ItPlayer::triggerNote(int ch, uint8_t note, uint8_t instArg, bool tonePorta
     v.volEnvOn = in && in->volEnv.on();
     v.panEnvOn = in && in->panEnv.on();
     v.pitchEnvOn = in && in->pitchEnv.on() && !(in->pitchEnv.flags & 0x80);
+    v.filterEnvOn = in && in->pitchEnv.on() && (in->pitchEnv.flags & 0x80);
     v.lastHz = -1;
+    v.fadeOut = false;
+    v.curL = v.curR = 0;
+    v.rampLeft = 0;
+    v.autoVibDepth = 0;
+    v.autoVibPos = 0;
+    // Random volume and pan (RV/RP), as OpenMPT plays IT: the volume swing
+    // is a share of the sample and instrument volume, the pan swing up to 4 * RP.
+    uint32_t insVol = (uint32_t)s.globalVolume * (in ? in->globalVolume : 128u);
+    v.panSwing = 0;
+    if (in && in->randVol) {
+        float d = (float)nextRand() / 32767.5f - 1.0f;
+        int sw = (int)floorf(d * (float)insVol * (float)in->randVol / 100.0f);
+        int iv = (int)insVol + sw;
+        insVol = (uint32_t)(iv < 0 ? 0 : (iv > 8192 ? 8192 : iv));
+    }
+    if (in && in->randPan) {
+        float d = (float)nextRand() / 32767.5f - 1.0f;
+        v.panSwing = (int16_t)floorf(d * 4.0f * (float)in->randPan);
+    }
+    v.insVol = (uint16_t)insVol;
+    if (in && (in->filterCutoff & 0x80)) c.cutoff = in->filterCutoff & 0x7F;
+    if (in && (in->filterReso & 0x80)) c.resonance = in->filterReso & 0x7F;
+    v.cutoff = c.cutoff;
+    v.resonance = c.resonance;
+    v.filterOn = false;
+    v.fy1 = v.fy2 = 0;
+    setupFilter(v, 256, true);
     v.loudness = 64;
     v.smp = &s.sustain;
     v.looping = s.sustain.loopEnd > s.sustain.loopStart;
@@ -983,6 +1146,255 @@ void ItPlayer::triggerNote(int ch, uint8_t note, uint8_t instArg, bool tonePorta
     (void)instArg;
 }
 
+// ---------------------------------------------------------------- filters
+
+// A macro string from the file, e.g. "F0F000z". Only the filter cutoff and
+// resonance ones are kept.
+ItPlayer::FilterMacro ItPlayer::parseMacro(const uint8_t* text) {
+    FilterMacro m;
+    int bytes[4], nb = 0, nib = -1;
+    for (int i = 0; i < 32 && text[i]; i++) {
+        char ch = (char)text[i];
+        int val;
+        if (ch == ' ') continue;
+        if (ch >= '0' && ch <= '9') val = ch - '0';
+        else if (ch >= 'A' && ch <= 'F') val = ch - 'A' + 10;
+        else if (ch == 'z' && nib < 0) { if (nb >= 4) return m; bytes[nb++] = 0x100; continue; }
+        else return m;
+        if (nib < 0) { nib = val; continue; }
+        if (nb >= 4) return m;
+        bytes[nb++] = (nib << 4) | val;
+        nib = -1;
+    }
+    if (nib >= 0 || nb != 4 || bytes[0] != 0xF0 || bytes[1] != 0xF0 || (bytes[2] != 0 && bytes[2] != 1)) return m;
+    m.kind = (uint8_t)(bytes[2] + 1);
+    m.value = bytes[3] == 0x100 ? 0xFF : (uint8_t)(bytes[3] & 0x7F);
+    return m;
+}
+
+// The file's MIDI macros if it has them, else OpenMPT's defaults: SF0 sets
+// the cutoff, Z80-Z8F the resonance in steps of 8.
+void ItPlayer::loadMacros(uint8_t special, uint32_t at) {
+    for (FilterMacro& m : _sfxMacro) m = FilterMacro();
+    for (FilterMacro& m : _zxxMacro) m = FilterMacro();
+    if (special & 8) {
+        if (special & 2) { // edit history comes first
+            uint8_t n[2];
+            if (!_file.seekSet(at) || _file.read(n, 2) != 2) return;
+            at += 2 + rd16(n) * 8u;
+        }
+        at += 9 * 32; // global macros
+        if (!_file.seekSet(at)) return;
+        for (int i = 0; i < 16 + 128; i += 32) {
+            int n = (16 + 128 - i) < 32 ? (16 + 128 - i) : 32;
+            if (_file.read(_rawScratch, n * 32) != n * 32) return;
+            for (int k = 0; k < n; k++) {
+                int idx = i + k;
+                FilterMacro m = parseMacro(_rawScratch + k * 32);
+                if (idx < 16) _sfxMacro[idx] = m;
+                else _zxxMacro[idx - 16] = m;
+            }
+        }
+        return;
+    }
+    _sfxMacro[0].kind = 1;
+    _sfxMacro[0].value = 0xFF;
+    for (int i = 0; i < 16; i++) { _zxxMacro[i].kind = 2; _zxxMacro[i].value = (uint8_t)(i * 8); }
+}
+
+// Zxx: Z00-Z7F run the channel's SFx macro with z = xx, Z80-ZFF the fixed ones.
+void ItPlayer::runMacro(int ch, uint8_t param, bool noteRow) {
+    ItChannel& c = _channels[ch];
+    const FilterMacro& m = param < 0x80 ? _sfxMacro[c.macro & 15] : _zxxMacro[param & 0x7F];
+    if (!m.kind) return;
+    uint8_t val = m.value == 0xFF ? (uint8_t)(param & 0x7F) : m.value;
+    ItVoice* v = c.voice >= 0 ? &_voices[c.voice] : nullptr;
+    if (m.kind == 1) {
+        int change = (int)c.cutoff - (int)val;
+        c.cutoff = val;
+        if (!v) return;
+        v->cutoff = val;
+        // As IT: a big cutoff change next to a note at volume 0 waits for the next tick's filter update.
+        if (c.volume > 0 || (change < 0 ? -change : change) < 0x10 || !v->filterOn || !noteRow) setupFilter(*v, 256, noteRow);
+    } else {
+        c.resonance = val;
+        if (!v) return;
+        v->resonance = val;
+        setupFilter(*v, 256, noteRow);
+    }
+}
+
+// Coefficients for v's cutoff and resonance, IT's filter as OpenMPT works
+// it out. envMod is the filter envelope, -256..256, 256 without one. Float,
+// but only when the settings change, never per sample.
+void ItPlayer::setupFilter(ItVoice& v, int envMod, bool noteRow) {
+    int cutoff = v.cutoff, reso = v.resonance;
+    int scaled = cutoff * (envMod + 256); // 0-127*512
+    // Full cutoff and no resonance turns the filter off next to a note,
+    // and otherwise leaves it as it was.
+    if (reso == 0 && scaled / 256 >= 254) {
+        if (noteRow) v.filterOn = false;
+        return;
+    }
+    float fc;
+    if (!_extFilterRange) {
+        // 110 * 2^(0.25 + scaled / 12288), from the tables.
+        int oct = scaled / 12288, rem = scaled % 12288;
+        fc = 130.8127827f * (float)(1 << oct) * EXP2_COARSE[rem / 96] * EXP2_FINE[rem % 96];
+    } else {
+        fc = 110.0f * powf(2.0f, 0.25f + (float)scaled / (20.0f * 512.0f));
+    }
+    int freq = (int)(fc + 0.5f);
+    if (freq < 120) freq = 120;
+    if (freq > 20000) freq = 20000;
+    if (freq * 2 > SAMPLE_RATE) freq = SAMPLE_RATE / 2;
+    // The coefficients only depend on the whole-Hz cutoff and the resonance.
+    if (v.filterOn && v.filterCut == (uint16_t)freq && v.filterReso == reso) return;
+    const float fs = (float)SAMPLE_RATE, pi = 3.14159265f;
+    float dmp = RESO_DAMP[reso & 127];
+    float d, e;
+    if (!_extFilterRange) {
+        float r = fs / (2.0f * pi * (float)freq);
+        d = dmp * r + dmp - 1.0f;
+        e = r * r;
+    } else {
+        float w = 2.0f * pi * (float)freq / fs;
+        d = (1.0f - 2.0f * dmp) * w;
+        if (d > 2.0f) d = 2.0f;
+        d = (2.0f * dmp - d) / w;
+        e = 1.0f / (w * w);
+    }
+    float inv = 1.0f / (1.0f + d + e);
+    auto q24 = [](float x) -> int32_t {
+        float y = x * 16777216.0f;
+        const float lim = 33554431.0f; // the mixer's split multiply needs |coef| < 2^25
+        if (y > lim) y = lim;
+        if (y < -lim) y = -lim;
+        return (int32_t)(y < 0 ? y - 0.5f : y + 0.5f);
+    };
+    v.fa0 = q24(inv);
+    v.fb0 = q24((d + e + e) * inv);
+    v.fb1 = q24(-e * inv);
+    if (!v.filterOn) v.fy1 = v.fy2 = 0;
+    v.filterOn = true;
+    v.filterCut = (uint16_t)freq;
+    v.filterReso = (uint8_t)reso;
+}
+
+// ---------------------------------------------------------------- mixing
+
+// Moves v's gains to the new ones over RAMP_UP or RAMP_DOWN frames.
+void ItPlayer::setRamp(ItVoice& v, int32_t tgtL, int32_t tgtR) {
+    int32_t tl = tgtL << 12, tr = tgtR << 12;
+    int32_t dl = tl - v.curL, dr = tr - v.curR;
+    // Magnitudes: a surround voice's right gain is negative.
+    int len = (abs(tl) > abs(v.curL) || abs(tr) > abs(v.curR)) ? RAMP_UP : RAMP_DOWN;
+    if ((dl < len && dl > -len) && (dr < len && dr > -len)) {
+        v.curL = tl;
+        v.curR = tr;
+        v.rampLeft = 0;
+        return;
+    }
+    v.stepL = dl / len;
+    v.stepR = dr / len;
+    v.rampLeft = (uint16_t)len;
+}
+
+#if defined(__not_in_flash)
+#define IT_MIX_RAM __not_in_flash("itmix")
+#else
+#define IT_MIX_RAM
+#endif
+
+// n frames of one voice added into acc: linear interpolation as the base
+// mixer, then the filter if on, then the gains (ramping if RAMP). All
+// 32-bit: the filter's Q24 products are split into 12-bit halves.
+template <bool FILTER, bool RAMP>
+IT_MIX_RAM void ItPlayer::mixVoice(ItVoice& v, int32_t* acc, uint32_t n) {
+    const TrackerSample& smp = *v.smp;
+    uint32_t pos = v.samplePos16, step = v.sampleStep16;
+    int32_t last = v.lastSrcSample, next = v.nextSrcSample;
+    int32_t curL = v.curL, curR = v.curR, stepL = v.stepL, stepR = v.stepR;
+    int32_t gl = curL >> 12, gr = curR >> 12;
+    int32_t y1 = v.fy1, y2 = v.fy2;
+    const int32_t a0h = v.fa0 >> 12, a0l = v.fa0 & 4095, b0h = v.fb0 >> 12, b0l = v.fb0 & 4095;
+    const int32_t b1h = v.fb1 >> 12, b1l = v.fb1 & 4095;
+    uint32_t k = 0;
+    for (; k < n; k++) {
+        uint32_t frac = pos & 0xFFFF;
+        int32_t diff = next - last;
+        int32_t lerp = (diff >= -32768 && diff <= 32767) ? (diff * (int32_t)frac) >> 16
+                                                         : ((diff >> 1) * (int32_t)frac) >> 15;
+        int32_t smpl = last + lerp;
+        if (FILTER) {
+            int32_t hi = smpl * a0h + y1 * b0h + y2 * b1h;
+            int32_t lo = smpl * a0l + y1 * b0l + y2 * b1l;
+            int32_t val = (hi + (lo >> 12) + 2048) >> 12;
+            if (val > 65534) val = 65534;
+            if (val < -65536) val = -65536;
+            y2 = y1;
+            y1 = val;
+            smpl = val;
+        }
+        if (RAMP) {
+            curL += stepL;
+            curR += stepR;
+            gl = curL >> 12;
+            gr = curR >> 12;
+        }
+        acc[2 * k] += (smpl * gl) >> 15;
+        acc[2 * k + 1] += (smpl * gr) >> 15;
+
+        pos += step;
+        bool ended = false;
+        while (pos >= 0x10000) {
+            pos -= 0x10000;
+            v.srcIndex++;
+            if (v.looping && smp.loopEnd > smp.loopStart && v.srcIndex >= smp.loopEnd) {
+                v.srcIndex = smp.loopStart + ((v.srcIndex - smp.loopEnd) % (smp.loopEnd - smp.loopStart));
+            } else if (!v.looping && v.srcIndex >= smp.length) {
+                v.havePair = false;
+                ended = true;
+                break;
+            }
+            last = next;
+            next = readRawSample(v, v.srcIndex + 1);
+        }
+        if (ended) { k++; break; }
+    }
+    v.samplePos16 = pos;
+    v.lastSrcSample = (int16_t)last;
+    v.nextSrcSample = (int16_t)next;
+    if (FILTER) { v.fy1 = y1; v.fy2 = y2; }
+    if (RAMP) {
+        v.curL = curL;
+        v.curR = curR;
+        v.rampLeft = (uint16_t)(v.rampLeft > k ? v.rampLeft - k : 0);
+    }
+}
+
+const int16_t* __not_in_flash_func(ItPlayer::mixBlock)(uint32_t n) {
+    int32_t* acc = _mix.acc;
+    memset(acc, 0, n * 2 * sizeof(int32_t));
+    for (int i = 0; i < MAX_VOICES; i++) {
+        ItVoice& v = _voices[i];
+        if (!v.havePair || v.sampleStep16 == 0 || !v.smp) continue;
+        uint32_t r = v.rampLeft < n ? v.rampLeft : n;
+        if (r) {
+            if (v.filterOn) mixVoice<true, true>(v, acc, r);
+            else mixVoice<false, true>(v, acc, r);
+        }
+        if (r < n && v.havePair) {
+            if (v.filterOn) mixVoice<true, false>(v, acc + 2 * r, n - r);
+            else mixVoice<false, false>(v, acc + 2 * r, n - r);
+        }
+        if (v.fadeOut && (v.rampLeft == 0 || !v.havePair)) releaseVoice(v);
+    }
+    // In place: out[i] only overwrites acc entries already read.
+    for (uint32_t i = 0; i < n * 2; i++) _mix.out[i] = finishMix(_mix.acc[i], _globalVolume);
+    return _mix.out;
+}
+
 // ---------------------------------------------------------------- rows
 
 void ItPlayer::handleCell(int ch, int note, uint8_t inst, uint8_t vol, uint8_t cmd, uint8_t param) {
@@ -1000,6 +1412,7 @@ void ItPlayer::handleCell(int ch, int note, uint8_t inst, uint8_t vol, uint8_t c
     c.volCol = vol;
 
     bool porta = cmd == 7 || cmd == 12 || (vol >= 193 && vol <= 202);
+    _noteRow = note >= 0 && note < 120 && !porta;
     if (inst != 0) {
         bool changed = inst != c.instrument;
         c.instrument = inst;
@@ -1041,12 +1454,12 @@ void ItPlayer::handleCell(int ch, int note, uint8_t inst, uint8_t vol, uint8_t c
     } else if (note == 255) {
         if (c.voice >= 0) voiceNoteOff(_voices[c.voice]);
     } else if (note == 254) {
-        if (c.voice >= 0) releaseVoice(_voices[c.voice]);
+        if (c.voice >= 0) cutVoice(_voices[c.voice]);
         c.period = 0;
     } else if (note >= 120) {
         if (c.voice >= 0) {
             if (_instrumentMode) _voices[c.voice].fading = true;
-            else releaseVoice(_voices[c.voice]);
+            else cutVoice(_voices[c.voice]);
         }
     }
 
@@ -1152,6 +1565,7 @@ void ItPlayer::rowEffect(int ch) {
         }
         case 24: c.pan = p; c.surround = false; break;
         case 25: if (p >> 4) c.panbSpeed = p >> 4; if (p & 15) c.panbDepth = p & 15; break;
+        case 26: runMacro(ch, p, _noteRow); break;
         default: break;
     }
 }
@@ -1169,7 +1583,7 @@ void ItPlayer::specialRow(int ch, uint8_t p) {
                 for (int i = 0; i < MAX_VOICES; i++) {
                     ItVoice& v = _voices[i];
                     if (v.channel != ch || !v.background) continue;
-                    if (y == 0) releaseVoice(v);
+                    if (y == 0) cutVoice(v);
                     else if (y == 1) voiceNoteOff(v);
                     else v.fading = true;
                 }
@@ -1182,8 +1596,11 @@ void ItPlayer::specialRow(int ch, uint8_t p) {
                 else if (y == 8) v.volEnvOn = in && in->volEnv.numPoints > 0;
                 else if (y == 9) v.panEnvOn = false;
                 else if (y == 10) v.panEnvOn = in && in->panEnv.numPoints > 0;
-                else if (y == 11) v.pitchEnvOn = false;
-                else if (y == 12) v.pitchEnvOn = in && in->pitchEnv.numPoints > 0 && !(in->pitchEnv.flags & 0x80);
+                else if (y == 11) v.pitchEnvOn = v.filterEnvOn = false;
+                else if (y == 12) {
+                    v.pitchEnvOn = in && in->pitchEnv.numPoints > 0 && !(in->pitchEnv.flags & 0x80);
+                    v.filterEnvOn = in && in->pitchEnv.numPoints > 0 && (in->pitchEnv.flags & 0x80);
+                }
             }
             break;
         case 8: c.pan = (uint16_t)(y * 256 / 15); c.surround = false; break;
@@ -1192,6 +1609,7 @@ void ItPlayer::specialRow(int ch, uint8_t p) {
         case 11: patternLoop(c.loopRow, c.loopCount, y); break;
         case 12: c.noteCutTick = y ? y : 1; break;
         case 14: if (_patternDelayRepeatsLeft == 0 && !_rowDelaySet) { _patternDelayRepeatsLeft = y; _rowDelaySet = true; } break;
+        case 15: c.macro = y; break;
         default: break;
     }
 }
@@ -1204,7 +1622,7 @@ void ItPlayer::tickEffect(int ch) {
         c.effect = 19; c.param = 0xD0;
     }
     if (c.noteCutTick != 0xFF && _tick == c.noteCutTick) {
-        if (c.voice >= 0) releaseVoice(_voices[c.voice]);
+        if (c.voice >= 0) cutVoice(_voices[c.voice]);
         c.noteCutTick = 0xFF;
     }
     volumeColumnTick(ch);
@@ -1316,12 +1734,11 @@ void ItPlayer::updateChannelVoice(int ch) {
     if (vol < 0) vol = 0;
     if (vol > 64) vol = 64;
     if (c.tremorMute || c.muted) vol = 0; // muted channels still run their effects, as OpenMPT
-    uint32_t igv = (_instrumentMode && v.instrument >= 1 && v.instrument <= MAX_INSTRUMENTS) ? _instruments[v.instrument - 1].globalVolume : 128;
-    uint32_t a = (uint32_t)vol * s.globalVolume;
-    a = (a * igv) >> 7;
+    uint32_t a = ((uint32_t)vol * v.insVol) >> 7;
     a = (a * c.channelVolume) >> 6;
     v.baseVolume = (uint16_t)a;
-    int pan = c.surround ? 128 : (int)c.pan + c.panbrelloDelta;
+    v.surround = c.surround;
+    int pan = c.surround ? 128 : (int)c.pan + c.panbrelloDelta + v.panSwing;
     v.basePan = (uint16_t)(pan < 0 ? 0 : (pan > 256 ? 256 : pan));
 }
 
@@ -1423,6 +1840,7 @@ void ItPlayer::processVoices() {
         uint32_t mv = (a + 32) >> 6;
         v.mixVolume = (uint8_t)(mv > 64 ? 64 : mv);
         v.loudness = (uint16_t)(v.background ? a >> 1 : a);
+        if (a > 4096) a = 4096;
 
         int pan = v.basePan;
         if (in && v.panEnvOn && in->panEnv.numPoints > 0) {
@@ -1438,9 +1856,14 @@ void ItPlayer::processVoices() {
         }
         // The header's mono flag is ignored, as OpenMPT plays such files in stereo.
         v.mixPan = (uint8_t)(pan < 0 ? 0 : (pan > 255 ? 255 : pan));
+        // Gains for the mixer, s * g >> 15; surround plays the right side inverted, as OpenMPT.
+        int32_t gl = (int32_t)((a * (255u - v.mixPan)) >> 5), gr = (int32_t)((a * v.mixPan) >> 5);
+        if (v.surround) gr = -gr;
+        setRamp(v, gl, gr);
 
         float hz = v.baseHz;
-        if (in && v.pitchEnvOn && in->pitchEnv.numPoints > 0) {
+        float octaves = 0;
+        if (in && (v.pitchEnvOn || v.filterEnvOn) && in->pitchEnv.numPoints > 0) {
             const ItEnvelope& e = in->pitchEnv;
             int ev = envValue(e.y, e.x, e.numPoints, v.pitchEnvPos);
             uint16_t p = v.pitchEnvPos + 1;
@@ -1448,8 +1871,30 @@ void ItPlayer::processVoices() {
             else if (e.flags & 2) { if (p > e.x[e.loopEnd]) p = e.x[e.loopStart]; }
             if (p > e.x[e.numPoints - 1]) p = e.x[e.numPoints - 1];
             v.pitchEnvPos = p;
-            if (ev) hz *= powf(2.0f, (float)ev / (24.0f * 256.0f));
+            if (v.filterEnvOn) setupFilter(v, ev / 32, false); // -256..256
+            else octaves = (float)ev / (24.0f * 256.0f);
         }
+        // Sample auto-vibrato, IT's way: the depth grows by the rate each
+        // tick up to depth * 256, and the swing is in 1/64 semitones, + is up.
+        const ItSample& smp = _samples[v.sampleIndex];
+        if (smp.vibDepth && smp.vibRate) {
+            uint32_t depth = (uint32_t)v.autoVibDepth + smp.vibRate;
+            if (depth > (uint32_t)smp.vibDepth * 256u) depth = (uint32_t)smp.vibDepth * 256u;
+            v.autoVibDepth = (uint16_t)depth;
+            uint8_t pos = v.autoVibPos;
+            v.autoVibPos = (uint8_t)(pos + smp.vibSpeed);
+            int w;
+            switch (smp.vibType) {
+                case 1: w = 64 - (pos + 1) / 2; break;       // ramp down
+                case 2: w = pos < 128 ? 64 : 0; break;        // square
+                case 3: w = (int)(nextRand() & 127) - 64; break; // random
+                case 4: w = (pos + 1) / 2 - 64; break;        // ramp up
+                default: w = itSine(pos); break;
+            }
+            int delta = w * (int)(depth >> 8) / 64;
+            octaves += (float)delta / 768.0f;
+        }
+        if (octaves != 0) hz *= powf(2.0f, octaves);
         if (hz != v.lastHz) {
             v.lastHz = hz;
             v.sampleStep16 = hz > 0 ? stepForHz(hz) : 0;

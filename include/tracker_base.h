@@ -89,6 +89,13 @@ public:
     // frame and starve the ring.
     static const uint32_t MAX_STEP16 = 8u << 16;
 
+#ifdef TRACKER_PROFILE
+    // Profile build only (env:pico_profile): time spent in update() calls
+    // that produced frames, and in sample cache refills (SD reads).
+    struct Profile { uint32_t updateUs, frames, worstUs, refillUs, refills; };
+    static Profile profile;
+#endif
+
 protected:
     static const size_t MAX_FRAMES_PER_UPDATE = 128;
     static const int RAW_SCRATCH_BYTES = 1024;
@@ -138,11 +145,30 @@ protected:
         }
         if (index >= s.length) return 0;
         if (v.chunkSmp == v.smp && index - v.chunkStart < v.chunkLen) return v.chunkBuf[index - v.chunkStart];
+#ifdef TRACKER_PROFILE
+        uint32_t t0 = micros();
+        int16_t r = refillChunk(v, index);
+        profile.refillUs += micros() - t0;
+        profile.refills++;
+        return r;
+#else
         return refillChunk(v, index);
+#endif
     }
 
     // Restarts v at frame `index` of its sample and primes the pair.
     void startVoiceAt(TrackerVoice& v, uint32_t index);
+
+    // A format can mix a block at a time with its own mixer: it sets
+    // _blockMix and overrides mixBlock(), which returns n interleaved
+    // stereo frames (n <= BLOCK_FRAMES, all inside one tick). The others
+    // use mixOneSample().
+    static const uint32_t BLOCK_FRAMES = 64;
+    bool _blockMix = false;
+    virtual const int16_t* mixBlock(uint32_t n) { (void)n; return nullptr; }
+    // Global volume, makeup gain and soft clamp on one channel's voice sum,
+    // the same last stage mixOneSample() uses.
+    static int16_t finishMix(int32_t mix, uint8_t globalVolume);
 
     FsFile _file;        // header reads at load(), sample data while playing
     FsFile _patternFile; // pattern reads while playing, so they never share a position with sample reads

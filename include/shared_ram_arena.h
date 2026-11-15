@@ -30,12 +30,12 @@
 // trying to out-guess it.
 namespace SharedRamArena {
 
-// Sized to ItPlayer (100164 bytes on this build), the largest user;
+// Sized to ItPlayer (103812 bytes on this build), the largest user;
 // LooperMode sizes its tracks to fill it. Each placement-new call site
 // carries its own static_assert against this, so a future growth in any
 // of these types past what fits here is a compile error, not a silent overlap.
 // The host test build has 8-byte pointers, so its players are a bit bigger.
-constexpr size_t SIZE = sizeof(void*) == 4 ? 100176 : 102400;
+constexpr size_t SIZE = sizeof(void*) == 4 ? 103824 : 106496;
 
 void* data();
 
