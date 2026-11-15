@@ -3,8 +3,6 @@
 #include "midi_output.h"
 #include <string.h>
 
-uint8_t SysExPlayer::_msgBuf[MIDI_SYSEX_MAX_LEN];
-
 bool SysExPlayer::load(const char* path) {
     close();
     _error[0] = '\0';
@@ -47,8 +45,9 @@ bool SysExPlayer::sendNextMessage() {
         return false;
     }
 
+    uint8_t* msgBuf = MidiOutput::sysExScratch();
     uint32_t bufLen = 1;
-    _msgBuf[0] = 0xF0;
+    msgBuf[0] = 0xF0;
     uint32_t rawLen = 1;
     for (;;) {
         int c = _file.read();
@@ -58,16 +57,17 @@ bool SysExPlayer::sendNextMessage() {
             return false;
         }
         rawLen++;
-        if (bufLen < MIDI_SYSEX_MAX_LEN) _msgBuf[bufLen++] = (uint8_t)c;
+        if (bufLen < MIDI_SYSEX_MAX_LEN) msgBuf[bufLen++] = (uint8_t)c;
         if (c == 0xF7) break;
     }
 
     _bytesSent += rawLen;
     _messagesSent++;
-    _lastSendMs = millis();
 
     // See this method's header comment on the MIDI_SYSEX_MAX_LEN skip.
-    if (rawLen <= MIDI_SYSEX_MAX_LEN) MidiOutput::sendSysExRaw(_msgBuf, bufLen);
+    if (rawLen <= MIDI_SYSEX_MAX_LEN) MidiOutput::sendSysExRaw(msgBuf, bufLen);
+    // After the send, so the gap is measured from when the message finished going out.
+    _lastSendMs = millis();
 
     return true;
 }

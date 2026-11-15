@@ -56,8 +56,6 @@ private:
     uint32_t _startMs = 0;
     uint32_t _lastSendMs = 0; // 0 = none sent yet
 
-    static uint8_t _msgBuf[MIDI_SYSEX_MAX_LEN];
-
     // Reads and sends the next F0...F7 message from the current file
     // position. Sets STATE_DONE at a clean EOF (right after a message's
     // trailing F7) or STATE_ERROR on a malformed/truncated file. A

@@ -1,6 +1,7 @@
 #include "midi_recorder.h"
 #include "sd_card.h"
 #include <string.h>
+#include <hardware/timer.h>
 
 namespace {
 // _file.write() below does NOT hit the card per call -- SdFat already
@@ -86,7 +87,7 @@ void MidiRecorder::writeHeader() {
     writeVarLen(0);
     writeBytes(tempoEvt, sizeof(tempoEvt));
 
-    _startMicros = micros();
+    _startMicros = time_us_64();
     _lastTick = 0;
     _lastSyncMs = millis();
     _state = STATE_RECORDING;
@@ -101,8 +102,8 @@ bool MidiRecorder::prepareEvent() {
 }
 
 uint32_t MidiRecorder::nextDeltaTick() {
-    uint32_t elapsedUs = micros() - _startMicros;
-    uint32_t absTick = (uint32_t)(((uint64_t)elapsedUs * _division) / _usPerQuarter);
+    uint64_t elapsedUs = time_us_64() - _startMicros;
+    uint32_t absTick = (uint32_t)((elapsedUs * _division) / _usPerQuarter);
     uint32_t deltaTick = absTick - _lastTick;
     _lastTick = absTick;
     return deltaTick;
@@ -179,7 +180,7 @@ void MidiRecorder::cancel() {
 
 uint32_t MidiRecorder::elapsedMs() const {
     if (_state != STATE_RECORDING) return 0;
-    return (micros() - _startMicros) / 1000;
+    return (uint32_t)((time_us_64() - _startMicros) / 1000);
 }
 
 uint32_t MidiRecorder::msSinceLastEvent() const {

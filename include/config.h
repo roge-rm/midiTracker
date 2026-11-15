@@ -1,11 +1,9 @@
 #pragma once
 
 // Maximum number of tracks a Standard MIDI File can have and still be
-// played by this firmware. Each track needs one open SdFat file handle
-// for the whole duration of playback (~108 bytes of RAM apiece -- no
-// per-file sector buffer, SdFat's cache is shared at the volume level),
-// so there's plenty of headroom to raise this well past what any real
-// SMF is likely to contain.
+// played by this firmware. Each track holds an open SdFat file handle
+// and a small read-ahead buffer (about 160 bytes of heap apiece while a
+// MIDI file is loaded, allocated for the file's own track count).
 #define MIDI_MAX_TRACKS 64
 
 // Button debounce time, ms
@@ -18,15 +16,10 @@
 // Longest file/dir name (8.3 + long name) we'll keep in memory per entry.
 #define MAX_FILENAME_LEN 64
 
-// Largest single System Exclusive message (boundary-inclusive, i.e.
-// including the leading F0 and trailing F7) this firmware will buffer in
-// RAM at once -- for receiving, capturing, and playing one back. Matches
-// the MIDI library's own SysExMaxSize (its default receive-side cap, see
-// midi_Defs.h/midi_Settings.h), so a message the library can even accept
-// is guaranteed to fit here too; anything longer (which the library
-// itself would already refuse) is silently dropped rather than raising
-// this further, since a single 1KB+ stack/static buffer is already a
-// meaningful RAM commitment on a 256KB device.
+// Largest single System Exclusive message (including the leading F0 and
+// trailing F7) this firmware will receive, capture or play back. The MIDI
+// input instances in midi_output.cpp use this as their SysExMaxSize, one
+// buffer of this size each; longer messages are dropped.
 #define MIDI_SYSEX_MAX_LEN 1024
 
 // Root directory to browse. Change if your card stores MIDI files elsewhere.

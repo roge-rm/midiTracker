@@ -13,6 +13,11 @@ class MidiPlayer {
 public:
     enum State { STATE_IDLE, STATE_PLAYING, STATE_PAUSED, STATE_DONE, STATE_ERROR };
 
+    MidiPlayer() = default;
+    ~MidiPlayer();
+    MidiPlayer(const MidiPlayer&) = delete;
+    MidiPlayer& operator=(const MidiPlayer&) = delete;
+
     // Opens and parses `path`, priming every track's first event.
     // Leaves the player in STATE_PAUSED (ready to play()) on success,
     // or STATE_ERROR (see errorMessage()) on failure.
@@ -72,9 +77,20 @@ public:
     void seekTo(uint32_t targetMs);
 
 private:
+    // Bytes each track reads ahead. SdFat has one sector cache per volume,
+    // so reading byte by byte from several tracks in turn re-reads a
+    // sector on every switch; this cuts that to once per buffer.
+    static const uint8_t TRACK_READ_BUF = 32;
+
     struct TrackReader {
         FsFile file;
         uint32_t chunkEnd = 0;
+        // Read-ahead: buf[0] is at file offset bufFilePos, bufPos is the
+        // next unread byte. The FsFile cursor sits at the end of buf.
+        uint8_t buf[TRACK_READ_BUF];
+        uint32_t bufFilePos = 0;
+        uint8_t bufLen = 0;
+        uint8_t bufPos = 0;
         uint32_t absoluteTick = 0; // cumulative tick position of the read cursor
         uint8_t runningStatus = 0;
         bool ended = false;
@@ -96,7 +112,10 @@ private:
         uint32_t pendingSysExLen = 0;
     };
 
-    TrackReader _tracks[MIDI_MAX_TRACKS];
+    // Heap array sized to the file's track count by load(), kept and
+    // reused while big enough.
+    TrackReader* _tracks = nullptr;
+    uint16_t _trackCapacity = 0;
     uint16_t _numTracks = 0;
     uint16_t _format = 0;
     uint16_t _division = 480; // ticks per quarter note
@@ -118,7 +137,14 @@ private:
     char _path[192] = {0}; // set by load(); lets seekTo() reopen without the caller re-supplying it
 
     static bool readChunkHeader(FsFile& f, char id[5], uint32_t& length);
-    static bool readVarLen(FsFile& f, uint32_t& value);
+    static bool readVarLen(TrackReader& t, uint32_t& value);
+
+    // Buffered reads on a track (see TrackReader's buf).
+    static int readByte(TrackReader& t);
+    static bool readBytes(TrackReader& t, uint8_t* dst, uint32_t n);
+    static void skipBytes(TrackReader& t, uint32_t n);
+    static void seekTrack(TrackReader& t, uint32_t pos);
+    static uint32_t trackPos(const TrackReader& t) { return t.bufFilePos + t.bufPos; }
     static uint8_t channelMessageDataBytes(uint8_t status);
 
     // Reads events for track idx until one worth stopping on (a channel

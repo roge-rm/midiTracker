@@ -30,12 +30,12 @@
 // trying to out-guess it.
 namespace SharedRamArena {
 
-// Sized to LoopTrack[NUM_TRACKS] (~131312 bytes measured on real
-// hardware -- see looper_mode.cpp), comfortably bigger than any of
+// Sized to LoopTrack[NUM_TRACKS] (131776 bytes on this build, see
+// looper_mode.cpp), comfortably bigger than any of
 // ModPlayer/S3mPlayer/XmPlayer. Each placement-new call site carries its
 // own static_assert against this, so a future growth in any of these
 // types past what fits here is a compile error, not a silent overlap.
-constexpr size_t SIZE = 131312;
+constexpr size_t SIZE = 131776;
 
 void* data();
 

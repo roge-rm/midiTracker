@@ -97,6 +97,10 @@ void sendRaw(uint8_t status, uint8_t data1, uint8_t data2, uint8_t len);
 // when SMF's own event-type byte already carries that role).
 void sendSysExRaw(const uint8_t* data, size_t len);
 
+// MIDI_SYSEX_MAX_LEN + 1 bytes for building an outgoing SysEx message.
+// Core 0 only; fill and send it within one call.
+uint8_t* sysExScratch();
+
 // Sends All Notes Off (CC 123) + All Sound Off (CC 120) on every channel
 // on whichever transport(s) are active. Call this on stop/panic.
 void allNotesOffAllChannels();

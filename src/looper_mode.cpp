@@ -4,6 +4,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
+#include <math.h>
 #include <new> // placement new, see tracks' declaration below
 
 #include "sd_card.h"
@@ -52,8 +53,17 @@ const uint8_t CHANNEL_AS_RECORDED = 16; // sentinel output-channel value: send e
 
 enum TrackState { TRACK_EMPTY, TRACK_ARMED, TRACK_RECORDING, TRACK_PLAYING, TRACK_MUTED, TRACK_STOPPED, TRACK_PAUSED };
 
+// Notes a recording pass can hold down at once and still close with a
+// Note Off when the pass ends (see closeRecordingPass()).
+const int MAX_HELD_NOTES = 16;
+// Note Ons left out because heldNotes[] was full; their Note Offs are left out too.
+const int MAX_DROPPED_NOTES = 4;
+// Notes a track's playback can have sounding at once and still stop one by
+// one (see allNotesOffForTrack()).
+const int MAX_SOUNDING_NOTES = 32;
+
 struct LoopEvent {
-    uint32_t offsetMs; // position within the loop cycle, 0..lengthMs-1
+    uint32_t offsetMs; // position within the loop cycle, 0..baseLengthMs-1
     uint8_t status, data1, data2;
 };
 
@@ -75,6 +85,11 @@ struct LoopTrack {
     int barLength = 0;
 
     uint32_t lengthMs = 0;     // 0 until this track's first recording pass is committed
+    // The length event offsets are measured against. Set with lengthMs on
+    // commit and load; a tempo rescale changes only lengthMs, and playback
+    // maps its position into this scale (see loopPos()), so offsets are
+    // never rewritten and repeated tempo changes can't wear them down.
+    uint32_t baseLengthMs = 0;
     uint32_t epochMs = 0;      // this track's own position-zero reference (Independent mode)
     uint32_t recordStartMs = 0; // valid while state==TRACK_RECORDING and lengthMs==0 (the open-ended first pass)
 
@@ -108,6 +123,22 @@ struct LoopTrack {
 
     uint32_t prevPos = 0; // last computed playback position, for wrap detection
     int playCursor = 0;   // index of the next not-yet-fired event this cycle
+
+    // Note Ons captured in the current recording pass and not yet
+    // released, as (channel << 7) | note. events[] keeps one free slot
+    // per entry for its Note Off.
+    uint16_t heldNotes[MAX_HELD_NOTES];
+    uint8_t heldCount = 0;
+    uint16_t droppedNotes[MAX_DROPPED_NOTES];
+    uint8_t droppedCount = 0;
+
+    // Notes this track's playback has sent a Note On for and not yet a
+    // Note Off, as (output channel << 7) | note. soundingOverflow is set
+    // if more were sounding than fit; allNotesOffForTrack() then falls
+    // back to CC 123.
+    uint16_t soundingNotes[MAX_SOUNDING_NOTES];
+    uint8_t soundingCount = 0;
+    bool soundingOverflow = false;
 
     LoopEvent events[MAX_EVENTS_PER_TRACK];
     int eventCount = 0;
@@ -198,6 +229,13 @@ bool metronomeOn = false;
 // resuming something already in progress).
 uint32_t masterClockNextDueMs = 0; // wall-clock deadline for the next beat; 0 = not running
 int masterClockBeatInBar = 0;      // which beat of the bar masterClockNextDueMs is (0 = downbeat)
+// Beats fall at masterClockAnchorMs + round(n * beatMs) so the fractional
+// ms never adds up. updateMasterClock() re-anchors on the beat just fired
+// when the tempo changes or something else set masterClockNextDueMs.
+uint32_t masterClockAnchorMs = 0;
+uint32_t masterClockBeatsSinceAnchor = 0;
+float masterClockAnchorBeatMs = 0.0f;
+uint32_t masterClockLastDueMs = 0; // what updateMasterClock() last set masterClockNextDueMs to
 int metronomeVolumePercent = 80; // scales METRONOME_VELOCITY(_DOWNBEAT) below -- see SettingsMode::metronomeVolume()
 const uint8_t METRONOME_CHANNEL = 9;   // GM percussion (MIDI channel 10) -- see PERCUSSION_CHANNEL in synth.cpp
 const uint8_t METRONOME_NOTE = 76;     // GM Hi Wood Block -- a resonant "knock" (synth.cpp's classifyDrum()), trying this in place of the previous Closed Hi-Hat tick
@@ -413,6 +451,8 @@ void showFlashMessage(const char* line1, const char* line2, uint32_t durationMs)
 
 void buildTrackViews(Ui::LoopTrackView out[4]); // defined below
 void rescaleBarQuantizedTracks(); // defined below
+void setCommittedLength(LoopTrack& t, uint32_t lengthMs); // defined below
+void closeRecordingPass(LoopTrack& t); // defined below
 void startArmedTracksTogether(); // defined below
 void handleBpmValueAdjust(); // defined below
 void handleTimeSigAdjust(); // defined below
@@ -529,8 +569,25 @@ uint8_t dataBytesForStatus(uint8_t status) {
 // jumps back to where it was frozen), so playback picks up correctly
 // instead of double-firing or skipping whatever's between the old and new
 // position.
-void resyncCursor(LoopTrack& t) {
+// Pulls events at or past the end of the loop back to its last
+// millisecond so they still fire. events[] is sorted, so only the tail
+// needs checking.
+void clampEventOffsets(LoopTrack& t) {
+    if (t.baseLengthMs == 0) return;
+    uint32_t last = t.baseLengthMs - 1;
+    for (int i = t.eventCount - 1; i >= 0 && t.events[i].offsetMs > last; i--) t.events[i].offsetMs = last;
+}
+
+// Current position in the loop, in the track's offset scale
+// (0..baseLengthMs-1, see LoopTrack::baseLengthMs). lengthMs must be > 0.
+uint32_t loopPos(const LoopTrack& t) {
     uint32_t pos = elapsedRunMs(t) % t.lengthMs;
+    if (t.baseLengthMs == 0 || t.baseLengthMs == t.lengthMs) return pos;
+    return (uint32_t)(((uint64_t)pos * t.baseLengthMs) / t.lengthMs);
+}
+
+void resyncCursor(LoopTrack& t) {
+    uint32_t pos = loopPos(t);
     t.prevPos = pos;
     int idx = 0;
     while (idx < t.eventCount && t.events[idx].offsetMs <= pos) idx++;
@@ -576,57 +633,87 @@ void resumeFromStop(LoopTrack& t) {
 // advance (silently) so unmuting doesn't have to "catch up". EMPTY,
 // STOPPED, PAUSED, and ARMED (whether fresh or waiting to overdub) tracks
 // are skipped entirely -- see elapsedRunMs().
+// Keeps t.soundingNotes in step with a message playback just sent.
+void trackSounding(LoopTrack& t, uint8_t status, uint8_t data1, uint8_t data2) {
+    uint8_t type = status & 0xF0;
+    if (type != 0x80 && type != 0x90) return;
+    uint16_t key = (uint16_t)(((status & 0x0F) << 7) | (data1 & 0x7F));
+    int idx = -1;
+    for (int i = 0; i < t.soundingCount; i++) {
+        if (t.soundingNotes[i] == key) { idx = i; break; }
+    }
+    if (type == 0x90 && data2 > 0) {
+        if (idx >= 0) return;
+        if (t.soundingCount < MAX_SOUNDING_NOTES) t.soundingNotes[t.soundingCount++] = key;
+        else t.soundingOverflow = true;
+    } else if (idx >= 0) {
+        t.soundingNotes[idx] = t.soundingNotes[--t.soundingCount];
+    }
+}
+
+// Sends every not-yet-fired event this cycle with offset <= limit.
+void fireEventsUpTo(LoopTrack& t, uint32_t limit) {
+    while (t.playCursor < t.eventCount && t.events[t.playCursor].offsetMs <= limit) {
+        const LoopEvent& e = t.events[t.playCursor];
+        if (t.state != TRACK_MUTED) {
+            // channelOut == CHANNEL_AS_RECORDED sends the event exactly
+            // as captured (its status byte's own channel nibble,
+            // whatever that was -- see recordEvent()); otherwise every
+            // event is forced onto one fixed output channel regardless
+            // of what it was recorded on, so e.g. a single input device
+            // can drive several pieces of outboard gear on different
+            // channels without ever touching that device's own channel.
+            uint8_t outStatus = (t.channelOut == CHANNEL_AS_RECORDED)
+                ? e.status : (uint8_t)((e.status & 0xF0) | t.channelOut);
+            MidiOutput::sendRaw(outStatus, e.data1, e.data2, dataBytesForStatus(e.status));
+            trackSounding(t, outStatus, e.data1, e.data2);
+            // Separate from recordEvent()'s lastRecordActivityMs: a
+            // track mid-overdub is simultaneously capturing new events
+            // AND playing back its existing content, so these need
+            // their own indicator rather than sharing one. Muted
+            // tracks don't flash: nothing actually went out.
+            t.lastPlaybackActivityMs = millis();
+        }
+        t.playCursor++;
+    }
+}
+
 void updatePlayback() {
     for (int i = 0; i < NUM_TRACKS; i++) {
         LoopTrack& t = tracks[i];
         if (t.state == TRACK_EMPTY || t.state == TRACK_STOPPED || t.state == TRACK_PAUSED ||
             t.state == TRACK_ARMED || t.lengthMs == 0) continue;
 
-        uint32_t pos = elapsedRunMs(t) % t.lengthMs;
-        if (pos < t.prevPos) t.playCursor = 0; // wrapped
-        t.prevPos = pos;
-
-        while (t.playCursor < t.eventCount && t.events[t.playCursor].offsetMs <= pos) {
-            const LoopEvent& e = t.events[t.playCursor];
-            if (t.state != TRACK_MUTED) {
-                // channelOut == CHANNEL_AS_RECORDED sends the event exactly
-                // as captured (its status byte's own channel nibble,
-                // whatever that was -- see recordEvent()); otherwise every
-                // event is forced onto one fixed output channel regardless
-                // of what it was recorded on, so e.g. a single input device
-                // can drive several pieces of outboard gear on different
-                // channels without ever touching that device's own channel.
-                uint8_t outStatus = (t.channelOut == CHANNEL_AS_RECORDED)
-                    ? e.status : (uint8_t)((e.status & 0xF0) | t.channelOut);
-                MidiOutput::sendRaw(outStatus, e.data1, e.data2, dataBytesForStatus(e.status));
-                // Separate from recordEvent()'s lastRecordActivityMs: a
-                // track mid-overdub is simultaneously capturing new events
-                // AND playing back its existing content, so these need
-                // their own indicator rather than sharing one. Muted
-                // tracks don't flash: nothing actually went out.
-                t.lastPlaybackActivityMs = millis();
-            }
-            t.playCursor++;
+        uint32_t pos = loopPos(t);
+        if (pos < t.prevPos) {
+            // Wrapped: finish the end of the last cycle before starting over.
+            fireEventsUpTo(t, UINT32_MAX);
+            t.playCursor = 0;
         }
+        t.prevPos = pos;
+        fireEventsUpTo(t, pos);
     }
 }
 
-// Silences whatever channel(s) this track has actually been sounding
-// notes on -- shared by every state transition that needs to avoid a
-// stuck note (Mute, Stop, Pause, MIDI Stop, Erase). A remapped output
-// channel (channelOut != CHANNEL_AS_RECORDED) only ever sends on that one
-// channel, so silencing just it is enough; in AS_RECORDED mode played-back
-// events keep whatever channel they were captured on, which can vary
-// per-event under OMNI input, so there's no single channel guaranteed to
-// catch every stuck note -- broadcast All Notes Off across all 16 real
-// channels instead. Deliberately just CC 123 (not also All Sound Off, the
-// way MidiOutput::allNotesOffAllChannels() does for a global panic) --
-// same narrow scope the single-channel call this replaces already had.
-void allNotesOffForTrack(const LoopTrack& t) {
-    if (t.channelOut != CHANNEL_AS_RECORDED) {
-        MidiOutput::sendControlChange(t.channelOut, 123, 0);
-    } else {
-        for (uint8_t ch = 0; ch < 16; ch++) MidiOutput::sendControlChange(ch, 123, 0);
+// Stops whatever this track's playback has sounding -- shared by every
+// state transition that needs to avoid a stuck note (Mute, Stop, Pause,
+// MIDI Stop, Erase). Sends a Note Off for each of its own sounding notes
+// only, so other tracks, file playback and thru are left alone. If more
+// were sounding than it could track, falls back to CC 123 on its output
+// channel, or on all 16 in AS_RECORDED mode.
+void allNotesOffForTrack(LoopTrack& t) {
+    for (int i = 0; i < t.soundingCount; i++) {
+        uint16_t key = t.soundingNotes[i];
+        MidiOutput::sendNoteOff((uint8_t)(key >> 7), (uint8_t)(key & 0x7F), 0);
+    }
+    t.soundingCount = 0;
+    if (t.soundingOverflow) {
+        if (t.channelOut != CHANNEL_AS_RECORDED) {
+            MidiOutput::sendControlChange(t.channelOut, 123, 0);
+        } else {
+            for (uint8_t ch = 0; ch < 16; ch++) MidiOutput::sendControlChange(ch, 123, 0);
+        }
+        t.soundingOverflow = false;
     }
 }
 
@@ -768,7 +855,14 @@ void updateMasterClock() {
     }
 
     masterClockBeatInBar = (masterClockBeatInBar + 1) % timeSigNum;
-    masterClockNextDueMs += (uint32_t)beatMs;
+    if (beatMs != masterClockAnchorBeatMs || masterClockNextDueMs != masterClockLastDueMs) {
+        masterClockAnchorMs = masterClockNextDueMs;
+        masterClockBeatsSinceAnchor = 0;
+        masterClockAnchorBeatMs = beatMs;
+    }
+    masterClockBeatsSinceAnchor++;
+    masterClockNextDueMs = masterClockAnchorMs + (uint32_t)llround((double)masterClockBeatsSinceAnchor * beatMs);
+    masterClockLastDueMs = masterClockNextDueMs;
 }
 
 // Derives which beat is current (0 = downbeat) -- despite the name, this
@@ -970,7 +1064,8 @@ void updateBarQuantizedRecording() {
 
         uint32_t target = barsToMs(t.barLength);
         if (millis() - t.recordStartMs >= target) {
-            t.lengthMs = target;
+            setCommittedLength(t, target);
+            closeRecordingPass(t);
             t.epochMs = t.recordStartMs;
             // Same re-zero as the manual-commit path in
             // toggleRecordOnSelected()'s TRACK_RECORDING case -- see its
@@ -989,15 +1084,11 @@ void updateBarQuantizedRecording() {
 // since offsets arrive already increasing; during an overdub, the new
 // event lands mid-buffer at wherever its position-in-cycle falls, so an
 // actual insertion is needed to keep the array sorted for updatePlayback().
-void recordEvent(LoopTrack& t, uint8_t status, uint8_t data1, uint8_t data2) {
-    t.lastRecordActivityMs = millis(); // flash the record indicator regardless of whether storage succeeds below
+void insertEvent(LoopTrack& t, uint32_t offset, uint8_t status, uint8_t data1, uint8_t data2) {
     if (t.eventCount >= MAX_EVENTS_PER_TRACK) {
-        t.bufferFull = true; // shown on-screen (see buildTrackViews()) rather than silently dropping unnoticed
+        t.bufferFull = true;
         return;
     }
-
-    uint32_t offset = (t.lengthMs == 0) ? (millis() - t.recordStartMs) : (elapsedRunMs(t) % t.lengthMs);
-
     int idx = t.eventCount;
     while (idx > 0 && t.events[idx - 1].offsetMs > offset) idx--;
     for (int j = t.eventCount; j > idx; j--) t.events[j] = t.events[j - 1];
@@ -1011,6 +1102,82 @@ void recordEvent(LoopTrack& t, uint8_t status, uint8_t data1, uint8_t data2) {
     // causing it to double-fire on this cycle while the just-inserted
     // event gets skipped until the next one.
     if (idx <= t.playCursor) t.playCursor++;
+}
+
+int findHeldNote(const LoopTrack& t, uint16_t key) {
+    for (int i = 0; i < t.heldCount; i++) {
+        if (t.heldNotes[i] == key) return i;
+    }
+    return -1;
+}
+
+void recordEvent(LoopTrack& t, uint8_t status, uint8_t data1, uint8_t data2) {
+    t.lastRecordActivityMs = millis(); // flash the record indicator regardless of whether storage succeeds below
+
+    uint8_t type = status & 0xF0;
+    bool noteOn = (type == 0x90 && data2 > 0);
+    bool noteOff = (type == 0x80 || (type == 0x90 && data2 == 0));
+    uint16_t key = (uint16_t)(((status & 0x0F) << 7) | (data1 & 0x7F));
+    int held = (noteOn || noteOff) ? findHeldNote(t, key) : -1;
+
+    if (noteOff && held < 0) {
+        // The Note Off of a Note On left out below: leave it out too.
+        for (int i = 0; i < t.droppedCount; i++) {
+            if (t.droppedNotes[i] == key) {
+                t.droppedNotes[i] = t.droppedNotes[--t.droppedCount];
+                return;
+            }
+        }
+    }
+
+    if (noteOff && held >= 0) {
+        // Uses the slot kept free for it.
+        t.heldNotes[held] = t.heldNotes[--t.heldCount];
+    } else {
+        // One slot is kept free per held note for its closing Note Off; a
+        // new held note needs room for that too.
+        int need = (noteOn && held < 0) ? 2 : 1;
+        if (t.eventCount + t.heldCount + need > MAX_EVENTS_PER_TRACK) {
+            t.bufferFull = true; // shown on-screen (see buildTrackViews()) rather than silently dropping unnoticed
+            return;
+        }
+        if (noteOn && held < 0) {
+            if (t.heldCount >= MAX_HELD_NOTES) {
+                // Can't promise it a Note Off, so leave it out and show the track as full.
+                t.bufferFull = true;
+                bool listed = false;
+                for (int i = 0; i < t.droppedCount; i++) listed |= (t.droppedNotes[i] == key);
+                if (!listed && t.droppedCount < MAX_DROPPED_NOTES) t.droppedNotes[t.droppedCount++] = key;
+                return;
+            }
+            t.heldNotes[t.heldCount++] = key;
+        }
+    }
+
+    uint32_t offset = (t.lengthMs == 0) ? (millis() - t.recordStartMs) : loopPos(t);
+    insertEvent(t, offset, status, data1, data2);
+}
+
+// Sets a just-committed first pass's length and pulls any event that
+// landed at or past the end back to the last millisecond so it still
+// plays (a bar-quantized commit lands a tick after its target).
+void setCommittedLength(LoopTrack& t, uint32_t lengthMs) {
+    t.lengthMs = lengthMs;
+    t.baseLengthMs = lengthMs;
+    clampEventOffsets(t);
+}
+
+// Ends a recording pass (first pass or overdub): every note still held
+// gets a Note Off on the last millisecond of the loop, otherwise it would
+// sound on every cycle with nothing to stop it. lengthMs must be set.
+void closeRecordingPass(LoopTrack& t) {
+    uint32_t at = t.baseLengthMs > 0 ? t.baseLengthMs - 1 : 0;
+    for (int i = 0; i < t.heldCount; i++) {
+        uint16_t key = t.heldNotes[i];
+        insertEvent(t, at, (uint8_t)(0x80 | (key >> 7)), (uint8_t)(key & 0x7F), 0);
+    }
+    t.heldCount = 0;
+    t.droppedCount = 0;
 }
 
 // Starts every currently-armed track's recording clock at once, right
@@ -1076,6 +1243,8 @@ void startArmedTracksTogether() {
                 // trigger moment, the "unquantized" option.
                 t.recordStartMs = now;
             }
+            t.heldCount = 0;
+            t.droppedCount = 0;
             t.state = TRACK_RECORDING;
             // This runs from the MIDI input callback or updateCountIn(),
             // not a button handler, so nothing else would otherwise tell
@@ -1143,6 +1312,7 @@ void toggleRecordOnSelected() {
             // updateMainScreen()), so arming several tracks in any order
             // first and then starting them together stays possible.
             t.lengthMs = 0;
+            t.baseLengthMs = 0;
             t.eventCount = 0;
             t.state = TRACK_ARMED;
             break;
@@ -1163,7 +1333,8 @@ void toggleRecordOnSelected() {
                 // Committing the open-ended first pass -- this defines
                 // the track's own length and position-zero.
                 uint32_t elapsed = millis() - t.recordStartMs;
-                t.lengthMs = elapsed > 0 ? elapsed : 1;
+                setCommittedLength(t, elapsed > 0 ? elapsed : 1);
+                closeRecordingPass(t);
                 t.epochMs = t.recordStartMs;
                 // Re-zero stopAccumMs against *this* commit instant --
                 // can't be left at whatever it was (0 by default, or a
@@ -1177,9 +1348,13 @@ void toggleRecordOnSelected() {
                 // its own beginning. Same "make elapsedRunMs() come out to
                 // 0 right now" trick resumeFromStop() uses.
                 t.stopAccumMs = millis() - epochFor(t);
+                t.playCursor = 0;
+                t.prevPos = 0;
+            } else {
+                // Ending an overdub: carry on from the current position.
+                closeRecordingPass(t);
+                resyncCursor(t);
             }
-            t.playCursor = 0;
-            t.prevPos = 0;
             t.state = TRACK_PLAYING; // recording (fresh or overdub) always leaves you hearing it
             break;
 
@@ -1187,6 +1362,8 @@ void toggleRecordOnSelected() {
         case TRACK_MUTED:
             // Start an overdub pass -- length/epoch stay put, new events
             // land at their current position-in-cycle (see recordEvent()).
+            t.heldCount = 0;
+            t.droppedCount = 0;
             t.state = TRACK_RECORDING;
             break;
 
@@ -1240,9 +1417,10 @@ void commitAndStop(LoopTrack& t) {
     if (t.state == TRACK_RECORDING) {
         if (t.lengthMs == 0) {
             uint32_t elapsed = millis() - t.recordStartMs;
-            t.lengthMs = elapsed > 0 ? elapsed : 1;
+            setCommittedLength(t, elapsed > 0 ? elapsed : 1);
             t.epochMs = t.recordStartMs;
         }
+        closeRecordingPass(t);
         t.state = TRACK_PLAYING;
     }
     if (t.state == TRACK_PLAYING || t.state == TRACK_MUTED) {
@@ -1540,41 +1718,46 @@ void midiTransportContinue() {
 // with), not a hard per-pulse phase lock; position/timing precision is
 // otherwise identical to Internal mode, just with the BPM itself tracking
 // the incoming clock instead of the manually-set value.
-uint32_t clockLastPulseMs = 0;
+uint32_t clockLastPulseUs = 0;
 bool clockLastPulseValid = false;
-float clockSmoothedIntervalMs = 0.0f;
-int clockLastAppliedBpmInt = -1;
+float clockSmoothedIntervalUs = 0.0f;
+
+// The slave BPM follows the estimate at once when it's this far off...
+const float CLOCK_BPM_JUMP = 0.5f;
+// ...and otherwise once it has stayed more than CLOCK_BPM_FINE off for
+// CLOCK_BPM_SETTLE_PULSES pulses in a row (two beats), so EMA jitter
+// doesn't keep changing the tempo but a small offset can't stay for good.
+const float CLOCK_BPM_FINE = 0.05f;
+const int CLOCK_BPM_SETTLE_PULSES = 48;
+int clockPulsesOffTempo = 0;
 
 void onMidiClockTick() {
-    uint32_t now = millis();
+    uint32_t now = micros();
     if (clockLastPulseValid) {
-        uint32_t interval = now - clockLastPulseMs;
+        uint32_t interval = now - clockLastPulseUs;
         // Ignore implausible gaps (external gear paused/reconnected) rather
         // than letting one huge interval corrupt the running average.
-        if (interval > 0 && interval < 2000) {
+        if (interval > 0 && interval < 2000000) {
             const float EMA_ALPHA = 0.2f;
-            clockSmoothedIntervalMs = (clockSmoothedIntervalMs <= 0.0f)
+            clockSmoothedIntervalUs = (clockSmoothedIntervalUs <= 0.0f)
                 ? (float)interval
-                : clockSmoothedIntervalMs + EMA_ALPHA * ((float)interval - clockSmoothedIntervalMs);
+                : clockSmoothedIntervalUs + EMA_ALPHA * ((float)interval - clockSmoothedIntervalUs);
         }
     }
-    clockLastPulseMs = now;
+    clockLastPulseUs = now;
     clockLastPulseValid = true;
 
-    if (!SettingsMode::clockSourceSlave() || clockSmoothedIntervalMs <= 0.0f) return;
+    if (!SettingsMode::clockSourceSlave() || clockSmoothedIntervalUs <= 0.0f) return;
 
-    float bpm = 60000.0f / (clockSmoothedIntervalMs * 24.0f);
+    float bpm = 60000000.0f / (clockSmoothedIntervalUs * 24.0f);
     if (bpm < 20.0f) bpm = 20.0f;
     if (bpm > 300.0f) bpm = 300.0f;
+    float off = fabsf(bpm - manualBpm);
+    if (off < CLOCK_BPM_FINE) { clockPulsesOffTempo = 0; return; }
+    if (off < CLOCK_BPM_JUMP && ++clockPulsesOffTempo < CLOCK_BPM_SETTLE_PULSES) return;
+    clockPulsesOffTempo = 0;
     manualBpm = bpm;
 
-    // Only rescale/redraw when the displayed integer actually changes --
-    // otherwise sub-BPM jitter from the EMA would churn bar-quantized
-    // track lengths and the BPM row far more often than anything on
-    // screen could usefully show.
-    int bpmInt = (int)(bpm + 0.5f);
-    if (bpmInt == clockLastAppliedBpmInt) return;
-    clockLastAppliedBpmInt = bpmInt;
     rescaleBarQuantizedTracks();
     if (screen == SCREEN_MAIN) {
         Ui::updateLooperBpm(manualBpm, timeSigNum, timeSigDen, syncMode, metronomeOn, metronomeVolumePercent,
@@ -1616,6 +1799,11 @@ void resetTrack(LoopTrack& t) {
     if (t.state != TRACK_EMPTY) allNotesOffForTrack(t);
     t.state = TRACK_EMPTY;
     t.lengthMs = 0;
+    t.baseLengthMs = 0;
+    t.heldCount = 0;
+    t.droppedCount = 0;
+    t.soundingCount = 0;
+    t.soundingOverflow = false;
     t.epochMs = 0;
     t.recordStartMs = 0;
     t.stopAccumMs = 0;
@@ -1752,7 +1940,10 @@ bool saveTrackToFile(const LoopTrack& t, const char* path) {
     uint32_t lastTick = 0;
     for (int i = 0; i < t.eventCount; i++) {
         const LoopEvent& e = t.events[i];
-        uint32_t tick = (uint32_t)(((uint64_t)e.offsetMs * 1000 * division) / usPerQuarter);
+        // Offsets are in baseLengthMs scale; the file holds real time.
+        uint64_t ms = e.offsetMs;
+        if (t.baseLengthMs > 0 && t.baseLengthMs != t.lengthMs) ms = ms * t.lengthMs / t.baseLengthMs;
+        uint32_t tick = (uint32_t)((ms * 1000 * division) / usPerQuarter);
         if (!writeVarLen(file, tick - lastTick, bytesWritten)) ok = false;
         lastTick = tick;
         uint8_t len = dataBytesForStatus(e.status);
@@ -2126,6 +2317,9 @@ void parkLoadedTrack(LoopTrack& t) {
     // startArmedTracksTogether() normally sets it) if nothing was ever
     // recorded before this load -- establish it now, same as that does.
     if (syncMode && !sessionEpochSet) { sessionEpochMs = now; sessionEpochSet = true; }
+    t.baseLengthMs = t.lengthMs;
+    clampEventOffsets(t); // an event on the end-of-track tick would otherwise never fire
+    t.heldCount = 0;
     t.epochMs = now;
     t.playCursor = 0;
     t.prevPos = 0;
@@ -2768,11 +2962,10 @@ void handleStopInput() {
 // quantized track's length is really "N bars", not a fixed millisecond
 // value, so its *effective* length should track the current tempo/meter.
 // Freeform tracks (barLength == 0)
-// are untouched -- they have no bar identity to rescale by. Rescales
-// every recorded event's offset by the same length ratio (not just the
-// wrap point), so relative timing within the loop is preserved -- this is
-// a genuine playback-speed change, like retuning a tape, not a
-// reinterpretation of where the loop happens to cut off.
+// are untouched -- they have no bar identity to rescale by. Only lengthMs
+// changes; playback maps it onto the offsets (see loopPos()), so relative
+// timing within the loop is kept -- a playback-speed change, like
+// retuning a tape, not a new cut-off point.
 void rescaleBarQuantizedTracks() {
     bool rescaled[NUM_TRACKS] = {false, false, false, false};
     bool anyRescaled = false;
@@ -2784,11 +2977,9 @@ void rescaleBarQuantizedTracks() {
         uint32_t newLengthMs = barsToMs(t.barLength);
         if (newLengthMs == 0 || newLengthMs == t.lengthMs) continue;
 
-        for (int e = 0; e < t.eventCount; e++) {
-            t.events[e].offsetMs = (uint32_t)(((uint64_t)t.events[e].offsetMs * newLengthMs) / t.lengthMs);
-        }
+        // Offsets stay in baseLengthMs scale; loopPos() maps the new length onto them.
         t.lengthMs = newLengthMs;
-        resyncCursor(t); // scaling preserves sort order, but playCursor's old index no longer matches the new position
+        resyncCursor(t);
         rescaled[i] = true;
         anyRescaled = true;
     }

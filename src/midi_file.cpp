@@ -2,6 +2,7 @@
 #include "sd_card.h"
 #include "midi_output.h"
 #include <string.h>
+#include <new>
 
 bool MidiPlayer::readChunkHeader(FsFile& f, char id[5], uint32_t& length) {
     uint8_t buf[8];
@@ -12,10 +13,45 @@ bool MidiPlayer::readChunkHeader(FsFile& f, char id[5], uint32_t& length) {
     return true;
 }
 
-bool MidiPlayer::readVarLen(FsFile& f, uint32_t& value) {
+int MidiPlayer::readByte(TrackReader& t) {
+    if (t.bufPos >= t.bufLen) {
+        t.bufFilePos += t.bufLen;
+        t.bufPos = 0;
+        int n = t.file.read(t.buf, TRACK_READ_BUF);
+        t.bufLen = n > 0 ? (uint8_t)n : 0;
+        if (t.bufLen == 0) return -1;
+    }
+    return t.buf[t.bufPos++];
+}
+
+bool MidiPlayer::readBytes(TrackReader& t, uint8_t* dst, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        int b = readByte(t);
+        if (b < 0) return false;
+        dst[i] = (uint8_t)b;
+    }
+    return true;
+}
+
+void MidiPlayer::skipBytes(TrackReader& t, uint32_t n) {
+    if (n <= (uint32_t)(t.bufLen - t.bufPos)) {
+        t.bufPos += (uint8_t)n;
+        return;
+    }
+    seekTrack(t, trackPos(t) + n);
+}
+
+void MidiPlayer::seekTrack(TrackReader& t, uint32_t pos) {
+    t.file.seekSet(pos);
+    t.bufFilePos = pos;
+    t.bufLen = 0;
+    t.bufPos = 0;
+}
+
+bool MidiPlayer::readVarLen(TrackReader& t, uint32_t& value) {
     value = 0;
     for (int i = 0; i < 4; i++) {
-        int b = f.read();
+        int b = readByte(t);
         if (b < 0) return false;
         value = (value << 7) | (uint32_t)(b & 0x7F);
         if (!(b & 0x80)) return true;
@@ -37,16 +73,16 @@ bool MidiPlayer::primeTrack(int idx) {
     TrackReader& t = _tracks[idx];
 
     while (true) {
-        if (!t.file || t.file.curPosition() >= t.chunkEnd) {
+        if (!t.file || trackPos(t) >= t.chunkEnd) {
             t.ended = true;
             return false;
         }
 
         uint32_t delta;
-        if (!readVarLen(t.file, delta)) { t.ended = true; return false; }
+        if (!readVarLen(t, delta)) { t.ended = true; return false; }
         t.absoluteTick += delta;
 
-        int b0i = t.file.read();
+        int b0i = readByte(t);
         if (b0i < 0) { t.ended = true; return false; }
         uint8_t b0 = (uint8_t)b0i;
 
@@ -67,15 +103,15 @@ bool MidiPlayer::primeTrack(int idx) {
 
         if (status == 0xFF) {
             // Meta event: FF <type> <varlen> <data...>
-            int metaTypeI = t.file.read();
+            int metaTypeI = readByte(t);
             if (metaTypeI < 0) { t.ended = true; return false; }
             uint8_t metaType = (uint8_t)metaTypeI;
             uint32_t len;
-            if (!readVarLen(t.file, len)) { t.ended = true; return false; }
+            if (!readVarLen(t, len)) { t.ended = true; return false; }
 
             if (metaType == 0x51 && len == 3) { // Set Tempo
                 uint8_t d[3];
-                if (t.file.read(d, 3) != 3) { t.ended = true; return false; }
+                if (!readBytes(t, d, 3)) { t.ended = true; return false; }
                 t.pendingTick = t.absoluteTick;
                 t.pendingIsTempo = true;
                 t.pendingIsSysEx = false;
@@ -86,7 +122,7 @@ bool MidiPlayer::primeTrack(int idx) {
                 t.ended = true;
                 return false;
             } else {
-                if (len > 0) t.file.seekCur(len);
+                if (len > 0) skipBytes(t, len);
                 continue; // not playable, keep scanning
             }
         } else if (status == 0xF0 || status == 0xF7) {
@@ -96,14 +132,14 @@ bool MidiPlayer::primeTrack(int idx) {
             // be arbitrarily long, unlike a channel-voice event's fixed
             // 1-2 data bytes.
             uint32_t len;
-            if (!readVarLen(t.file, len)) { t.ended = true; return false; }
+            if (!readVarLen(t, len)) { t.ended = true; return false; }
             t.pendingTick = t.absoluteTick;
             t.pendingIsTempo = false;
             t.pendingIsSysEx = true;
             t.pendingSysExHasF0 = (status == 0xF0);
-            t.pendingSysExPos = t.file.curPosition();
+            t.pendingSysExPos = trackPos(t);
             t.pendingSysExLen = len;
-            if (len > 0) t.file.seekCur(len);
+            if (len > 0) skipBytes(t, len);
             return true;
         } else if (status >= 0x80 && status < 0xF0) {
             // Channel voice/mode message.
@@ -113,18 +149,18 @@ bool MidiPlayer::primeTrack(int idx) {
             if (haveFirstDataByte) {
                 d1 = firstDataByte;
                 if (need >= 2) {
-                    int r = t.file.read();
+                    int r = readByte(t);
                     if (r < 0) { t.ended = true; return false; }
                     d2 = (uint8_t)r;
                 }
             } else {
                 if (need >= 1) {
-                    int r = t.file.read();
+                    int r = readByte(t);
                     if (r < 0) { t.ended = true; return false; }
                     d1 = (uint8_t)r;
                 }
                 if (need >= 2) {
-                    int r = t.file.read();
+                    int r = readByte(t);
                     if (r < 0) { t.ended = true; return false; }
                     d2 = (uint8_t)r;
                 }
@@ -152,15 +188,17 @@ void MidiPlayer::sendPendingSysEx(TrackReader& t) {
     uint32_t len = t.pendingSysExLen;
     if (len == 0 || len > MIDI_SYSEX_MAX_LEN) return; // 0 = malformed; oversized -- see config.h's MIDI_SYSEX_MAX_LEN comment
 
-    uint32_t savedPos = t.file.curPosition(); // primeTrack() already advanced past the payload for scanning
+    // Reads straight from the file, then puts the file cursor back at the
+    // end of the read-ahead buffer, which stays valid.
+    uint32_t savedPos = t.file.curPosition();
     t.file.seekSet(t.pendingSysExPos);
 
-    static uint8_t buf[MIDI_SYSEX_MAX_LEN + 1]; // +1 for the F0 this reconstructs below
+    uint8_t* buf = MidiOutput::sysExScratch(); // MIDI_SYSEX_MAX_LEN + 1, room for the F0 added below
     const uint32_t off = t.pendingSysExHasF0 ? 1 : 0;
     buf[0] = 0xF0;
     bool ok = t.file.read(buf + off, len) == (int)len;
 
-    t.file.seekSet(savedPos); // restore, so the next primeTrack(idx) continues from the right place
+    t.file.seekSet(savedPos);
     if (ok) MidiOutput::sendSysExRaw(buf, len + off);
 }
 
@@ -175,6 +213,11 @@ int MidiPlayer::findNextTrack() const {
         }
     }
     return best;
+}
+
+MidiPlayer::~MidiPlayer() {
+    close();
+    delete[] _tracks;
 }
 
 bool MidiPlayer::load(const char* path) {
@@ -239,6 +282,17 @@ bool MidiPlayer::load(const char* path) {
         _state = STATE_ERROR;
         return false;
     }
+    if (ntrks > _trackCapacity) {
+        delete[] _tracks;
+        _tracks = new (std::nothrow) TrackReader[ntrks];
+        _trackCapacity = _tracks ? ntrks : 0;
+        if (!_tracks) {
+            strncpy(_error, "not enough memory", sizeof(_error) - 1);
+            hdr.close();
+            _state = STATE_ERROR;
+            return false;
+        }
+    }
     if (len > 6) hdr.seekCur(len - 6); // tolerate padded header chunks
 
     _numTracks = 0;
@@ -259,7 +313,7 @@ bool MidiPlayer::load(const char* path) {
             hdr.seekCur(tlen);
             continue;
         }
-        t.file.seekSet(trackStart);
+        seekTrack(t, trackStart);
         t.chunkEnd = trackStart + tlen;
 
         hdr.seekSet(trackStart + tlen); // advance master cursor past this track

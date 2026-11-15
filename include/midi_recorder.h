@@ -66,7 +66,7 @@ private:
     uint16_t _division = 480;        // ticks per quarter note
     uint32_t _usPerQuarter = 500000; // fixed synthetic tempo, 120 BPM
 
-    uint32_t _startMicros = 0; // micros() of the first event (tick origin)
+    uint64_t _startMicros = 0; // time_us_64() of the first event (tick origin); 64-bit so it never wraps
     uint32_t _lastTick = 0;    // absolute tick of the last event written
     uint32_t _mtrkLenPos = 0;  // file offset of the MTrk length field
     uint32_t _bytesWritten = 0; // bytes written after the length field

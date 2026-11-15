@@ -1,5 +1,6 @@
 #include "midi_output.h"
 #include "pins.h"
+#include "config.h"
 #include "synth.h"
 
 #include <Adafruit_TinyUSB.h>
@@ -8,8 +9,26 @@
 // ---- transports ----
 Adafruit_USBD_MIDI usb_midi_transport;
 
-MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, MIDIHW);
-MIDI_CREATE_INSTANCE(Adafruit_USBD_MIDI, usb_midi_transport, MIDIUSB);
+// SysExMaxSize matches MIDI_SYSEX_MAX_LEN, so a message up to that size
+// arrives whole. Built by hand since MIDI_CREATE_CUSTOM_INSTANCE only
+// passes its settings to the transport, not to MidiInterface. Each
+// instance holds one receive buffer of this size.
+struct MidiInSettings : public midi::DefaultSettings {
+    static const unsigned SysExMaxSize = MIDI_SYSEX_MAX_LEN;
+};
+
+midi::SerialMIDI<HardwareSerial> serialMIDIHW(Serial1);
+midi::MidiInterface<midi::SerialMIDI<HardwareSerial>, MidiInSettings> MIDIHW(serialMIDIHW);
+midi::SerialMIDI<Adafruit_USBD_MIDI> serialMIDIUSB(usb_midi_transport);
+midi::MidiInterface<midi::SerialMIDI<Adafruit_USBD_MIDI>, MidiInSettings> MIDIUSB(serialMIDIUSB);
+
+// Most bytes pumpIncoming() parses per transport per update(). The
+// library parses one byte per read() call.
+const int MAX_BYTES_PER_UPDATE = 64;
+
+// Shared by the SysEx senders (SMF player, .syx player). Each fills and
+// sends it within one call on core 0, so they never overlap.
+uint8_t g_sysExScratch[MIDI_SYSEX_MAX_LEN + 1];
 
 namespace {
 MidiOutTarget g_target = MIDI_OUT_BOTH;
@@ -45,7 +64,7 @@ void sendChannelVoiceTo(Interface& iface, uint8_t status, uint8_t data1, uint8_t
     switch (type) {
         case 0x80: iface.sendNoteOff(data1, data2, channel1based); break;
         case 0x90: iface.sendNoteOn(data1, data2, channel1based); break;
-        case 0xA0: iface.sendPolyPressure(data1, data2, channel1based); break;
+        case 0xA0: iface.sendAfterTouch(data1, data2, channel1based); break;
         case 0xB0: iface.sendControlChange(data1, data2, channel1based); break;
         case 0xC0: iface.sendProgramChange(data1, channel1based); break;
         case 0xD0: iface.sendAfterTouch(data1, channel1based); break;
@@ -110,7 +129,7 @@ MidiOutput::RealtimeHandler g_realtimeHandler = nullptr;
 // MIDIUSB are distinct MidiInterface<Transport> instantiations with the
 // same API.
 template <typename Interface>
-void pumpIncoming(Interface& iface, bool fromHw) {
+void pumpOne(Interface& iface, bool fromHw) {
     if (!iface.read()) return;
     bool thruActive = g_thruMode != MIDI_THRU_OFF;
     if (!g_inputHandler && !g_sysExHandler && !g_realtimeHandler && !thruActive) return;
@@ -120,6 +139,9 @@ void pumpIncoming(Interface& iface, bool fromHw) {
     if (type == midi::SystemExclusive) {
         const uint8_t* data = iface.getSysExArray();
         size_t len = iface.getSysExArrayLength();
+        // A message longer than MIDI_SYSEX_MAX_LEN comes back as its last
+        // chunk, starting with F7. Drop it.
+        if (len == 0 || data[0] != 0xF0) return;
         if (thruActive) routeThruSysEx(fromHw, data, len);
         if (g_sysExHandler) g_sysExHandler(data, len);
         return;
@@ -154,6 +176,12 @@ void pumpIncoming(Interface& iface, bool fromHw) {
     if (thruActive) routeThruChannelVoice(fromHw, status, iface.getData1(), iface.getData2());
     if (g_inputHandler) g_inputHandler(status, iface.getData1(), iface.getData2(), len);
 }
+
+// Parses whatever `port` has waiting, up to MAX_BYTES_PER_UPDATE bytes.
+template <typename Interface, typename Port>
+void pumpIncoming(Interface& iface, Port& port, bool fromHw) {
+    for (int n = 0; n < MAX_BYTES_PER_UPDATE && port.available() > 0; n++) pumpOne(iface, fromHw);
+}
 } // namespace
 
 namespace MidiOutput {
@@ -165,6 +193,7 @@ void begin() {
     // changes underneath us.
     Serial1.setTX(MIDI_OUT_PIN);
     Serial1.setRX(MIDI_IN_PIN);
+    Serial1.setFIFOSize(256); // default RX FIFO is 32 bytes, about 10 ms at 31250 baud
     MIDIHW.begin(MIDI_CHANNEL_OMNI);
     MIDIHW.turnThruOff();
 
@@ -176,8 +205,8 @@ void begin() {
 void update() {
     // Always pumps both transports so the TinyUSB stack + libmidi
     // internal buffers don't stall, even with no input handler registered.
-    pumpIncoming(MIDIHW, true);
-    pumpIncoming(MIDIUSB, false);
+    pumpIncoming(MIDIHW, Serial1, true);
+    pumpIncoming(MIDIUSB, usb_midi_transport, false);
 }
 
 void setTarget(MidiOutTarget target) { g_target = target; }
@@ -238,8 +267,8 @@ void sendAfterTouch(uint8_t channel, uint8_t pressure) {
 }
 
 void sendPolyAfterTouch(uint8_t channel, uint8_t note, uint8_t pressure) {
-    if (hwEnabled())  MIDIHW.sendPolyPressure(note, pressure, channel + 1);
-    if (usbEnabled()) MIDIUSB.sendPolyPressure(note, pressure, channel + 1);
+    if (hwEnabled())  MIDIHW.sendAfterTouch(note, pressure, channel + 1);
+    if (usbEnabled()) MIDIUSB.sendAfterTouch(note, pressure, channel + 1);
 }
 
 void sendRaw(uint8_t status, uint8_t data1, uint8_t data2, uint8_t len) {
@@ -276,6 +305,8 @@ void sendSysExRaw(const uint8_t* data, size_t len) {
     if (hwEnabled())  MIDIHW.sendSysEx((unsigned)len, data, true);
     if (usbEnabled()) MIDIUSB.sendSysEx((unsigned)len, data, true);
 }
+
+uint8_t* sysExScratch() { return g_sysExScratch; }
 
 void allNotesOffAllChannels() {
     for (int note = 0; note < 128; note++) g_noteChannelMask[note] = 0;
