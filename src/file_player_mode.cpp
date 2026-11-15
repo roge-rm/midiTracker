@@ -2397,4 +2397,11 @@ void freeBrowserBuffers() {
     browser.freeBuffers();
 }
 
+void resetBrowser() {
+    browser.resetToRoot();
+    dirStackDepth = 0;
+    selectedIndex = 0;
+    scrollOffset = 0;
+}
+
 } // namespace FilePlayerMode

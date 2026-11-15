@@ -12,6 +12,7 @@
 #include "pari_synth_grid.h"
 #include "settings_mode.h"
 #include "synth_editor.h"
+#include "usb_drive_mode.h"
 
 // Top-level boot screen: the user picks one of a small number of
 // self-contained modes, each of which owns its own screens/input/state
@@ -108,6 +109,15 @@ void setup() {
     delay(1000);
 
     MidiOutput::begin();
+    UsbDriveMode::begin();
+
+    // The MIDI and drive interfaces are added after the core has
+    // enumerated the serial port, so re-enumerate for the host to see them.
+    if (TinyUSBDevice.mounted()) {
+        TinyUSBDevice.detach();
+        delay(10);
+        TinyUSBDevice.attach();
+    }
 
     bool sdOk = sdCardBegin();
     // Only now unblock core 1's I2S/PIO init (see the comment on
@@ -117,6 +127,16 @@ void setup() {
     // starts essentially in parallel with this whole function.
     Synth::begin();
 
+    if (!sdOk && sdCardDetected()) {
+        // The card answers but its volume doesn't mount: offer it over USB
+        // until it's fixed and mounts.
+        UsbDriveMode::enterMountFailed();
+        do {
+            Input::update();
+            MidiOutput::update();
+        } while (!UsbDriveMode::update());
+        sdOk = true;
+    }
     if (!sdOk) {
         Ui::drawMessage("SD card not found", "check card");
         while (true) { delay(1000); }

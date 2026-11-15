@@ -47,6 +47,14 @@ The internal synth, named pariSynth, can be played over TRS or USB MIDI, multiti
 
 The UI's color scheme is fully customizable through a dedicated theme editor with 19 editable colour roles - UI chrome, looper track states, beat/rhythm accents, and the note-activity display's velocity tiers. Themes can be saved to the SD card (and loaded) or reset back to the default. The selected theme is remembered and reloaded automatically on boot.
 
+### USB Drive
+
+Press ENTER on USB Drive, on the MIDI/System page of Settings, and the SD card shows up on your computer as a USB drive, so you can copy files on and off without taking the card out. USB MIDI and serial keep working while it's on and after you eject. Eject the drive on the computer, or press LEFT, to give the card back to midiTracker. Eject first if you've copied anything, since LEFT doesn't wait for the computer to finish writing. Unplugging the cable also gives the card back.
+
+Use Eject rather than Power Off (GNOME and other Linux desktops) or Safely Remove Hardware (Windows): those turn off the whole USB device, MIDI and serial included, until you unplug it and plug it back in.
+
+If the card can't be read at startup, for example after it was formatted on the computer, midiTracker offers it as a drive so you can fix it, and carries on once it reads again.
+
 ### Settings
 
 Various settings can be modified and will be saved to the SD card to be loaded on boot. Currently the following items can be set:

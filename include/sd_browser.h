@@ -85,6 +85,10 @@ public:
     // huge folder doesn't compete with it for RAM. See needsRebuild().
     void freeBuffers();
 
+    // freeBuffers(), and goes back to the root folder. For when the card's
+    // contents may have changed under the browser (USB Drive mode).
+    void resetToRoot();
+
     // True exactly when freeBuffers() has dropped this browser's data and
     // nothing has rebuilt it since. A caller whose own entry point
     // doesn't already unconditionally refresh() (see FilePlayerMode::

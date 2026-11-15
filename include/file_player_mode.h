@@ -53,4 +53,8 @@ void consumeLooperImport(char* pathOut, size_t pathOutSize, int& trackIndexOut);
 // reasoning as hasPendingLooperImport()'s own comment above.
 void freeBrowserBuffers();
 
+// Drops the browser's list and goes back to the root folder; enter()
+// rescans. Called after the computer has had the card (USB Drive mode).
+void resetBrowser();
+
 } // namespace FilePlayerMode

@@ -11,6 +11,7 @@
 #include "sd_card.h"
 #include "midi_output.h"
 #include "shared_ram_arena.h"
+#include "usb_drive_mode.h"
 #include "keyboard_layout.h" // Theme page's "Save Theme" name entry -- see handleThemeSaveNameInput()
 
 namespace SettingsMode
@@ -45,6 +46,7 @@ namespace SettingsMode
             SETTING_BRIGHTNESS,
             SETTING_REBOOT_BOOTLOADER,
             SETTING_THEME_EDITOR, // ENTER opens the Theme editor (see beginThemeEditor()) -- not adjusted with EDIT+LEFT/RIGHT like every other row here
+            SETTING_USB_DRIVE,    // ENTER starts USB Drive mode (see usb_drive_mode.h)
             SETTING_COUNT,
         };
 
@@ -70,10 +72,10 @@ namespace SettingsMode
         const SettingIndex PAGE_AUDIO_ITEMS[] = {SETTING_OUTPUT_LEVEL, SETTING_DEFAULT_VOLUME, SETTING_REVERB, SETTING_REVERB_MIX, SETTING_REVERB_TYPE, SETTING_SYNTH_AUDIO, SETTING_LFO_RATE, SETTING_LFO_VOICES, SETTING_STEREO_SPREAD};
         const SettingIndex PAGE_LOOPER_ITEMS[] = {SETTING_BPM, SETTING_TIME_SIGNATURE, SETTING_BAR_LENGTH, SETTING_SYNC};
         const SettingIndex PAGE_METRONOME_ITEMS[] = {SETTING_METRONOME, SETTING_METRONOME_VOLUME, SETTING_COUNT_IN, SETTING_COUNT_IN_BARS};
-        const SettingIndex PAGE_MIDI_SYSTEM_ITEMS[] = {SETTING_CLOCK_SOURCE, SETTING_MIDI_TRANSPORT, SETTING_MIDI_THRU, SETTING_BRIGHTNESS, SETTING_THEME_EDITOR, SETTING_REBOOT_BOOTLOADER};
+        const SettingIndex PAGE_MIDI_SYSTEM_ITEMS[] = {SETTING_CLOCK_SOURCE, SETTING_MIDI_TRANSPORT, SETTING_MIDI_THRU, SETTING_BRIGHTNESS, SETTING_THEME_EDITOR, SETTING_USB_DRIVE, SETTING_REBOOT_BOOTLOADER};
 
         const SettingIndex *PAGE_ITEMS[PAGE_COUNT] = {PAGE_AUDIO_ITEMS, PAGE_LOOPER_ITEMS, PAGE_METRONOME_ITEMS, PAGE_MIDI_SYSTEM_ITEMS};
-        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {9, 4, 4, 6};
+        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {9, 4, 4, 7};
 
         int currentPage = 0;
 
@@ -87,6 +89,9 @@ namespace SettingsMode
         // gates handleInput()/update() into handleThemeInput()/the Theme draw
         // dispatch instead of the generic per-page logic while it's open.
         bool inThemeEditor = false;
+
+        // USB Drive mode is running and owns the screen and the card.
+        bool inUsbDrive = false;
         enum ThemeScreen
         {
             THEME_LIST,           // the R/G/B color list itself
@@ -321,6 +326,8 @@ namespace SettingsMode
                 return "MIDI Transport";
             case SETTING_BRIGHTNESS:
                 return "Brightness";
+            case SETTING_USB_DRIVE:
+                return "USB Drive";
             case SETTING_REBOOT_BOOTLOADER:
                 return "USB Bootloader";
             case SETTING_THEME_EDITOR:
@@ -416,6 +423,9 @@ namespace SettingsMode
                 // Not a stored value -- see handleBootloaderHold() for the
                 // actual trigger. Static instructional text instead.
                 snprintf(out, outSize, "Hold ENTER");
+                break;
+            case SETTING_USB_DRIVE:
+                snprintf(out, outSize, "ENTER to start");
                 break;
             case SETTING_THEME_EDITOR:
                 // Not a stored value either -- see beginThemeEditor(), triggered
@@ -1678,7 +1688,27 @@ namespace SettingsMode
                 return handleThemeInput();
             }
 
+            if (inUsbDrive)
+            {
+                if (UsbDriveMode::update())
+                {
+                    inUsbDrive = false;
+                    needsRedraw = true;
+                }
+                return false;
+            }
+
             handleBootloaderHold();
+
+            // Saves first so the card holds the current settings while the
+            // computer has it.
+            if (Input::justPressed(BTN_ENTER) && currentPageItem(cursor) == SETTING_USB_DRIVE)
+            {
+                saveSettings();
+                inUsbDrive = true;
+                UsbDriveMode::enter();
+                return false;
+            }
 
             // A tap (not hold -- that's handleBootloaderHold()'s own row,
             // mutually exclusive since they're different SettingIndex values)
@@ -1778,7 +1808,7 @@ namespace SettingsMode
         if (handleInput())
             return true;
 
-        if (needsRedraw)
+        if (needsRedraw && !inUsbDrive)
         {
             needsRedraw = false;
             if (inThemeEditor)

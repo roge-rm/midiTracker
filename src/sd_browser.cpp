@@ -153,6 +153,12 @@ void SdBrowser::freeBuffers() {
     _windowNextSlot = 0;
 }
 
+void SdBrowser::resetToRoot() {
+    freeBuffers();
+    strncpy(_path, BROWSE_ROOT, sizeof(_path) - 1);
+    _path[sizeof(_path) - 1] = '\0';
+}
+
 // Two passes: the first just counts how many entries actually qualify
 // (cheap -- no storage, same openNext() walk as before), so the second
 // pass can ask for a heap buffer sized to what THIS folder really has

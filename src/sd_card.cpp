@@ -31,6 +31,10 @@ bool sdCardBegin() {
     return sd.begin(SdioConfig(SDIO_CLK, SDIO_CMD, SDIO_D0, (float)F_CPU / 133000000.0f));
 }
 
+bool sdCardDetected() {
+    return sd.card() && !sd.card()->errorCode();
+}
+
 // Opens each folder of `path` in turn, leaving the last open one in
 // *parent and the final component in `leaf`. a and b are scratch handles.
 static bool walkToParent(FsFile& a, FsFile& b, const char* path, FsFile*& parent, const char*& leaf) {

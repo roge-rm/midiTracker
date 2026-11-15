@@ -11,6 +11,9 @@ extern SdFs sd;
 // sd.sdErrorCode() for diagnostics.
 bool sdCardBegin();
 
+// True if the card itself initialised, whether or not its volume mounted.
+bool sdCardDetected();
+
 // Path helpers for paths built by SdBrowser. A path component of the form
 // "*<n>" (never a valid FAT name) stands for the entry with directory
 // index n in its folder, used for names that are too long or not plain
