@@ -312,7 +312,24 @@ bool ItPlayer::load(const char* path) {
     _baseSpeed = initSpeed;
     _tickFraction = 0;
     _rowsPerBeat = h[0x1E] ? h[0x1E] : 4;
-    _tempoMode = (uint8_t)readTempoMode(dataEnd, insNum);
+    // OpenMPT's song settings after the last pattern or sample data.
+    SongExtensions ext;
+    bool xtpm = readSongExtensions(dataEnd, insNum, ext);
+    _tempoMode = (uint8_t)(ext.tempoMode < 0 ? 0 : ext.tempoMode);
+    // Master level, as OpenMPT: MV is the pre-amp, and files it reads as
+    // made by ModPlug play at its old mix levels unless they say otherwise.
+    uint16_t cwtv = rd16(h + 0x28);
+    uint32_t reserved = rd32(h + 0x3C);
+    bool modplug = ((cwtv & 0xF000) == 0x5000 && memcmp(h + 0x3C, "OMPT", 4) == 0) || cwtv == 0x888 || cmwt == 0x888 ||
+                   (cwtv == 0x0214 && cmwt == 0x0202 && reserved == 0) ||
+                   (cwtv == 0x0300 && cmwt == 0x0300 && reserved == 0 && ordNum == 256 && h[0x34] == 128 && h[0x35] == 0) ||
+                   (cwtv == 0x0217 && cmwt == 0x0200 && reserved == 0) || xtpm;
+    uint8_t levels = ext.mixLevels >= 0 && ext.mixLevels <= MIX_COMPATIBLE_FT2 ? (uint8_t)ext.mixLevels
+                     : (uint8_t)(modplug ? MIX_ORIGINAL : MIX_COMPATIBLE);
+    uint32_t preamp = ext.preamp >= 0 ? (uint32_t)ext.preamp : _mixVolume;
+    if (ext.preamp < 0 && cwtv == 0x0214 && cmwt == 0x0214 && memcmp(h + 0x3C, "CHBI", 4) == 0) preamp /= 2; // ChibiTracker
+    int chans = ext.channels > _numChannels ? ext.channels : _numChannels;
+    _masterGain = masterGainFor(levels, preamp, chans);
     resetSequencer(initSpeed, initTempo);
     return true;
 }
@@ -473,52 +490,6 @@ uint32_t ItPlayer::sampleDataEnd(const ItSample& s) {
         at += 2 + rd16(lb);
     }
     return at;
-}
-
-// OpenMPT's settings after the last pattern or sample data: optionally
-// "XTPM" instrument entries (4-byte id, 16-bit size, size bytes per
-// instrument), then "STPM" song entries (4-byte id, 16-bit size, data).
-// "..MT" is the tempo mode.
-int ItPlayer::readTempoMode(uint32_t at, int numInstruments) {
-    uint8_t e[6];
-    if (at > 0 && _file.seekSet(at) && _file.read(e, 4) == 4) {
-        if (memcmp(e, "XTPM", 4) == 0) {
-            for (int guard = 0; guard < 256; guard++) {
-                if (_file.read(e, 4) != 4) return 0;
-                if (memcmp(e, "STPM", 4) == 0) break;
-                if (_file.read(e + 4, 2) != 2) return 0;
-                at = (uint32_t)_file.curPosition() + (uint32_t)rd16(e + 4) * (uint32_t)numInstruments;
-                if (!_file.seekSet(at)) return 0;
-            }
-        }
-        if (memcmp(e, "STPM", 4) == 0) {
-            for (int guard = 0; guard < 256; guard++) {
-                if (_file.read(e, 6) != 6) return 0;
-                uint16_t len = rd16(e + 4);
-                if (memcmp(e, "..MT", 4) == 0) {
-                    uint8_t mode = 0;
-                    return (len >= 1 && _file.read(&mode, 1) == 1) ? mode : 0;
-                }
-                if (!_file.seekSet((uint32_t)_file.curPosition() + len)) return 0;
-            }
-            return 0;
-        }
-    }
-    // Fall back to looking in the last bytes of the file.
-    uint32_t size = (uint32_t)_file.fileSize();
-    uint32_t n = size < (uint32_t)RAW_SCRATCH_BYTES ? size : (uint32_t)RAW_SCRATCH_BYTES;
-    if (!_file.seekSet(size - n) || _file.read(_rawScratch, n) != (int)n) return 0;
-    for (int i = (int)n - 4; i >= 0; i--) {
-        if (memcmp(_rawScratch + i, "STPM", 4) != 0) continue;
-        uint32_t p = (uint32_t)i + 4;
-        while (p + 6 <= n) {
-            uint32_t len = rd16(_rawScratch + p + 4);
-            if (memcmp(_rawScratch + p, "..MT", 4) == 0 && len >= 1 && p + 6 < n) return _rawScratch[p + 6];
-            p += 6 + len;
-        }
-        return 0;
-    }
-    return 0;
 }
 
 void ItPlayer::scanChannels() {
@@ -1346,7 +1317,8 @@ const int16_t* __not_in_flash_func(ItPlayer::mixBlock)(uint32_t n) {
         if (v.fadeOut && (v.rampLeft == 0 || !v.havePair)) releaseVoice(v);
     }
     // In place: out[i] only overwrites acc entries already read.
-    for (uint32_t i = 0; i < n * 2; i++) _mix.out[i] = finishMix(_mix.acc[i], _globalVolume);
+    const int32_t gain = outputGain(), limit = mixLimit(gain);
+    for (uint32_t i = 0; i < n * 2; i++) _mix.out[i] = finishMix(_mix.acc[i], gain, limit);
     return _mix.out;
 }
 
@@ -1759,7 +1731,6 @@ uint32_t ItPlayer::tickLength() {
 // Envelopes, fadeout and the mix values for every sounding voice, once a tick.
 void ItPlayer::processVoices() {
     _globalVolume = (uint8_t)(_globalVol >> 1);
-    uint32_t mvGain = _mixVolume >= 64 ? 128 : (uint32_t)_mixVolume * 2;
     for (int i = 0; i < MAX_VOICES; i++) {
         ItVoice& v = _voices[i];
         if (v.channel < 0) continue;
@@ -1791,7 +1762,6 @@ void ItPlayer::processVoices() {
         uint32_t a = v.baseVolume; // 0-4096
         a = (a * (uint32_t)envVol) >> 14;
         a = (a * (v.fadeVolume >> 4)) >> 12;
-        a = (a * mvGain) >> 7;
         uint32_t mv = (a + 32) >> 6;
         v.mixVolume = (uint8_t)(mv > 64 ? 64 : mv);
         v.loudness = (uint16_t)(v.background ? a >> 1 : a);

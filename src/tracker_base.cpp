@@ -472,14 +472,116 @@ const int16_t* __not_in_flash_func(TrackerPlayer::mixBlock)(uint32_t n) {
     }
     for (int i = 0; i < _tailCount; i++) if (_tails[i].left) mixTail(_tails[i], acc, n);
     // In place: out[i] only overwrites acc entries already read.
-    for (uint32_t i = 0; i < n * 2; i++) _mix.out[i] = finishMix(acc[i], _globalVolume);
+    const int32_t gain = outputGain(), limit = mixLimit(gain);
+    for (uint32_t i = 0; i < n * 2; i++) _mix.out[i] = finishMix(acc[i], gain, limit);
     return _mix.out;
 }
 
-int16_t __not_in_flash_func(TrackerPlayer::finishMix)(int32_t mix, uint8_t globalVolume) {
-    mix = (mix * (int32_t)globalVolume) >> 6;
-    mix += mix >> 2;
-    return (int16_t)softClampMix(mix);
+int16_t __not_in_flash_func(TrackerPlayer::finishMix)(int32_t mix, int32_t gain, int32_t limit) {
+    // Limited first so mix * gain fits in 32 bits; anything past limit is
+    // far above full scale after the gain.
+    if (mix > limit) mix = limit;
+    else if (mix < -limit) mix = -limit;
+    return (int16_t)softClampMix((mix * gain) >> 11);
+}
+
+// OpenMPT's PreAmpTable: the headroom for Original mix levels, by
+// channels / 2. Unity there is 128 at the global pre-amp of 128.
+static const uint8_t PREAMP_ATTENUATION[16] = {
+    0x60, 0x60, 0x60, 0x70, 0x80, 0x88, 0x90, 0x98, 0xA0, 0xA4, 0xA8, 0xAC, 0xB0, 0xB4, 0xB8, 0xBC,
+};
+
+uint16_t TrackerPlayer::masterGainFor(uint8_t mixLevels, uint32_t preamp, int channels) {
+    // Voice gains here are 1.0 at full volume panned to one side, as
+    // OpenMPT's. Compatible levels: pre-amp / 256 * 2 (its extra halving
+    // and its pan law), so 1.0 at pre-amp 128. Older levels: 2 * pre-amp /
+    // attenuation, then its 4 bits of headroom and the pan law.
+    if (preamp > 2000) preamp = 2000;
+    uint32_t g;
+    if (mixLevels == MIX_ORIGINAL || mixLevels == MIX_RC1 || mixLevels == MIX_RC2) {
+        int n = channels < 1 ? 1 : channels > 31 ? 31 : channels;
+        g = preamp * 1024 / PREAMP_ATTENUATION[n / 2];
+    } else {
+        g = preamp * 16;
+    }
+    return (uint16_t)(g > 4095 ? 4095 : g);
+}
+
+static uint32_t rdLe(const uint8_t* p, uint32_t n) {
+    uint32_t v = 0;
+    for (uint32_t i = 0; i < n && i < 4; i++) v |= (uint32_t)p[i] << (8 * i);
+    return v;
+}
+
+// True if "STPM" entries from pos walk to the end of the file or to an
+// MPTM block, each with a printable id.
+bool TrackerPlayer::songExtensionsEndAt(uint32_t pos, uint32_t size) {
+    uint8_t e[6];
+    for (int guard = 0; guard < 512; guard++) {
+        if (pos == size) return true;
+        if (pos + 6 > size || !_file.seekSet(pos) || _file.read(e, 6) != 6) return false;
+        if (memcmp(e, "228\x04", 4) == 0) return true;
+        if (((e[0] | e[1] | e[2] | e[3]) & 0x80) || !((e[0] | e[1] | e[2] | e[3]) & 0x60)) return false;
+        pos += 6 + rdLe(e + 4, 2);
+    }
+    return false;
+}
+
+bool TrackerPlayer::readSongExtensions(uint32_t at, int numInstruments, SongExtensions& ext) {
+    uint8_t e[6];
+    bool xtpm = false;
+    uint32_t stpm = 0; // file offset just past "STPM", 0 if not found yet
+    if (at > 0 && _file.seekSet(at) && _file.read(e, 4) == 4) {
+        if (memcmp(e, "XTPM", 4) == 0) {
+            xtpm = true;
+            // 4-byte id, 16-bit size, size bytes per instrument, until "STPM".
+            for (int guard = 0; guard < 256; guard++) {
+                if (_file.read(e, 4) != 4) break;
+                if (memcmp(e, "STPM", 4) == 0) break;
+                if (_file.read(e + 4, 2) != 2) break;
+                uint32_t next = (uint32_t)_file.curPosition() + rdLe(e + 4, 2) * (uint32_t)numInstruments;
+                if (!_file.seekSet(next)) break;
+            }
+        }
+        if (memcmp(e, "STPM", 4) == 0) stpm = (uint32_t)_file.curPosition();
+    }
+    if (!stpm) {
+        // Otherwise the last "STPM" in the last 8 KB whose entries run
+        // cleanly to the end of the file (or to an MPTM block). Read in
+        // RAW_SCRATCH_BYTES pieces from the end, 3 bytes overlapping.
+        uint32_t size = (uint32_t)_file.fileSize();
+        uint32_t floor = size > 8192 ? size - 8192 : 0;
+        uint32_t end = size;
+        while (!stpm && end >= floor + 4) {
+            uint32_t start = end > floor + (uint32_t)RAW_SCRATCH_BYTES ? end - (uint32_t)RAW_SCRATCH_BYTES : floor;
+            uint32_t n = end - start;
+            if (!_file.seekSet(start) || _file.read(_rawScratch, n) != (int)n) break;
+            for (int i = (int)n - 4; i >= 0 && !stpm; i--) {
+                if (memcmp(_rawScratch + i, "STPM", 4) == 0 && songExtensionsEndAt(start + (uint32_t)i + 4, size))
+                    stpm = start + (uint32_t)i + 4;
+            }
+            if (start == floor) break;
+            end = start + 3;
+        }
+    }
+    if (!stpm || !_file.seekSet(stpm)) return xtpm;
+    // 4-byte id (stored reversed), 16-bit size, then the value.
+    for (int guard = 0; guard < 256; guard++) {
+        if (_file.read(e, 6) != 6 || memcmp(e, "228\x04", 4) == 0) break;
+        if ((e[0] | e[1] | e[2] | e[3]) & 0x80) break;
+        if (!((e[0] | e[1] | e[2] | e[3]) & 0x60)) break;
+        uint32_t len = rdLe(e + 4, 2);
+        uint8_t val[4] = {0};
+        uint32_t take = len < 4 ? len : 4;
+        if (_file.read(val, take) != (int)take) break;
+        uint32_t v = rdLe(val, take);
+        if (memcmp(e, "..MT", 4) == 0) ext.tempoMode = (int)v;
+        else if (memcmp(e, ".MMP", 4) == 0) ext.mixLevels = (int)v;
+        else if (memcmp(e, ".APS", 4) == 0) ext.preamp = (int32_t)v;
+        else if (memcmp(e, "...C", 4) == 0) ext.channels = (int)v;
+        if (len > take && !_file.seekSet((uint32_t)_file.curPosition() + (len - take))) break;
+    }
+    return xtpm;
 }
 
 void __not_in_flash_func(TrackerPlayer::update)() {

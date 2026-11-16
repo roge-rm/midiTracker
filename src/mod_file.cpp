@@ -198,6 +198,10 @@ bool ModPlayer::load(const char* path) {
     attachTails(_tails, (int)(sizeof(_tails) / sizeof(_tails[0])), _tailPool, TAIL_POOL_FRAMES);
 
     _globalVolume = 64;
+    // OpenMPT's pre-amp for MODs, 256 / channels within 32-128: the most
+    // that can't clip with every channel at full volume, up to 8 channels.
+    int pre = 256 / (_numChannels > 0 ? _numChannels : 4);
+    _masterGain = masterGainFor(MIX_COMPATIBLE, (uint32_t)(pre < 32 ? 32 : pre > 128 ? 128 : pre), _numChannels);
     _nextTempo = 0;
     resetSequencer(6, 125);
     return true;

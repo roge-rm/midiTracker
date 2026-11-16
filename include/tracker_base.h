@@ -202,8 +202,16 @@ protected:
     // one tick). The base mixes every voice and the tails; IT has its own.
     static const uint32_t BLOCK_FRAMES = 64;
     virtual const int16_t* mixBlock(uint32_t n);
-    // Global volume, makeup gain and soft clamp on one channel's voice sum.
-    static int16_t finishMix(int32_t mix, uint8_t globalVolume);
+    // One channel's voice sum times gain (outputGain()), soft clamped.
+    // limit is mixLimit(gain), worked out once a block.
+    static int16_t finishMix(int32_t mix, int32_t gain, int32_t limit);
+    // Largest |mix| whose product with gain fits in 32 bits.
+    static int32_t mixLimit(int32_t gain) { return gain > 0 ? 0x7FFFFFFF / gain : 0x7FFFFFFF; }
+    // _globalVolume times _masterGain, Q11, below 4096.
+    int32_t outputGain() const {
+        int32_t g = ((int32_t)_globalVolume * _masterGain + 32) >> 6;
+        return g > 4095 ? 4095 : g;
+    }
     // Adds n frames of v into acc (interleaved stereo), through filter f
     // if not null. With stopAfterRamp the voice is left once its ramp ends.
     void mixVoiceBlock(TrackerVoice& v, TrackerFilter* f, int32_t* acc, uint32_t n, bool stopAfterRamp);
@@ -237,6 +245,22 @@ protected:
     int _numChannels = 0;
     int _numInstruments = 0;
     uint8_t _globalVolume = 64; // 0-64
+    // Master level, Q11 (2048 is 1.0), set at load from masterGainFor().
+    uint16_t _masterGain = 2048;
+
+    // OpenMPT's mix levels, the "PMM." song extension's values.
+    enum : uint8_t { MIX_ORIGINAL = 0, MIX_RC1, MIX_RC2, MIX_RC3, MIX_COMPATIBLE, MIX_COMPATIBLE_FT2 };
+    // OpenMPT's master level for a sample pre-amp (48 is the default) and
+    // channel count, as _masterGain: Compatible levels play pre-amp / 128,
+    // the older ones scale it down by channel count instead.
+    static uint16_t masterGainFor(uint8_t mixLevels, uint32_t preamp, int channels);
+    // OpenMPT's song extensions in an .it or .xm, -1 where missing.
+    struct SongExtensions { int tempoMode = -1, mixLevels = -1, channels = -1; int32_t preamp = -1; };
+    // Reads them from the "XTPM" instrument block at `at` and the "STPM"
+    // block after it, or from the last bytes of _file when at is 0 or
+    // holds neither. True if `at` starts an "XTPM" block.
+    bool readSongExtensions(uint32_t at, int numInstruments, SongExtensions& ext);
+    bool songExtensionsEndAt(uint32_t pos, uint32_t size);
 
     // Sequencer position.
     int _orderPos = 0;

@@ -267,6 +267,8 @@ bool S3mPlayer::load(const char* path) {
     if (tempo < 33) tempo = isST3 ? 125 : 32;
     resetSequencer(initialSpeed, tempo);
     _globalVolume = (uint8_t)((_songVolume * _preamp + 24) / 48);
+    // The master volume is in _globalVolume, relative to 48.
+    _masterGain = masterGainFor(MIX_COMPATIBLE, 48, _numChannels);
     return true;
 }
 

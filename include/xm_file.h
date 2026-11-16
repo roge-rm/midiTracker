@@ -127,6 +127,7 @@ private:
 
     bool _linearFreqTable = true;
     bool _exactFinetune = false; // old ModPlug files, see detectHeader()
+    bool _linearPan = false;     // OpenMPT's non-FT2 mix levels pan linearly
 
     XmInstrument _instruments[MAX_INSTRUMENTS];
     XmSample _samples[MAX_SAMPLES];
@@ -186,6 +187,8 @@ private:
                                  bool& withSamples);
     static void detectSample(uint16_t& m, const uint8_t* sh, uint8_t& reservedOr, int& lastReserved);
     bool detectEnd(uint16_t m, const uint8_t* hdr, uint8_t reservedOr);
+    // OpenMPT's mix levels and pre-amp, into _masterGain and _linearPan.
+    void setMasterLevel(uint16_t m, bool oldModPlug, const uint8_t* hdr, int channels);
 
     void openPatternForScan(int num);
     void advanceToRow(int targetRow);

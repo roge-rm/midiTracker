@@ -272,6 +272,41 @@ bool XmPlayer::detectEnd(uint16_t m, const uint8_t* hdr, uint8_t reservedOr) {
     return (m & VER_CONFIRMED) && (m & (VER_BIDI_FLAG | VER_NEW_MODPLUG));
 }
 
+void XmPlayer::setMasterLevel(uint16_t m, bool oldModPlug, const uint8_t* hdr, int channels) {
+    const char* tracker = (const char*)hdr + 38;
+    uint8_t levels = MIX_COMPATIBLE;
+    if (!memcmp(tracker, "OpenMPT ", 8)) {
+        // Version digits are hex, 1.22.07.19 is 0x01220719.
+        uint32_t ver = 0, part = 0;
+        int parts = 0;
+        for (int i = 8; i < 20; i++) {
+            char c = tracker[i];
+            int d = (c >= '0' && c <= '9') ? c - '0' : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : -1;
+            if (d >= 0) part = part * 16 + (uint32_t)d;
+            else if (c == '.' && parts < 3) { ver = (ver << 8) | (part & 0xFF); part = 0; parts++; }
+            else break;
+        }
+        ver = (ver << 8) | (part & 0xFF);
+        while (++parts < 4) ver <<= 8;
+        levels = ver < 0x01220719 ? MIX_COMPATIBLE : MIX_COMPATIBLE_FT2;
+    } else if ((m & VER_FT2_GENERIC) || !memcmp(tracker, "Fasttracker II clone", 20)) {
+        levels = MIX_COMPATIBLE_FT2;
+    } else if (oldModPlug) {
+        levels = MIX_ORIGINAL;
+    } else if (!memcmp(tracker, "MilkyTracker", 12) && memcmp(tracker + 12, "        ", 8)) {
+        levels = MIX_COMPATIBLE_FT2;
+    }
+    SongExtensions ext;
+    readSongExtensions(0, 0, ext);
+    if (ext.mixLevels >= 0 && ext.mixLevels <= MIX_COMPATIBLE_FT2) levels = (uint8_t)ext.mixLevels;
+    uint32_t g = masterGainFor(levels, ext.preamp >= 0 ? (uint32_t)ext.preamp : 48, channels);
+    _linearPan = levels != MIX_COMPATIBLE_FT2;
+    // FT2's pan law is 1.0 at the side and 0.707 at the centre; PAN_SQRT
+    // is that over sqrt(2).
+    if (!_linearPan) g = (g * 46341 + 16384) >> 15;
+    _masterGain = (uint16_t)(g > 4095 ? 4095 : g);
+}
+
 bool XmPlayer::load(const char* path) {
     close();
     _error[0] = '\0';
@@ -473,6 +508,7 @@ bool XmPlayer::load(const char* path) {
     }
 
     _exactFinetune = detectEnd(madeWith, hdr, sampleReserved);
+    setMasterLevel(madeWith, _exactFinetune, hdr, numChannelsReal);
 
     for (int ch = 0; ch < MAX_CHANNELS; ch++) _channels[ch] = XmChannel();
     attachVoices(&_channels[0], sizeof(XmChannel), _numChannels, &_chunks[0][0], CHUNK_FRAMES);
@@ -1424,6 +1460,12 @@ void __not_in_flash_func(XmPlayer::tickEnd)() {
 
 void __not_in_flash_func(XmPlayer::voiceGains)(const TrackerVoice& v, int32_t& l, int32_t& r) {
     const XmChannel& c = static_cast<const XmChannel&>(v);
+    if (_linearPan) {
+        // 32768 at full volume on one side; XM samples stay within int16.
+        l = (int32_t)(((uint32_t)c.finalVol * (256u - c.finalPan)) >> 5);
+        r = (int32_t)(((uint32_t)c.finalVol * c.finalPan) >> 5);
+        return;
+    }
     l = (int32_t)(((uint32_t)c.finalVol * PAN_SQRT[256 - c.finalPan]) >> 12);
     r = (int32_t)(((uint32_t)c.finalVol * PAN_SQRT[c.finalPan]) >> 12);
 }

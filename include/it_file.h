@@ -229,9 +229,8 @@ private:
     void tickEnd() override { processVoices(); }
     uint32_t tickLength() override;
     uint32_t _tickFraction = 0; // carried part of a frame, in 1/65536ths
-    uint8_t _tempoMode = 0;     // OpenMPT's tempo mode: 0 classic, 1 alternative, 2 modern, see readTempoMode()
+    uint8_t _tempoMode = 0;     // OpenMPT's tempo mode: 0 classic, 1 alternative, 2 modern
     uint8_t _rowsPerBeat = 4;
-    int readTempoMode(uint32_t at, int numInstruments);
     uint32_t sampleDataEnd(const ItSample& s);
     int16_t refillChunk(TrackerVoice& v, uint32_t index) override;
 
