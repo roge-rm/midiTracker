@@ -631,7 +631,7 @@ void openSelected() {
 
     stoppedViaNav = false; // a fresh open is never "stopped", see its own comment
 
-    if (e.kind == FILE_WAV) {
+    if (e.kind == FILE_WAV || e.kind == FILE_AIFF) {
         audio = &wavPlayer;
         if (audio->load(path)) audio->play();
         // On failure, audio->state() == STATE_ERROR and drawWavPlayer()
@@ -820,12 +820,16 @@ void beginNewFolderName() {
     beginNameEntry(NAME_NEW_FOLDER, "");
 }
 
+// An AIFF keeps the extension it has (.aif, .aiff or .aifc) when renamed.
+char renameAiffExt[8] = ".aiff";
+
 // The extension that goes with a given file kind -- used for both
 // stripping (rename entry) and re-appending (rename commit).
 const char* extensionForKind(FileKind kind) {
     switch (kind) {
         case FILE_SYX: return ".syx";
         case FILE_WAV: return ".wav";
+        case FILE_AIFF: return ".aiff";
         case FILE_MP3: return ".mp3";
         case FILE_MOD: return ".mod";
         case FILE_S3M: return ".s3m";
@@ -835,19 +839,27 @@ const char* extensionForKind(FileKind kind) {
     }
 }
 
+const char* renameExtension() {
+    return renameKind == FILE_AIFF ? renameAiffExt : extensionForKind(renameKind);
+}
+
 void beginRename() {
     if (selectedIndex < 0 || selectedIndex >= browser.entryCount()) return;
     const BrowserEntry& e = browser.entry(selectedIndex);
     browser.buildFullPath(selectedIndex, renameOldPath, sizeof(renameOldPath));
     renameIsDir = e.isDir;
     renameKind = e.kind;
+    if (!e.isDir && e.kind == FILE_AIFF) {
+        const char* dot = strrchr(e.name, '.');
+        if (dot && strlen(dot) < sizeof(renameAiffExt)) strcpy(renameAiffExt, dot);
+    }
 
     char base[NAME_ENTRY_MAX_LEN + 1];
     size_t baseLen = strlen(e.name);
     if (!e.isDir) {
         // Strip the actual extension before cutting to the editable length; re-appended on save.
-        size_t extLen = strlen(extensionForKind(renameKind));
-        if (baseLen > extLen && strcasecmp(e.name + baseLen - extLen, extensionForKind(renameKind)) == 0) baseLen -= extLen;
+        size_t extLen = strlen(renameExtension());
+        if (baseLen > extLen && strcasecmp(e.name + baseLen - extLen, renameExtension()) == 0) baseLen -= extLen;
     }
     if (baseLen > NAME_ENTRY_MAX_LEN) baseLen = NAME_ENTRY_MAX_LEN;
     memcpy(base, e.name, baseLen);
@@ -886,7 +898,7 @@ void moveKeyboardCursor(int dRow, int dCol) {
 // the live preview update (partial redraw) so both agree on what's
 // appended after the typed name.
 const char* currentNameSuffix() {
-    if (namePurpose == NAME_RENAME) return renameIsDir ? "" : extensionForKind(renameKind);
+    if (namePurpose == NAME_RENAME) return renameIsDir ? "" : renameExtension();
     if (namePurpose == NAME_NEW_RECORDING) return ".mid";
     if (namePurpose == NAME_NEW_SYSEX_CAPTURE) return ".syx";
     return "";
@@ -961,8 +973,8 @@ void performNameEntryAction(const char* trimmed, bool replace = false) {
     if (renameIsDir) {
         browser.buildPath(trimmed, newPath, sizeof(newPath));
     } else {
-        char filename[NAME_ENTRY_MAX_LEN + 5];
-        snprintf(filename, sizeof(filename), "%s%s", trimmed, extensionForKind(renameKind));
+        char filename[NAME_ENTRY_MAX_LEN + 8];
+        snprintf(filename, sizeof(filename), "%s%s", trimmed, renameExtension());
         browser.buildPath(filename, newPath, sizeof(newPath));
     }
     if (strcmp(newPath, renameOldPath) == 0) {
@@ -1025,8 +1037,8 @@ void finishNameEntry() {
             browser.buildPath(trimmed, path, sizeof(path));
             isDir = true; // describes whatever's already AT this path, not the thing being renamed
         } else {
-            char filename[NAME_ENTRY_MAX_LEN + 5];
-            snprintf(filename, sizeof(filename), "%s%s", trimmed, extensionForKind(renameKind));
+            char filename[NAME_ENTRY_MAX_LEN + 8];
+            snprintf(filename, sizeof(filename), "%s%s", trimmed, renameExtension());
             browser.buildPath(filename, path, sizeof(path));
         }
         if (strcmp(trimmed, renameInitialName) == 0) {
@@ -2001,7 +2013,8 @@ struct ConvertRows {
 
 ConvertSource* convertSourceFor(FileKind kind) {
     switch (kind) {
-        case FILE_WAV: return &wavConvertSource;
+        case FILE_WAV:
+        case FILE_AIFF: return &wavConvertSource;
         case FILE_MP3: return &mp3ConvertSource;
         case FILE_MID: return &midiConvertSource;
         case FILE_MOD:

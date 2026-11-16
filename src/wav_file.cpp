@@ -10,12 +10,27 @@ namespace {
 
 // WAV chunk header: 4-byte ID + 4-byte LITTLE-endian length (contrast
 // MidiPlayer::readChunkHeader()'s SMF chunks, which are big-endian).
-bool readChunkHeader(FsFile& f, char id[5], uint32_t& length) {
+bool readChunkHeader(FsFile& f, char id[5], uint32_t& length, bool bigEndian = false) {
     uint8_t buf[8];
     if (f.read(buf, 8) != 8) return false;
     id[0] = buf[0]; id[1] = buf[1]; id[2] = buf[2]; id[3] = buf[3]; id[4] = '\0';
-    length = (uint32_t)buf[4] | ((uint32_t)buf[5] << 8) | ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 24);
+    if (bigEndian) {
+        length = ((uint32_t)buf[4] << 24) | ((uint32_t)buf[5] << 16) | ((uint32_t)buf[6] << 8) | (uint32_t)buf[7];
+    } else {
+        length = (uint32_t)buf[4] | ((uint32_t)buf[5] << 8) | ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 24);
+    }
     return true;
+}
+
+// AIFF's 80-bit extended float sample rate (sign and 15-bit exponent, then a
+// 64-bit mantissa with its top bit set) to whole Hz. 0 if it isn't sane.
+uint32_t extendedToRate(const uint8_t* b) {
+    int exp = (int)(((b[0] & 0x7F) << 8) | b[1]);
+    if (b[0] & 0x80) return 0;
+    uint32_t mant = ((uint32_t)b[2] << 24) | ((uint32_t)b[3] << 16) | ((uint32_t)b[4] << 8) | b[5];
+    int shift = 16383 + 31 - exp;
+    if (shift < 0 || shift > 31) return 0;
+    return mant >> shift;
 }
 
 const uint16_t WAVE_FORMAT_PCM = 1;
@@ -101,17 +116,18 @@ bool WavPlayer::load(const char* path) {
 
     if (!sdOpenPath(_file, path, O_RDONLY)) return fail("could not open file");
 
-    char id[5];
-    uint32_t riffLen;
-    uint8_t waveId[4];
-    if (!readChunkHeader(_file, id, riffLen) || strncmp(id, "RIFF", 4) != 0 ||
-        _file.read(waveId, 4) != 4 || strncmp((const char*)waveId, "WAVE", 4) != 0) {
-        return fail("not a WAV file");
-    }
+    uint8_t head[12];
+    if (_file.read(head, 12) != 12) return fail("not a WAV or AIFF file");
+    bool aiff = memcmp(head, "FORM", 4) == 0 && (memcmp(head + 8, "AIFF", 4) == 0 || memcmp(head + 8, "AIFC", 4) == 0);
+    bool aifc = aiff && head[11] == 'C';
+    if (!aiff && (memcmp(head, "RIFF", 4) != 0 || memcmp(head + 8, "WAVE", 4) != 0)) return fail("not a WAV or AIFF file");
+    _bigEndian = false;
+    _isAiff = aiff;
+    _signed8 = false;
 
     bool haveFmt = false, extensibleOk = true;
     uint16_t formatTag = 0, channels = 0, bitsPerSample = 0, blockAlign = 0, samplesPerBlock = 0;
-    uint32_t sampleRate = 0;
+    uint32_t sampleRate = 0, aiffFrames = 0;
     _dataChunkStart = 0;
     _dataChunkLen = 0;
 
@@ -120,10 +136,49 @@ bool WavPlayer::load(const char* path) {
     while (true) {
         char cid[5];
         uint32_t clen;
-        if (!readChunkHeader(_file, cid, clen)) break; // EOF -- stop scanning
+        if (!readChunkHeader(_file, cid, clen, aiff)) break; // EOF -- stop scanning
         uint32_t chunkDataStart = _file.curPosition();
 
-        if (strncmp(cid, "fmt ", 4) == 0) {
+        if (aiff) {
+            if (strncmp(cid, "COMM", 4) == 0) {
+                // channels, frames, bits, 80-bit rate, then AIFC's compression type
+                uint8_t cb[22];
+                if (clen < 18 || _file.read(cb, 18) != 18) return fail("invalid AIFF file");
+                if (aifc && (clen < 22 || _file.read(cb + 18, 4) != 4)) return fail("invalid AIFF file");
+                channels = (uint16_t)((cb[0] << 8) | cb[1]);
+                aiffFrames = ((uint32_t)cb[2] << 24) | ((uint32_t)cb[3] << 16) | ((uint32_t)cb[4] << 8) | cb[5];
+                bitsPerSample = (uint16_t)((cb[6] << 8) | cb[7]);
+                sampleRate = extendedToRate(cb + 8);
+                formatTag = WAVE_FORMAT_PCM;
+                _bigEndian = true;
+                _signed8 = true;
+                if (aifc) {
+                    if (!memcmp(cb + 18, "NONE", 4) || !memcmp(cb + 18, "twos", 4)) {
+                    } else if (!memcmp(cb + 18, "sowt", 4)) {
+                        _bigEndian = false;
+                    } else if (!memcmp(cb + 18, "fl32", 4) || !memcmp(cb + 18, "FL32", 4)) {
+                        formatTag = WAVE_FORMAT_IEEE_FLOAT;
+                    } else {
+                        return fail("unsupported codec");
+                    }
+                }
+                // 12 or 20-bit samples sit left-justified in whole bytes
+                if (formatTag == WAVE_FORMAT_PCM && bitsPerSample >= 1 && bitsPerSample <= 32) bitsPerSample = (bitsPerSample + 7) & ~7u;
+                haveFmt = true;
+            } else if (strncmp(cid, "SSND", 4) == 0) {
+                // offset and block size, then the samples
+                uint8_t sb[8];
+                if (clen < 8 || _file.read(sb, 8) != 8) return fail("invalid AIFF file");
+                uint32_t offset = ((uint32_t)sb[0] << 24) | ((uint32_t)sb[1] << 16) | ((uint32_t)sb[2] << 8) | sb[3];
+                uint64_t start = (uint64_t)chunkDataStart + 8 + offset;
+                uint64_t size = _file.fileSize();
+                uint32_t avail = start < size ? (uint32_t)(size - start) : 0;
+                uint32_t len = (uint64_t)offset + 8 <= clen ? clen - 8 - offset : 0;
+                _dataChunkStart = (uint32_t)start;
+                _dataChunkLen = len > avail ? avail : len;
+                if (haveFmt) break;
+            }
+        } else if (strncmp(cid, "fmt ", 4) == 0) {
             // 16 basic bytes, then cbSize and its extra bytes: IMA ADPCM's
             // samplesPerBlock, or EXTENSIBLE's valid bits, channel mask and
             // subformat GUID (40 bytes in all).
@@ -156,12 +211,12 @@ bool WavPlayer::load(const char* path) {
         if (!_file.seekSet((uint32_t)next64)) break;
     }
 
-    if (!haveFmt || _dataChunkLen == 0) return fail("invalid WAV file");
+    if (!haveFmt || _dataChunkLen == 0) return fail(aiff ? "invalid AIFF file" : "invalid WAV file");
     if (!extensibleOk) return fail("unsupported format");
     bool isAdpcm = (formatTag == WAVE_FORMAT_IMA_ADPCM);
     bool isFloat = (formatTag == WAVE_FORMAT_IEEE_FLOAT);
     if (formatTag != WAVE_FORMAT_PCM && !isAdpcm && !isFloat) return fail("unsupported codec");
-    if (channels == 0 || channels > 2) return fail(channels > 2 ? "too many channels" : "invalid WAV file");
+    if (channels == 0 || channels > 2) return fail(channels > 2 ? "too many channels" : aiff ? "invalid AIFF file" : "invalid WAV file");
     if (isAdpcm) {
         // A block is a 4-byte header per channel and then the nibbles, which
         // stereo groups in 4 bytes per channel. Its first sample is in the
@@ -174,8 +229,14 @@ bool WavPlayer::load(const char* path) {
                        : (bitsPerSample != 8 && bitsPerSample != 16 && bitsPerSample != 24 && bitsPerSample != 32)) {
         return fail("unsupported bit depth");
     }
-    if (sampleRate < 4000 || sampleRate > 192000) return fail("invalid WAV file");
+    if (sampleRate < 4000 || sampleRate > 192000) return fail(aiff ? "invalid AIFF file" : "invalid WAV file");
 
+    if (aiff) {
+        // The frame count in COMM can be shorter than the data, as when more audio follows.
+        uint64_t bytes = (uint64_t)aiffFrames * channels * (bitsPerSample / 8);
+        if (bytes < _dataChunkLen) _dataChunkLen = (uint32_t)bytes;
+        if (_dataChunkLen == 0) return fail("invalid AIFF file");
+    }
     _isAdpcm = isAdpcm;
     _isFloat = isFloat;
     _srcSampleRate = sampleRate;
@@ -252,13 +313,18 @@ bool WavPlayer::fill(uint32_t n) {
 }
 
 int16_t WavPlayer::pcmSample(const uint8_t* p) const {
+    // The top 16 bits, from the low byte of them and the high byte.
     switch (_srcBitsPerSample) {
-        case 8: return (int16_t)(((int)p[0] - 128) << 8); // 8-bit PCM is unsigned, 128 is silence
-        case 16: return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-        case 24: return (int16_t)((uint16_t)p[1] | ((uint16_t)p[2] << 8)); // top 16 bits
+        case 8: return _signed8 ? (int16_t)((int)(int8_t)p[0] << 8) : (int16_t)(((int)p[0] - 128) << 8); // WAV's is unsigned, 128 is silence
+        case 16: return _bigEndian ? (int16_t)(((uint16_t)p[0] << 8) | p[1]) : (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+        case 24: return _bigEndian ? (int16_t)(((uint16_t)p[0] << 8) | p[1]) : (int16_t)((uint16_t)p[1] | ((uint16_t)p[2] << 8));
         default: {
-            if (_isFloat) return floatToS16((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
-            return (int16_t)((uint16_t)p[2] | ((uint16_t)p[3] << 8));
+            if (_isFloat) {
+                uint32_t b = _bigEndian ? ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]
+                                        : (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+                return floatToS16(b);
+            }
+            return _bigEndian ? (int16_t)(((uint16_t)p[0] << 8) | p[1]) : (int16_t)((uint16_t)p[2] | ((uint16_t)p[3] << 8));
         }
     }
 }

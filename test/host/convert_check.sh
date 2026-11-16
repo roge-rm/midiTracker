@@ -35,6 +35,11 @@ make_src 44100 w44_16m.wav pcm_s16le 1
 make_src 44100 w44_adpcm.wav adpcm_ima_wav 2
 make_src 32000 w32_adpcmm.wav adpcm_ima_wav 1
 make_src 44100 w44_s32m.wav pcm_s32le 1
+make_src 48000 a48_24.aiff pcm_s24be 2
+make_src 44100 a44_16.aif pcm_s16be 2
+make_src 44100 a44_16m.aif pcm_s16be 1
+make_src 22050 a22_8m.aiff pcm_s8 1
+make_src 44100 a44_sowt.aifc pcm_s16le 2
 ff -f lavfi -i "aevalsrc='${SIG}':s=44100:d=12" -c:a libmp3lame -b:a 192k "$DIR/m44.mp3"
 ff -f lavfi -i "aevalsrc='${SIG}':s=48000:d=12" -ac 1 -c:a libmp3lame -q:a 4 "$DIR/m48m.mp3"
 ff -f lavfi -i "aevalsrc='${SIG}':s=22050:d=12" -c:a libmp3lame -b:a 64k "$DIR/m22.mp3"
@@ -88,6 +93,15 @@ echo "== target lists and names"
 for f in "$DIR"/w*.wav; do
     targets=$("$BIN" run "$f" list 2>/dev/null | sed -n 's/^targets://p')
     echo "== $(basename "$f"):$targets"
+    for t in $(echo "$targets" | grep -o '[0-9](' | tr -d '('); do
+        convert "$f" "$t"
+    done
+done
+for f in "$DIR"/a*.aif*; do
+    targets=$("$BIN" run "$f" list 2>/dev/null | sed -n 's/^targets://p')
+    echo "== $(basename "$f"):$targets"
+    n=$(echo "$targets" | grep -o '[0-9](' | wc -l)
+    [ "$n" = 2 ] || bad "$f: $n targets, should be 2"
     for t in $(echo "$targets" | grep -o '[0-9](' | tr -d '('); do
         convert "$f" "$t"
     done

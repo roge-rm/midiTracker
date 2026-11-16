@@ -10,6 +10,9 @@
 // after load() (the `data` chunk's byte length gives it directly, no
 // prescan).
 //
+// AIFF and AIFF-C (NONE, twos, sowt, fl32) play through the same path:
+// big-endian samples and signed 8-bit are flags on the decode.
+//
 // Supports PCM (8-bit unsigned, 16, 24 or 32-bit signed), 32-bit float
 // and IMA ADPCM (4-bit, ~4:1 compressed), plain or WAVE_FORMAT_EXTENSIBLE.
 // Not supported: Microsoft ADPCM or any other codec, 64-bit float, more
@@ -89,7 +92,7 @@ public:
     // True for 16-bit PCM, the format convert writes.
     bool isPcm16() const { return !_isAdpcm && !_isFloat && _srcBitsPerSample == 16; }
 
-    const char* typeLabel() const override { return "WAV"; }
+    const char* typeLabel() const override { return _isAiff ? "AIFF" : "WAV"; }
     void formatText(char* out, size_t size) const override; // "16BIT", "4BIT" for ADPCM
 
 #ifdef TRACKER_PROFILE
@@ -110,6 +113,9 @@ private:
     uint32_t _srcFramesRead = 0;    // read cursor, in source frames from data start
     uint32_t _totalSrcFrames = 0;
     bool _isFloat = false;          // 32-bit IEEE float samples
+    bool _isAiff = false;           // AIFF or AIFF-C, not RIFF
+    bool _bigEndian = false;        // samples are big-endian (AIFF, not AIFF-C sowt)
+    bool _signed8 = false;          // 8-bit samples are signed (AIFF), not unsigned (WAV)
     bool _sourceEnded = false;      // wavStreamEnd() already signaled for this position
     bool _readFailed = false;       // fill() got a card error
 

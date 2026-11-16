@@ -10,6 +10,7 @@
 #   make -C test/host look OUT_DIR=dir   render the M12 screens to PNGs in dir (default build/host/look)
 #   make -C test/host players OUT_DIR=dir   the player screens, drawn from host renders of real songs
 #   make -C test/host wav            build build/host/render_wav (WavPlayer over the host ring)
+#   make -C test/host aiff-check AIFF_DIR=dir   AIFF and AIFF-C through render_wav against the same audio as WAV
 #   make -C test/host mp3            build build/host/render_mp3 (Mp3Player and lib/helix_mp3 over the host ring)
 #                                    and render_mp3_ops (counts the decoder's long multiplies)
 #   make -C test/host rec-check      MidiRecorder, SysExRecorder and SysExPlayer on an in-memory card
@@ -30,7 +31,7 @@ PLAYER_SRC := $(wildcard $(ROOT)/src/tracker_base.cpp) $(ROOT)/src/ui_tap.cpp $(
 HARNESS_SRC := $(CURDIR)/render.cpp $(CURDIR)/host_stubs.cpp
 SECONDS ?= 60
 
-.PHONY: all baseline check clean midi midi-baseline midi-check look players wav mp3 rec-check battery-check play-mode-check convert-check mp3-seek-check
+.PHONY: all baseline check clean midi midi-baseline midi-check look players wav mp3 rec-check battery-check play-mode-check convert-check mp3-seek-check aiff-check
 all: $(OUT)/render $(OUT)/gen $(OUT)/corr
 
 $(OUT)/corr: $(CURDIR)/corr.cpp
@@ -68,6 +69,11 @@ wav: $(OUT)/render_wav
 $(OUT)/render_wav: $(WAV_SRC) $(wildcard $(CURDIR)/stub/*.h) $(ROOT)/include/wav_file.h $(ROOT)/include/shared_ram_arena.h
 	@mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -o $@ $(WAV_SRC)
+
+# AIFF and AIFF-C files made with ffmpeg in AIFF_DIR play the same as the WAVs they come from.
+AIFF_DIR ?= $(OUT)/aiff
+aiff-check: $(OUT)/render_wav
+	$(CURDIR)/aiff_check.sh $(OUT)/render_wav $(AIFF_DIR)
 
 # MP3 target: the real mp3_file.cpp and Helix decoder over the host ring and FsFile.
 HELIX := $(ROOT)/lib/helix_mp3/src

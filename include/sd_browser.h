@@ -205,6 +205,7 @@ private:
     static bool isSysExFilename(const char* name);
     static bool isWavFilename(const char* name);
     static bool isMp3Filename(const char* name);
+    static bool isAiffFilename(const char* name); // .aif, .aiff, .aifc
     static bool isModFilename(const char* name);
     static bool isS3mFilename(const char* name);
     static bool isXmFilename(const char* name);

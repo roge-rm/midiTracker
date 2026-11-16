@@ -129,7 +129,7 @@ bool convertProbe(FileKind kind, const char* path, WavPlayer& wav, ConvertFormat
         fmt.pcm16 = true; // what it decodes to
         return ok;
     }
-    if (kind != FILE_WAV) return false;
+    if (kind != FILE_WAV && kind != FILE_AIFF) return false;
     bool ok = wav.load(path);
     if (ok) {
         fmt.rate = wav.sampleRate();
@@ -152,9 +152,11 @@ int convertTargets(FileKind kind, const ConvertFormat* fmt, ConvertTarget* out, 
             // A 44.1k mono MP3 to WAV is already that.
             if (!(fmt->rate == OUT_RATE_44K && fmt->channels == 1)) add(CONVERT_WAV_44K_MONO);
             break;
-        case FILE_WAV: {
+        case FILE_WAV:
+        case FILE_AIFF: {
             if (!fmt || !fmt->rate) break; // unreadable
-            bool same44 = fmt->pcm16 && fmt->rate == OUT_RATE_44K;
+            // An AIFF is still worth converting when it's already 44.1k 16-bit, for the container.
+            bool same44 = kind == FILE_WAV && fmt->pcm16 && fmt->rate == OUT_RATE_44K;
             if (!(same44 && fmt->channels == 2)) add(CONVERT_WAV_44K_STEREO);
             if (!(same44 && fmt->channels == 1)) add(CONVERT_WAV_44K_MONO);
             break;

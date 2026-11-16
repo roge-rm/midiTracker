@@ -45,6 +45,7 @@ static int run(int argc, char** argv) {
     if (dot) {
         if (!strcasecmp(dot, ".mp3")) kind = FILE_MP3;
         else if (!strcasecmp(dot, ".mid")) kind = FILE_MID;
+        else if (!strcasecmp(dot, ".aif") || !strcasecmp(dot, ".aiff") || !strcasecmp(dot, ".aifc")) kind = FILE_AIFF;
         else if (!strcasecmp(dot, ".mod")) kind = FILE_MOD;
         else if (!strcasecmp(dot, ".s3m")) kind = FILE_S3M;
         else if (!strcasecmp(dot, ".xm")) kind = FILE_XM;
@@ -52,7 +53,7 @@ static int run(int argc, char** argv) {
     }
     trackerSrc.setKind(kind);
     ConvertSource& cs = kind == FILE_MP3 ? (ConvertSource&)mp3Src
-                      : kind == FILE_WAV ? (ConvertSource&)wavSrc
+                      : kind == FILE_WAV || kind == FILE_AIFF ? (ConvertSource&)wavSrc
                       : kind == FILE_MID ? (ConvertSource&)midiSrc : (ConvertSource&)trackerSrc;
 
     // The targets the menu would list.
@@ -267,6 +268,11 @@ static int names(int argc, char** argv) {
     f.rate = 44100; f.channels = 2; f.pcm16 = false;
     expect(convertTargets(FILE_WAV, &f, t, 4) == 2, "44.1k 24-bit wav: both");
     expect(convertTargets(FILE_WAV, nullptr, t, 4) == 0, "unreadable wav: none");
+    f.rate = 44100; f.channels = 2; f.pcm16 = true;
+    expect(convertTargets(FILE_AIFF, &f, t, 4) == 2, "44.1k 16-bit stereo aiff: both");
+    f.channels = 1;
+    expect(convertTargets(FILE_AIFF, &f, t, 4) == 2, "44.1k 16-bit mono aiff: both");
+    expect(convertTargets(FILE_AIFF, nullptr, t, 4) == 0, "unreadable aiff: none");
     f.rate = 44100; f.channels = 1; f.pcm16 = true;
     expect(convertTargets(FILE_MP3, &f, t, 4) == 1 && t[0] == CONVERT_WAV, "44.1k mono mp3: WAV only");
     f.channels = 2;
