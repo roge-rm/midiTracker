@@ -48,6 +48,9 @@
 
 const char* ItPlayer::cacheDir = "/.itcache";
 void (*ItPlayer::progressCallback)(int percent) = nullptr;
+#ifdef TRACKER_PROFILE
+uint32_t ItPlayer::profileSampleReads[MAX_SAMPLES];
+#endif
 
 namespace {
 
@@ -192,6 +195,9 @@ struct BitReader {
 // ---------------------------------------------------------------- loading
 
 bool ItPlayer::load(const char* path) {
+#ifdef TRACKER_PROFILE
+    memset(profileSampleReads, 0, sizeof(profileSampleReads));
+#endif
     close();
     _cacheFile.close();
     _error[0] = '\0';
@@ -831,6 +837,20 @@ int16_t __not_in_flash_func(ItPlayer::refillChunk)(TrackerVoice& tv, uint32_t in
     if (frames > (uint32_t)(CHUNK_FRAMES * run)) frames = (uint32_t)(CHUNK_FRAMES * run);
     uint32_t realStart = mirrored ? (2 * view.realLoopEnd - index - frames) : index;
     FsFile& f = s.inCache ? _cacheFile : _file;
+#ifdef TRACKER_PROFILE
+    uint32_t reads0 = profile.reads;
+    struct Attribute {
+        ItVoice& v; uint32_t r0;
+        ~Attribute() {
+            uint32_t d = profile.reads - r0;
+            if (v.background) profile.readsBg += d;
+            if ((v.background ? v.loudness << 1 : v.loudness) < 16) profile.readsQ48 += d; // a under 16, see processVoices()
+            if (v.sampleStep16 > (1u << 16)) profile.readsUp1 += d;
+            if (v.sampleStep16 > (2u << 16)) profile.readsUp2 += d;
+            profileSampleReads[v.sampleIndex] += d;
+        }
+    } attribute{static_cast<ItVoice&>(tv), reads0};
+#endif
     int got = readFrames(f, s.dataOffset, realStart, frames, s.is16Bit, s.isSigned, tv.chunkBuf, false);
     if (got > 0 && s.rightOffset) readFrames(f, s.rightOffset, realStart, (uint32_t)got, s.is16Bit, s.isSigned, tv.chunkBuf, true);
     if (got <= 0) { tv.chunkLen = 0; return 0; }
@@ -1741,6 +1761,10 @@ uint32_t ItPlayer::tickLength() {
 // Envelopes, fadeout and the mix values for every sounding voice, once a tick.
 void ItPlayer::processVoices() {
     _globalVolume = (uint8_t)(_globalVol >> 1);
+#ifdef TRACKER_PROFILE
+    uint32_t sounding = 0;
+    profile.ticks++;
+#endif
     for (int i = 0; i < MAX_VOICES; i++) {
         ItVoice& v = _voices[i];
         if (v.channel < 0) continue;
@@ -1776,6 +1800,15 @@ void ItPlayer::processVoices() {
         v.mixVolume = (uint8_t)(mv > 64 ? 64 : mv);
         v.loudness = (uint16_t)(v.background ? a >> 1 : a);
         if (a > 4096) a = 4096;
+#ifdef TRACKER_PROFILE
+        // a is 4096 at full volume: under 16 is below -48 dB.
+        sounding++;
+        if (v.background) profile.bgTicks++;
+        if (a < 16) { profile.q48Ticks++; if (v.background) profile.q48BgTicks++; }
+        if (a == 0) profile.zeroTicks++;
+        if (v.sampleStep16 > (1u << 16)) profile.up1Ticks++;
+        if (v.sampleStep16 > (2u << 16)) profile.up2Ticks++;
+#endif
 
         int pan = v.basePan;
         if (in && v.panEnvOn && in->panEnv.numPoints > 0) {
@@ -1835,4 +1868,8 @@ void ItPlayer::processVoices() {
             v.sampleStep16 = hz > 0 ? stepForHz(hz) : 0;
         }
     }
+#ifdef TRACKER_PROFILE
+    profile.voiceTicks += sounding;
+    if (sounding > profile.peakVoices) profile.peakVoices = sounding;
+#endif
 }

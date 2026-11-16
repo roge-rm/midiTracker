@@ -32,6 +32,10 @@ public:
 
     ~ItPlayer() override { _cacheFile.close(); }
     bool load(const char* path) override;
+#ifdef TRACKER_PROFILE
+    // SD reads per sample (index 0-based) since load(), profile build only.
+    static uint32_t profileSampleReads[MAX_SAMPLES];
+#endif
 
 private:
     struct ItEnvelope {

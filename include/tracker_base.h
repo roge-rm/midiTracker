@@ -123,7 +123,13 @@ public:
 #ifdef TRACKER_PROFILE
     // Profile build only (env:pico_profile): time spent in update() calls
     // that produced frames, and in sample cache refills (SD reads).
-    struct Profile { uint32_t updateUs, frames, worstUs, refillUs, refills, refillFrames, seekUs, readUs, reads, hist[6], histUs[6]; };
+    struct Profile { uint32_t updateUs, frames, worstUs, refillUs, refills, refillFrames, seekUs, readUs, reads, hist[6], histUs[6];
+        // .it only, summed once a tick over sounding voices (see ItPlayer::processVoices()):
+        // voices, background (NNA) ones, ones under -48 dB (and of those,
+        // background), at 0, stepping faster than 1 and 2 source frames a frame.
+        // reads* split the SD reads by the same groups.
+        uint32_t ticks, voiceTicks, peakVoices, bgTicks, q48Ticks, q48BgTicks, zeroTicks, up1Ticks, up2Ticks;
+        uint32_t readsBg, readsQ48, readsUp1, readsUp2; };
     static Profile profile;
 #endif
 

@@ -178,6 +178,19 @@ void report(const char* tag, const char* name, const TrackerPlayer::Profile& p, 
                   (unsigned long)p.hist[0], (unsigned long)p.histUs[0] / 1000, (unsigned long)p.hist[1], (unsigned long)p.histUs[1] / 1000,
                   (unsigned long)p.hist[2], (unsigned long)p.histUs[2] / 1000, (unsigned long)p.hist[3], (unsigned long)p.histUs[3] / 1000,
                   (unsigned long)p.hist[4], (unsigned long)p.histUs[4] / 1000, (unsigned long)p.hist[5], (unsigned long)p.histUs[5] / 1000);
+    if (p.ticks) {
+        // Voice counts as an average per tick, in tenths.
+        auto avg = [&](uint32_t n) { return (unsigned long)((uint64_t)n * 10 / p.ticks); };
+        Serial.printf("PROFILE %s %s: voices avg %lu.%lu peak %lu, background %lu.%lu, under -48 dB %lu.%lu (background %lu.%lu), at 0 %lu.%lu, "
+                      "step > 1 %lu.%lu, > 2 %lu.%lu\n", tag, name,
+                      avg(p.voiceTicks) / 10, avg(p.voiceTicks) % 10, (unsigned long)p.peakVoices, avg(p.bgTicks) / 10, avg(p.bgTicks) % 10,
+                      avg(p.q48Ticks) / 10, avg(p.q48Ticks) % 10, avg(p.q48BgTicks) / 10, avg(p.q48BgTicks) % 10,
+                      avg(p.zeroTicks) / 10, avg(p.zeroTicks) % 10, avg(p.up1Ticks) / 10, avg(p.up1Ticks) % 10,
+                      avg(p.up2Ticks) / 10, avg(p.up2Ticks) % 10);
+        Serial.printf("PROFILE %s %s: reads by voice: background %lu, under -48 dB %lu, step > 1 %lu, > 2 %lu (of %lu)\n", tag, name,
+                      (unsigned long)p.readsBg, (unsigned long)p.readsQ48, (unsigned long)p.readsUp1, (unsigned long)p.readsUp2,
+                      (unsigned long)p.reads);
+    }
 }
 
 void addProfile(TrackerPlayer::Profile& t, const TrackerPlayer::Profile& c) {
@@ -185,6 +198,10 @@ void addProfile(TrackerPlayer::Profile& t, const TrackerPlayer::Profile& c) {
     t.refillFrames += c.refillFrames; t.seekUs += c.seekUs; t.readUs += c.readUs; t.reads += c.reads;
     for (int h = 0; h < 6; h++) { t.hist[h] += c.hist[h]; t.histUs[h] += c.histUs[h]; }
     if (c.worstUs > t.worstUs) t.worstUs = c.worstUs;
+    t.ticks += c.ticks; t.voiceTicks += c.voiceTicks; t.bgTicks += c.bgTicks; t.q48Ticks += c.q48Ticks;
+    t.q48BgTicks += c.q48BgTicks; t.zeroTicks += c.zeroTicks; t.up1Ticks += c.up1Ticks; t.up2Ticks += c.up2Ticks;
+    t.readsBg += c.readsBg; t.readsQ48 += c.readsQ48; t.readsUp1 += c.readsUp1; t.readsUp2 += c.readsUp2;
+    if (c.peakVoices > t.peakVoices) t.peakVoices = c.peakVoices;
 }
 
 const uint32_t WATCHDOG_MS = 5000;
@@ -431,6 +448,12 @@ void trackerProfileRun() {
             TrackerPlayer::Profile& c = TrackerPlayer::profile;
             addProfile(total, c);
             report("RESULT", want, total, Synth::wavStreamUnderrunSamples() - u0);
+            if (!strcasecmp(strrchr(path, '.'), ".it")) {
+                Serial.printf("PROFILE RESULT %s: reads by sample since load:", want);
+                for (int i = 0; i < ItPlayer::MAX_SAMPLES; i++)
+                    if (ItPlayer::profileSampleReads[i]) Serial.printf(" %d:%lu", i + 1, (unsigned long)ItPlayer::profileSampleReads[i]);
+                Serial.println();
+            }
             p->stop();
             p->~TrackerPlayer();
         }
