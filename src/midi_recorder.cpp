@@ -15,7 +15,7 @@ const uint32_t SYNC_INTERVAL_MS = 5000;
 const uint32_t SYNC_QUIET_MS = 200;
 const uint32_t SYNC_MAX_MS = 15000;
 
-const char* const MSG_FAILED_LOST = "Write failed (card full?), not saved";
+const char* const MSG_FAILED_LOST = "Card full or write failed, not saved";
 
 void setError(char* dst, size_t size, const char* msg) {
     strncpy(dst, msg, size - 1);
@@ -79,7 +79,7 @@ bool recorderSettleTake(const char* written, const char* path, bool replace, boo
         }
     }
     if (failed) {
-        snprintf(err, errSize, "Write failed (card full?), %s kept", what);
+        snprintf(err, errSize, "Card full or write failed, %s kept", what);
         return false;
     }
     if (!synced) {

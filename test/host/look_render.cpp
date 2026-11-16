@@ -6,6 +6,7 @@
 #include "ui_look.h"
 #include "ui_player.h"
 #include "ui_modes.h"
+#include "ui_rec.h"
 #include "ui_tap.h"
 #include "ui_saver.h"
 #include "synth.h"
@@ -830,6 +831,136 @@ int bootFrames() {
 } // namespace
 
 // look_render <out dir> [--players <snapshot dir> | --boot-frames]
+// ---- recording, SysEx capture and send ------------------------------------------
+
+void recChrome() {
+    g_tft.fillScreen(COLOR_BG);
+    statusLeds(true, false);
+    statusBattery(70, false, false);
+}
+
+const char* const REC_LOG[] = {
+    "Ch1  Note On   C4  v100", "Ch1  Note Off  C4  v64", "Ch10 Note On   D2  v127",
+    "Ch2  CC 74  = 90",        "Ch1  Bend      +1024",   "Ch3  Prog Chg  12",
+    "Ch10 Note Off  D2  v0",   "Ch1  Note On   G#5 v88",
+};
+const char* const SYX_LOG[] = {"SysEx  9 bytes", "SysEx  266 bytes", "SysEx  266 bytes", "SysEx  11 bytes"};
+
+void recScreens() {
+    using namespace UiRec;
+    RecInfo r;
+    r.kind = KIND_MIDI;
+    r.name = "REC004.mid";
+    r.state = REC_WAITING;
+    recChrome();
+    recDraw(r, nullptr, 0);
+    save("rec-midi-waiting");
+
+    r.name = "a much longer take name for the jam.mid";
+    r.state = REC_RECORDING;
+    r.elapsedMs = 754000;
+    r.count = 1288;
+    r.active = true;
+    recChrome();
+    recDraw(r, REC_LOG, 8);
+    save("rec-midi-recording");
+    r.elapsedMs = 755000;
+    r.count = 1302;
+    r.active = false;
+    recLive(r);
+    recLog(REC_LOG + 2, 6);
+    save("rec-midi-live");
+
+    discardCard(KIND_MIDI, r.name);
+    save("rec-midi-discard");
+
+    // Past an hour the time shrinks to fit beside the count, and a live
+    // tick after invalidate() repaints every field.
+    r.elapsedMs = 17UL * 3600000 + 2 * 60000 + 3000;
+    r.count = 4123456;
+    recChrome();
+    recDraw(r, REC_LOG, 8);
+    invalidate();
+    r.elapsedMs += 1000;
+    recLive(r);
+    recLog(REC_LOG, 8);
+    save("rec-midi-17h");
+    r.elapsedMs = 100UL * 3600000;
+    recLive(r);
+    save("rec-midi-100h");
+
+    r.state = REC_ERROR;
+    r.error = "Old file locked, saved as REC002.mid";
+    recChrome();
+    recDraw(r, nullptr, 0);
+    save("rec-midi-error");
+    r.error = "Card full or write failed, the take up to 12:34 is kept";
+    recChrome();
+    recDraw(r, nullptr, 0);
+    save("rec-midi-error-long");
+
+    RecInfo c;
+    c.kind = KIND_SYSEX;
+    c.name = "DUMP001.syx";
+    c.state = REC_WAITING;
+    recChrome();
+    recDraw(c, nullptr, 0);
+    save("sysex-capture-waiting");
+    c.state = REC_RECORDING;
+    c.elapsedMs = 42000;
+    c.count = 128;
+    c.bytes = 34048;
+    c.dropped = 2;
+    c.active = true;
+    recChrome();
+    recDraw(c, SYX_LOG, 4);
+    save("sysex-capture");
+    c.bytes = 1250000;
+    c.count = 4700;
+    c.dropped = 3;
+    c.active = false;
+    recLive(c);
+    save("sysex-capture-live");
+    discardCard(KIND_SYSEX, c.name);
+    save("sysex-capture-discard");
+    c.state = REC_ERROR;
+    c.error = "Sync failed, kept the messages before it";
+    recChrome();
+    recDraw(c, nullptr, 0);
+    save("sysex-capture-error");
+
+    SendInfo s;
+    s.name = "Roland JV-1080 full bank backup, patches and performances.syx";
+    s.state = SEND_SENDING;
+    s.elapsedMs = 18000;
+    s.bytesSent = 12345;
+    s.totalBytes = 40000;
+    s.messages = 46;
+    s.active = true;
+    recChrome();
+    sendDraw(s);
+    save("sysex-send");
+    s.bytesSent = 20480;
+    s.messages = 77;
+    s.skipped = 2;
+    s.active = false;
+    s.elapsedMs = 29000;
+    sendLive(s);
+    save("sysex-send-live");
+    s.state = SEND_DONE;
+    s.bytesSent = 40000;
+    s.messages = 150;
+    s.junk = 5;
+    recChrome();
+    sendDraw(s);
+    save("sysex-send-done");
+    s.state = SEND_ERROR;
+    s.error = "Can't open the file";
+    recChrome();
+    sendDraw(s);
+    save("sysex-send-error");
+}
+
 int main(int argc, char** argv) {
     g_outDir = argc > 1 ? argv[1] : ".";
     crcInit();
@@ -890,6 +1021,7 @@ int main(int argc, char** argv) {
     synthBank(2);
     synthResultCard("RESET", "all sounds back to built-in", true);
     save("synthbank-reset");
+    recScreens();
     fontSheet();
     save("fonts");
     return 0;

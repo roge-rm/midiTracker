@@ -208,56 +208,37 @@ struct MidiLogEntry {
     uint16_t sysExLen; // SysEx entries only
 };
 
-// Full redraw of the recording status screen (waiting for input / actively
-// recording / error). `log`/`logCount` are the most recent MIDI-in events
-// (oldest-first, see updateRecordingLog()) to seed the scrolling log with;
-// pass logCount 0 for a fresh recording that hasn't received anything yet.
+// The recording screen (waiting, recording or error), see ui_rec.h.
+// `log`/`logCount` are the newest MIDI-in events, oldest first.
 void drawRecording(const char* filename, const MidiRecorder& recorder,
                     const MidiLogEntry* log, int logCount);
 
-// Cheap partial redraw of the recording screen: updates only the elapsed-
-// time and event-count rows. Meant to be called at a low fixed rate while
-// STATE_RECORDING; does not touch the header/filename/state rows drawn by
-// drawRecording().
+// Elapsed time, event count and the activity dot, only what changed. Call
+// at a fixed rate while STATE_RECORDING.
 void updateRecordingLive(const MidiRecorder& recorder);
 
-// Redraws the scrolling MIDI-in log on the Recording screen: fills its
-// region and draws up to as many of the most recent `count` entries
-// (oldest-first) as actually fit. Meant to be called from the same low
-// fixed rate tick as updateRecordingLive(), but only when something new
-// has actually arrived -- an idle stretch costs nothing. Also called by
-// drawRecording() itself for the initial/full-redraw case.
+// Repaints the log rows whose text changed. Call when something new has
+// arrived, on the recording or capture screen.
 void updateRecordingLog(const MidiLogEntry* entries, int count);
 
-// Full redraw of the SysEx capture screen -- deliberately the same shape
-// as drawRecording() (filename/state/elapsed/message-count rows), plus a
-// receive-activity dot next to the message count: lit while a message
-// arrived within the last moment, dim once it's been quiet a while, so
-// it's obvious at a glance when the dump has actually stopped arriving
-// and it's time to stop & save rather than having to watch the count.
-// `log`/`logCount` are the same MIDI-in log updateRecordingLog() draws for
-// the plain Recording screen -- every entry here is naturally a SysEx one.
+// The SysEx capture screen: time, messages, bytes and dropped count, with
+// the same log as the recording screen.
 void drawSysExCapture(const char* filename, const SysExRecorder& recorder,
                        const MidiLogEntry* log, int logCount);
 
-// Cheap partial redraw of the SysEx capture screen: elapsed time, message
-// count, and the activity dot. Meant to be called at a fairly fast fixed
-// rate (faster than updateRecordingLive()'s -- the activity dot's whole
-// point is tracking short-lived blips) while STATE_RECORDING.
+// Time, counts and the activity dot. Call at a fixed rate while
+// STATE_RECORDING.
 void updateSysExCaptureLive(const SysExRecorder& recorder);
 
-// Full redraw of the .syx playback screen. Reuses the same filename/
-// state/elapsed/message-count rows as drawSysExCapture() for a consistent
-// look, but replaces drawPlayer()'s note strip -- meaningless here, a raw
-// SysEx dump has no notes -- with a byte-progress bar (meaningful because,
-// unlike a live performance, the total size is known upfront) whose fill
-// color briefly brightens each time a message is actually sent, so it
-// reads as "actively transmitting" rather than a static progress meter.
+// Discard confirm over the recording or capture screen.
+void drawConfirmDiscard(bool sysex, const char* filename);
+
+// The .syx send screen: time, messages, a byte progress bar whose head
+// lights while bytes go out, and skipped and junk counts when not 0.
 void drawSysExPlayer(const char* filename, const SysExPlayer& player);
 
-// Cheap partial redraw of the .syx playback screen: elapsed time, message
-// count, and the progress bar (including its send-activity flash). Meant
-// to be called at a fairly fast fixed rate while STATE_SENDING.
+// Time, counts and the progress bar. Call at a fixed rate while
+// STATE_SENDING.
 void updateSysExPlayerLive(const SysExPlayer& player);
 
 // Centered one/two line status/error message (e.g. "SD card not found").

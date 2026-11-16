@@ -108,9 +108,9 @@ midi-check: midi $(MIDI_DIR)/.copied
 	EXT=wav $(CURDIR)/compare.sh $(OUT)/midi-baseline $(OUT)/midi-current
 
 # M12 look: the real ui_look.cpp and ui_player.cpp drawn into a framebuffer, written as PNGs.
-LOOK_SRC := $(ROOT)/src/ui_look.cpp $(ROOT)/src/ui_player.cpp $(ROOT)/src/ui_modes.cpp $(ROOT)/src/ui_tap.cpp $(ROOT)/src/ui_saver.cpp $(CURDIR)/look_render.cpp
+LOOK_SRC := $(ROOT)/src/ui_look.cpp $(ROOT)/src/ui_player.cpp $(ROOT)/src/ui_modes.cpp $(ROOT)/src/ui_rec.cpp $(ROOT)/src/ui_tap.cpp $(ROOT)/src/ui_saver.cpp $(CURDIR)/look_render.cpp
 LOOK_H := $(wildcard $(CURDIR)/stub-look/*.h) $(ROOT)/include/ui_look.h $(ROOT)/include/ui_strip.h \
-          $(ROOT)/include/ui_player.h $(ROOT)/include/ui_modes.h $(ROOT)/include/ui_tap.h $(ROOT)/include/ui_saver.h $(CURDIR)/host_snap.h $(wildcard $(ROOT)/include/fonts/*.h)
+          $(ROOT)/include/ui_player.h $(ROOT)/include/ui_modes.h $(ROOT)/include/ui_rec.h $(ROOT)/include/ui_tap.h $(ROOT)/include/ui_saver.h $(CURDIR)/host_snap.h $(wildcard $(ROOT)/include/fonts/*.h)
 OUT_DIR ?= $(OUT)/look
 
 $(OUT)/look_render: $(LOOK_SRC) $(LOOK_H)

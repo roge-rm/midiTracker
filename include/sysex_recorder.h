@@ -64,6 +64,7 @@ public:
     // Messages cut off by another status byte, the other source, 1 s
     // without bytes or stopping mid-message.
     uint32_t droppedCount() const { return _droppedCount; }
+    uint32_t bytesKept() const { return _goodPos; } // whole messages in the file
     uint32_t elapsedMs() const; // 0 until the first message starts the clock
 
     // ms since the last message arrived, or UINT32_MAX if none has yet --

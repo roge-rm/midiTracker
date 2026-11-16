@@ -27,6 +27,7 @@
 #include "ui.h"
 #include "ui_strip.h"
 #include "ui_transition.h"
+#include "ui_rec.h"
 #include "keyboard_layout.h"
 
 namespace FilePlayerMode {
@@ -138,6 +139,12 @@ int midiLogCount = 0;
 // SPI cost) entirely during idle stretches with nothing new to show.
 bool midiLogDirty = false;
 
+// The state each screen last drew, so a change made by the input handler
+// forces a full redraw. Set when the recorder is armed or the file loaded.
+MidiRecorder::State lastRecorderState = MidiRecorder::STATE_IDLE;
+SysExRecorder::State lastSysExRecState = SysExRecorder::STATE_IDLE;
+SysExPlayer::State lastSysExPlayState = SysExPlayer::STATE_IDLE;
+
 // Pushed from the channel-voice/SysEx input-handler callbacks in enter()
 // below, only while the relevant recorder is actually STATE_RECORDING --
 // cheap enough (a struct copy, worst case a 7-element memmove) to call
@@ -169,6 +176,13 @@ void pumpPlayer() {
         case APP_PLAY_IT:    if (itPlayer) itPlayer->update(); break;
         default: break;
     }
+}
+
+// Draw pump for the SysEx send screen's transition: MIDI in as the
+// transition's own pump does, and the send.
+void pumpSysExSend() {
+    MidiOutput::update();
+    sysexPlayer.update();
 }
 
 int selectedIndex = 0;
@@ -529,8 +543,10 @@ void openSelected() {
 
     if (e.kind == FILE_SYX) {
         sysexPlayer.load(path); // failure surfaces via sysexPlayer.state() on the playback screen
+        lastSysExPlayState = sysexPlayer.state();
         appState = APP_PLAY_SYSEX;
         needsRedraw = true;
+        Ui::transitionNext(Ui::TRANSITION_IN);
         return;
     }
 
@@ -801,9 +817,11 @@ void performNameEntryAction(const char* trimmed, bool replace = false) {
         nowRecordingName[sizeof(nowRecordingName) - 1] = '\0';
 
         recorder.arm(path, replace); // failure (e.g. the collision we already cleared reappearing from a race) surfaces via recorder.state() on the recording screen
+        lastRecorderState = recorder.state();
         midiLogCount = 0; // clear any previous take's log before this one starts receiving
         appState = APP_RECORDING;
         needsRedraw = true;
+        Ui::transitionNext(Ui::TRANSITION_IN);
         return;
     }
 
@@ -817,9 +835,11 @@ void performNameEntryAction(const char* trimmed, bool replace = false) {
         nowCapturingSysExName[sizeof(nowCapturingSysExName) - 1] = '\0';
 
         sysexRecorder.arm(path, replace); // failure surfaces via sysexRecorder.state() on the capture screen
+        lastSysExRecState = sysexRecorder.state();
         midiLogCount = 0; // clear any previous take's log before this one starts receiving
         appState = APP_CAPTURING_SYSEX;
         needsRedraw = true;
+        Ui::transitionNext(Ui::TRANSITION_IN);
         return;
     }
 
@@ -1881,6 +1901,7 @@ void handleRecordingInput() {
         if (recorder.stop() || wasError) {
             browser.refresh(); // so the new file shows up in the list
             appState = APP_BROWSE;
+            Ui::transitionNext(Ui::TRANSITION_OUT);
         }
         needsRedraw = true;
         return;
@@ -1894,10 +1915,12 @@ void handleRecordingInput() {
             recorder.cancel();
             browser.refresh();
             appState = APP_BROWSE;
+            Ui::transitionNext(Ui::TRANSITION_OUT);
             needsRedraw = true;
         } else if (recorder.eventCount() == 0) {
             recorder.cancel();
             appState = APP_BROWSE;
+            Ui::transitionNext(Ui::TRANSITION_OUT);
             needsRedraw = true;
         } else {
             appState = APP_CONFIRM_CANCEL_RECORDING;
@@ -1911,6 +1934,7 @@ void handleConfirmCancelRecordingInput() {
         recorder.cancel();
         browser.refresh(); // in case a partial file had already been created and just got deleted
         appState = APP_BROWSE;
+        Ui::transitionNext(Ui::TRANSITION_OUT);
         needsRedraw = true;
     } else if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
         // Back to the recording screen -- still recording, nothing lost.
@@ -1928,6 +1952,7 @@ void handleCapturingSysExInput() {
         if (sysexRecorder.stop() || wasError) {
             browser.refresh(); // so the new file shows up in the list
             appState = APP_BROWSE;
+            Ui::transitionNext(Ui::TRANSITION_OUT);
         }
         needsRedraw = true;
         return;
@@ -1937,10 +1962,12 @@ void handleCapturingSysExInput() {
             sysexRecorder.cancel();
             browser.refresh();
             appState = APP_BROWSE;
+            Ui::transitionNext(Ui::TRANSITION_OUT);
             needsRedraw = true;
         } else if (sysexRecorder.messageCount() == 0) {
             sysexRecorder.cancel();
             appState = APP_BROWSE;
+            Ui::transitionNext(Ui::TRANSITION_OUT);
             needsRedraw = true;
         } else {
             appState = APP_CONFIRM_CANCEL_SYSEX_CAPTURE;
@@ -1954,6 +1981,7 @@ void handleConfirmCancelSysExCaptureInput() {
         sysexRecorder.cancel();
         browser.refresh(); // in case a partial file had already been created and just got deleted
         appState = APP_BROWSE;
+        Ui::transitionNext(Ui::TRANSITION_OUT);
         needsRedraw = true;
     } else if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
         // Back to the capture screen -- still capturing, nothing lost.
@@ -1968,6 +1996,7 @@ void handlePlaySysExInput() {
     if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
         sysexPlayer.close();
         appState = APP_BROWSE;
+        Ui::transitionNext(Ui::TRANSITION_OUT);
         needsRedraw = true;
     }
 }
@@ -2284,7 +2313,6 @@ bool update() {
             // catches its ARMED->RECORDING transition -- otherwise the
             // "Sending" state text (and STATE_ERROR's different layout)
             // would never update once the file actually finishes.
-            static SysExPlayer::State lastSysExPlayState = SysExPlayer::STATE_IDLE;
             if (sysexPlayer.state() != lastSysExPlayState) {
                 lastSysExPlayState = sysexPlayer.state();
                 needsRedraw = true;
@@ -2319,7 +2347,6 @@ bool update() {
             // loop, so catch it here and force a full redraw -- otherwise
             // the "Waiting for input" state text would never update once
             // the first MIDI byte actually arrives.
-            static MidiRecorder::State lastRecorderState = MidiRecorder::STATE_IDLE;
             if (recorder.state() != lastRecorderState) {
                 lastRecorderState = recorder.state();
                 needsRedraw = true;
@@ -2364,7 +2391,6 @@ bool update() {
             // Same reasoning as APP_RECORDING above: the ARMED->RECORDING
             // (or ->ERROR) transition happens inside the SysEx input-
             // handler callback, asynchronously to this loop.
-            static SysExRecorder::State lastSysExRecState = SysExRecorder::STATE_IDLE;
             if (sysexRecorder.state() != lastSysExRecState) {
                 lastSysExRecState = sysexRecorder.state();
                 needsRedraw = true;
@@ -2447,7 +2473,11 @@ bool update() {
                 break;
 
             case APP_PLAY_SYSEX:
-                Ui::drawSysExPlayer(nowPlayingName, sysexPlayer);
+                // Sending goes on through the transition.
+                Ui::setDrawPump(pumpSysExSend);
+                Ui::transitionDraw([] { Ui::drawSysExPlayer(nowPlayingName, sysexPlayer); });
+                Ui::setDrawPump(nullptr);
+                UiRec::invalidate();
                 break;
 
             case APP_PLAY_WAV:
@@ -2506,27 +2536,27 @@ bool update() {
             }
 
             case APP_RECORDING:
-                Ui::drawRecording(nowRecordingName, recorder, midiLog, midiLogCount);
-                midiLogDirty = false; // just drawn above, nothing new to catch on the next tick
+                Ui::transitionDraw([] { Ui::drawRecording(nowRecordingName, recorder, midiLog, midiLogCount); });
+                // MIDI in runs between a transition's steps, so the bands
+                // can show older values: the next tick repaints them all.
+                UiRec::invalidate();
+                midiLogDirty = true;
                 break;
 
             case APP_CONFIRM_CANCEL_RECORDING:
-                // Deliberately avoids "NAV cancel" here (the usual hint
-                // line elsewhere) -- on a screen that's itself about
-                // canceling something, that reads ambiguously as "NAV
-                // cancels the recording" rather than its actual meaning,
-                // "back out of this confirmation".
-                Ui::drawMessage("Discard this recording?", "ENTER discard  NAV keep recording");
+                Ui::drawConfirmDiscard(false, nowRecordingName);
                 break;
 
             case APP_CAPTURING_SYSEX:
-                Ui::drawSysExCapture(nowCapturingSysExName, sysexRecorder, midiLog, midiLogCount);
-                midiLogDirty = false; // just drawn above, nothing new to catch on the next tick
+                Ui::transitionDraw([] {
+                    Ui::drawSysExCapture(nowCapturingSysExName, sysexRecorder, midiLog, midiLogCount);
+                });
+                UiRec::invalidate(); // as APP_RECORDING
+                midiLogDirty = true;
                 break;
 
             case APP_CONFIRM_CANCEL_SYSEX_CAPTURE:
-                // Same reasoning as APP_CONFIRM_CANCEL_RECORDING above.
-                Ui::drawMessage("Discard this capture?", "ENTER discard  NAV keep capturing");
+                Ui::drawConfirmDiscard(true, nowCapturingSysExName);
                 break;
 
             case APP_LOOPER_TRACK_PICK:

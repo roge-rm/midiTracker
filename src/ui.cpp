@@ -8,6 +8,7 @@
 #include "ui_look.h"
 #include "ui_player.h"
 #include "ui_modes.h"
+#include "ui_rec.h"
 #include "ui_saver.h"
 #include "input.h"
 #include <ctype.h>
@@ -116,43 +117,9 @@ const int HEADER_HEIGHT = Look::HEADER_H;
 const int FOOTER_HEIGHT = Look::FOOTER_H;
 
 
-// Recording screen layout, same fixed-offset approach as the player
-// screen above so updateRecordingLive() can repaint just the elapsed/
-// event-count rows.
-const int REC_FILENAME_Y = HEADER_HEIGHT + 10;
-const int REC_STATE_Y    = REC_FILENAME_Y + ROW_HEIGHT + 6;
-const int REC_ELAPSED_Y  = REC_STATE_Y + ROW_HEIGHT;
-const int REC_EVENTS_Y   = REC_ELAPSED_Y + ROW_HEIGHT;
-
-// Scrolling MIDI-in log (see updateRecordingLog()), filling the otherwise-
-// empty stretch between the Events row and the footer. Row count isn't a
-// fixed constant -- it's however many ROW_HEIGHT rows actually fit between
-// REC_LOG_Y and the footer, computed at draw time the same way drawPlayer()
-// et al. compute fy from tft.height() rather than assuming a screen size.
-// Same ROW_HEIGHT/font as the rest of this screen rather than a smaller
-// font to pack in more lines -- shrinking the font to fit more on screen
-// was tried for a different layout and rejected on real hardware as
-// illegible (see embedded-ui-change-approach memory).
-const int REC_LOG_Y = REC_EVENTS_Y + ROW_HEIGHT + 8;
-
-// SysEx capture/playback screens reuse the REC_* rows above (filename/
-// state/elapsed/message-count) for a consistent look with drawRecording()
-// -- see drawSysExCapture()/drawSysExPlayer()'s own comments for what
-// replaces drawRecording()'s footer-only tail below that.
-
-// Activity dot (recording/capture screens) / progress-bar flash (SysEx
-// playback screen): lit/bright while an event/message arrived (or was
-// sent) within this long, dim/steady otherwise -- short enough to read as
-// a per-event blip rather than a sustained glow, same "recent activity"
-// convention LooperMode's track activity dots use (ACTIVITY_FLASH_MS
-// there).
+// Activity dot (recording and capture) and the send bar's head: lit while
+// something arrived or went out within this long.
 const uint32_t RECORDING_ACTIVITY_MS = 250;
-
-// .syx playback's progress bar, filling the same vertical space
-// drawPlayer()'s note strip would otherwise occupy.
-const int SYSEX_PROGRESS_LABEL_Y = REC_EVENTS_Y + ROW_HEIGHT + 12;
-const int SYSEX_PROGRESS_BAR_Y   = SYSEX_PROGRESS_LABEL_Y + ROW_HEIGHT;
-const int SYSEX_PROGRESS_BAR_H   = 24;
 
 // On-screen QWERTY keyboard layout (name entry screen). Rows 0-3 (digits,
 // QWERTYUIOP, ASDFGHJKL, ZXCVBNM_-) use KB_KEY_W; row 4 (SPACE/DEL/OK)
@@ -208,25 +175,6 @@ void drawScrollbar(int count, int scrollOffset, int rows, int trackY) {
     Look::drawScrollbar(trackY, rows, count, scrollOffset);
 }
 
-// Clears a w x h box at x, y to bg and draws `text` in font 2 at tx along
-// from x, top aligned, through the strip canvas. A box taller than one strip
-// at that width goes out in bands, the text clipped to each.
-void stripText(int x, int y, int w, int h, const char* text, int tx, uint16_t fg, uint16_t bg) {
-    if (x + w > tft.width()) w = tft.width() - x;
-    if (w <= 0 || h <= 0) return;
-    int rows = stripMaxRows(w);
-    for (int by = 0; by < h; by += rows) {
-        int bh = (h - by < rows) ? h - by : rows;
-        TFT_eSprite& s = stripBegin(x, y + by, w, bh, bg);
-        if (text && text[0]) {
-            s.setTextColor(fg, bg);
-            s.drawString(text, tx, -by);
-        }
-        stripSend();
-    }
-}
-
-
 void formatDuration(uint32_t ms, char* out, size_t outSize) {
     uint32_t totalSec = ms / 1000;
     uint32_t m = totalSec / 60;
@@ -240,15 +188,6 @@ const char* targetLabel(MidiOutTarget t) {
         case MIDI_OUT_HARDWARE: return "HW MIDI";
         case MIDI_OUT_USB:      return "USB MIDI";
         default:                return "HW+USB";
-    }
-}
-
-const char* recordStateLabel(MidiRecorder::State s) {
-    switch (s) {
-        case MidiRecorder::STATE_ARMED:     return "Waiting for input";
-        case MidiRecorder::STATE_RECORDING: return "Recording";
-        case MidiRecorder::STATE_ERROR:     return "Error";
-        default:                            return "Idle";
     }
 }
 
@@ -307,110 +246,6 @@ void formatMidiLogLine(const Ui::MidiLogEntry& e, char* out, size_t outSize) {
             snprintf(out, outSize, "Ch%-2d %02X %02X %02X", channel, e.status, e.data1, e.data2);
             break;
     }
-}
-
-const char* sysExCaptureStateLabel(SysExRecorder::State s) {
-    switch (s) {
-        case SysExRecorder::STATE_ARMED:     return "Waiting for SysEx";
-        case SysExRecorder::STATE_RECORDING: return "Capturing";
-        case SysExRecorder::STATE_ERROR:     return "Error";
-        default:                             return "Idle";
-    }
-}
-
-const char* sysExPlayerStateLabel(SysExPlayer::State s) {
-    switch (s) {
-        case SysExPlayer::STATE_SENDING: return "Sending";
-        case SysExPlayer::STATE_DONE:    return "Finished";
-        case SysExPlayer::STATE_ERROR:   return "Error";
-        default:                         return "Idle";
-    }
-}
-
-// "Messages: 12", with ", 1 dropped" when messages were cut off.
-void sysExCaptureCount(const SysExRecorder& recorder, char* out, size_t size) {
-    int n = snprintf(out, size, "Messages: %lu", (unsigned long)recorder.messageCount());
-    if (recorder.droppedCount() && n > 0 && (size_t)n < size)
-        snprintf(out + n, size - n, ", %lu dropped", (unsigned long)recorder.droppedCount());
-}
-
-// "State: Finished, 2 skipped, 5 junk bytes", the counts only when not 0.
-void sysExPlayerState(const SysExPlayer& player, char* out, size_t size) {
-    int n = snprintf(out, size, "State: %s", sysExPlayerStateLabel(player.state()));
-    if (player.state() != SysExPlayer::STATE_DONE) return;
-    if (player.messagesSkipped() && n > 0 && (size_t)n < size)
-        n += snprintf(out + n, size - n, ", %lu skipped", (unsigned long)player.messagesSkipped());
-    if (player.junkBytes() && n > 0 && (size_t)n < size)
-        snprintf(out + n, size - n, ", %lu junk bytes", (unsigned long)player.junkBytes());
-}
-
-void drawActivityDot(int x, int y, bool active) {
-    tft.fillCircle(x, y, 5, active ? COLOR_PULSE : COLOR_DIM);
-}
-
-// Paints a progress bar's change from `lastFill` to `fillW` pixels (the bar
-// is `barW` wide at x, y, `h` high, COLOR_DIM behind the fill). lastFill < 0
-// paints the whole bar; colorChanged repaints the whole fill.
-void paintBarDelta(int x, int y, int h, int barW, int fillW, int lastFill, uint16_t color, bool colorChanged) {
-    if (lastFill < 0) {
-        tft.fillRect(x, y, barW, h, COLOR_DIM);
-        if (fillW > 0) tft.fillRect(x, y, fillW, h, color);
-        return;
-    }
-    if (fillW < lastFill) tft.fillRect(x + fillW, y, lastFill - fillW, h, COLOR_DIM);
-    if (colorChanged) {
-        if (fillW > 0) tft.fillRect(x, y, fillW, h, color);
-    } else if (fillW > lastFill) {
-        tft.fillRect(x + lastFill, y, fillW - lastFill, h, color);
-    }
-}
-
-// Byte-progress bar + numeric readout, filling the space drawPlayer()'s
-// note strip would otherwise occupy (meaningless for a raw SysEx dump --
-// there are no notes). The filled portion briefly switches from steady
-// green to bright yellow immediately after a message is actually sent
-// (see RECORDING_ACTIVITY_MS), then settles back -- a static bar alone reads
-// as "how far along", the flash is what reads as "actively sending right
-// now" per this screen's whole point.
-char g_sysexLabel[32] = {0};
-int g_sysexFill = -1;
-uint16_t g_sysexColor = 0;
-
-// `full` (the screen's entry draw) clears the whole progress area and
-// repaints it; live ticks only repaint the label if its text changed and
-// the part of the bar that changed.
-void drawSysExProgress(const SysExPlayer& player, bool full) {
-    uint32_t total = player.totalBytes();
-    uint32_t sent = player.bytesSent();
-    int pct = total > 0 ? (int)(((uint64_t)sent * 100) / total) : 0;
-
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%lu / %lu bytes (%d%%)", (unsigned long)sent, (unsigned long)total, pct);
-    if (full) {
-        g_sysexLabel[0] = '\0';
-        g_sysexFill = -1;
-        // The bar is inset 8px each side; clear its margins once.
-        tft.fillRect(0, SYSEX_PROGRESS_BAR_Y, tft.width(), SYSEX_PROGRESS_BAR_H, COLOR_BG);
-        // Nothing else occupies the space below the bar down to the footer.
-        int fy = tft.height() - FOOTER_HEIGHT;
-        int contentBottom = SYSEX_PROGRESS_BAR_Y + SYSEX_PROGRESS_BAR_H;
-        if (fy > contentBottom) {
-            tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
-        }
-    }
-    if (strcmp(buf, g_sysexLabel) != 0) {
-        stripText(0, SYSEX_PROGRESS_LABEL_Y, tft.width(), ROW_HEIGHT, buf, 8, COLOR_DIM, COLOR_BG);
-        strcpy(g_sysexLabel, buf);
-    }
-
-    int barX = 8, barW = tft.width() - 16;
-    int fillW = total > 0 ? (int)(((uint64_t)barW * sent) / total) : 0;
-    uint16_t color = (fillW > 0 && player.msSinceLastSend() < RECORDING_ACTIVITY_MS) ? COLOR_PULSE : COLOR_ACCENT;
-    if (fillW == g_sysexFill && (fillW == 0 || color == g_sysexColor)) return;
-    paintBarDelta(barX, SYSEX_PROGRESS_BAR_Y, SYSEX_PROGRESS_BAR_H, barW, fillW, g_sysexFill,
-                  color, color != g_sysexColor);
-    g_sysexFill = fillW;
-    g_sysexColor = color;
 }
 
 // Shared keypad footer from up to two hint lines, see Look::drawHintFooter().
@@ -1028,262 +863,135 @@ void drawConfirmOverwrite(const char* name, bool isDir) {
     Look::drawCard(c);
 }
 
-char g_liveElapsed[24] = {0};
-char g_liveCount[48] = {0};
-int8_t g_liveDot = -1;
-uint32_t g_logHash[12] = {0};
-
-void resetLiveRows() {
-    g_liveElapsed[0] = '\0';
-    g_liveCount[0] = '\0';
-    g_liveDot = -1;
-    for (uint32_t& h : g_logHash) h = 0;
+static UiRec::RecState recState(MidiRecorder::State s) {
+    switch (s) {
+        case MidiRecorder::STATE_ARMED:     return UiRec::REC_WAITING;
+        case MidiRecorder::STATE_RECORDING: return UiRec::REC_RECORDING;
+        case MidiRecorder::STATE_ERROR:     return UiRec::REC_ERROR;
+        default:                            return UiRec::REC_IDLE;
+    }
 }
 
-// dot < 0: this screen has no activity dot.
-void drawLiveRows(const char* elapsed, const char* count, int dot) {
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.setTextDatum(TL_DATUM);
-    if (strcmp(elapsed, g_liveElapsed) != 0) {
-        stripText(0, REC_ELAPSED_Y, tft.width(), ROW_HEIGHT, elapsed, 8, COLOR_DIM, COLOR_BG);
-        strlcpy(g_liveElapsed, elapsed, sizeof(g_liveElapsed));
+static UiRec::RecState recState(SysExRecorder::State s) {
+    switch (s) {
+        case SysExRecorder::STATE_ARMED:     return UiRec::REC_WAITING;
+        case SysExRecorder::STATE_RECORDING: return UiRec::REC_RECORDING;
+        case SysExRecorder::STATE_ERROR:     return UiRec::REC_ERROR;
+        default:                             return UiRec::REC_IDLE;
     }
-    bool countChanged = strcmp(count, g_liveCount) != 0;
-    if (countChanged) {
-        stripText(0, REC_EVENTS_Y, tft.width(), ROW_HEIGHT, count, 8, COLOR_DIM, COLOR_BG);
-        strlcpy(g_liveCount, count, sizeof(g_liveCount));
+}
+
+// name is the file name without its extension; buf holds it with one.
+static UiRec::RecInfo recInfo(const char* name, const char* ext, char* buf, size_t bufSize,
+                       const MidiRecorder& recorder) {
+    UiRec::RecInfo r;
+    r.kind = UiRec::KIND_MIDI;
+    if (name) {
+        snprintf(buf, bufSize, "%s%s", name, ext);
+        r.name = buf;
     }
-    if (dot >= 0 && (countChanged || g_liveDot != (int8_t)dot)) {
-        drawActivityDot(tft.width() - 16, REC_EVENTS_Y + ROW_HEIGHT / 2, dot != 0);
-        g_liveDot = (int8_t)dot;
+    r.state = recState(recorder.state());
+    r.error = recorder.errorMessage();
+    r.elapsedMs = recorder.elapsedMs();
+    r.count = recorder.eventCount();
+    r.active = recorder.msSinceLastEvent() < RECORDING_ACTIVITY_MS;
+    return r;
+}
+
+static UiRec::RecInfo recInfo(const char* name, const char* ext, char* buf, size_t bufSize,
+                       const SysExRecorder& recorder) {
+    UiRec::RecInfo r;
+    r.kind = UiRec::KIND_SYSEX;
+    if (name) {
+        snprintf(buf, bufSize, "%s%s", name, ext);
+        r.name = buf;
     }
+    r.state = recState(recorder.state());
+    r.error = recorder.errorMessage();
+    r.elapsedMs = recorder.elapsedMs();
+    r.count = recorder.messageCount();
+    r.bytes = recorder.bytesKept();
+    r.dropped = recorder.droppedCount();
+    r.active = recorder.msSinceLastMessage() < RECORDING_ACTIVITY_MS;
+    return r;
+}
+
+// The log as text lines for UiRec, newest last. lines points into text.
+static int logLines(const MidiLogEntry* entries, int count, char (*text)[40], const char** lines) {
+    int shown = count < 0 ? 0 : (count < UiRec::LOG_ROWS ? count : UiRec::LOG_ROWS);
+    int start = count - shown;
+    for (int i = 0; i < shown; i++) {
+        formatMidiLogLine(entries[start + i], text[i], sizeof(text[i]));
+        lines[i] = text[i];
+    }
+    return shown;
 }
 
 void drawRecording(const char* filename, const MidiRecorder& recorder,
                     const MidiLogEntry* log, int logCount) {
-    resetLiveRows();
-    statusBar("RECORD", &Look::ICON_REC, COLOR_ERROR);
-
-    // Same reasoning as drawPlayer()/drawConfirmDelete(): clear each row
-    // (and the gaps between them) right before drawing into it, rather
-    // than relying on a blanket fillScreen() (removed: it caused a
-    // visible full-screen black flash on every redraw).
-    tft.fillRect(0, HEADER_HEIGHT, tft.width(), REC_FILENAME_Y - HEADER_HEIGHT, COLOR_BG);
-
-    tft.fillRect(0, REC_FILENAME_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    char nameBuf[MAX_FILENAME_LEN + 4];
-    snprintf(nameBuf, sizeof(nameBuf), "%s.mid", filename);
-    tft.setTextColor(COLOR_TEXT, COLOR_BG);
-    tft.drawString(nameBuf, 8, REC_FILENAME_Y);
-
-    int gapTop = REC_FILENAME_Y + ROW_HEIGHT;
-    if (REC_STATE_Y > gapTop) {
-        tft.fillRect(0, gapTop, tft.width(), REC_STATE_Y - gapTop, COLOR_BG);
-    }
-
-    tft.fillRect(0, REC_STATE_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    char buf[48];
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    snprintf(buf, sizeof(buf), "State: %s", recordStateLabel(recorder.state()));
-    tft.drawString(buf, 8, REC_STATE_Y);
-
-    tft.fillRect(0, REC_ELAPSED_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    if (recorder.state() == MidiRecorder::STATE_ERROR) {
-        tft.setTextColor(COLOR_ERROR, COLOR_BG);
-        tft.drawString(recorder.errorMessage(), 8, REC_ELAPSED_Y);
-        tft.fillRect(0, REC_EVENTS_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    } else {
-        char timeStr[16];
-        formatDuration(recorder.elapsedMs(), timeStr, sizeof(timeStr));
-        snprintf(buf, sizeof(buf), "Elapsed: %s", timeStr);
-        tft.drawString(buf, 8, REC_ELAPSED_Y);
-
-        tft.fillRect(0, REC_EVENTS_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-        snprintf(buf, sizeof(buf), "Events: %lu", (unsigned long)recorder.eventCount());
-        tft.drawString(buf, 8, REC_EVENTS_Y);
-        drawActivityDot(tft.width() - 16, REC_EVENTS_Y + ROW_HEIGHT / 2,
-                         recorder.msSinceLastEvent() < RECORDING_ACTIVITY_MS);
-    }
-
-    int fy = tft.height() - FOOTER_HEIGHT;
-    int contentBottom = REC_EVENTS_Y + ROW_HEIGHT;
-    if (fy > contentBottom) {
-        tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
-    }
-    if (recorder.state() != MidiRecorder::STATE_ERROR) {
-        updateRecordingLog(log, logCount);
-        drawFooter("NAV/LEFT stop & save  EDIT discard");
-    } else {
-        drawFooter("NAV/EDIT back"); // whatever was saved stays
-    }
+    char name[MAX_FILENAME_LEN + 8];
+    char text[UiRec::LOG_ROWS][40];
+    const char* lines[UiRec::LOG_ROWS];
+    int n = logLines(log, logCount, text, lines);
+    UiRec::recDraw(recInfo(filename, ".mid", name, sizeof(name), recorder), lines, n);
 }
 
 void updateRecordingLive(const MidiRecorder& recorder) {
-    // Only meaningful (and only called) while STATE_RECORDING, so the
-    // fixed non-error layout offsets from drawRecording() apply here.
-    char timeStr[16], elapsed[24], count[24];
-    formatDuration(recorder.elapsedMs(), timeStr, sizeof(timeStr));
-    snprintf(elapsed, sizeof(elapsed), "Elapsed: %s", timeStr);
-    snprintf(count, sizeof(count), "Events: %lu", (unsigned long)recorder.eventCount());
-    drawLiveRows(elapsed, count, recorder.msSinceLastEvent() < RECORDING_ACTIVITY_MS ? 1 : 0);
+    UiRec::recLive(recInfo(nullptr, nullptr, nullptr, 0, recorder));
 }
 
 void updateRecordingLog(const MidiLogEntry* entries, int count) {
-    int fy = tft.height() - FOOTER_HEIGHT;
-    int rows = (fy - REC_LOG_Y) / ROW_HEIGHT;
-    if (rows <= 0) return;
-    int maxRows = (int)(sizeof(g_logHash) / sizeof(g_logHash[0]));
-    if (rows > maxRows) rows = maxRows;
-
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.setTextDatum(TL_DATUM);
-    // entries[] is oldest-first; show only the most recent `shown`, newest
-    // at the bottom, so it reads like a scrolling log rather than a
-    // shrinking one. Each row is repainted only if its text changed
-    // (g_logHash holds a hash of what it shows, 0 for blank).
-    int shown = count < 0 ? 0 : (count < rows ? count : rows);
-    int startIdx = count - shown;
-    for (int i = 0; i < rows; i++) {
-        char buf[40];
-        buf[0] = '\0';
-        uint32_t h = 0;
-        if (i < shown) {
-            formatMidiLogLine(entries[startIdx + i], buf, sizeof(buf));
-            h = 2166136261u;
-            for (const char* c = buf; *c; c++) h = (h ^ (uint8_t)*c) * 16777619u;
-            if (h == 0) h = 1;
-        }
-        if (h == g_logHash[i]) continue;
-        g_logHash[i] = h;
-        tft.fillRect(0, REC_LOG_Y + i * ROW_HEIGHT, tft.width(), ROW_HEIGHT, COLOR_BG);
-        if (h) tft.drawString(buf, 8, REC_LOG_Y + i * ROW_HEIGHT);
-    }
+    char text[UiRec::LOG_ROWS][40];
+    const char* lines[UiRec::LOG_ROWS];
+    int n = logLines(entries, count, text, lines);
+    UiRec::recLog(lines, n);
 }
 
 void drawSysExCapture(const char* filename, const SysExRecorder& recorder,
                        const MidiLogEntry* log, int logCount) {
-    resetLiveRows();
-    statusBar("SYSEX CAPTURE", &Look::ICON_REC, COLOR_ERROR);
-
-    tft.fillRect(0, HEADER_HEIGHT, tft.width(), REC_FILENAME_Y - HEADER_HEIGHT, COLOR_BG);
-
-    tft.fillRect(0, REC_FILENAME_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    char nameBuf[MAX_FILENAME_LEN + 4];
-    snprintf(nameBuf, sizeof(nameBuf), "%s.syx", filename);
-    tft.setTextColor(COLOR_TEXT, COLOR_BG);
-    tft.drawString(nameBuf, 8, REC_FILENAME_Y);
-
-    int gapTop = REC_FILENAME_Y + ROW_HEIGHT;
-    if (REC_STATE_Y > gapTop) {
-        tft.fillRect(0, gapTop, tft.width(), REC_STATE_Y - gapTop, COLOR_BG);
-    }
-
-    tft.fillRect(0, REC_STATE_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    char buf[48];
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    snprintf(buf, sizeof(buf), "State: %s", sysExCaptureStateLabel(recorder.state()));
-    tft.drawString(buf, 8, REC_STATE_Y);
-
-    tft.fillRect(0, REC_ELAPSED_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    if (recorder.state() == SysExRecorder::STATE_ERROR) {
-        tft.setTextColor(COLOR_ERROR, COLOR_BG);
-        tft.drawString(recorder.errorMessage(), 8, REC_ELAPSED_Y);
-        tft.fillRect(0, REC_EVENTS_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    } else {
-        char timeStr[16];
-        formatDuration(recorder.elapsedMs(), timeStr, sizeof(timeStr));
-        snprintf(buf, sizeof(buf), "Elapsed: %s", timeStr);
-        tft.drawString(buf, 8, REC_ELAPSED_Y);
-
-        tft.fillRect(0, REC_EVENTS_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-        sysExCaptureCount(recorder, buf, sizeof(buf));
-        tft.drawString(buf, 8, REC_EVENTS_Y);
-        drawActivityDot(tft.width() - 16, REC_EVENTS_Y + ROW_HEIGHT / 2,
-                              recorder.msSinceLastMessage() < RECORDING_ACTIVITY_MS);
-    }
-
-    int fy = tft.height() - FOOTER_HEIGHT;
-    int contentBottom = REC_EVENTS_Y + ROW_HEIGHT;
-    if (fy > contentBottom) {
-        tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
-    }
-    if (recorder.state() != SysExRecorder::STATE_ERROR) {
-        updateRecordingLog(log, logCount);
-        drawFooter("NAV/LEFT stop & save  EDIT discard");
-    } else {
-        drawFooter("NAV/EDIT back"); // whatever was saved stays
-    }
+    char name[MAX_FILENAME_LEN + 8];
+    char text[UiRec::LOG_ROWS][40];
+    const char* lines[UiRec::LOG_ROWS];
+    int n = logLines(log, logCount, text, lines);
+    UiRec::recDraw(recInfo(filename, ".syx", name, sizeof(name), recorder), lines, n);
 }
 
 void updateSysExCaptureLive(const SysExRecorder& recorder) {
-    // Only meaningful (and only called) while STATE_RECORDING, so the
-    // fixed non-error layout offsets from drawSysExCapture() apply here.
-    char timeStr[16], elapsed[24], count[48];
-    formatDuration(recorder.elapsedMs(), timeStr, sizeof(timeStr));
-    snprintf(elapsed, sizeof(elapsed), "Elapsed: %s", timeStr);
-    sysExCaptureCount(recorder, count, sizeof(count));
-    drawLiveRows(elapsed, count, recorder.msSinceLastMessage() < RECORDING_ACTIVITY_MS ? 1 : 0);
+    UiRec::recLive(recInfo(nullptr, nullptr, nullptr, 0, recorder));
+}
+
+void drawConfirmDiscard(bool sysex, const char* filename) {
+    char name[MAX_FILENAME_LEN + 8];
+    snprintf(name, sizeof(name), "%s%s", filename, sysex ? ".syx" : ".mid");
+    UiRec::discardCard(sysex ? UiRec::KIND_SYSEX : UiRec::KIND_MIDI, name);
+}
+
+static UiRec::SendInfo sendInfo(const char* filename, const SysExPlayer& player) {
+    UiRec::SendInfo s;
+    s.name = filename;
+    switch (player.state()) {
+        case SysExPlayer::STATE_SENDING: s.state = UiRec::SEND_SENDING; break;
+        case SysExPlayer::STATE_DONE:    s.state = UiRec::SEND_DONE; break;
+        case SysExPlayer::STATE_ERROR:   s.state = UiRec::SEND_ERROR; break;
+        default:                         s.state = UiRec::SEND_IDLE; break;
+    }
+    s.error = player.errorMessage();
+    s.elapsedMs = player.elapsedMs();
+    s.bytesSent = player.bytesSent();
+    s.totalBytes = player.totalBytes();
+    s.messages = player.messagesSent();
+    s.skipped = player.messagesSkipped();
+    s.junk = player.junkBytes();
+    s.active = player.msSinceLastSend() < RECORDING_ACTIVITY_MS;
+    return s;
 }
 
 void drawSysExPlayer(const char* filename, const SysExPlayer& player) {
-    resetLiveRows();
-    statusBar("SYSEX", &Look::ICON_NOTE, COLOR_DIM);
-
-    tft.fillRect(0, HEADER_HEIGHT, tft.width(), REC_FILENAME_Y - HEADER_HEIGHT, COLOR_BG);
-
-    tft.fillRect(0, REC_FILENAME_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_TEXT, COLOR_BG);
-    tft.drawString(filename, 8, REC_FILENAME_Y);
-
-    int gapTop = REC_FILENAME_Y + ROW_HEIGHT;
-    if (REC_STATE_Y > gapTop) {
-        tft.fillRect(0, gapTop, tft.width(), REC_STATE_Y - gapTop, COLOR_BG);
-    }
-
-    tft.fillRect(0, REC_STATE_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    char buf[48];
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    sysExPlayerState(player, buf, sizeof(buf));
-    tft.drawString(buf, 8, REC_STATE_Y);
-
-    tft.fillRect(0, REC_ELAPSED_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    if (player.state() == SysExPlayer::STATE_ERROR) {
-        tft.setTextColor(COLOR_ERROR, COLOR_BG);
-        tft.drawString(player.errorMessage(), 8, REC_ELAPSED_Y);
-        tft.fillRect(0, REC_EVENTS_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-        int fy = tft.height() - FOOTER_HEIGHT;
-        int contentBottom = REC_EVENTS_Y + ROW_HEIGHT;
-        if (fy > contentBottom) {
-            tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
-        }
-    } else {
-        char timeStr[16];
-        formatDuration(player.elapsedMs(), timeStr, sizeof(timeStr));
-        snprintf(buf, sizeof(buf), "Elapsed: %s", timeStr);
-        tft.drawString(buf, 8, REC_ELAPSED_Y);
-
-        tft.fillRect(0, REC_EVENTS_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-        snprintf(buf, sizeof(buf), "Messages: %lu", (unsigned long)player.messagesSent());
-        tft.drawString(buf, 8, REC_EVENTS_Y);
-
-        drawSysExProgress(player, true);
-    }
-
-    // No footer hint line -- NAV/LEFT (stop & back) is this screen's only
-    // input, and that's standard back-navigation, not called out here.
-    drawFooter(nullptr);
+    UiRec::sendDraw(sendInfo(filename, player));
 }
 
 void updateSysExPlayerLive(const SysExPlayer& player) {
-    // Only meaningful (and only called) while STATE_SENDING, so the fixed
-    // non-error layout offsets from drawSysExPlayer() apply here.
-    char timeStr[16], elapsed[24], count[24];
-    formatDuration(player.elapsedMs(), timeStr, sizeof(timeStr));
-    snprintf(elapsed, sizeof(elapsed), "Elapsed: %s", timeStr);
-    snprintf(count, sizeof(count), "Messages: %lu", (unsigned long)player.messagesSent());
-    drawLiveRows(elapsed, count, -1);
-
-    drawSysExProgress(player, false);
+    UiRec::sendLive(sendInfo(nullptr, player));
 }
 
 // -- Looper screen (ui_modes.cpp) -----------------------------------------

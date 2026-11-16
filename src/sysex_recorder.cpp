@@ -13,7 +13,7 @@ const uint32_t SYNC_MAX_MS = 15000;
 // A message with no bytes for this long is dropped (cable pulled).
 const uint32_t OPEN_MESSAGE_TIMEOUT_MS = 1000;
 
-const char* const MSG_FAILED_LOST = "Write failed (card full?), not saved";
+const char* const MSG_FAILED_LOST = "Card full or write failed, not saved";
 
 void setError(char* dst, size_t size, const char* msg) {
     strncpy(dst, msg, size - 1);
