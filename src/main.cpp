@@ -206,6 +206,9 @@ void setup() {
     SynthEditor::begin(); // same ordering requirement -- loading the active bank pushes dirty-doorbell messages core 1 must already be running to drain
     PariSynthGrid::begin(); // no ordering requirement -- no-op today, kept for symmetry with SynthEditor::begin()
     Ui::bootAnimFinish();
+    // The home screen comes in over the boot screen on the first loop,
+    // well inside the transition's arm time.
+    Ui::transitionNext(Ui::TRANSITION_IN);
 }
 
 void loop() {

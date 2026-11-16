@@ -41,10 +41,12 @@ bool frame(const Info& info);
 uint32_t frameMs(View v);
 
 // ---- boot animation ---------------------------------------------------------
-// Pattern decode: columns of pattern text fall, then lock one by one from
-// the left into MIDITRACKER, then the version shows under it. Frames are
-// drawn from the time since bootStart(), so it takes the same time however
-// often bootFrame() is called, and the last frame is up about 0.8 s in. Each frame is one strip per raining column.
+// Pattern decode: columns of pattern text fall in from the top and
+// brighten, then lock one by one from the left into MIDITRACKER, the
+// version shows under it and both hold for 0.4 s. Frames are drawn from
+// the time since bootStart(), so it takes the same time however often
+// bootFrame() is called; the name and version are up at about 0.64 s and
+// it ends at about 1.04 s. Each frame is one strip per raining column.
 
 // Draws the first frame. nowMs is millis().
 void bootStart(const char* version, uint32_t nowMs);

@@ -30,7 +30,7 @@ void bootAnimStart();
 // Draws a frame if one is due. Returns true while the animation runs.
 bool bootAnimStep();
 
-// Runs the rest of the animation, under 1 s from bootAnimStart().
+// Runs the rest of the animation, to about 1 s from bootAnimStart().
 void bootAnimFinish();
 
 // Full redraw of the top-level mode-select screen (the boot screen):

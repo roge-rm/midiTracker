@@ -701,7 +701,7 @@ void bootScreens() {
     uint32_t t0 = g_hostMs;
     UiSaver::bootStart("0.6.0", t0);
     save("boot-0");
-    struct { uint32_t ms; const char* name; } shots[] = {{200, "boot-rain"}, {420, "boot-mid"}, {700, "boot-late"}};
+    struct { uint32_t ms; const char* name; } shots[] = {{80, "boot-in"}, {240, "boot-rain"}, {420, "boot-mid"}, {700, "boot-late"}};
     for (auto& s : shots) {
         UiSaver::bootFrame(t0 + s.ms);
         save(s.name);

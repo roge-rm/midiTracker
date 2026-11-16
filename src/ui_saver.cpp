@@ -433,20 +433,29 @@ const int BOOT_PITCH = 12;                   // rain line height
 const char BOOT_NAME[] = "MIDITRACKER";
 const int BOOT_NAME_SCALE = 3;
 const int BOOT_NAME_Y = 96;
-const int BOOT_VER_Y = BOOT_NAME_Y + 5 * BOOT_NAME_SCALE + 10;
+const int BOOT_VER_Y = BOOT_NAME_Y + 5 * BOOT_NAME_SCALE + 9;
+const int BOOT_VER_H = 12;
+const uint32_t START_STEP_MS = 20;           // columns start 0-5 steps late
+const uint32_t DROP_PX_S = 1600;             // the rain's front falls this fast
+const uint32_t FADE_MS = 160;                // a column brightens from the background over this
+const int FADE_STEPS = 4;
 const uint32_t LOCK_START_MS = 260;          // column 0 locks
-const uint32_t LOCK_STEP_MS = 30;            // then one more every step
-const uint32_t FLASH_MS = 60;                // a locked column shows bright this long
+const uint32_t LOCK_STEP_MS = 20;            // then one more every step
+const uint32_t FLASH_MS = 50;                // a locked column shows bright this long
 const uint32_t VER_MS = LOCK_START_MS + (BOOT_COLS - 1) * LOCK_STEP_MS + FLASH_MS;
+const uint32_t VER_FADE_MS = 30;             // version at half, then full this much later
+const uint32_t HOLD_MS = 400;                // name and version hold this long at the end
+const uint32_t DONE_MS = VER_MS + VER_FADE_MS + HOLD_MS;
 const uint16_t FLASH = rgb(0xFFF0C8);
 
 // Colours taken at bootStart(), so a theme loading part way through
 // doesn't mix two palettes on the screen.
-uint16_t g_bootBg, g_bootAccent, g_bootDim;
+uint16_t g_bootBg, g_bootAccent, g_bootDim, g_bootText;
 uint32_t g_bootT0;
 const char* g_bootVersion = "";
 uint8_t g_bootCol[BOOT_COLS]; // 0 raining, 1 drawn locked bright, 2 drawn locked
-bool g_bootVerDrawn = true;
+uint8_t g_bootVer = 2;        // version steps drawn, 0-2
+bool g_bootDone = true;
 
 uint32_t bootHash(uint32_t a, uint32_t b) {
     uint32_t h = a * 0x9E3779B1u ^ (b + 0x7F4A7C15u) * 0x85EBCA77u;
@@ -454,6 +463,16 @@ uint32_t bootHash(uint32_t a, uint32_t b) {
     h *= 0x2C1B3C6Du;
     h ^= h >> 12;
     return h;
+}
+
+// c moved from the background towards itself, n of FADE_STEPS of the way.
+uint16_t bootFade(uint16_t c, int n) {
+    if (n >= FADE_STEPS) return c;
+    int br = g_bootBg >> 11, bg = (g_bootBg >> 5) & 0x3F, bb = g_bootBg & 0x1F;
+    int r = br + ((c >> 11) - br) * n / FADE_STEPS;
+    int g = bg + (((c >> 5) & 0x3F) - bg) * n / FADE_STEPS;
+    int b = bb + ((c & 0x1F) - bb) * n / FADE_STEPS;
+    return (uint16_t)(r << 11 | g << 5 | b);
 }
 
 // A pattern cell from a hash: a note, an instrument, an effect or dots,
@@ -479,17 +498,26 @@ uint16_t bootCell(uint32_t h, char* t) {
 }
 
 // Column k at t ms: lines of cells moving down at the column's own speed.
+// The column starts a little late, then its front falls from the top with
+// the lowest line lit, and it brightens from the background as it goes.
 void paintBootRain(int k, uint32_t t) {
     int x = k * BOOT_COL_W;
+    uint32_t start = bootHash(k, 3) % 6 * START_STEP_MS;
+    uint32_t ct = t > start ? t - start : 0;
+    int front = (int)(ct * DROP_PX_S / 1000);
+    int fade = (int)(ct * FADE_STEPS / FADE_MS);
     uint32_t speed = 120 + bootHash(k, 1) % 180; // px a second
     uint32_t off = t * speed / 1000 + bootHash(k, 2) % (BOOT_PITCH * 20);
     int sub = (int)(off % BOOT_PITCH);
     int32_t first = (int32_t)(off / BOOT_PITCH);
     band(x, 0, BOOT_COL_W, SCREEN_H, g_bootBg, [&](TFT_eSPI& g) {
         for (int i = -1; i * BOOT_PITCH + sub < SCREEN_H; i++) {
+            int y = i * BOOT_PITCH + sub;
+            if (y + BOOT_PITCH > front) break;
             char t[8];
             uint16_t c = bootCell(bootHash(k + 100, (uint32_t)(i - first)), t);
-            drawText(g, FONT_TEXT, t, x + (BOOT_COL_W - textWidth(FONT_TEXT, t)) / 2, i * BOOT_PITCH + sub + 2, c);
+            if (front < SCREEN_H && y + 2 * BOOT_PITCH > front) c = FLASH;
+            drawText(g, FONT_TEXT, t, x + (BOOT_COL_W - textWidth(FONT_TEXT, t)) / 2, y + 2, bootFade(c, fade));
         }
     });
 }
@@ -499,6 +527,14 @@ void paintBootLocked(int k, uint16_t c) {
     int nameX = (SCREEN_W - textWidth(FONT_LABEL, BOOT_NAME, BOOT_NAME_SCALE)) / 2 + 1;
     band(k * BOOT_COL_W, 0, BOOT_COL_W, SCREEN_H, g_bootBg, [&](TFT_eSPI& g) {
         drawText(g, FONT_LABEL, BOOT_NAME, nameX, BOOT_NAME_Y, c, BOOT_NAME_SCALE);
+    });
+}
+
+void paintBootVersion(uint16_t c) {
+    char ver[24];
+    snprintf(ver, sizeof(ver), "v%s", g_bootVersion);
+    band(0, BOOT_VER_Y, SCREEN_W, BOOT_VER_H, g_bootBg, [&](TFT_eSPI& g) {
+        drawText(g, FONT_TEXT, ver, (SCREEN_W - textWidth(FONT_TEXT, ver)) / 2, BOOT_VER_Y + 1, c);
     });
 }
 
@@ -515,14 +551,14 @@ void bootDraw(uint32_t t) {
             g_bootCol[k] = 2;
         }
     }
-    if (t >= VER_MS && !g_bootVerDrawn) {
-        char ver[24];
-        snprintf(ver, sizeof(ver), "V%s", g_bootVersion);
-        band(0, BOOT_VER_Y, SCREEN_W, 8, g_bootBg, [&](TFT_eSPI& g) {
-            drawText(g, FONT_LABEL, ver, (SCREEN_W - textWidth(FONT_LABEL, ver)) / 2, BOOT_VER_Y + 1, g_bootDim);
-        });
-        g_bootVerDrawn = true;
+    if (t >= VER_MS + VER_FADE_MS && g_bootVer < 2) {
+        paintBootVersion(g_bootText);
+        g_bootVer = 2;
+    } else if (t >= VER_MS && g_bootVer < 1) {
+        paintBootVersion(bootFade(g_bootText, FADE_STEPS / 2));
+        g_bootVer = 1;
     }
+    if (t >= DONE_MS) g_bootDone = true;
 }
 
 } // namespace
@@ -532,23 +568,26 @@ void bootStart(const char* version, uint32_t nowMs) {
     g_bootBg = COLOR_BG;
     g_bootAccent = COLOR_ACCENT;
     g_bootDim = COLOR_DIM;
+    g_bootText = COLOR_TEXT;
     g_bootVersion = version ? version : "";
     g_bootT0 = nowMs;
     memset(g_bootCol, 0, sizeof(g_bootCol));
-    g_bootVerDrawn = false;
+    g_bootVer = 0;
+    g_bootDone = false;
     bootDraw(0);
 }
 
 bool bootFrame(uint32_t nowMs) {
-    if (g_bootVerDrawn) return false;
+    if (g_bootDone) return false;
     bootDraw(nowMs - g_bootT0);
-    return !g_bootVerDrawn;
+    return !g_bootDone;
 }
 
 void bootSkip() {
-    if (!g_bootVerDrawn) bootDraw(VER_MS);
+    if (!g_bootDone) bootDraw(DONE_MS);
 }
 
-bool bootDone() { return g_bootVerDrawn; }
+bool bootDone() { return g_bootDone; }
+
 
 } // namespace UiSaver
