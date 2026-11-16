@@ -163,4 +163,30 @@ void synthEditCursor(const SynthEditView& v, int prevCursor, int newCursor);
 // part it drives.
 void synthEditValue(const SynthEditView& v, int idx);
 
+// ---- synth editor bank screens ----------------------------------------------
+// bankName is the loaded bank, "" for the built-in sounds.
+
+// The bank menu: Save, Load, Reset.
+const int SYNTH_BANK_ITEMS = 3;
+void synthBankDraw(const char* bankName, int cursor);
+void synthBankCursor(int prevCursor, int newCursor);
+
+// The saved banks, SYNTH_PICK_ROWS to a page. An empty list shows a card.
+void synthLoadDraw(const char* const* names, int count, int cursor, int scrollOffset, const char* bankName);
+void synthLoadCursor(const char* const* names, int count, int prevCursor, int newCursor, int scrollOffset,
+                     const char* bankName);
+
+// Naming a bank: the name in big cells over the KEYBOARD_ROWS grid. error
+// shows in red over the name, null for none.
+const int SYNTH_NAME_MAX = 16;
+void synthNameDraw(const char* name, const char* error, int keyRow, int keyCol);
+void synthNameKey(int prevRow, int prevCol, int newRow, int newCol);
+// After a key typed or deleted: the cells from prevLen to the new length.
+void synthNameText(const char* name, int prevLen);
+void synthNameError(const char* name, const char* error);
+
+// Cards over the screen below.
+void synthOverwriteCard(const char* name);
+void synthResultCard(const char* title, const char* line, bool ok);
+
 } // namespace UiModes

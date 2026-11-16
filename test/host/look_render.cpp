@@ -494,6 +494,31 @@ void synthEditScreen(bool drum, int cursor) {
     if (cursor != 0) synthEditCursor(v, 0, cursor);
 }
 
+// The bank screens, as synth_editor.cpp calls them.
+void synthBank(int cursor) {
+    g_tft.fillScreen(COLOR_BG);
+    statusLeds(false, false);
+    synthBankDraw("my bank", 0);
+    if (cursor != 0) synthBankCursor(0, cursor);
+}
+
+void synthName(const char* error) {
+    g_tft.fillScreen(COLOR_BG);
+    synthNameDraw("PADS", nullptr, 1, 2);
+    synthNameText("PADS_2", 4); // typed two more
+    synthNameKey(1, 2, 2, 5);
+    if (error) synthNameError("PADS_2", error);
+}
+
+const char* const BANKS[] = {"bright leads", "default copy", "drums 808", "my bank", "organ set", "pads",
+                             "PADS_2", "piano and strings", "a very long bank n", "test", "zz last"};
+
+void synthLoad(int count, int cursor) {
+    g_tft.fillScreen(COLOR_BG);
+    synthLoadDraw(BANKS, count, 0, 0, "my bank");
+    if (cursor != 0) synthLoadCursor(BANKS, count, 0, cursor, 0, "my bank");
+}
+
 void fontSheet() {
     g_tft.fillScreen(COLOR_BG);
     char line[40];
@@ -842,6 +867,28 @@ int main(int argc, char** argv) {
     save("synthedit-wave");
     synthEditScreen(true, 3);
     save("synthedit-drum");
+    synthBank(1);
+    save("synthbank");
+    synthName(nullptr);
+    save("synthbank-name");
+    synthName("save failed");
+    save("synthbank-name-error");
+    synthName(nullptr);
+    synthOverwriteCard("PADS_2");
+    save("synthbank-overwrite");
+    synthLoad(11, 3);
+    save("synthbank-load");
+    synthLoad(0, 0);
+    save("synthbank-load-empty");
+    synthLoad(11, 3);
+    synthResultCard("BANK LOADED", "my bank", true);
+    save("synthbank-loaded");
+    synthLoad(11, 3);
+    synthResultCard("LOAD FAILED", "drums 808", false);
+    save("synthbank-load-failed");
+    synthBank(2);
+    synthResultCard("RESET", "all sounds back to built-in", true);
+    save("synthbank-reset");
     fontSheet();
     save("fonts");
     return 0;

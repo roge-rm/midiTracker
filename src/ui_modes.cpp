@@ -4,6 +4,7 @@
 #include "ui_player.h"
 #include "ui_tap.h"
 #include "midi_output.h"
+#include "keyboard_layout.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -1315,6 +1316,282 @@ void synthEditValue(const SynthEditView& v, int idx) {
     SynthEditPart p = partAt(v, idx);
     if (isEnvPart(p)) seEnv(v, p);
     else if (p == PART_WAVE) seWave(v, p);
+}
+
+// =============================================================================
+// synth editor bank screens
+// =============================================================================
+
+namespace {
+
+const uint16_t BANK_SAVE_ROWS[] = {
+    0x0600, // .....##.....
+    0x0600, // .....##.....
+    0x0600, // .....##.....
+    0x0600, // .....##.....
+    0x36C0, // ..##.##.##..
+    0x1F80, // ...######...
+    0x0F00, // ....####....
+    0x0600, // .....##.....
+    0x8010, // #..........#
+    0x8010, // #..........#
+    0xFFF0, // ############
+    0x0000, // ............
+};
+const uint16_t BANK_LOAD_ROWS[] = {
+    0x0600, // .....##.....
+    0x0F00, // ....####....
+    0x1F80, // ...######...
+    0x36C0, // ..##.##.##..
+    0x0600, // .....##.....
+    0x0600, // .....##.....
+    0x0600, // .....##.....
+    0x0600, // .....##.....
+    0x8010, // #..........#
+    0x8010, // #..........#
+    0xFFF0, // ############
+    0x0000, // ............
+};
+const uint16_t BANK_RESET_ROWS[] = {
+    0x0000, // ............
+    0x1000, // ...#........
+    0x3000, // ..##........
+    0x7F80, // .########...
+    0x3040, // ..##.....#..
+    0x1020, // ...#......#.
+    0x0020, // ..........#.
+    0x0020, // ..........#.
+    0x0040, // .........#..
+    0x3F80, // ..#######...
+    0x0000, // ............
+    0x0000, // ............
+};
+const Icon BANK_ICONS[SYNTH_BANK_ITEMS] = {
+    {12, 12, BANK_SAVE_ROWS}, {12, 12, BANK_LOAD_ROWS}, {12, 12, BANK_RESET_ROWS}};
+const char* const BANK_LABELS[SYNTH_BANK_ITEMS] = {"SAVE BANK", "LOAD BANK", "RESET"};
+const char* const BANK_NOTES[SYNTH_BANK_ITEMS] = {"write to /synth", "from /synth", "all sounds back to built-in"};
+
+void bankStatus(const char* title, const char* bankName) {
+    g_looperUp = false;
+    g_synUp = false;
+    Status st;
+    st.icon = &ICON_PARISYNTH;
+    st.iconColor = COLOR_MIDI;
+    st.title = title;
+    if (bankName) {
+        if (bankName[0]) st.textLast = bankName;
+        else st.text = "built-in";
+    }
+    drawStatus(st);
+}
+
+void bankRow(int i, bool selected) {
+    if (i < 0 || i >= SYNTH_BANK_ITEMS) return;
+    uint16_t c = i == 0 ? COLOR_ACCENT : i == 1 ? COLOR_SELECT : COLOR_DIM;
+    drawIconRow(i, BANK_ICONS[i], c, BANK_LABELS[i], BANK_NOTES[i], selected);
+}
+
+// ---- load list ---------------------------------------------------------------
+
+void loadRow(const char* const* names, int count, int idx, int scrollOffset, const char* bankName, bool selected) {
+    int row = idx - scrollOffset;
+    if (row < 0 || row >= SYNTH_PICK_ROWS) return;
+    int y = LIST_TOP + row * LIST_ROW_H;
+    if (idx < 0 || idx >= count) {
+        band(0, y, LIST_W, LIST_ROW_H, COLOR_BG, [](TFT_eSPI&) {});
+        return;
+    }
+    bool loaded = bankName && bankName[0] && strcmp(names[idx], bankName) == 0;
+    listRow(y, LIST_W, selected, [&](TFT_eSPI& g, uint16_t) {
+        int right = LIST_W - 8;
+        if (loaded) {
+            right -= textWidth(FONT_LABEL, "LOADED");
+            drawText(g, FONT_LABEL, "LOADED", right, y + (LIST_ROW_H - 5) / 2, COLOR_ACCENT);
+            right -= 8;
+        }
+        char buf[32];
+        fitText(FONT_TEXT, names[idx], right - 10, buf, sizeof(buf));
+        drawText(g, FONT_TEXT, buf, 10, rowTextY(y), COLOR_TEXT);
+    });
+}
+
+// ---- name entry ----------------------------------------------------------------
+const int NM_LABEL_Y = HEADER_H + 5;
+const int NM_CELL_Y = NM_LABEL_Y + 11, NM_CELL_H = 26;
+const int NM_CELL_W = 16, NM_PITCH = 18;
+const int NM_W = SYNTH_NAME_MAX * NM_PITCH - (NM_PITCH - NM_CELL_W);
+const int NM_X0 = (SCREEN_W - NM_W) / 2;
+const int KB_Y0 = NM_CELL_Y + NM_CELL_H + 12;
+const int KB_KEY_H = 25, KB_STEP = 28;
+const int KB_PITCH = 30, KB_WIDE_PITCH = 100;
+
+void nameLabel(const char* name, const char* error) {
+    band(0, NM_LABEL_Y - 1, SCREEN_W, 9, COLOR_BG, [&](TFT_eSPI& g) {
+        drawText(g, FONT_LABEL, "NAME", NM_X0, NM_LABEL_Y, COLOR_DIM);
+        if (error) {
+            drawTextRight(g, FONT_TEXT, error, NM_X0 + NM_W, NM_LABEL_Y - 1, COLOR_ERROR);
+        } else {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%d/%d", (int)strlen(name), SYNTH_NAME_MAX);
+            drawTextRight(g, FONT_LABEL, buf, NM_X0 + NM_W, NM_LABEL_Y, COLOR_DIM);
+        }
+    });
+}
+
+// Cell i: a character, the cursor (the next one to type) or an empty slot.
+void nameCell(const char* name, int i) {
+    if (i < 0 || i >= SYNTH_NAME_MAX) return;
+    int len = (int)strlen(name);
+    int x = NM_X0 + i * NM_PITCH, y = NM_CELL_Y;
+    bool cursor = i == len;
+    band(x, y, NM_CELL_W, NM_CELL_H, cursor ? COLOR_HILITE_BG : COLOR_SURFACE, [&](TFT_eSPI& g) {
+        if (cursor) {
+            g.drawRect(x, y, NM_CELL_W, NM_CELL_H, COLOR_SELECT);
+            g.fillRect(x + 3, y + NM_CELL_H - 5, NM_CELL_W - 6, 2, COLOR_SELECT);
+        } else if (i < len) {
+            char c[2] = {name[i], '\0'};
+            drawTextCentre(g, FONT_TEXT, c, x + NM_CELL_W / 2, y + (NM_CELL_H - 14) / 2, COLOR_TEXT, 2);
+        } else {
+            g.fillRect(x + 4, y + NM_CELL_H - 5, NM_CELL_W - 8, 1, COLOR_RULE);
+        }
+    });
+}
+
+void keyRect(int row, int col, int& x, int& y, int& w) {
+    int pitch = row == KEYBOARD_ROW_COUNT - 1 ? KB_WIDE_PITCH : KB_PITCH;
+    x = (SCREEN_W - KEYBOARD_ROW_LENS[row] * pitch) / 2 + col * pitch + 1;
+    y = KB_Y0 + row * KB_STEP;
+    w = pitch - 2;
+}
+
+void nameKey(int row, int col, bool selected) {
+    if (row < 0 || row >= KEYBOARD_ROW_COUNT || col < 0 || col >= KEYBOARD_ROW_LENS[row]) return;
+    int x, y, w;
+    keyRect(row, col, x, y, w);
+    const KeyDef& k = KEYBOARD_ROWS[row][col];
+    band(x, y, w, KB_KEY_H, selected ? COLOR_HILITE_BG : COLOR_SURFACE, [&](TFT_eSPI& g) {
+        g.drawRect(x, y, w, KB_KEY_H, selected ? COLOR_SELECT : COLOR_RULE);
+        if (k.kind == KEY_CHAR && k.ch != ' ') {
+            drawTextCentre(g, FONT_TEXT, k.label, x + w / 2 + 1, y + (KB_KEY_H - 14) / 2, selected ? COLOR_SELECT : COLOR_TEXT, 2);
+        } else {
+            uint16_t c = selected ? COLOR_SELECT : k.kind == KEY_OK ? COLOR_ACCENT : k.kind == KEY_DEL ? COLOR_ERROR : COLOR_DIM;
+            drawTextCentre(g, FONT_LABEL, k.label, x + w / 2 + 1, y + (KB_KEY_H - 10) / 2, c, 2);
+        }
+    });
+}
+
+} // namespace
+
+void synthBankDraw(const char* bankName, int cursor) {
+    bankStatus("BANK", bankName);
+    clearModeList();
+    for (int i = 0; i < 4; i++) {
+        if (i < SYNTH_BANK_ITEMS) bankRow(i, i == cursor);
+        else clearModeRow(i);
+    }
+    static const Key keys[] = {{"UD", "move", TONE_TEXT}, {"ENT", "open", TONE_SELECT}, {"LEFT", "back", TONE_TEXT}};
+    drawKeyFooter(keys, 3);
+}
+
+void synthBankCursor(int prevCursor, int newCursor) {
+    bankRow(prevCursor, false);
+    bankRow(newCursor, true);
+}
+
+void synthLoadDraw(const char* const* names, int count, int cursor, int scrollOffset, const char* bankName) {
+    bankStatus("LOAD BANK", bankName);
+    TFT_eSPI& s = screen();
+    s.fillRect(0, HEADER_H, SCREEN_W, LIST_TOP - HEADER_H, COLOR_BG);
+    for (int r = 0; r < SYNTH_PICK_ROWS; r++) {
+        int idx = scrollOffset + r;
+        loadRow(names, count, idx, scrollOffset, bankName, idx == cursor);
+    }
+    int rowsBottom = LIST_TOP + SYNTH_PICK_ROWS * LIST_ROW_H;
+    s.fillRect(0, rowsBottom, SCREEN_W, SCREEN_H - FOOTER_H1 - rowsBottom, COLOR_BG);
+    drawScrollbar(LIST_TOP, SYNTH_PICK_ROWS, count, scrollOffset);
+    if (count > 0) {
+        static const Key keys[] = {{"UD", "move", TONE_TEXT}, {"ENT", "load", TONE_SELECT}, {"LEFT", "back", TONE_TEXT}};
+        drawKeyFooter(keys, 3);
+        return;
+    }
+    static const Key back[] = {{"LEFT", "back", TONE_TEXT}};
+    drawKeyFooter(back, 1);
+    Card c;
+    c.title = "NO SAVED BANKS";
+    c.line1 = "nothing in /synth";
+    drawCard(c);
+}
+
+void synthLoadCursor(const char* const* names, int count, int prevCursor, int newCursor, int scrollOffset,
+                     const char* bankName) {
+    loadRow(names, count, prevCursor, scrollOffset, bankName, false);
+    loadRow(names, count, newCursor, scrollOffset, bankName, true);
+}
+
+void synthNameDraw(const char* name, const char* error, int keyRow, int keyCol) {
+    bankStatus("SAVE BANK", nullptr);
+    TFT_eSPI& s = screen();
+    int bodyBottom = SCREEN_H - FOOTER_H1;
+    s.fillRect(0, HEADER_H, SCREEN_W, NM_LABEL_Y - 1 - HEADER_H, COLOR_BG);
+    s.fillRect(0, NM_LABEL_Y + 8, SCREEN_W, NM_CELL_Y - NM_LABEL_Y - 8, COLOR_BG);
+    nameLabel(name, error);
+    s.fillRect(0, NM_CELL_Y, NM_X0, NM_CELL_H, COLOR_BG);
+    s.fillRect(NM_X0 + NM_W, NM_CELL_Y, SCREEN_W - NM_X0 - NM_W, NM_CELL_H, COLOR_BG);
+    for (int i = 0; i < SYNTH_NAME_MAX; i++) {
+        if (i < SYNTH_NAME_MAX - 1) s.fillRect(NM_X0 + i * NM_PITCH + NM_CELL_W, NM_CELL_Y, NM_PITCH - NM_CELL_W, NM_CELL_H, COLOR_BG);
+        nameCell(name, i);
+    }
+    s.fillRect(0, NM_CELL_Y + NM_CELL_H, SCREEN_W, KB_Y0 - NM_CELL_Y - NM_CELL_H, COLOR_BG);
+    for (int r = 0; r < KEYBOARD_ROW_COUNT; r++) {
+        s.fillRect(0, KB_Y0 + r * KB_STEP, SCREEN_W, KB_STEP, COLOR_BG);
+        for (int c = 0; c < KEYBOARD_ROW_LENS[r]; c++) nameKey(r, c, r == keyRow && c == keyCol);
+    }
+    int kbBottom = KB_Y0 + KEYBOARD_ROW_COUNT * KB_STEP;
+    if (bodyBottom > kbBottom) s.fillRect(0, kbBottom, SCREEN_W, bodyBottom - kbBottom, COLOR_BG);
+    static const Key keys[] = {{"ARROWS", "move", TONE_TEXT}, {"ENT", "type", TONE_SELECT}, {"NAV", "cancel", TONE_TEXT}};
+    drawKeyFooter(keys, 3);
+}
+
+void synthNameKey(int prevRow, int prevCol, int newRow, int newCol) {
+    nameKey(prevRow, prevCol, false);
+    nameKey(newRow, newCol, true);
+}
+
+void synthNameText(const char* name, int prevLen) {
+    int len = (int)strlen(name);
+    int lo = prevLen < len ? prevLen : len, hi = prevLen < len ? len : prevLen;
+    for (int i = lo; i <= hi; i++) nameCell(name, i);
+    nameLabel(name, nullptr);
+}
+
+void synthNameError(const char* name, const char* error) { nameLabel(name, error); }
+
+void synthOverwriteCard(const char* name) {
+    Card c;
+    c.icon = &ICON_WARNING;
+    c.border = COLOR_ACCENT;
+    c.title = "OVERWRITE BANK";
+    c.line1 = name;
+    c.line2 = "this can't be undone";
+    static const Key keys[] = {{"NAV", "cancel", TONE_TEXT}, {"ENT", "overwrite", TONE_PLAY}};
+    c.buttons = keys;
+    c.buttonCount = 2;
+    dimBody();
+    drawCard(c);
+}
+
+void synthResultCard(const char* title, const char* line, bool ok) {
+    Card c;
+    c.title = title;
+    c.line1 = line && line[0] ? line : nullptr;
+    if (ok) {
+        c.border = COLOR_SELECT;
+    } else {
+        c.icon = &ICON_WARNING;
+        c.border = COLOR_ERROR;
+    }
+    dimBody();
+    drawCard(c);
 }
 
 } // namespace UiModes

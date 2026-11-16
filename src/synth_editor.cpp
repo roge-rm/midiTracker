@@ -34,6 +34,8 @@ bool needsRedraw = true;
 // Set when the editor opens or the picker opens a field list; update()
 // arms the transition just before it draws, in the same loop.
 bool transitionIn = false;
+// The same for going back out of a bank sub-screen.
+bool transitionOut = false;
 
 // -- Instrument picker state ------------------------------------------------
 // Melodic entries (0-15) point straight at Synth::instrumentFamilyName()'s
@@ -432,26 +434,31 @@ void handleFieldAdjust() {
 // Reset flow almost line for line -- same file-per-set-of-records pattern,
 // same on-screen-keyboard naming + overwrite-confirm, same folder scan) --
 
+const char* g_flashTitle = "";
 char g_flashMsg[32] = {0};
+bool g_flashOk = true;
+bool g_flashBack = false; // shown over a sub-screen, so going on to the menu is going back out
 uint32_t g_flashUntilMs = 0;
 
-// Shows `msg` for a bit, then returns to SCREEN_EDITOR_MENU (see
-// handleInput()'s SCREEN_FLASH case) -- same idea as SettingsMode's own
-// showThemeFlash().
-void showFlash(const char* msg) {
-    strncpy(g_flashMsg, msg, sizeof(g_flashMsg) - 1);
+// Shows a result card for a bit, then returns to SCREEN_EDITOR_MENU (see
+// handleInput()'s SCREEN_FLASH case).
+void showFlash(const char* title, const char* line, bool ok) {
+    g_flashBack = screen != SCREEN_EDITOR_MENU;
+    g_flashTitle = title;
+    strncpy(g_flashMsg, line ? line : "", sizeof(g_flashMsg) - 1);
     g_flashMsg[sizeof(g_flashMsg) - 1] = '\0';
+    g_flashOk = ok;
     g_flashUntilMs = millis() + 1200;
     screen = SCREEN_FLASH;
     needsRedraw = true;
 }
 
-const char* const EDITOR_MENU_LABELS[] = {"Save Bank", "Load Bank", "Reset to Default"};
-const int EDITOR_MENU_COUNT = 3;
+const int EDITOR_MENU_COUNT = UiModes::SYNTH_BANK_ITEMS;
 int editorMenuCursor = 0;
 
 const char* SYNTH_BANKS_ROOT = "/synth";
 const int BANK_NAME_MAX_LEN = 16;
+static_assert(BANK_NAME_MAX_LEN == UiModes::SYNTH_NAME_MAX, "the name entry shows one cell per character");
 char bankNameBuf[BANK_NAME_MAX_LEN + 1] = {0};
 int bankNameLen = 0;
 int bankKeyRow = 1, bankKeyCol = 0; // on-screen keyboard cursor, see keyboard_layout.h
@@ -663,11 +670,9 @@ void scanBanksFolder() {
     if (dir) dir.close();
 }
 
-// Same page-snap scroll-window convention as ensurePickerVisible()/
-// SettingsMode's ensureThemeVisible().
+// Pages by SYNTH_PICK_ROWS, as ensurePickerVisible().
 void ensureBankLoadVisible() {
-    int rows = Ui::visibleRows();
-    if (rows <= 0) return;
+    const int rows = UiModes::SYNTH_PICK_ROWS;
     if (bankLoadCursor < bankLoadScrollOffset || bankLoadCursor >= bankLoadScrollOffset + rows) {
         bankLoadScrollOffset = (bankLoadCursor / rows) * rows;
     }
@@ -687,6 +692,7 @@ void beginBankLoadPick() {
     bankLoadScrollOffset = 0;
     screen = SCREEN_LOAD_PICK;
     needsRedraw = true;
+    transitionIn = true;
 }
 
 void beginBankSaveName() {
@@ -697,6 +703,7 @@ void beginBankSaveName() {
     bankKeyCol = 0;
     screen = SCREEN_SAVE_NAME;
     needsRedraw = true;
+    transitionIn = true;
 }
 
 void finishBankSaveName() {
@@ -726,10 +733,10 @@ void finishBankSaveName() {
         strncpy(activeBankName, trimmed, BANK_NAME_MAX_LEN);
         activeBankName[BANK_NAME_MAX_LEN] = '\0';
         persistActiveBankName();
-        showFlash("Bank saved");
+        showFlash("BANK SAVED", activeBankName, true);
     } else {
         strncpy(bankNameError, "save failed", sizeof(bankNameError) - 1);
-        Ui::updateNameEntryError(bankNameError);
+        UiModes::synthNameError(bankNameBuf, bankNameError);
     }
 }
 
@@ -750,34 +757,32 @@ void handleBankSaveNameInput() {
             int prevRow = bankKeyRow, prevCol = bankKeyCol;
             bankKeyRow = newRow;
             bankKeyCol = newCol;
-            Ui::updateNameEntryKey(prevRow, prevCol, bankKeyRow, bankKeyCol);
+            UiModes::synthNameKey(prevRow, prevCol, bankKeyRow, bankKeyCol);
         }
     }
 
     if (Input::justPressed(BTN_NAV)) {
         screen = SCREEN_EDITOR_MENU;
         needsRedraw = true;
+        transitionOut = true;
         return;
     }
 
     if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
         const KeyDef& key = KEYBOARD_ROWS[bankKeyRow][bankKeyCol];
-        bool hadError = (bankNameError[0] != '\0');
         bankNameError[0] = '\0';
         switch (key.kind) {
             case KEY_CHAR:
                 if (bankNameLen < BANK_NAME_MAX_LEN) {
                     bankNameBuf[bankNameLen++] = key.ch;
                     bankNameBuf[bankNameLen] = '\0';
-                    Ui::updateNameEntryPreview(bankNameBuf, "");
-                    if (hadError) Ui::updateNameEntryError(nullptr);
+                    UiModes::synthNameText(bankNameBuf, bankNameLen - 1);
                 }
                 break;
             case KEY_DEL:
                 if (bankNameLen > 0) {
                     bankNameBuf[--bankNameLen] = '\0';
-                    Ui::updateNameEntryPreview(bankNameBuf, "");
-                    if (hadError) Ui::updateNameEntryError(nullptr);
+                    UiModes::synthNameText(bankNameBuf, bankNameLen + 1);
                 }
                 break;
             case KEY_OK:
@@ -798,7 +803,7 @@ void handleBankSaveOverwriteInput() {
             strncpy(activeBankName, bankNameBuf, BANK_NAME_MAX_LEN);
             activeBankName[BANK_NAME_MAX_LEN] = '\0';
             persistActiveBankName();
-            showFlash("Bank saved");
+            showFlash("BANK SAVED", activeBankName, true);
         } else {
             strncpy(bankNameError, "save failed", sizeof(bankNameError) - 1);
             screen = SCREEN_SAVE_NAME;
@@ -816,12 +821,12 @@ bool handleEditorMenuInput() {
     if (Input::justPressed(BTN_UP)) {
         int prev = editorMenuCursor;
         editorMenuCursor = (editorMenuCursor > 0) ? editorMenuCursor - 1 : EDITOR_MENU_COUNT - 1;
-        Ui::updateEntryMenuSelection(EDITOR_MENU_LABELS, EDITOR_MENU_COUNT, prev, editorMenuCursor);
+        UiModes::synthBankCursor(prev, editorMenuCursor);
     }
     if (Input::justPressed(BTN_DOWN)) {
         int prev = editorMenuCursor;
         editorMenuCursor = (editorMenuCursor < EDITOR_MENU_COUNT - 1) ? editorMenuCursor + 1 : 0;
-        Ui::updateEntryMenuSelection(EDITOR_MENU_LABELS, EDITOR_MENU_COUNT, prev, editorMenuCursor);
+        UiModes::synthBankCursor(prev, editorMenuCursor);
     }
     if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
         return true;
@@ -836,26 +841,43 @@ bool handleEditorMenuInput() {
             activeBankName[0] = '\0';
             persistActiveBankName();
             refreshEditingFromSynth();
-            showFlash("Reset to default");
+            showFlash("RESET", "all sounds back to built-in", true);
         }
     }
     return false;
 }
 
+// Pointers to the scanned names, for the list drawing.
+void bankLoadLabels(const char** labels) {
+    for (int i = 0; i < bankLoadCount; i++) labels[i] = bankLoadNames[i];
+}
+
+// Repaints the two rows, or the whole list when the move scrolls it.
+void moveBankLoadCursor(int newCursor) {
+    int prev = bankLoadCursor;
+    int prevScroll = bankLoadScrollOffset;
+    bankLoadCursor = newCursor;
+    ensureBankLoadVisible();
+    if (bankLoadScrollOffset != prevScroll) {
+        needsRedraw = true;
+        return;
+    }
+    const char* labels[MAX_SAVED_BANKS];
+    bankLoadLabels(labels);
+    UiModes::synthLoadCursor(labels, bankLoadCount, prev, bankLoadCursor, bankLoadScrollOffset, activeBankName);
+}
+
 void handleBankLoadPickInput() {
     if (Input::justPressed(BTN_UP) && bankLoadCount > 0) {
-        bankLoadCursor = (bankLoadCursor > 0) ? bankLoadCursor - 1 : bankLoadCount - 1;
-        ensureBankLoadVisible();
-        needsRedraw = true;
+        moveBankLoadCursor((bankLoadCursor > 0) ? bankLoadCursor - 1 : bankLoadCount - 1);
     }
     if (Input::justPressed(BTN_DOWN) && bankLoadCount > 0) {
-        bankLoadCursor = (bankLoadCursor < bankLoadCount - 1) ? bankLoadCursor + 1 : 0;
-        ensureBankLoadVisible();
-        needsRedraw = true;
+        moveBankLoadCursor((bankLoadCursor < bankLoadCount - 1) ? bankLoadCursor + 1 : 0);
     }
     if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
         screen = SCREEN_EDITOR_MENU;
-        Ui::drawEntryMenu("Bank", EDITOR_MENU_LABELS, EDITOR_MENU_COUNT, editorMenuCursor);
+        needsRedraw = true;
+        transitionOut = true;
         return;
     }
     if ((Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) && bankLoadCount > 0) {
@@ -866,9 +888,9 @@ void handleBankLoadPickInput() {
             activeBankName[BANK_NAME_MAX_LEN] = '\0';
             persistActiveBankName();
             refreshEditingFromSynth();
-            showFlash("Bank loaded");
+            showFlash("BANK LOADED", activeBankName, true);
         } else {
-            showFlash("Load failed");
+            showFlash("LOAD FAILED", bankLoadNames[bankLoadCursor], false);
         }
     }
 }
@@ -970,6 +992,7 @@ bool handleInput() {
             if (millis() >= g_flashUntilMs) {
                 screen = SCREEN_EDITOR_MENU;
                 needsRedraw = true;
+                transitionOut = g_flashBack;
             }
             return false;
     }
@@ -1022,30 +1045,22 @@ static void draw() {
             break;
         }
         case SCREEN_EDITOR_MENU:
-            Ui::drawEntryMenu("Bank", EDITOR_MENU_LABELS, EDITOR_MENU_COUNT, editorMenuCursor);
+            UiModes::synthBankDraw(activeBankName, editorMenuCursor);
             break;
         case SCREEN_SAVE_NAME:
-            Ui::drawNameEntry("Save Bank", bankNameBuf, "",
-                               bankNameError[0] ? bankNameError : nullptr,
-                               bankKeyRow, bankKeyCol);
+            UiModes::synthNameDraw(bankNameBuf, bankNameError[0] ? bankNameError : nullptr, bankKeyRow, bankKeyCol);
             break;
-        case SCREEN_SAVE_OVERWRITE: {
-            const char* slash = strrchr(pendingOverwritePath, '/');
-            const char* name = slash ? slash + 1 : pendingOverwritePath;
-            Ui::drawConfirmOverwrite(name, false);
+        case SCREEN_SAVE_OVERWRITE:
+            UiModes::synthOverwriteCard(bankNameBuf);
+            break;
+        case SCREEN_LOAD_PICK: {
+            const char* labels[MAX_SAVED_BANKS];
+            bankLoadLabels(labels);
+            UiModes::synthLoadDraw(labels, bankLoadCount, bankLoadCursor, bankLoadScrollOffset, activeBankName);
             break;
         }
-        case SCREEN_LOAD_PICK:
-            if (bankLoadCount > 0) {
-                const char* labels[MAX_SAVED_BANKS];
-                for (int i = 0; i < bankLoadCount; i++) labels[i] = bankLoadNames[i];
-                Ui::drawEntryMenu("Load Bank", labels, bankLoadCount, bankLoadCursor, bankLoadScrollOffset);
-            } else {
-                Ui::drawMessage("No saved banks", "NAV back");
-            }
-            break;
         case SCREEN_FLASH:
-            Ui::drawMessage(g_flashMsg, nullptr);
+            UiModes::synthResultCard(g_flashTitle, g_flashMsg, g_flashOk);
             break;
     }
 }
@@ -1056,7 +1071,9 @@ bool update(void (*pump)()) {
     if (!done && needsRedraw) {
         needsRedraw = false;
         if (transitionIn) Ui::transitionNext(Ui::TRANSITION_IN);
+        else if (transitionOut) Ui::transitionNext(Ui::TRANSITION_OUT);
         transitionIn = false;
+        transitionOut = false;
         Ui::transitionDraw([] { draw(); });
     }
     Ui::setDrawPump(nullptr);

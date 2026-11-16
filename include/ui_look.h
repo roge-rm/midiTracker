@@ -265,4 +265,7 @@ void drawModeRow(int index, const char* label, const char* note, bool selected);
 // centred in the icon space. Settings' page list uses it.
 void drawIconRow(int index, const Icon& icon, uint16_t iconColor, const char* label, const char* note, bool selected);
 
+// Blanks one row slot, for lists of fewer than four.
+void clearModeRow(int index);
+
 } // namespace Look

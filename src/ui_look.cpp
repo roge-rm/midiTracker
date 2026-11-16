@@ -914,4 +914,8 @@ void drawIconRow(int index, const Icon& icon, uint16_t iconColor, const char* la
     });
 }
 
+void clearModeRow(int index) {
+    screen().fillRect(MODE_X, MODE_Y + index * (MODE_ROW_H + MODE_GAP), MODE_W, MODE_ROW_H, COLOR_BG);
+}
+
 } // namespace Look
