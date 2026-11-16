@@ -342,6 +342,9 @@ void profileGet(SynthProfile& p);
 // so diff two readings less than ~21 s apart at 200 MHz). Everything else
 // on core 1 counts as busy.
 uint32_t profileCore1IdleCycles();
+// Fill for the stack paint: core 1 paints SCRATCH_X below its stack in
+// setup1(), core 0 its own in tracker_profile.cpp.
+const uint32_t PROFILE_STACK_PAINT = 0x5AC5AC5A;
 
 // Hang trace, kept in RAM a watchdog reset leaves alone. where1 is set by
 // core 1 (PW_* codes, | voice index while a voice renders), where0 by
@@ -351,6 +354,7 @@ const uint32_t PROFILE_TRACE_MAGIC = 0x50524F46;
 enum : uint32_t {
     PW_DRAIN = 0x10, PW_MESSAGE = 0x11, PW_NOTE_ON = 0x12, PW_STEAL = 0x13, PW_START_PENDING = 0x14,
     PW_RENDER = 0x20, PW_VOICE = 0x100, PW_MIX = 0x21, PW_GOVERNOR = 0x22, PW_SHED = 0x23, PW_I2S = 0x24,
+    PW_MP3_PUSH = 0x25, PW_MP3_DECODE = 0x26,
     PW0_IDLE = 0x1000, PW0_FIND = 0x1001, PW0_LOAD = 0x1002, PW0_PLAY = 0x1003, PW0_UPDATE = 0x1004,
     PW0_PRINT = 0x1005, PW0_STOP = 0x1006, PW0_PUSH_WAIT = 0x1007,
 };

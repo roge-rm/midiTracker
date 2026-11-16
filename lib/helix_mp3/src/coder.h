@@ -1,3 +1,4 @@
+/* midiTracker: changed, see VENDORED.txt (MP3_POLY_SPLIT below). */
 /* ***** BEGIN LICENSE BLOCK ***** 
  * Version: RCSL 1.0/RPSL 1.0 
  *  
@@ -46,6 +47,13 @@
 
 #include "mp3common.h"
 
+/* midiTracker: MP3_POLY_SPLIT (on by default on Cortex-M0+) runs the
+ * polyphase filter on 16-bit pieces with 32-bit sums, from a coefficient
+ * table built in the decoder state (SubbandInfo.polyK), exact to the bit. */
+#if defined(__ARM_ARCH_6M__) && !defined(MP3_POLY_SPLIT)
+#define MP3_POLY_SPLIT 1
+#endif
+
 #if defined(ASSERT)
 #undef ASSERT
 #endif
@@ -87,6 +95,7 @@
 #define BLOCK_SIZE				18
 #define	NBANDS					32
 #define MAX_REORDER_SAMPS		((192-126)*3)		/* largest critical band for short blocks (see sfBandTable) */
+#define POLY_K_WORDS			512	/* 32 sums of 16 taps, see polyphase.c */
 #define VBUF_LENGTH				(17 * 2 * NBANDS)	/* for double-sized vbuf FIFO */
 
 /* additional external symbols to name-mangle for static linking */
@@ -253,6 +262,9 @@ typedef struct _ScaleFactorInfo {
 typedef struct _SubbandInfo {
 	int vbuf[MAX_NCHAN * VBUF_LENGTH];		/* vbuf for fast DCT-based synthesis PQMF - double size for speed (no modulo indexing) */
 	int vindex;								/* internal index for tracking position in vbuf */
+#ifdef MP3_POLY_SPLIT
+	int polyK[POLY_K_WORDS];				/* polyCoef split for the M0+ filter, see polyphase.c */
+#endif
 } SubbandInfo;
 
 /* bitstream.c */
@@ -291,6 +303,9 @@ extern "C" {
 #endif
 void PolyphaseMono(short *pcm, int *vbuf, const int *coefBase);
 void PolyphaseStereo(short *pcm, int *vbuf, const int *coefBase);
+#ifdef MP3_POLY_SPLIT
+void xmp3_PolyInitTable(int *k, const int *coefBase);
+#endif
 #ifdef __cplusplus
 }
 #endif

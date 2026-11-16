@@ -71,10 +71,11 @@ MP3_C := $(wildcard $(HELIX)/*.c)
 MP3_DEPS := $(MP3_SRC) $(MP3_C) $(wildcard $(HELIX)/*.h) $(wildcard $(CURDIR)/stub/*.h) $(ROOT)/include/mp3_file.h $(ROOT)/include/shared_ram_arena.h
 mp3: $(OUT)/render_mp3 $(OUT)/render_mp3_ops $(OUT)/corr
 
-# MP3_EXTRA=-DMP3_MULHS_C uses the M0+ multiply on the host.
+# render_mp3 runs the polyphase filter the device's way (MP3_POLY_SPLIT, in C).
+# MP3_EXTRA=-DMP3_MULHS_C also uses the M0+ multiply on the host.
 $(OUT)/render_mp3: $(MP3_DEPS)
 	@mkdir -p $(OUT)/mp3obj
-	cd $(OUT)/mp3obj && gcc -O2 -g -w $(MP3_EXTRA) -c $(MP3_C)
+	cd $(OUT)/mp3obj && gcc -O2 -g -w -DMP3_POLY_SPLIT $(MP3_EXTRA) -c $(MP3_C)
 	$(CXX) $(CXXFLAGS) -I$(HELIX) -o $@ $(MP3_SRC) $(OUT)/mp3obj/*.o
 
 $(OUT)/render_mp3_ops: $(MP3_DEPS)

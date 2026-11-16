@@ -8,4 +8,9 @@ Changes here:
 - buffers.c rewritten: the decoder state comes from one block given with
   MP3SetPool() (declared in mp3dec.h), no heap.
 - assembly.h: Cortex-M0+ (or MP3_MULHS_C) builds the 32x32 multiply's high
-  word from 16-bit products; MP3_COUNT_OPS counts the long multiplies.
+  word from 16-bit products, in inline asm on the M0+; MP3_COUNT_OPS counts
+  the long multiplies.
+- coder.h, polyphase.c, subband.c, buffers.c: MP3_POLY_SPLIT (on by default
+  on the M0+) runs the polyphase filter as dot products of 16-bit pieces
+  with 32-bit sums (xmp3_PolyDot(), asm in RAM on the M0+), from a table in
+  the decoder state built by MP3InitDecoder(). Exact to the bit.

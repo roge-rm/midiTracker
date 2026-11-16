@@ -1,3 +1,6 @@
+/* midiTracker: changed. With MP3_POLY_SPLIT (Cortex-M0+) PolyphaseMono()
+ * and PolyphaseStereo() use xmp3_PolyDot() and the table from
+ * xmp3_PolyInitTable() instead of 64-bit sums, see the end of this file. */
 /* ***** BEGIN LICENSE BLOCK ***** 
  * Version: RCSL 1.0/RPSL 1.0 
  *  
@@ -71,6 +74,7 @@ static __inline short ClipToShort(int x, int fracBits)
 	return (short)x;
 }
 
+#ifndef MP3_POLY_SPLIT
 #define MC0M(x)	{ \
 	c1 = *coef;		coef++;		c2 = *coef;		coef++; \
 	vLo = *(vb1+(x));			vHi = *(vb1+(23-(x))); \
@@ -293,3 +297,206 @@ void PolyphaseStereo(short *pcm, int *vbuf, const int *coefBase)
 		pcm += 2;
 	}
 }
+#endif /* !MP3_POLY_SPLIT */
+
+#ifdef MP3_POLY_SPLIT
+/* midiTracker: the filter for cores without a 32x32->64 multiply.
+ *
+ * Every output is a dot product of 16 vbuf values v with 16 coefficients
+ * k, taken from v[0..7] and v[16..23] of the row. Each k fits in 20 bits
+ * (CSHIFT above), so with v = vh*2^16 + vl (vl unsigned 16 bits) and
+ * k = kh*2^10 + kl (kl unsigned 10 bits) every partial product fits in 26
+ * bits and 16 of them sum in 32 bits without overflow:
+ *   S = A26*2^26 + A16*2^16 + A10*2^10 + A0
+ * with A26 = sum vh*kh, A16 = sum vh*kl, A10 = sum vl*kh, A0 = sum vl*kl.
+ * The result is (int)((S + rnd) >> 20) of the 64-bit sum, exact to the bit.
+ *
+ * The table holds each k packed as (kh << 16) | kl, in the order the dot
+ * product reads them, with the signs of the original MC0/MC2 terms folded
+ * in: 16 words for output 0, 16 for output 16 (8 of them 0), then for each
+ * of the 15 rows the 16 for output 16-i and the 16 for output 16+i. */
+
+static int PolyPack(int k)
+{
+	return (int)(((unsigned int)(k >> 10) << 16) | (unsigned int)(k & 1023));
+}
+
+void xmp3_PolyInitTable(int *K, const int *c)
+{
+	int x, n;
+	const int *b;
+
+	for (x = 0; x < 8; x++) {
+		K[x] = PolyPack(c[2*x]);
+		K[15 - x] = PolyPack(-c[2*x + 1]);
+		K[16 + x] = PolyPack(c[256 + x]);
+		K[24 + x] = 0;
+	}
+	for (n = 0; n < 15; n++) {
+		b = c + 16 + 16*n;
+		for (x = 0; x < 8; x++) {
+			K[32 + 32*n + x] = PolyPack(b[2*x]);
+			K[32 + 32*n + 15 - x] = PolyPack(-b[2*x + 1]);
+			K[48 + 32*n + x] = PolyPack(b[2*x + 1]);
+			K[48 + 32*n + 15 - x] = PolyPack(b[2*x]);
+		}
+	}
+}
+
+/* out[j] = (int)((S + 2^25) >> 20) for the dot products of v with k + 16*j,
+ * j < n (1 or more). 2^25 is the rounding the original adds, 1 << (DEF_NFRACBITS - 1 + 32 - CSHIFT). */
+void xmp3_PolyDot(const int *v, const int *k, int *out, int n);
+
+#if defined(__ARM_ARCH_6M__) && defined(__thumb__)
+/* About 17 cycles a tap. Runs from RAM (.time_critical), it is the
+ * decoder's inner loop. A0..A26 live in r8, r11, r10, r9. */
+#define PD_TAP(voff, koff) \
+	"ldr r2, [r0, #" #voff "]\n" \
+	"ldr r4, [r1, #" #koff "]\n" \
+	"asrs r3, r2, #16\n" \
+	"uxth r2, r2\n" \
+	"asrs r5, r4, #16\n" \
+	"uxth r4, r4\n" \
+	"movs r6, r2\n" \
+	"muls r6, r4, r6\n" \
+	"add r8, r6\n" \
+	"muls r2, r5, r2\n" \
+	"add r9, r2\n" \
+	"muls r5, r3, r5\n" \
+	"add r11, r5\n" \
+	"muls r3, r4, r3\n" \
+	"add r10, r3\n"
+
+__asm__(
+	".section .time_critical.xmp3_PolyDot, \"ax\", %progbits\n"
+	".syntax unified\n"
+	".thumb\n"
+	".align 2\n"
+	".global xmp3_PolyDot\n"
+	".type xmp3_PolyDot, %function\n"
+	".thumb_func\n"
+	"xmp3_PolyDot:\n"
+	"push {r4-r7, lr}\n"
+	"mov r4, r8\n"
+	"mov r5, r9\n"
+	"mov r6, r10\n"
+	"mov r7, r11\n"
+	"push {r4-r7}\n"
+	"push {r2, r3}\n"           /* [sp] out, [sp + 4] n */
+	"1:\n"
+	"movs r2, #0\n"
+	"mov r8, r2\n"
+	"mov r9, r2\n"
+	"mov r10, r2\n"
+	"mov r11, r2\n"
+	PD_TAP(0, 0) PD_TAP(4, 4) PD_TAP(8, 8) PD_TAP(12, 12)
+	PD_TAP(16, 16) PD_TAP(20, 20) PD_TAP(24, 24) PD_TAP(28, 28)
+	PD_TAP(64, 32) PD_TAP(68, 36) PD_TAP(72, 40) PD_TAP(76, 44)
+	PD_TAP(80, 48) PD_TAP(84, 52) PD_TAP(88, 56) PD_TAP(92, 60)
+	/* r7 = A26*64 + (A16 >> 4) + (A10 >> 10)
+	 *    + ((((A16 & 15) << 16) + ((A10 & 1023) << 10) + A0 + 2^25) >> 20),
+	 * the last sum is under 2^31. */
+	"mov r2, r10\n"
+	"lsls r3, r2, #28\n"
+	"lsrs r3, r3, #12\n"
+	"asrs r2, r2, #4\n"
+	"mov r4, r9\n"
+	"lsls r5, r4, #22\n"
+	"lsrs r5, r5, #12\n"
+	"asrs r4, r4, #10\n"
+	"adds r3, r5\n"
+	"mov r5, r8\n"
+	"adds r3, r5\n"
+	"movs r5, #1\n"
+	"lsls r5, r5, #25\n"
+	"adds r3, r5\n"
+	"lsrs r3, r3, #20\n"
+	"mov r7, r11\n"
+	"lsls r7, r7, #6\n"
+	"adds r7, r2\n"
+	"adds r7, r4\n"
+	"adds r7, r3\n"
+	"ldr r6, [sp]\n"
+	"stmia r6!, {r7}\n"
+	"str r6, [sp]\n"
+	"adds r1, #64\n"
+	"ldr r6, [sp, #4]\n"
+	"subs r6, #1\n"
+	"str r6, [sp, #4]\n"
+	"beq 2f\n"
+	"b 1b\n"
+	"2:\n"
+	"add sp, #8\n"
+	"pop {r4-r7}\n"
+	"mov r8, r4\n"
+	"mov r9, r5\n"
+	"mov r10, r6\n"
+	"mov r11, r7\n"
+	"pop {r4-r7, pc}\n"
+	".size xmp3_PolyDot, . - xmp3_PolyDot\n"
+	".text\n"
+);
+#else
+/* The same sums in C, for checking the method on the host. */
+void xmp3_PolyDot(const int *v, const int *k, int *out, int n)
+{
+	int j, t, vv, kk, vh, kh, a10, a16, a26, r;
+	unsigned int vl, kl, a0;
+
+	for (j = 0; j < n; j++, k += 16) {
+		a0 = 0; a10 = a16 = a26 = 0;
+		for (t = 0; t < 16; t++) {
+			vv = v[t < 8 ? t : t + 8];
+			kk = k[t];
+			vl = (unsigned int)vv & 0xFFFF; vh = vv >> 16;
+			kl = (unsigned int)kk & 0xFFFF; kh = kk >> 16;
+			a0 += vl * kl;
+			a10 += (int)vl * kh;
+			a16 += vh * (int)kl;
+			a26 += vh * kh;
+		}
+		r = (int)(((((unsigned int)a16 & 15) << 16) + (((unsigned int)a10 & 1023) << 10) + a0 + (1u << 25)) >> 20);
+		out[j] = (int)((unsigned int)a26 * 64u + (unsigned int)(a16 >> 4) + (unsigned int)(a10 >> 10) + (unsigned int)r);
+	}
+}
+#endif
+
+/* One channel's 32 samples, every stride'th short from pcm. In RAM on the
+ * device, next to xmp3_PolyDot(). */
+#if defined(__ARM_ARCH_6M__)
+__attribute__((section(".time_critical.xmp3_PolyChannel"), noinline))
+#endif
+static void PolyChannel(short *pcm, int stride, int *vbuf, const int *K)
+{
+	int i, r[2];
+	int *vb1;
+	const int *k;
+
+	xmp3_PolyDot(vbuf, K, r, 1);
+	pcm[0] = ClipToShort(r[0], DEF_NFRACBITS);
+	xmp3_PolyDot(vbuf + 64*16, K + 16, r, 1);
+	pcm[16*stride] = ClipToShort(r[0], DEF_NFRACBITS);
+
+	vb1 = vbuf + 64;
+	k = K + 32;
+	for (i = 15; i > 0; i--) {
+		xmp3_PolyDot(vb1, k, r, 2);
+		pcm[(16 - i)*stride] = ClipToShort(r[0], DEF_NFRACBITS);
+		pcm[(16 + i)*stride] = ClipToShort(r[1], DEF_NFRACBITS);
+		vb1 += 64;
+		k += 32;
+	}
+}
+
+/* coefBase is SubbandInfo.polyK here, see xmp3_PolyInitTable(). */
+void PolyphaseMono(short *pcm, int *vbuf, const int *coefBase)
+{
+	PolyChannel(pcm, 1, vbuf, coefBase);
+}
+
+void PolyphaseStereo(short *pcm, int *vbuf, const int *coefBase)
+{
+	PolyChannel(pcm, 2, vbuf, coefBase);
+	PolyChannel(pcm + 1, 2, vbuf + 32, coefBase);
+}
+#endif /* MP3_POLY_SPLIT */

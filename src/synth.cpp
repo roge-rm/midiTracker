@@ -19,12 +19,13 @@ uint32_t g_hostGovernorSheds = 0;
 #include <hardware/clocks.h>
 #endif
 
+#if defined(MP3_PLAYER) && !defined(HOST_MIDI)
+#include "mp3_file.h"
+#endif
+
 #if defined(TRACKER_PROFILE) && !defined(HOST_MIDI)
 #include <Arduino.h>
 #include <hardware/timer.h>
-#ifdef MP3_PLAYER
-#include "mp3_file.h"
-#endif
 // Profile build only: where each core is, in RAM that a watchdog reset
 // leaves alone, so a hang can be read back after the reboot (see
 // tracker_profile.cpp). where1/where0 are PW_* codes.
@@ -2338,6 +2339,24 @@ void reverbTypeChanged(uint8_t newType) {
 // channel's CC7, CC11 and CC10, see applyChannelGains()), and a WAV stream
 // (genuinely stereo -- see popWavFrame()) adds in on top of that; softLimit()/
 // the leveler/volume then apply per-channel.
+#ifdef MP3_PLAYER
+// Core 1, while an MP3 is loaded (see loop1Mp3()). g_mp3Block: renderSample()
+// runs in block output. g_mp3NoVoices: no voice was active when the block
+// started, so the voice loop is skipped (voices only start from messages,
+// which are drained at the block's start).
+// The reverb sleeps after REVERB_SLEEP_SAMPLES samples with no send, all
+// comb damp states 0 and tank and wet outputs 0. That long with no input
+// means every comb and allpass slot was read as 0 and written back 0, and
+// the Lush and Shimmer buffers (2048 at most) hold only zeros, so the
+// reverb would go on giving 0. Only the Lush LFO and Lo-fi decimation
+// phases stop while it sleeps.
+bool g_mp3Block = false;
+bool g_mp3NoVoices = false;
+bool g_reverbAsleep = false;
+uint32_t g_reverbQuiet = 0;
+const uint32_t REVERB_SLEEP_SAMPLES = 8192;
+#endif
+
 // One WAV leveler step with no WAV playing (magnitude 0), the same maths
 // as in renderSample(). Out of line: it only runs for a few seconds after
 // a WAV or tracker file ends.
@@ -2371,6 +2390,9 @@ void __not_in_flash_func(renderSample)(int16_t& outLeft, int16_t& outRight) {
     // sendSum is the reverb send, each voice at its channel's CC91. Only
     // synth voices feed it, so WAV and tracker playback never reach the tank.
     int32_t mixL = 0, mixR = 0, sendSum = 0;
+#ifdef MP3_PLAYER
+    if (!g_mp3NoVoices)
+#endif
     for (int i = 0; i < NUM_VOICES; i++) {
         if (!g_voices[i].active) continue;
         PROF_WHERE1(Synth::PW_VOICE | i);
@@ -2414,7 +2436,22 @@ void __not_in_flash_func(renderSample)(int16_t& outLeft, int16_t& outRight) {
     // g_reverbType's own comment for why all three share one tank). Lush
     // and Shimmer run on the mid of the stereo tank and add its side back.
     // Skipped entirely (tank included) when off, see Synth::setReverbEnabled().
+#ifdef MP3_PLAYER
+    // In MP3 block output it also sleeps once the tank has gone silent, see
+    // g_reverbAsleep, and wakes on the next send.
+    bool reverbOn = g_reverbEnabled;
+    if (g_mp3Block) {
+        if (sendSum != 0) {
+            g_reverbAsleep = false;
+            g_reverbQuiet = 0;
+        } else if (g_reverbAsleep) {
+            reverbOn = false;
+        }
+    }
+    if (reverbOn) {
+#else
     if (g_reverbEnabled) {
+#endif
         int32_t tankIn = sendSum >> REVERB_SEND_SHIFT;
         int32_t tankL, tankR, wetL, wetR;
 
@@ -2458,6 +2495,15 @@ void __not_in_flash_func(renderSample)(int16_t& outLeft, int16_t& outRight) {
         // the product fits int32; the shift puts back REVERB_SEND_SHIFT.
         mixL += (wetL * (int32_t)g_reverbMixQ16) >> (16 - REVERB_SEND_SHIFT);
         mixR += (wetR * (int32_t)g_reverbMixQ16) >> (16 - REVERB_SEND_SHIFT);
+#ifdef MP3_PLAYER
+        if (g_mp3Block) {
+            const ReverbState& rs = g_reverbState;
+            bool quiet = sendSum == 0 && (tankL | tankR | wetL | wetR | g_shimmerFeedbackHeld) == 0 &&
+                         (rs.damp[0] | rs.damp[1] | rs.damp[2] | rs.damp[3]) == 0;
+            g_reverbQuiet = quiet ? g_reverbQuiet + 1 : 0;
+            if (g_reverbQuiet >= REVERB_SLEEP_SAMPLES) g_reverbAsleep = true;
+        }
+#endif
     }
 
     // Synth: scaled straight to the output (volume, output level and
@@ -2830,6 +2876,14 @@ uint32_t Synth::wavStreamUnderrunSamples() {
 void setupGovernor(); // see the render governor above loop1()
 
 void setup1() {
+#if defined(TRACKER_PROFILE) && !defined(HOST_MIDI)
+    // Paint SCRATCH_X below this stack for the STACK line in tracker_profile.cpp.
+    {
+        uint32_t sp;
+        asm volatile("mov %0, sp" : "=r"(sp));
+        for (uint32_t a = SRAM4_BASE; a < sp - 64; a += 4) *(volatile uint32_t*)a = Synth::PROFILE_STACK_PAINT;
+    }
+#endif
     while (!g_readyForPioInit) {
         // Busy-wait for core 0 to finish claiming PIO resources for the SD
         // card/display before this core claims one for I2S.
@@ -3057,7 +3111,97 @@ ALWAYS_INLINE void __not_in_flash_func(governorTick)(uint32_t used) {
     g_governorUsed = 0;
 }
 
+#if defined(MP3_PLAYER) && !defined(HOST_MIDI)
+// Core 1 while an MP3 is loaded: renders MP3_BLOCK samples, writes them to
+// I2S in one go, then moves decoded audio into the WAV ring and decodes the
+// next frame when it's due. Messages are drained once per block, so notes
+// start on a block boundary (0.7 ms).
+const int MP3_BLOCK = 32;
+uint32_t g_mp3Out[MP3_BLOCK]; // core 1 only, L in the top half as write16() packs it
+
+#ifdef TRACKER_PROFILE
+// The per-sample profile counters and voice snapshot, as loop1() keeps them.
+ALWAYS_INLINE void profileSample(uint32_t cyc) {
+    g_trace.count1++;
+    if (cyc > g_profPeakSample) g_profPeakSample = cyc;
+    g_profSumCycles += cyc;
+    g_profSamples++;
+    if ((g_trace.count1 & 1023) == 0) {
+        for (int i = 0; i < NUM_VOICES && i < 32; i++) {
+            const Voice& v = g_voices[i];
+            g_trace.vstate[i] = (uint8_t)(v.active | ((v.stage & 3) << 1) | ((v.pendVel != 0) << 3) | (v.held << 4));
+            g_trace.vamp[i] = (int16_t)(v.amplitude >> 16);
+        }
+        g_trace.snapAt = g_trace.count1;
+        g_trace.msgHead = g_msgHead;
+        g_trace.msgTail = g_msgTail;
+    }
+}
+#endif
+
+void __not_in_flash_func(loop1Mp3)() {
+    if (!g_mp3Block) {
+        g_mp3Block = true;
+        g_reverbAsleep = false;
+        g_reverbQuiet = 0;
+    }
+    PROF_WHERE1(Synth::PW_DRAIN);
+    drainMessages(64);
+    bool anyVoice = false;
+    for (int i = 0; i < NUM_VOICES; i++) {
+        if (g_voices[i].active) {
+            anyVoice = true;
+            break;
+        }
+    }
+    g_mp3NoVoices = !anyVoice;
+    for (int n = 0; n < MP3_BLOCK; n++) {
+        PROF_WHERE1(Synth::PW_RENDER);
+        uint32_t start = systick_hw->cvr;
+        int16_t left, right;
+        renderSample(left, right);
+        uint32_t cyc = (start - systick_hw->cvr) & 0x00FFFFFF;
+#ifdef TRACKER_PROFILE
+        PROF_WHERE1(Synth::PW_GOVERNOR);
+        profileSample(cyc);
+#endif
+        governorTick(cyc);
+        g_mp3Out[n] = ((uint32_t)(uint16_t)left << 16) | (uint16_t)right;
+    }
+    PROF_WHERE1(Synth::PW_I2S);
+#ifdef TRACKER_PROFILE
+    uint32_t idleStart = systick_hw->cvr;
+#endif
+    // write() doesn't wait for room, so this loop does, which paces core 1.
+    const uint8_t* p = (const uint8_t*)g_mp3Out;
+    size_t left = sizeof(g_mp3Out);
+    while (left) {
+        size_t n = g_i2s.write(p, left);
+        p += n;
+        left -= n;
+    }
+#ifdef TRACKER_PROFILE
+    g_profIdleCycles = g_profIdleCycles + ((idleStart - systick_hw->cvr) & 0x00FFFFFF);
+#endif
+    // A decode only starts with at most one 256-frame I2S buffer free, so
+    // 7 of the 8 (40 ms) are queued; a frame takes about 10 ms.
+    PROF_WHERE1(Synth::PW_MP3_PUSH);
+    if (Mp3Player::core1Push() && g_i2s.availableForWrite() <= 256 * 4) {
+        PROF_WHERE1(Synth::PW_MP3_DECODE);
+        Mp3Player::core1Decode();
+    }
+}
+#endif
+
 void __not_in_flash_func(loop1)() {
+#if defined(MP3_PLAYER) && !defined(HOST_MIDI)
+    if (Mp3Player::core1Active()) {
+        loop1Mp3();
+        return;
+    }
+    g_mp3Block = false;
+    g_mp3NoVoices = false;
+#endif
     // A cap per sample keeps a long burst from holding up one sample; the
     // rest wait for the next sample.
 #if defined(TRACKER_PROFILE) && !defined(HOST_MIDI)
@@ -3105,12 +3249,6 @@ void __not_in_flash_func(loop1)() {
         governorTick(used);
     }
 #endif
-#ifdef MP3_PLAYER
-    // MP3 decoding runs here, between samples. A frame takes up to about
-    // 26 ms, so it only starts with at most one 256-frame I2S buffer free,
-    // which leaves 35-46 ms queued. Render time and the governor don't see it.
-    if (Mp3Player::core1Push() && g_i2s.availableForWrite() <= 256 * 4) Mp3Player::core1Decode();
-#endif
     PROF_WHERE1(Synth::PW_I2S);
 #if defined(TRACKER_PROFILE) && !defined(HOST_MIDI)
     uint32_t idleStart = systick_hw->cvr;
@@ -3157,7 +3295,9 @@ static const char* whereName(uint32_t w) {
         case Synth::PW_MIX: return "renderSample mix/reverb";
         case Synth::PW_GOVERNOR: return "governorTick";
         case Synth::PW_SHED: return "governorShed";
-        case Synth::PW_I2S: return "i2s write16";
+        case Synth::PW_I2S: return "i2s write";
+        case Synth::PW_MP3_PUSH: return "Mp3Player core1Push";
+        case Synth::PW_MP3_DECODE: return "Mp3Player decode";
         case Synth::PW0_IDLE: return "idle";
         case Synth::PW0_FIND: return "findFile";
         case Synth::PW0_LOAD: return "MidiPlayer load";

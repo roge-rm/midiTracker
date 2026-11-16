@@ -107,16 +107,16 @@ bool isMp3(const char* name) {
 enum FindKind { FIND_TRACKER, FIND_MIDI, FIND_WAV };
 
 // Core 0's stack is the top of SCRATCH_Y (4 KB) and grows down into
-// SCRATCH_X, whose top is core 1's stack. Both get painted at boot and the
-// heartbeat says how much of each was never touched.
-const uint32_t STACK_PAINT = 0x5AC5AC5A;
-const uint32_t CORE1_PAINT_END = SRAM4_BASE + 0x800; // the top 2 KB is left to core 1
+// SCRATCH_X, whose top is core 1's stack (SCRATCH_X, 4 KB, nothing else in
+// it). Core 0 paints its own below where it is at boot, core 1 paints all
+// of SCRATCH_X below its stack in setup1(), and the heartbeat says how much
+// of each was never touched.
+const uint32_t STACK_PAINT = Synth::PROFILE_STACK_PAINT;
 
 void paintStacks() {
     uint32_t sp;
     asm volatile("mov %0, sp" : "=r"(sp));
     for (uint32_t a = SRAM5_BASE; a < sp - 64; a += 4) *(volatile uint32_t*)a = STACK_PAINT;
-    for (uint32_t a = SRAM4_BASE; a < CORE1_PAINT_END; a += 4) *(volatile uint32_t*)a = STACK_PAINT;
 }
 
 // Bytes never written from the bottom of a painted region up.
@@ -128,8 +128,8 @@ uint32_t untouched(uint32_t from, uint32_t to) {
 
 void printStacks(const char* when) {
     uint32_t c0 = untouched(SRAM5_BASE, SRAM5_BASE + 0x1000);
-    uint32_t c1 = untouched(SRAM4_BASE, CORE1_PAINT_END);
-    Serial.printf("STACK %s: core0 never used %lu bytes of SCRATCH_Y%s, SCRATCH_X never used %lu of its lower 2048\n", when,
+    uint32_t c1 = untouched(SRAM4_BASE, SRAM4_BASE + 0x1000);
+    Serial.printf("STACK %s: core0 never used %lu bytes of SCRATCH_Y%s, core1 never used %lu bytes of SCRATCH_X (4096)\n", when,
                   (unsigned long)c0, c0 == 0 ? " (reached SCRATCH_X, core 1's stack)" : "", (unsigned long)c1);
 }
 
@@ -507,26 +507,37 @@ void profileMp3Path(const char* path, const char* want) {
     uint32_t t0 = micros(), win = millis(), winT0 = t0;
     Mp3Player::Profile total = {};
     Mp3Player::profileTake();
+    Synth::profileReset();
+    // core1 load splits into decode (the frames that decoded) and output,
+    // which is the rest: render, I2S writes, resampling into the WAV ring
+    // and rejected decoder calls. render is renderSample()'s average and
+    // peak since the file's first second.
     auto print = [&](const char* tag, uint32_t busy, uint32_t us, uint64_t idle, uint32_t worst, const Mp3Player::Profile& r,
                      uint32_t underruns) {
         int load = us ? (int)(1000.0f * (float)busy / (float)us) : 0;
         float idleUs = (float)idle / (float)cyclesPerUs;
         int load1 = us ? (int)(1000.0f * (1.0f - idleUs / (float)us)) : 0;
         if (load1 < 0) load1 = 0;
+        int dec1 = us ? (int)(1000.0f * (float)r.decodeUs / (float)us) : 0;
+        int out1 = load1 > dec1 ? load1 - dec1 : 0;
+        Synth::SynthProfile sp;
+        Synth::profileGet(sp);
         uint32_t avg = r.frames ? r.decodeUs / r.frames : 0;
         int avgPct = frameUs ? (int)(1000u * avg / frameUs) : 0;
         int worstPct = frameUs ? (int)(1000u * r.decodeWorstUs / frameUs) : 0;
-        Serial.printf("PROFILE %s %s: core0 load %d.%d%%, worst update %lu us, core1 load %d.%d%%, "
-                      "core1 decode %lu frames avg %lu us (%d.%d%%) worst %lu us (%d.%d%%), errors %lu, input starved %lu, "
+        Serial.printf("PROFILE %s %s: core0 load %d.%d%%, worst update %lu us, core1 load %d.%d%% "
+                      "(decode %d.%d%%, output %d.%d%%, render avg %lu peak %lu cycles/sample), "
+                      "core1 decode %lu frames avg %lu us (%d.%d%%) worst %lu us (%d.%d%%), rejects %lu, input starved %lu, "
                       "reads %lu (%lu KB, %lu ms), underrun samples %lu\n",
-                      tag, want, load / 10, load % 10, (unsigned long)worst, load1 / 10, load1 % 10, (unsigned long)r.frames,
-                      (unsigned long)avg, avgPct / 10, avgPct % 10, (unsigned long)r.decodeWorstUs, worstPct / 10, worstPct % 10,
-                      (unsigned long)r.errors, (unsigned long)r.starved, (unsigned long)r.reads, (unsigned long)(r.readBytes / 1024),
-                      (unsigned long)(r.readUs / 1000), (unsigned long)underruns);
+                      tag, want, load / 10, load % 10, (unsigned long)worst, load1 / 10, load1 % 10, dec1 / 10, dec1 % 10,
+                      out1 / 10, out1 % 10, (unsigned long)sp.avgSampleCycles, (unsigned long)sp.peakSampleCycles,
+                      (unsigned long)r.frames, (unsigned long)avg, avgPct / 10, avgPct % 10, (unsigned long)r.decodeWorstUs,
+                      worstPct / 10, worstPct % 10, (unsigned long)r.rejects, (unsigned long)r.starved, (unsigned long)r.reads,
+                      (unsigned long)(r.readBytes / 1024), (unsigned long)(r.readUs / 1000), (unsigned long)underruns);
     };
     auto add = [](Mp3Player::Profile& t, const Mp3Player::Profile& c) {
         t.reads += c.reads; t.readBytes += c.readBytes; t.readUs += c.readUs;
-        t.frames += c.frames; t.decodeUs += c.decodeUs; t.errors += c.errors; t.starved += c.starved;
+        t.frames += c.frames; t.decodeUs += c.decodeUs; t.rejects += c.rejects; t.starved += c.starved;
         if (c.decodeWorstUs > t.decodeWorstUs) t.decodeWorstUs = c.decodeWorstUs;
     };
     while (millis() - start < 1000u + PROFILE_SECONDS * 1000u && p.state() == Mp3Player::STATE_PLAYING) {

@@ -55,16 +55,21 @@ public:
     // Core 1, between samples. core1Push() resamples decoded audio into the
     // WAV stream and returns true when the next frame is due and its input
     // is in the ring. core1Decode() then decodes that frame, which takes up
-    // to about 26 ms on the device, so call it only when the I2S buffers
-    // hold more than that. Both return at once when no MP3 is loaded.
+    // to about 10 ms on the device (320 kbps stereo), so call it only when
+    // the I2S buffers hold more than that. Both return at once when no MP3
+    // is loaded.
     static bool core1Push();
     static void core1Decode();
+    // True while an MP3 is loaded and core 1 feeds it (any core may ask).
+    static bool core1Active();
 
 #ifdef TRACKER_PROFILE
     // Card reads (core 0) and decoding (core 1) since the last call.
-    // starved counts the times core 1 had room for a frame but the input
-    // ring didn't hold one yet.
-    struct Profile { uint32_t reads, readBytes, readUs, frames, decodeUs, decodeWorstUs, errors, starved; };
+    // frames, decodeUs and decodeWorstUs cover the frames that decoded,
+    // rejects counts the decoder calls that gave no audio (bit reservoir
+    // still filling, bad or cut frames). starved counts the times core 1
+    // had room for a frame but the input ring didn't hold one yet.
+    struct Profile { uint32_t reads, readBytes, readUs, frames, decodeUs, decodeWorstUs, rejects, starved; };
     static Profile profileTake();
 #endif
 

@@ -1,3 +1,4 @@
+/* midiTracker: changed, see VENDORED.txt (the M0+ multiply below). */
 /* ***** BEGIN LICENSE BLOCK ***** 
  * Version: RCSL 1.0/RPSL 1.0 
  *  
@@ -430,7 +431,39 @@ extern unsigned long xmp3_mulshiftCount, xmp3_madd64Count;
 #define MP3_COUNT(c) ((void)0)
 #endif
 
-#if defined(__ARM_ARCH_6M__) || defined(MP3_MULHS_C)
+#if defined(__ARM_ARCH_6M__) && defined(__thumb__)
+/* The same sum in 17 single-cycle instructions. In asm so GCC can't turn
+ * the multiplies by constants into longer shift-and-add runs. */
+static __inline int MP3_MULHS(int a, int b)
+{
+  int t0, t1, t2;
+  __asm__(
+    ".syntax unified\n"
+    "uxth %[t0], %[a]\n"
+    "asrs %[a], %[a], #16\n"
+    "uxth %[t1], %[b]\n"
+    "asrs %[b], %[b], #16\n"
+    "movs %[t2], %[t0]\n"
+    "muls %[t2], %[t1], %[t2]\n" /* al*bl */
+    "muls %[t1], %[a], %[t1]\n"  /* ah*bl */
+    "muls %[t0], %[b], %[t0]\n"  /* al*bh */
+    "muls %[b], %[a], %[b]\n"    /* ah*bh */
+    "lsrs %[t2], %[t2], #16\n"
+    "adds %[t1], %[t1], %[t2]\n"
+    "uxth %[t2], %[t1]\n"
+    "asrs %[t1], %[t1], #16\n"
+    "adds %[t0], %[t0], %[t2]\n"
+    "asrs %[t0], %[t0], #16\n"
+    "adds %[b], %[b], %[t1]\n"
+    "adds %[b], %[b], %[t0]\n"
+    ".syntax divided\n"
+    : [a] "+l"(a), [b] "+l"(b), [t0] "=&l"(t0), [t1] "=&l"(t1), [t2] "=&l"(t2)
+    :
+    : "cc");
+  return b;
+}
+#define MP3_USE_MULHS 1
+#elif defined(__ARM_ARCH_6M__) || defined(MP3_MULHS_C)
 static __inline int MP3_MULHS(int a, int b)
 {
   unsigned int al = (unsigned int)a & 0xFFFF, bl = (unsigned int)b & 0xFFFF;

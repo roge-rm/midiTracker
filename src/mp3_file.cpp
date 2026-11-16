@@ -61,13 +61,32 @@ struct Core1 {
 Core1 g_c1;
 
 #ifdef TRACKER_PROFILE
-// Written by core 1 only, they only go up. Core 0 asks for a new worst by
-// bumping g_worstReq, core 1 clears g_worstUs when it sees that.
-volatile uint32_t g_frames = 0, g_decodeUs = 0, g_errors = 0, g_starved = 0, g_worstUs = 0;
-volatile uint32_t g_worstReq = 0, g_worstAck = 0;
+// Written by core 1 only, they only go up.
+volatile uint32_t g_frames = 0, g_decodeUs = 0, g_rejects = 0, g_starved = 0;
+// The worst decode per window. Core 0 starts a window by bumping
+// g_worstEpoch. Core 1 keeps the window's worst in g_worstSlot[epoch & 1]
+// with the epoch in the top 8 bits and the time in the low 24, and holds
+// g_worstBusy while it reads the epoch and writes the slot:
+// - core 1: busy, dmb, epoch, slot, dmb, clear busy;
+// - core 0: epoch + 1, dmb, wait while busy, dmb, then the old slot.
+// After that wait core 1 can't write the old slot again, and a slot whose
+// tag isn't the old epoch had no decodes in that window.
+volatile uint32_t g_worstEpoch = 0, g_worstSlot[2] = {0, 0};
+volatile bool g_worstBusy = false;
 Mp3Player::Profile g_reads; // core 0 only
-uint32_t g_frames0 = 0, g_decodeUs0 = 0, g_errors0 = 0, g_starved0 = 0;
+uint32_t g_frames0 = 0, g_decodeUs0 = 0, g_rejects0 = 0, g_starved0 = 0;
 #define PROF1(x) x
+
+void noteDecode(uint32_t us) {
+    if (us > 0xFFFFFF) us = 0xFFFFFF;
+    g_worstBusy = true;
+    MP3_DMB(); // busy written before the epoch is read, see above
+    uint32_t e = g_worstEpoch & 0xFF;
+    uint32_t w = g_worstSlot[e & 1];
+    if ((w >> 24) != e || us > (w & 0xFFFFFF)) g_worstSlot[e & 1] = (e << 24) | us;
+    MP3_DMB(); // slot written before busy clears
+    g_worstBusy = false;
+}
 #else
 #define PROF1(x)
 #endif
@@ -215,28 +234,24 @@ DecodeResult decodeOne() {
         PROF1(uint32_t t0 = micros());
         int err = MP3Decode((HMP3Decoder)g_c1.dec, &ip, &left, g_c1.pcm, 0);
 #ifdef TRACKER_PROFILE
-        uint32_t d = micros() - t0;
-        if (g_worstReq != g_worstAck) {
-            g_worstUs = 0;
-            g_worstAck = g_worstReq;
+        // Only frames that decode count and are timed, the rest are rejects.
+        if (err == 0) {
+            uint32_t d = micros() - t0;
+            g_decodeUs = g_decodeUs + d;
+            g_frames = g_frames + 1;
+            noteDecode(d);
+        } else {
+            g_rejects = g_rejects + 1;
         }
-        g_decodeUs = g_decodeUs + d;
-        if (d > g_worstUs) g_worstUs = d;
-        g_frames = g_frames + 1;
 #endif
         if (err == ERR_MP3_INVALID_FRAMEHEADER || err == ERR_MP3_INDATA_UNDERFLOW) {
             // Not a real frame here, or the last one is cut short.
             if (err == ERR_MP3_INDATA_UNDERFLOW && w.eof) return SOURCE_END;
             consume(w.tail, 1);
-            PROF1(g_errors = g_errors + 1);
             continue;
         }
         consume(w.tail, w.len - (uint32_t)left);
-        if (err == ERR_MP3_MAINDATA_UNDERFLOW) return DECODED; // bit reservoir not filled yet, no audio
-        if (err) {
-            PROF1(g_errors = g_errors + 1);
-            return DECODED;
-        }
+        if (err) return DECODED; // no audio: bit reservoir not filled yet, or a bad frame
         MP3FrameInfo fi;
         MP3GetLastFrameInfo((HMP3Decoder)g_c1.dec, &fi);
         g_c1.pcmChannels = (uint8_t)fi.nChans;
@@ -381,7 +396,7 @@ void Mp3Player::stopCore1() {
     g_sh.run = false;
     MP3_DMB(); // run cleared before inService is read, see enter()
     while (g_sh.inService) {
-        // at most one decode, about 26 ms
+        // at most one decode, about 10 ms
     }
     MP3_DMB(); // acquire: core 1's writes before it left
 }
@@ -568,17 +583,30 @@ uint32_t Mp3Player::underrunSamples() const { return Synth::wavStreamUnderrunSam
 Mp3Player::Profile Mp3Player::profileTake() {
     Profile p = g_reads;
     g_reads = {};
-    uint32_t frames = g_frames, us = g_decodeUs, errors = g_errors, starved = g_starved;
+    uint32_t e = g_worstEpoch & 0xFF;
+    MP3_DMB(); // release: the last call's slot reset before the new epoch
+    g_worstEpoch = g_worstEpoch + 1;
+    MP3_DMB(); // new epoch written before busy is read, see g_worstBusy
+    while (g_worstBusy) {
+        // core 1 is a few instructions from done
+    }
+    MP3_DMB(); // acquire: the old slot after core 1 is out
+    uint32_t w = g_worstSlot[e & 1];
+    p.decodeWorstUs = (w >> 24) == e ? (w & 0xFFFFFF) : 0;
+    // Core 1 next uses this slot at epoch e + 2, so it's core 0's until
+    // then; a tag of e + 1 marks it empty.
+    g_worstSlot[e & 1] = ((e + 1) & 0xFF) << 24;
+    uint32_t frames = g_frames, us = g_decodeUs, rejects = g_rejects, starved = g_starved;
     p.frames = frames - g_frames0;
     p.decodeUs = us - g_decodeUs0;
-    p.errors = errors - g_errors0;
+    p.rejects = rejects - g_rejects0;
     p.starved = starved - g_starved0;
-    p.decodeWorstUs = g_worstUs;
     g_frames0 = frames;
     g_decodeUs0 = us;
-    g_errors0 = errors;
+    g_rejects0 = rejects;
     g_starved0 = starved;
-    g_worstReq = g_worstReq + 1;
     return p;
 }
 #endif
+
+bool Mp3Player::core1Active() { return g_sh.run; }

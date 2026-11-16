@@ -1,3 +1,5 @@
+/* midiTracker: changed. With MP3_POLY_SPLIT the polyphase filter gets
+ * SubbandInfo.polyK instead of polyCoef. */
 /* ***** BEGIN LICENSE BLOCK ***** 
  * Version: RCSL 1.0/RPSL 1.0 
  *  
@@ -69,6 +71,10 @@ int Subband(MP3DecInfo *mp3DecInfo, short *pcmBuf)
 
 	mi = (IMDCTInfo *)(mp3DecInfo->IMDCTInfoPS);
 	sbi = (SubbandInfo*)(mp3DecInfo->SubbandInfoPS);
+#ifdef MP3_POLY_SPLIT
+#undef polyCoef
+#define polyCoef sbi->polyK
+#endif
 
 	if (mp3DecInfo->nChans == 2) {
 		/* stereo */

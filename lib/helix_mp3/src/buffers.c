@@ -1,6 +1,7 @@
 /* midiTracker replacement for Helix's buffers.c: the decoder's state is
  * carved from one caller-owned block (MP3SetPool()) instead of the heap.
- * MP3FreeDecoder() only forgets it, the caller owns the memory. */
+ * MP3FreeDecoder() only forgets it, the caller owns the memory.
+ * With MP3_POLY_SPLIT it also builds the polyphase table there. */
 
 #include <string.h>
 #include "coder.h"
@@ -41,6 +42,9 @@ MP3DecInfo *AllocateBuffers(void)
 	d->DequantInfoPS = p;               p += ALIGN4(sizeof(DequantInfo));
 	d->IMDCTInfoPS = p;                 p += ALIGN4(sizeof(IMDCTInfo));
 	d->SubbandInfoPS = p;
+#ifdef MP3_POLY_SPLIT
+	xmp3_PolyInitTable(((SubbandInfo *)p)->polyK, polyCoef);
+#endif
 	return d;
 }
 
