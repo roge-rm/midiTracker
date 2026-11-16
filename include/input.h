@@ -24,4 +24,9 @@ void update(); // call once per loop() iteration, before checking buttons
 bool isDown(ButtonId id);       // current debounced level
 bool justPressed(ButtonId id);  // true for exactly one update() after press
 bool justReleased(ButtonId id); // true for exactly one update() after release
+
+// A button reads pressed that update() still has as up. Reads the pins
+// only, so the press is still picked up by the next update(). For long
+// draws that stop early on a key.
+bool anyNewPress();
 } // namespace Input

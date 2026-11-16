@@ -14,6 +14,7 @@
 #include "input.h"
 #include "ui.h"
 #include "ui_strip.h"
+#include "ui_transition.h"
 #include "config.h"
 #include "synth.h"
 #include "settings_mode.h"
@@ -3938,6 +3939,16 @@ void beginLoadLoopBrowse() {
     Ui::drawLoopBrowser(loopBrowser, loopBrowseSelectedIndex, loopBrowseScrollOffset);
 }
 
+void pumpLooper();
+
+// The loop browser after a folder change, with the loops kept going.
+void drawLoopBrowserTransition(Ui::TransitionDir dir) {
+    Ui::transitionNext(dir);
+    Ui::setDrawPump(pumpLooper);
+    Ui::transitionDraw([] { Ui::drawLoopBrowser(loopBrowser, loopBrowseSelectedIndex, loopBrowseScrollOffset); });
+    Ui::setDrawPump(nullptr);
+}
+
 // ENTER tap: descend into a folder, or import the selected .mid into
 // whichever track was selected when "Load Selected Loop" was opened --
 // same importFileIntoTrack() OMNI-in/this-slot-out/Freeform defaults
@@ -3951,7 +3962,7 @@ void selectHighlightedLoopEntry() {
         loopBrowser.enterDir(loopBrowseSelectedIndex);
         loopBrowseSelectedIndex = 0;
         loopBrowseScrollOffset = 0;
-        Ui::drawLoopBrowser(loopBrowser, loopBrowseSelectedIndex, loopBrowseScrollOffset);
+        drawLoopBrowserTransition(Ui::TRANSITION_IN);
         return;
     }
     if (e.kind != FILE_MID) return; // nothing this screen can do with a non-.mid file
@@ -4038,7 +4049,7 @@ void updateLoadLoopBrowse() {
             loopBrowser.goUp();
             loopBrowseSelectedIndex = 0;
             loopBrowseScrollOffset = 0;
-            Ui::drawLoopBrowser(loopBrowser, loopBrowseSelectedIndex, loopBrowseScrollOffset);
+            drawLoopBrowserTransition(Ui::TRANSITION_OUT);
         }
         return;
     }
@@ -4541,9 +4552,11 @@ bool update() {
         // updateMasterClock()'s own comment), so showBeatIndicator alone
         // decides whether to show it here.
         int currentBeat = showBeatIndicator ? masterClockCurrentBeat() : -1;
-        Ui::drawLooper(views, selectedTrack, onBpmRow, syncMode, manualBpm, timeSigNum, timeSigDen,
-                       metronomeOn, metronomeVolumePercent, false, countInEnabled, countInBars, false,
-                       (int)bpmRowFocus, showBeatIndicator, currentBeat);
+        Ui::transitionDraw([&] {
+            Ui::drawLooper(views, selectedTrack, onBpmRow, syncMode, manualBpm, timeSigNum, timeSigDen,
+                           metronomeOn, metronomeVolumePercent, false, countInEnabled, countInBars, false,
+                           (int)bpmRowFocus, showBeatIndicator, currentBeat);
+        });
     } else {
         // -1 when the BPM row is selected, so no track row is treated as
         // highlighted. The 40 ms gate above sets the frame rate.

@@ -26,6 +26,7 @@
 #include "input.h"
 #include "ui.h"
 #include "ui_strip.h"
+#include "ui_transition.h"
 #include "keyboard_layout.h"
 
 namespace FilePlayerMode {
@@ -509,6 +510,7 @@ void openSelected() {
         scrollOffset = 0;
         appState = APP_BROWSE;
         needsRedraw = true;
+        Ui::transitionNext(Ui::TRANSITION_IN);
         return;
     }
 
@@ -1076,6 +1078,7 @@ bool handleBrowseInput() {
                 scrollOffset = 0;
             }
             needsRedraw = true;
+            Ui::transitionNext(Ui::TRANSITION_OUT);
         } else {
             // Leaving the browser entirely from its true root -- unlike
             // every other goUp() call above, there's no smaller parent
@@ -2330,7 +2333,7 @@ bool update() {
         needsRedraw = false;
         switch (appState) {
             case APP_BROWSE:
-                Ui::drawBrowser(browser, selectedIndex, scrollOffset);
+                Ui::transitionDraw([] { Ui::drawBrowser(browser, selectedIndex, scrollOffset); });
                 break;
 
             case APP_PLAY:

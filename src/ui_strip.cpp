@@ -44,7 +44,11 @@ bool g_open = false;
 int g_x = 0, g_y = 0, g_w = 0, g_h = 0;
 
 void (*g_pump)() = nullptr;
+int g_drawPass = 0;
 bool g_inPump = false;
+
+// The draw clip, x0 y0 inclusive, x1 y1 exclusive.
+int g_clipX0 = 0, g_clipY0 = 0, g_clipX1 = 320, g_clipY1 = 240;
 
 uint32_t g_sliceSpentUs = 0;
 bool g_forceMeters = false;
@@ -114,6 +118,45 @@ void stripSend() {
 }
 
 void setDrawPump(void (*pump)()) { g_pump = pump; }
+
+int drawPass() { return g_drawPass; }
+void setDrawPass(int pass) { g_drawPass = pass; }
+bool hasDrawPump() { return g_pump != nullptr; }
+
+void pumpOnce() {
+    if (!g_pump || g_inPump) return;
+    g_inPump = true;
+    g_pump();
+    g_inPump = false;
+}
+
+void setDrawClip(int x, int y, int w, int h) {
+    g_clipX0 = x;
+    g_clipY0 = y;
+    g_clipX1 = x + w;
+    g_clipY1 = y + h;
+    // The tft viewport clips direct draws and the strip's DMA push.
+    g_tft->setViewport(x, y, w, h, false);
+}
+
+void clearDrawClip() {
+    g_clipX0 = 0;
+    g_clipY0 = 0;
+    g_clipX1 = g_tft->width();
+    g_clipY1 = g_tft->height();
+    g_tft->resetViewport();
+}
+
+bool clipRect(int& x, int& y, int& w, int& h) {
+    int x1 = x + w, y1 = y + h;
+    if (x < g_clipX0) x = g_clipX0;
+    if (y < g_clipY0) y = g_clipY0;
+    if (x1 > g_clipX1) x1 = g_clipX1;
+    if (y1 > g_clipY1) y1 = g_clipY1;
+    w = x1 - x;
+    h = y1 - y;
+    return w > 0 && h > 0;
+}
 
 void sliceBeginLoop() { g_sliceSpentUs = 0; }
 

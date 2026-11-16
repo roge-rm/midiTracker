@@ -43,6 +43,27 @@ void stripSend();
 // nullptr afterwards. It never runs nested inside itself.
 void setDrawPump(void (*pump)());
 
+// Draw clip, for transitions. While set, strips and direct tft draws only
+// change pixels inside x, y, w, h, and Look::band() skips or narrows bands
+// to it. clearDrawClip() puts the whole screen back.
+void setDrawClip(int x, int y, int w, int h);
+void clearDrawClip();
+
+// Cuts x, y, w, h down to the clip. False when nothing is left.
+bool clipRect(int& x, int& y, int& w, int& h);
+
+// 0 for an ordinary draw and a transition's first step, then 1, 2... for
+// its later steps, which draw the same screen again. Widgets that take a
+// snapshot when drawn keep the first step's.
+int drawPass();
+void setDrawPass(int pass);
+
+// True while a draw pump is set.
+bool hasDrawPump();
+
+// Runs the draw pump once if one is set and it isn't already running.
+void pumpOnce();
+
 // UI time slice. main.cpp calls sliceBeginLoop() at the top of each loop().
 // Draws charge their time to the slice; once it's spent, or when the WAV
 // ring is running low, sliceAllows(DRAW_METER) says no and meters wait for

@@ -37,6 +37,8 @@ TFT_eSprite& stripBegin(int x, int y, int w, int h, uint16_t bg) {
 void stripSend() {}
 bool sliceAllows(DrawKind) { return true; }
 void sliceCharge(uint32_t) {}
+bool clipRect(int&, int&, int&, int&) { return true; }
+int drawPass() { return 0; }
 } // namespace Ui
 
 // ---- the player screens' sources, played back from host renders ----------

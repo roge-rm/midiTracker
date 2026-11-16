@@ -58,4 +58,10 @@ bool isDown(ButtonId id) { return stableState[id]; }
 bool justPressed(ButtonId id) { return edgePressed[id]; }
 bool justReleased(ButtonId id) { return edgeReleased[id]; }
 
+bool anyNewPress() {
+    for (int i = 0; i < BTN_COUNT; i++)
+        if (!stableState[i] && readRawPressed(kPins[i])) return true;
+    return false;
+}
+
 } // namespace Input

@@ -991,8 +991,12 @@ void drawSynthFooter() {
 
 void synthDraw(const SynthCell* cells, int selected, uint16_t activeMask) {
     g_looperUp = false;
+    // Later transition steps keep the first step's hit counts, so notes
+    // played during the transition still move the meters after it.
+    uint8_t hits[16];
+    memcpy(hits, Ui::drawPass() > 0 ? g_syn.hits : UiTap::g_midi.hits, sizeof(hits));
     memset(&g_syn, 0, sizeof(g_syn));
-    memcpy(g_syn.hits, UiTap::g_midi.hits, sizeof(g_syn.hits));
+    memcpy(g_syn.hits, hits, sizeof(g_syn.hits));
     g_synUp = true;
     Status st;
     st.icon = &ICON_PARISYNTH;

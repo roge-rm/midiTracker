@@ -4,6 +4,7 @@
 
 #include "input.h"
 #include "ui.h"
+#include "ui_transition.h"
 #include "midi_output.h"
 #include "synth.h"
 #include "synth_editor.h"
@@ -201,8 +202,11 @@ bool update() {
     if (needsRedraw) {
         needsRedraw = false;
         cellDirty = 0;
-        Ui::drawPariSynthPlay(PariSynthGrid::selectedChannel(), MidiOutput::activeChannelMask());
-        if (PariSynthGrid::volumeOverlayVisible()) Ui::updatePariSynthVolumeOverlay(volume);
+        uint16_t active = MidiOutput::activeChannelMask();
+        Ui::transitionDraw([&] {
+            Ui::drawPariSynthPlay(PariSynthGrid::selectedChannel(), active);
+            if (PariSynthGrid::volumeOverlayVisible()) Ui::updatePariSynthVolumeOverlay(volume);
+        });
     } else {
         // Redraw cells whose active state or program changed since drawn.
         uint16_t todo = (uint16_t)((MidiOutput::activeChannelMask() ^ Ui::pariSynthDrawnActiveMask()) | cellDirty);

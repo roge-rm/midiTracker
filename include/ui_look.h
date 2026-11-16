@@ -126,6 +126,7 @@ void band(int x, int y, int w, int h, uint16_t bg, F draw) {
     if (x < 0) { w += x; x = 0; }
     if (x + w > SCREEN_W) w = SCREEN_W - x;
     if (w <= 0 || h <= 0) return;
+    if (!Ui::clipRect(x, y, w, h)) return;
     int rows = Ui::stripMaxRows(w);
     for (int by = 0; by < h; by += rows) {
         int bh = (h - by < rows) ? h - by : rows;

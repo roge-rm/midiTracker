@@ -6,6 +6,7 @@
 #include "input.h"
 #include "ui.h"
 #include "ui_strip.h"
+#include "ui_transition.h"
 #include "battery.h"
 #include "file_player_mode.h"
 #include "looper_mode.h"
@@ -38,7 +39,15 @@ TopMode topMode = MODE_SELECT;
 int modeCursor = 0;
 bool needsRedraw = true; // only used for the mode-select screen itself
 
+// Set when enterMode() arms a transition; the new mode draws on its first
+// update, in the next loop.
+bool armedThisLoop = false;
+
 void enterMode(TopMode mode) {
+    // The looper import goes from one mode straight to another, no slide.
+    if (mode == MODE_SELECT) Ui::transitionNext(Ui::TRANSITION_OUT);
+    else if (topMode == MODE_SELECT) Ui::transitionNext(Ui::TRANSITION_IN);
+    armedThisLoop = true;
     topMode = mode;
     needsRedraw = true;
     switch (mode) {
@@ -195,7 +204,7 @@ void loop() {
 
     if (needsRedraw && topMode == MODE_SELECT) {
         needsRedraw = false;
-        Ui::drawModeSelect(MODE_LABELS, MODE_COUNT, modeCursor);
+        Ui::transitionDraw([] { Ui::drawModeSelect(MODE_LABELS, MODE_COUNT, modeCursor); });
     }
 
     // Battery gauge, bottom-right corner. Battery::update() re-samples the
@@ -203,4 +212,9 @@ void loop() {
     // Screens draw it with their footer, so a screen change brings it back.
     Battery::update();
     Ui::updateBatteryMeter();
+
+    // A screen that doesn't draw through transitionDraw() on its first
+    // update leaves the transition unused; drop it.
+    if (!armedThisLoop) Ui::transitionCancel();
+    armedThisLoop = false;
 }

@@ -8,6 +8,7 @@
 
 #include "input.h"
 #include "ui.h"
+#include "ui_transition.h"
 #include "sd_card.h"
 #include "midi_output.h"
 #include "shared_ram_arena.h"
@@ -44,6 +45,7 @@ namespace SettingsMode
             SETTING_MIDI_TRANSPORT,
             SETTING_MIDI_THRU,
             SETTING_BRIGHTNESS,
+            SETTING_TRANSITIONS,
             SETTING_REBOOT_BOOTLOADER,
             SETTING_THEME_EDITOR, // ENTER opens the Theme editor (see beginThemeEditor()) -- not adjusted with EDIT+LEFT/RIGHT like every other row here
             SETTING_USB_DRIVE,    // ENTER starts USB Drive mode (see usb_drive_mode.h)
@@ -72,10 +74,10 @@ namespace SettingsMode
         const SettingIndex PAGE_AUDIO_ITEMS[] = {SETTING_OUTPUT_LEVEL, SETTING_DEFAULT_VOLUME, SETTING_REVERB, SETTING_REVERB_MIX, SETTING_REVERB_TYPE, SETTING_SYNTH_AUDIO, SETTING_LFO_RATE, SETTING_LFO_VOICES, SETTING_STEREO_SPREAD};
         const SettingIndex PAGE_LOOPER_ITEMS[] = {SETTING_BPM, SETTING_TIME_SIGNATURE, SETTING_BAR_LENGTH, SETTING_SYNC};
         const SettingIndex PAGE_METRONOME_ITEMS[] = {SETTING_METRONOME, SETTING_METRONOME_VOLUME, SETTING_COUNT_IN, SETTING_COUNT_IN_BARS};
-        const SettingIndex PAGE_MIDI_SYSTEM_ITEMS[] = {SETTING_CLOCK_SOURCE, SETTING_MIDI_TRANSPORT, SETTING_MIDI_THRU, SETTING_BRIGHTNESS, SETTING_THEME_EDITOR, SETTING_USB_DRIVE, SETTING_REBOOT_BOOTLOADER};
+        const SettingIndex PAGE_MIDI_SYSTEM_ITEMS[] = {SETTING_CLOCK_SOURCE, SETTING_MIDI_TRANSPORT, SETTING_MIDI_THRU, SETTING_BRIGHTNESS, SETTING_TRANSITIONS, SETTING_THEME_EDITOR, SETTING_USB_DRIVE, SETTING_REBOOT_BOOTLOADER};
 
         const SettingIndex *PAGE_ITEMS[PAGE_COUNT] = {PAGE_AUDIO_ITEMS, PAGE_LOOPER_ITEMS, PAGE_METRONOME_ITEMS, PAGE_MIDI_SYSTEM_ITEMS};
-        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {9, 4, 4, 7};
+        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {9, 4, 4, 8};
 
         int currentPage = 0;
 
@@ -206,6 +208,8 @@ namespace SettingsMode
         bool g_clockSourceSlave = false;     // false = Internal (preset BPM), true = Slave (follow MIDI clock)
         bool g_midiTransportEnabled = false; // react to incoming Start/Stop/Continue
         int g_displayBrightness = 100; // percent -- see Ui::setBacklightBrightness()
+        int g_transitions = Ui::TRANSITION_WIPE; // a Ui::TransitionStyle
+        const char *const TRANSITION_LABELS[] = {"Off", "Wipe", "Slide"};
         // Empty = the hardcoded default palette (Ui's own THEME_COLORS defaults,
         // never touched unless a theme's explicitly loaded). Set whenever a
         // theme is saved or loaded (see finishThemeSaveName()/
@@ -326,6 +330,8 @@ namespace SettingsMode
                 return "MIDI Transport";
             case SETTING_BRIGHTNESS:
                 return "Brightness";
+            case SETTING_TRANSITIONS:
+                return "Transitions";
             case SETTING_USB_DRIVE:
                 return "USB Drive";
             case SETTING_REBOOT_BOOTLOADER:
@@ -418,6 +424,9 @@ namespace SettingsMode
                 break;
             case SETTING_BRIGHTNESS:
                 snprintf(out, outSize, "%d%%", g_displayBrightness);
+                break;
+            case SETTING_TRANSITIONS:
+                snprintf(out, outSize, "%s", TRANSITION_LABELS[g_transitions]);
                 break;
             case SETTING_REBOOT_BOOTLOADER:
                 // Not a stored value -- see handleBootloaderHold() for the
@@ -603,6 +612,14 @@ namespace SettingsMode
                     g_displayBrightness = 100;
                 Ui::setBacklightBrightness(g_displayBrightness); // live-applied immediately, same as MIDI Thru above
                 break;
+            case SETTING_TRANSITIONS:
+                g_transitions += direction;
+                if (g_transitions < Ui::TRANSITION_OFF)
+                    g_transitions = Ui::TRANSITION_OFF;
+                if (g_transitions > Ui::TRANSITION_SLIDE)
+                    g_transitions = Ui::TRANSITION_SLIDE;
+                Ui::setTransitionStyle((Ui::TransitionStyle)g_transitions);
+                break;
             }
         }
 
@@ -702,6 +719,8 @@ namespace SettingsMode
             n = snprintf(line, sizeof(line), "midiTransport=%d\n", g_midiTransportEnabled ? 1 : 0);
             file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "brightness=%d\n", g_displayBrightness);
+            file.write((const uint8_t *)line, n);
+            n = snprintf(line, sizeof(line), "transitions=%d\n", g_transitions);
             file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "activeTheme=%s\n", g_activeThemeName);
             file.write((const uint8_t *)line, n);
@@ -871,6 +890,13 @@ namespace SettingsMode
                     g_displayBrightness = 10;
                 if (g_displayBrightness > 100)
                     g_displayBrightness = 100;
+                return;
+            }
+            if (strncmp(line, "transitions=", 12) == 0)
+            {
+                g_transitions = atoi(line + 12);
+                if (g_transitions < Ui::TRANSITION_OFF || g_transitions > Ui::TRANSITION_SLIDE)
+                    g_transitions = Ui::TRANSITION_WIPE;
                 return;
             }
             if (strncmp(line, "activeTheme=", 12) == 0)
@@ -1784,6 +1810,7 @@ namespace SettingsMode
         // (it runs first, for the splash screen), so this is what actually
         // brings it to the saved value.
         Ui::setBacklightBrightness(g_displayBrightness);
+        Ui::setTransitionStyle((Ui::TransitionStyle)g_transitions);
         // And again for whichever theme was last active (empty = the
         // hardcoded default palette Ui's own THEME_COLORS already start
         // at, so there's nothing to do then) -- a silent no-op if the file
@@ -1861,7 +1888,8 @@ namespace SettingsMode
                 char values[SETTING_COUNT][16];
                 const char *valuePtrs[SETTING_COUNT];
                 buildLists(labelPtrs, values, valuePtrs);
-                Ui::drawSettings(labelPtrs, valuePtrs, currentPageItemCount(), cursor, scrollOffset, PAGE_TITLES[currentPage]);
+                Ui::transitionDraw([&]
+                                   { Ui::drawSettings(labelPtrs, valuePtrs, currentPageItemCount(), cursor, scrollOffset, PAGE_TITLES[currentPage]); });
             }
         }
         return false;
