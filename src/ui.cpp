@@ -327,6 +327,23 @@ const char* sysExPlayerStateLabel(SysExPlayer::State s) {
     }
 }
 
+// "Messages: 12", with ", 1 dropped" when messages were cut off.
+void sysExCaptureCount(const SysExRecorder& recorder, char* out, size_t size) {
+    int n = snprintf(out, size, "Messages: %lu", (unsigned long)recorder.messageCount());
+    if (recorder.droppedCount() && n > 0 && (size_t)n < size)
+        snprintf(out + n, size - n, ", %lu dropped", (unsigned long)recorder.droppedCount());
+}
+
+// "State: Finished, 2 skipped, 5 junk bytes", the counts only when not 0.
+void sysExPlayerState(const SysExPlayer& player, char* out, size_t size) {
+    int n = snprintf(out, size, "State: %s", sysExPlayerStateLabel(player.state()));
+    if (player.state() != SysExPlayer::STATE_DONE) return;
+    if (player.messagesSkipped() && n > 0 && (size_t)n < size)
+        n += snprintf(out + n, size - n, ", %lu skipped", (unsigned long)player.messagesSkipped());
+    if (player.junkBytes() && n > 0 && (size_t)n < size)
+        snprintf(out + n, size - n, ", %lu junk bytes", (unsigned long)player.junkBytes());
+}
+
 void drawActivityDot(int x, int y, bool active) {
     tft.fillCircle(x, y, 5, active ? COLOR_PULSE : COLOR_DIM);
 }
@@ -1012,7 +1029,7 @@ void drawConfirmOverwrite(const char* name, bool isDir) {
 }
 
 char g_liveElapsed[24] = {0};
-char g_liveCount[24] = {0};
+char g_liveCount[48] = {0};
 int8_t g_liveDot = -1;
 uint32_t g_logHash[12] = {0};
 
@@ -1179,7 +1196,7 @@ void drawSysExCapture(const char* filename, const SysExRecorder& recorder,
         tft.drawString(buf, 8, REC_ELAPSED_Y);
 
         tft.fillRect(0, REC_EVENTS_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-        snprintf(buf, sizeof(buf), "Messages: %lu", (unsigned long)recorder.messageCount());
+        sysExCaptureCount(recorder, buf, sizeof(buf));
         tft.drawString(buf, 8, REC_EVENTS_Y);
         drawActivityDot(tft.width() - 16, REC_EVENTS_Y + ROW_HEIGHT / 2,
                               recorder.msSinceLastMessage() < RECORDING_ACTIVITY_MS);
@@ -1201,10 +1218,10 @@ void drawSysExCapture(const char* filename, const SysExRecorder& recorder,
 void updateSysExCaptureLive(const SysExRecorder& recorder) {
     // Only meaningful (and only called) while STATE_RECORDING, so the
     // fixed non-error layout offsets from drawSysExCapture() apply here.
-    char timeStr[16], elapsed[24], count[24];
+    char timeStr[16], elapsed[24], count[48];
     formatDuration(recorder.elapsedMs(), timeStr, sizeof(timeStr));
     snprintf(elapsed, sizeof(elapsed), "Elapsed: %s", timeStr);
-    snprintf(count, sizeof(count), "Messages: %lu", (unsigned long)recorder.messageCount());
+    sysExCaptureCount(recorder, count, sizeof(count));
     drawLiveRows(elapsed, count, recorder.msSinceLastMessage() < RECORDING_ACTIVITY_MS ? 1 : 0);
 }
 
@@ -1226,7 +1243,7 @@ void drawSysExPlayer(const char* filename, const SysExPlayer& player) {
     tft.fillRect(0, REC_STATE_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
     char buf[48];
     tft.setTextColor(COLOR_DIM, COLOR_BG);
-    snprintf(buf, sizeof(buf), "State: %s", sysExPlayerStateLabel(player.state()));
+    sysExPlayerState(player, buf, sizeof(buf));
     tft.drawString(buf, 8, REC_STATE_Y);
 
     tft.fillRect(0, REC_ELAPSED_Y, tft.width(), ROW_HEIGHT, COLOR_BG);

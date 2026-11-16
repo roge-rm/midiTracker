@@ -1989,24 +1989,26 @@ void enter() {
             pushMidiLogEntry({false, status, d1, d2, len, 0});
         }
     });
-    // Both feed() calls below self-guard on their own ARMED/RECORDING
-    // state (same as the channel-voice handler above), so it's safe to
-    // register both unconditionally rather than switching on appState --
-    // recorder and sysexRecorder are never both active at once (only one
-    // of APP_RECORDING/APP_CAPTURING_SYSEX can be current), and this is
-    // also what makes Capture SysEx Dump naturally "not respond to
-    // standard MIDI": recorder just stays idle while sysexRecorder is the
-    // one actually armed.
+    // Whole SysEx messages for the MIDI recorder's .mid, and SysEx of any
+    // length streamed to the capture. Both recorders self-guard on their
+    // own ARMED/RECORDING state, and only one of APP_RECORDING/
+    // APP_CAPTURING_SYSEX is ever current, which is also what makes
+    // Capture SysEx Dump not respond to standard MIDI.
     MidiOutput::setSysExHandler([](const uint8_t* data, size_t len) {
         recorder.feedSysEx(data, len);
-        sysexRecorder.feed(data, len);
-        // Both recorders self-guard on their own ARMED/RECORDING state
-        // (see the comment below), and only one of APP_RECORDING/
-        // APP_CAPTURING_SYSEX is ever current, so at most one of these is
-        // ever true -- same log/gate either way.
-        if (recorder.state() == MidiRecorder::STATE_RECORDING ||
-            sysexRecorder.state() == SysExRecorder::STATE_RECORDING) {
-            pushMidiLogEntry({true, 0, 0, 0, 0, (uint16_t)len});
+        if (recorder.state() == MidiRecorder::STATE_RECORDING) {
+            pushMidiLogEntry({true, 0, 0, 0, 0, (uint16_t)(len > 0xFFFF ? 0xFFFF : len)});
+        }
+    });
+    MidiOutput::setSysExStreamHandler([](SysExStreamEvent ev, uint8_t source, const uint8_t* data, size_t len) {
+        switch (ev) {
+            case SYSEX_BEGIN: sysexRecorder.beginMessage(source); break;
+            case SYSEX_DATA:  sysexRecorder.writeMessage(source, data, len); break;
+            case SYSEX_ABORT: sysexRecorder.abortMessage(source); break;
+            case SYSEX_END:
+                if (sysexRecorder.endMessage(source))
+                    pushMidiLogEntry({true, 0, 0, 0, 0, (uint16_t)(len > 0xFFFF ? 0xFFFF : len)});
+                break;
         }
     });
     MidiOutput::setTarget(outputTarget);

@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include "sysex_stream.h"
 
 // Bitmask by construction (see hwEnabled()/usbEnabled() in midi_output.cpp,
 // which just `&` this against MIDI_OUT_HARDWARE/MIDI_OUT_USB) -- MIDI_OUT_OFF
@@ -101,6 +102,26 @@ void sendSysExRaw(const uint8_t* data, size_t len);
 // Core 0 only; fill and send it within one call.
 uint8_t* sysExScratch();
 
+// Sends one SysEx message of any length in pieces, for the .syx player.
+// Core 0 only. Between sysExOutBegin() and sysExOutEnd() the outputs it
+// uses (the current target, USB only if mounted) carry nothing else but
+// realtime bytes: other sends and thru to them are dropped.
+// sysExOutWrite() takes the message's bytes in order (F0 ... F7, no
+// realtime bytes) and returns how many it took without blocking, paced to
+// DIN's 31250 baud and the room in the USB buffer; 0 means try again
+// later. sysExOutEnd() before the F7 went out ends the message with F7.
+// Thru channel messages meant for a busy output are held (32 each) and
+// sent after the message. With DIN on, USB never holds it up: if USB is
+// full, it's left out until the next sysExOutNewPlayback(); with USB
+// alone, that happens after 100 ms without room.
+void sysExOutNewPlayback();
+void sysExOutBegin();
+size_t sysExOutWrite(const uint8_t* data, size_t len);
+void sysExOutEnd();
+// True once the held thru messages are out and DIN has had time to send
+// everything written to it.
+bool sysExOutDrained();
+
 // Sends All Notes Off (CC 123) + All Sound Off (CC 120) on every channel
 // on whichever transport(s) are active. Call this on stop/panic.
 void allNotesOffAllChannels();
@@ -169,15 +190,19 @@ void setInputHandler(InputHandler handler);
 // and no fixed data-byte count, so it doesn't fit that callback's shape.
 // `data` is boundary-inclusive (data[0]==0xF0, data[len-1]==0xF7) and
 // only valid for the duration of the call -- it points at the MIDI
-// library's own internal receive buffer (up to 1024 bytes, its
-// SysExMaxSize), which the next incoming message overwrites.
+// library's own internal receive buffer (MIDI_SYSEX_MAX_LEN, its
+// SysExMaxSize), which the next incoming message overwrites. Longer
+// messages don't come here; see setSysExStreamHandler() for those.
 typedef void (*SysExHandler)(const uint8_t* data, size_t len);
 
 // Registers the handler above; pass nullptr to disable. Independent of
-// setInputHandler() -- a mode can register one, both, or neither (e.g.
-// a SysEx-only capture screen registers just this one, so it never
-// reacts to ordinary channel-voice input).
+// setInputHandler(): a mode can register one, both or neither.
 void setSysExHandler(SysExHandler handler);
+
+// Every incoming SysEx of any length from either transport, in pieces as
+// it arrives (see sysex_stream.h), for SysEx capture. Independent of
+// setSysExHandler(); pass nullptr to disable.
+void setSysExStreamHandler(SysExStreamHandler handler);
 
 // Called for every incoming Clock/Start/Stop/Continue message read from
 // either transport, separately from InputHandler/SysExHandler above --

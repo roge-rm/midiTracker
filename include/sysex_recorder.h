@@ -11,29 +11,38 @@
 // happened in a performance. Same arm/feed/stop/cancel state-machine
 // shape as MidiRecorder (see its own header comment) for a consistent
 // capture UX, but a much simpler body: no MThd/MTrk, no delta-time, no
-// var-len event framing, since there's nothing to time here. Runs on
-// core 0 the same way MidiRecorder does: feed() from the MIDI input
-// handler, service()/stop()/cancel() from the file player's update loop.
+// var-len event framing, since there's nothing to time here. Only whole
+// messages stay in the file. Runs on core 0 the same way MidiRecorder
+// does: the *Message() calls from the MIDI input handler, service()/stop()/cancel() from the file player's update loop.
 class SysExRecorder {
 public:
     enum State { STATE_IDLE, STATE_ARMED, STATE_RECORDING, STATE_ERROR };
 
     // Arms the recorder to capture to `path`. Nothing is created on disk
-    // yet -- see feed(). `replace` works as in MidiRecorder::arm(): the
+    // yet -- see beginMessage(). `replace` works as in MidiRecorder::arm(): the
     // capture goes to a temp file and replaces `path` only on stop().
     // Returns false (STATE_ERROR, see errorMessage()) if `path` already
     // exists and `replace` is false, or the path is too long.
     bool arm(const char* path, bool replace = false);
 
-    // Feeds one incoming System Exclusive message. `data` must be
-    // boundary-inclusive (data[0]==0xF0, data[len-1]==0xF7) -- the same
-    // shape MidiOutput::SysExHandler hands back. No-op outside
-    // STATE_ARMED/STATE_RECORDING. The first call after arm() creates the
-    // file.
+    // Streamed input from MidiOutput's SysEx stream handler (see
+    // sysex_stream.h), any length. The first beginMessage() after arm()
+    // creates the file. Bytes go straight to the file; endMessage() keeps
+    // the message and is true if it did, abortMessage() drops it. While
+    // one source's message is open, a message starting on the other
+    // source is dropped. No-ops outside STATE_ARMED/STATE_RECORDING.
+    void beginMessage(uint8_t source);
+    void writeMessage(uint8_t source, const uint8_t* data, size_t len);
+    bool endMessage(uint8_t source);
+    void abortMessage(uint8_t source);
+
+    // One whole message (data[0]==0xF0, data[len-1]==0xF7) through the
+    // calls above, from source 0.
     void feed(const uint8_t* data, size_t len);
 
     // Call from the main loop while capturing: syncs the file every few
-    // seconds, and after a failed write keeps the whole messages already
+    // seconds between messages, drops a message that has had no bytes for
+    // 1 s, and after a failed write keeps the whole messages already
     // written and moves to STATE_ERROR.
     void service();
 
@@ -43,7 +52,7 @@ public:
     bool stop();
 
     // Abandons the current capture instead of finalizing it: if a file
-    // was already created on disk (STATE_RECORDING -- see feed()), closes
+    // was already created on disk (STATE_RECORDING -- see beginMessage()), closes
     // and deletes it. A file being replaced is left as it was. Resets to
     // STATE_IDLE either way.
     void cancel();
@@ -52,6 +61,9 @@ public:
     const char* errorMessage() const { return _error; }
 
     uint32_t messageCount() const { return _messageCount; }
+    // Messages cut off by another status byte, the other source, 1 s
+    // without bytes or stopping mid-message.
+    uint32_t droppedCount() const { return _droppedCount; }
     uint32_t elapsedMs() const; // 0 until the first message starts the clock
 
     // ms since the last message arrived, or UINT32_MAX if none has yet --
@@ -71,6 +83,9 @@ private:
     uint32_t _lastMessageMs = 0; // millis() of the most recent message; 0 = none yet
     uint32_t _lastSyncMs = 0;   // last _file.sync(), see service()
     uint32_t _messageCount = 0;
+    uint32_t _droppedCount = 0;
+    static const uint8_t NO_SOURCE = 0xFF;
+    uint8_t _msgSource = NO_SOURCE; // source of the message being written
 
     const char* writePath(char* buf, size_t size) const;
     bool finish();

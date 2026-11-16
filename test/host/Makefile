@@ -10,7 +10,7 @@
 #   make -C test/host look OUT_DIR=dir   render the M12 screens to PNGs in dir (default build/host/look)
 #   make -C test/host players OUT_DIR=dir   the player screens, drawn from host renders of real songs
 #   make -C test/host wav            build build/host/render_wav (WavPlayer over the host ring)
-#   make -C test/host rec-check      MidiRecorder and SysExRecorder on an in-memory card (full card, replace)
+#   make -C test/host rec-check      MidiRecorder, SysExRecorder and SysExPlayer on an in-memory card
 ROOT   := $(abspath ../..)
 OUT    := $(ROOT)/build/host
 CXX    ?= g++
@@ -62,9 +62,9 @@ $(OUT)/render_wav: $(WAV_SRC) $(wildcard $(CURDIR)/stub/*.h) $(ROOT)/include/wav
 	$(CXX) $(CXXFLAGS) -o $@ $(WAV_SRC)
 
 # Recorder check: the real recorders over stub-rec/'s in-memory card.
-REC_SRC := $(ROOT)/src/midi_recorder.cpp $(ROOT)/src/sysex_recorder.cpp $(CURDIR)/rec_check.cpp
+REC_SRC := $(ROOT)/src/midi_recorder.cpp $(ROOT)/src/sysex_recorder.cpp $(ROOT)/src/sysex_player.cpp $(CURDIR)/rec_check.cpp
 
-$(OUT)/rec_check: $(REC_SRC) $(wildcard $(CURDIR)/stub-rec/*.h $(CURDIR)/stub-rec/hardware/*.h) $(ROOT)/include/midi_recorder.h $(ROOT)/include/sysex_recorder.h $(ROOT)/include/smf.h
+$(OUT)/rec_check: $(REC_SRC) $(wildcard $(CURDIR)/stub-rec/*.h $(CURDIR)/stub-rec/hardware/*.h) $(ROOT)/include/midi_recorder.h $(ROOT)/include/sysex_recorder.h $(ROOT)/include/smf.h $(ROOT)/include/sysex_player.h $(ROOT)/include/sysex_stream.h $(ROOT)/include/midi_output.h $(ROOT)/include/thru_hold.h
 	@mkdir -p $(OUT)
 	$(CXX) -std=gnu++17 -O1 -g -Wall -Wextra -Wno-unused-parameter -I$(CURDIR)/stub-rec -I$(ROOT)/include -o $@ $(REC_SRC)
 

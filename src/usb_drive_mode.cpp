@@ -197,6 +197,7 @@ void clearMidiHandlers() {
     // No handler at all means nothing from MIDI input can reach the card.
     MidiOutput::setInputHandler(nullptr);
     MidiOutput::setSysExHandler(nullptr);
+    MidiOutput::setSysExStreamHandler(nullptr);
     MidiOutput::setRealtimeHandler(nullptr);
 }
 

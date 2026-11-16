@@ -1,15 +1,17 @@
 #include "sysex_recorder.h"
 #include "sd_card.h"
-#include "config.h"
 #include <string.h>
 
 namespace {
 // Same sync timing as MidiRecorder: every SYNC_INTERVAL_MS, held back
 // until input has been quiet for SYNC_QUIET_MS so a bulk dump isn't
-// interrupted, but never longer than SYNC_MAX_MS.
+// interrupted, or SYNC_MAX_MS has passed. Only between messages, so a
+// power cut never leaves part of one in the file.
 const uint32_t SYNC_INTERVAL_MS = 5000;
 const uint32_t SYNC_QUIET_MS = 200;
 const uint32_t SYNC_MAX_MS = 15000;
+// A message with no bytes for this long is dropped (cable pulled).
+const uint32_t OPEN_MESSAGE_TIMEOUT_MS = 1000;
 
 const char* const MSG_FAILED_LOST = "Write failed (card full?), not saved";
 
@@ -29,6 +31,8 @@ bool SysExRecorder::arm(const char* path, bool replace) {
     stop(); // finalize any previous session first
     _error[0] = '\0';
     _messageCount = 0;
+    _droppedCount = 0;
+    _msgSource = NO_SOURCE;
     _lastMessageMs = 0;
     _writeOk = true;
     _goodPos = 0;
@@ -58,9 +62,7 @@ bool SysExRecorder::arm(const char* path, bool replace) {
     return true;
 }
 
-void SysExRecorder::feed(const uint8_t* data, size_t len) {
-    if (len < 2 || len > MIDI_SYSEX_MAX_LEN) return; // malformed, or bigger than this firmware buffers anywhere -- see config.h
-
+void SysExRecorder::beginMessage(uint8_t source) {
     if (_state == STATE_ARMED) {
         char tmp[RECORDER_PATH_MAX + 8];
         if (!sdOpenPath(_file, writePath(tmp, sizeof(tmp)), O_RDWR | O_CREAT | O_TRUNC)) {
@@ -73,23 +75,58 @@ void SysExRecorder::feed(const uint8_t* data, size_t len) {
         _state = STATE_RECORDING;
     }
     if (_state != STATE_RECORDING || !_writeOk) return;
+    if (_msgSource != NO_SOURCE) {
+        if (source != _msgSource) { // the other source is mid-message
+            _droppedCount++;
+            return;
+        }
+        abortMessage(source);
+    }
+    _msgSource = source;
+    _lastMessageMs = millis();
+}
 
-    // Raw, boundary-inclusive: messages are self-delimiting via their own
-    // F0/F7, no framing needed. Written to SdFat's sector cache; syncing
-    // is left to service().
+// Raw, boundary-inclusive: messages are self-delimiting via their own
+// F0/F7, no framing needed. Written to SdFat's sector cache; syncing is
+// left to service().
+void SysExRecorder::writeMessage(uint8_t source, const uint8_t* data, size_t len) {
+    if (_state != STATE_RECORDING || !_writeOk || source != _msgSource) return;
     if (_file.write(data, len) != len) {
         _writeOk = false;
         return;
     }
+    _lastMessageMs = millis();
+}
+
+bool SysExRecorder::endMessage(uint8_t source) {
+    if (_state != STATE_RECORDING || !_writeOk || source != _msgSource) return false;
+    _msgSource = NO_SOURCE;
     _goodPos = (uint32_t)_file.curPosition();
     _messageCount++;
     _lastMessageMs = millis();
+    return true;
+}
+
+// Cuts the file back to the end of the last whole message.
+void SysExRecorder::abortMessage(uint8_t source) {
+    if (_state != STATE_RECORDING || source != _msgSource) return;
+    _msgSource = NO_SOURCE;
+    _droppedCount++;
+    if (_writeOk && !_file.truncate(_goodPos)) _writeOk = false;
+}
+
+void SysExRecorder::feed(const uint8_t* data, size_t len) {
+    if (len < 2 || data[0] != 0xF0 || data[len - 1] != 0xF7) return;
+    beginMessage(0);
+    writeMessage(0, data, len);
+    endMessage(0);
 }
 
 void SysExRecorder::service() {
     if (_state != STATE_RECORDING) return;
     uint32_t now = millis();
-    if (_writeOk && now - _lastSyncMs >= SYNC_INTERVAL_MS &&
+    if (_msgSource != NO_SOURCE && now - _lastMessageMs >= OPEN_MESSAGE_TIMEOUT_MS) abortMessage(_msgSource);
+    if (_writeOk && _msgSource == NO_SOURCE && now - _lastSyncMs >= SYNC_INTERVAL_MS &&
         (now - _lastMessageMs >= SYNC_QUIET_MS || now - _lastSyncMs >= SYNC_MAX_MS)) {
         if (!_file.sync()) _writeOk = false;
         _lastSyncMs = now;
@@ -104,11 +141,14 @@ void SysExRecorder::service() {
 // Removes it only if no whole message made it. False with _error set on
 // any problem.
 bool SysExRecorder::finish() {
-    bool failed = !_writeOk;
-    if (failed) {
-        _file.clearWriteError();
-        _file.truncate(_goodPos); // if this fails the tail is a part message, still kept
+    if (_msgSource != NO_SOURCE) { // stopped mid-message
+        _msgSource = NO_SOURCE;
+        _droppedCount++;
     }
+    bool failed = !_writeOk;
+    if (failed) _file.clearWriteError();
+    if (failed || _file.fileSize() > _goodPos)
+        _file.truncate(_goodPos); // if this fails the tail is a part message, still kept
     bool synced = _file.sync();
     _file.close();
     _writeOk = true;
@@ -117,7 +157,7 @@ bool SysExRecorder::finish() {
     const char* written = writePath(tmp, sizeof(tmp));
     if (_messageCount == 0) {
         sdRemove(written);
-        setError(_error, sizeof(_error), MSG_FAILED_LOST);
+        setError(_error, sizeof(_error), failed ? MSG_FAILED_LOST : "No whole message came in, not saved");
         return false;
     }
     return recorderSettleTake(written, _path, _replace, failed, synced, "dump", _error, sizeof(_error));
@@ -133,6 +173,7 @@ bool SysExRecorder::stop() {
 }
 
 void SysExRecorder::cancel() {
+    _msgSource = NO_SOURCE;
     if (_state == STATE_RECORDING) {
         _file.close();
         char tmp[RECORDER_PATH_MAX + 8];

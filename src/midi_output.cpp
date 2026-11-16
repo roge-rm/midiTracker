@@ -3,6 +3,8 @@
 #include "config.h"
 #include "synth.h"
 #include "ui_tap.h"
+#include "sysex_stream.h"
+#include "thru_hold.h"
 
 #include <Adafruit_TinyUSB.h>
 #include <MIDI.h>
@@ -18,17 +20,34 @@ struct MidiInSettings : public midi::DefaultSettings {
     static const unsigned SysExMaxSize = MIDI_SYSEX_MAX_LEN;
 };
 
-midi::SerialMIDI<HardwareSerial> serialMIDIHW(Serial1);
-midi::MidiInterface<midi::SerialMIDI<HardwareSerial>, MidiInSettings> MIDIHW(serialMIDIHW);
-midi::SerialMIDI<Adafruit_USBD_MIDI> serialMIDIUSB(usb_midi_transport);
-midi::MidiInterface<midi::SerialMIDI<Adafruit_USBD_MIDI>, MidiInSettings> MIDIUSB(serialMIDIUSB);
+// The library's serial transport, keeping the last byte the library read
+// so pumpOne() can pass it to the SysEx stream parser too.
+template <class Port>
+class TapSerialMIDI : public midi::SerialMIDI<Port> {
+public:
+    explicit TapSerialMIDI(Port& port) : midi::SerialMIDI<Port>(port) {}
+    byte read() {
+        byte b = midi::SerialMIDI<Port>::read();
+        tapped = b;
+        return b;
+    }
+    int tapped = -1; // -1 = nothing read
+};
+
+TapSerialMIDI<HardwareSerial> serialMIDIHW(Serial1);
+midi::MidiInterface<TapSerialMIDI<HardwareSerial>, MidiInSettings> MIDIHW(serialMIDIHW);
+TapSerialMIDI<Adafruit_USBD_MIDI> serialMIDIUSB(usb_midi_transport);
+midi::MidiInterface<TapSerialMIDI<Adafruit_USBD_MIDI>, MidiInSettings> MIDIUSB(serialMIDIUSB);
+
+// SysEx of any length from each transport, see setSysExStreamHandler().
+SysExInParser g_sysExInHw(0);
+SysExInParser g_sysExInUsb(1);
 
 // Most bytes pumpIncoming() parses per transport per update(). The
 // library parses one byte per read() call.
 const int MAX_BYTES_PER_UPDATE = 64;
 
-// Shared by the SysEx senders (SMF player, .syx player). Each fills and
-// sends it within one call on core 0, so they never overlap.
+// For the SMF player's SysEx, filled and sent within one call on core 0.
 uint8_t g_sysExScratch[MIDI_SYSEX_MAX_LEN + 1];
 
 namespace {
@@ -39,19 +58,66 @@ MidiThruMode g_thruMode = MIDI_THRU_OFF;
 inline bool hwEnabled()  { return g_target & MIDI_OUT_HARDWARE; }
 inline bool usbEnabled() { return g_target & MIDI_OUT_USB; }
 
+// Streamed SysEx out, see sysExOutBegin(). While `busy`, nothing but
+// realtime bytes goes to the outputs it uses. Core 0 only.
+struct SysExOut {
+    bool busy = false;
+    bool hw = false;
+    bool usb = false;
+    bool ended = false;       // last byte taken was F7
+    uint8_t usbPend[2];       // bytes waiting for a full USB packet
+    uint8_t usbPendN = 0;
+    uint32_t usbStallMs = 0;  // when USB stopped taking packets, 0 = it isn't stalled
+    bool usbSkip = false;     // USB stalled once this playback, see sysExOutNewPlayback()
+};
+SysExOut g_sxOut;
+
+// Thru channel messages waiting for a streamed SysEx to finish, per output.
+ThruHold g_holdHw, g_holdUsb;
+
+// DIN pacing: the UART's TX FIFO holds 32 bytes and drains one byte per
+// 320 us at 31250 baud. g_dinCredit is how many bytes it can take without
+// write() blocking, worked out from the time since the last write.
+const int DIN_FIFO_BYTES = 32;
+const uint32_t DIN_BYTE_US = 320;
+// With USB as the only output, it gives up after this long without taking
+// a packet (no host reading).
+const uint32_t USB_STALL_MS = 100;
+int g_dinCredit = DIN_FIFO_BYTES;
+uint32_t g_dinStampUs = 0;
+
+void updateDinCredit() {
+    uint32_t now = micros();
+    uint32_t add = (now - g_dinStampUs) / DIN_BYTE_US;
+    if (g_dinCredit + (int64_t)add >= DIN_FIFO_BYTES) {
+        g_dinCredit = DIN_FIFO_BYTES;
+        g_dinStampUs = now;
+    } else if (add) {
+        g_dinCredit += (int)add;
+        g_dinStampUs += add * DIN_BYTE_US;
+    }
+}
+
+inline bool hwFree()  { return !(g_sxOut.busy && g_sxOut.hw); }
+inline bool usbFree() { return !(g_sxOut.busy && g_sxOut.usb); }
+
 // Messages in and out on DIN or USB, for the status strip LEDs. Core 0 only.
 uint32_t g_inActivity = 0;
 uint32_t g_outActivity = 0;
 
 // hwEnabled() and usbEnabled() for a send, counting it for the LED.
-inline bool hwOut()  { bool on = hwEnabled(); g_outActivity += on; return on; }
-inline bool usbOut() { bool on = usbEnabled(); g_outActivity += on; return on; }
+// Off on an output a streamed SysEx is using, so nothing splits it.
+inline bool hwOut()  { bool on = hwEnabled() && hwFree(); g_outActivity += on; return on; }
+inline bool usbOut() { bool on = usbEnabled() && usbFree(); g_outActivity += on; return on; }
 inline bool audioOutEnabled() { return g_audioOutput; }
 
 // Which outgoing transport(s) a message arriving on `fromHw` should be
 // echoed to under the current thru mode -- see MidiThruMode's doc comment
 // in midi_output.h for what each mode means.
-inline void thruDestinations(bool fromHw, bool& toHw, bool& toUsb) {
+// `realtime` messages may go out in the middle of a streamed SysEx,
+// anything else is dropped on the outputs it's using (channel thru
+// passes true and holds them instead).
+inline void thruDestinations(bool fromHw, bool& toHw, bool& toUsb, bool realtime = false) {
     switch (g_thruMode) {
         case MIDI_THRU_OFF:     toHw = false;    toUsb = false;   break;
         case MIDI_THRU_ON:      toHw = true;     toUsb = true;    break;
@@ -59,6 +125,10 @@ inline void thruDestinations(bool fromHw, bool& toHw, bool& toUsb) {
         case MIDI_THRU_USB2TRS: toHw = !fromHw;  toUsb = false;   break;
         case MIDI_THRU_TRS2TRS: toHw = fromHw;   toUsb = false;   break;
         case MIDI_THRU_USB2USB: toHw = false;    toUsb = !fromHw; break;
+    }
+    if (!realtime) {
+        toHw = toHw && hwFree();
+        toUsb = toUsb && usbFree();
     }
 }
 
@@ -86,19 +156,65 @@ void sendChannelVoiceTo(Interface& iface, uint8_t status, uint8_t data1, uint8_t
     }
 }
 
+// Held while a streamed SysEx uses the output, and after it until the
+// held ones have gone, so the order stays the same. See flushHeld().
 void routeThruChannelVoice(bool fromHw, uint8_t status, uint8_t data1, uint8_t data2) {
     bool toHw, toUsb;
-    thruDestinations(fromHw, toHw, toUsb);
+    thruDestinations(fromHw, toHw, toUsb, true);
     g_outActivity += toHw || toUsb;
-    if (toHw)  sendChannelVoiceTo(MIDIHW, status, data1, data2);
-    if (toUsb) sendChannelVoiceTo(MIDIUSB, status, data1, data2);
+    if (toHw) {
+        if (!hwFree() || !g_holdHw.empty()) g_holdHw.push(status, data1, data2);
+        else sendChannelVoiceTo(MIDIHW, status, data1, data2);
+    }
+    if (toUsb) {
+        if (!usbFree() || !g_holdUsb.empty()) g_holdUsb.push(status, data1, data2);
+        else sendChannelVoiceTo(MIDIUSB, status, data1, data2);
+    }
+}
+
+// Sends held thru messages once their output is free, DIN paced like the
+// SysEx so this never blocks, then the panic for any channel that overflowed.
+void flushHeld() {
+    if (hwFree()) {
+        while (!g_holdHw.empty()) {
+            updateDinCredit();
+            if (g_dinCredit < 6) break;
+            if (g_holdHw.count()) {
+                const ThruHold::Msg& m = g_holdHw.front();
+                sendChannelVoiceTo(MIDIHW, m.status, m.data1, m.data2);
+                g_holdHw.pop();
+                g_dinCredit -= 3;
+            } else {
+                uint8_t ch = (uint8_t)g_holdHw.takePanicChannel();
+                sendChannelVoiceTo(MIDIHW, 0xB0 | ch, 123, 0); // All Notes Off
+                sendChannelVoiceTo(MIDIHW, 0xB0 | ch, 64, 0);  // sustain off
+                g_dinCredit -= 6;
+            }
+        }
+    }
+    if (usbFree()) {
+        while (!g_holdUsb.empty()) {
+            if (g_holdUsb.count()) {
+                const ThruHold::Msg& m = g_holdUsb.front();
+                sendChannelVoiceTo(MIDIUSB, m.status, m.data1, m.data2);
+                g_holdUsb.pop();
+            } else {
+                uint8_t ch = (uint8_t)g_holdUsb.takePanicChannel();
+                sendChannelVoiceTo(MIDIUSB, 0xB0 | ch, 123, 0);
+                sendChannelVoiceTo(MIDIUSB, 0xB0 | ch, 64, 0);
+            }
+        }
+    }
 }
 
 void routeThruSysEx(bool fromHw, const uint8_t* data, size_t len) {
     if (len == 1) {
         // A one-byte F7 escape can carry a real-time byte (e.g. F8).
         if (data[0] >= 0xF8) {
-            if (hwEnabled())  MIDIHW.sendRealTime((midi::MidiType)data[0]);
+            if (hwEnabled()) {
+                MIDIHW.sendRealTime((midi::MidiType)data[0]);
+                g_dinCredit--; // a FIFO byte the SysEx pacing doesn't know about
+            }
             if (usbEnabled()) MIDIUSB.sendRealTime((midi::MidiType)data[0]);
         }
         return;
@@ -111,10 +227,16 @@ void routeThruSysEx(bool fromHw, const uint8_t* data, size_t len) {
     if (toUsb) MIDIUSB.sendSysEx((unsigned)len, data, true);
 }
 
+// Realtime bytes may sit inside a SysEx on DIN. On USB they're packets of
+// their own, which TinyUSB's stream writer sends apart from the SysEx
+// packets sysExOutWrite() makes.
 void routeThruRealtime(bool fromHw, midi::MidiType type) {
     bool toHw, toUsb;
-    thruDestinations(fromHw, toHw, toUsb);
-    if (toHw)  MIDIHW.sendRealTime(type);
+    thruDestinations(fromHw, toHw, toUsb, true);
+    if (toHw) {
+        MIDIHW.sendRealTime(type);
+        g_dinCredit--;
+    }
     if (toUsb) MIDIUSB.sendRealTime(type);
 }
 
@@ -128,6 +250,7 @@ uint8_t  g_noteVelocity[128] = {0};
 MidiOutput::InputHandler g_inputHandler = nullptr;
 MidiOutput::SysExHandler g_sysExHandler = nullptr;
 MidiOutput::RealtimeHandler g_realtimeHandler = nullptr;
+SysExStreamHandler g_sysExStreamHandler = nullptr;
 
 // Reads one message off `iface` if available, thru-routes it (see
 // routeThruChannelVoice()/routeThruSysEx()/routeThruRealtime()) and
@@ -139,9 +262,12 @@ MidiOutput::RealtimeHandler g_realtimeHandler = nullptr;
 // depends on source as well as destination. Templated since MIDIHW and
 // MIDIUSB are distinct MidiInterface<Transport> instantiations with the
 // same API.
-template <typename Interface>
-void pumpOne(Interface& iface, bool fromHw) {
-    if (!iface.read()) return;
+template <typename Interface, typename Tap>
+void pumpOne(Interface& iface, Tap& tap, SysExInParser& sysExIn, bool fromHw) {
+    tap.tapped = -1;
+    bool got = iface.read();
+    if (tap.tapped >= 0) sysExIn.byte((uint8_t)tap.tapped, g_sysExStreamHandler);
+    if (!got) return;
     midi::MidiType t = iface.getType();
     if (t != midi::Clock && t != midi::ActiveSensing) g_inActivity++;
     bool thruActive = g_thruMode != MIDI_THRU_OFF;
@@ -191,9 +317,11 @@ void pumpOne(Interface& iface, bool fromHw) {
 }
 
 // Parses whatever `port` has waiting, up to MAX_BYTES_PER_UPDATE bytes.
-template <typename Interface, typename Port>
-void pumpIncoming(Interface& iface, Port& port, bool fromHw) {
-    for (int n = 0; n < MAX_BYTES_PER_UPDATE && port.available() > 0; n++) pumpOne(iface, fromHw);
+// The library reads one byte per read() (Use1ByteParsing).
+template <typename Interface, typename Port, typename Tap>
+void pumpIncoming(Interface& iface, Port& port, Tap& tap, SysExInParser& sysExIn, bool fromHw) {
+    for (int n = 0; n < MAX_BYTES_PER_UPDATE && port.available() > 0; n++) pumpOne(iface, tap, sysExIn, fromHw);
+    sysExIn.flush(g_sysExStreamHandler);
 }
 } // namespace
 
@@ -219,8 +347,9 @@ void begin() {
 void update() {
     // Always pumps both transports so the TinyUSB stack + libmidi
     // internal buffers don't stall, even with no input handler registered.
-    pumpIncoming(MIDIHW, Serial1, true);
-    pumpIncoming(MIDIUSB, usb_midi_transport, false);
+    pumpIncoming(MIDIHW, Serial1, serialMIDIHW, g_sysExInHw, true);
+    pumpIncoming(MIDIUSB, usb_midi_transport, serialMIDIUSB, g_sysExInUsb, false);
+    flushHeld();
 }
 
 void setTarget(MidiOutTarget target) { g_target = target; }
@@ -328,6 +457,104 @@ void sendSysExRaw(const uint8_t* data, size_t len) {
 
 uint8_t* sysExScratch() { return g_sysExScratch; }
 
+void sysExOutBegin() {
+    SysExOut& o = g_sxOut;
+    o.busy = true;
+    o.hw = hwEnabled();
+    o.usb = usbEnabled() && TinyUSBDevice.mounted() && !o.usbSkip;
+    o.ended = false;
+    o.usbPendN = 0;
+    o.usbStallMs = 0;
+    g_outActivity += o.hw + o.usb;
+}
+
+// USB-MIDI SysEx packets: CIN 4 for three bytes that don't end the
+// message, CIN 5/6/7 for one/two/three bytes ending with F7.
+static bool usbSysExPacket(const uint8_t* bytes, uint8_t n, bool last) {
+    uint8_t p[4] = {(uint8_t)(last ? 0x04 + n : 0x04), 0, 0, 0};
+    for (uint8_t i = 0; i < n; i++) p[1 + i] = bytes[i];
+    return usb_midi_transport.writePacket(p);
+}
+
+size_t sysExOutWrite(const uint8_t* data, size_t len) {
+    SysExOut& o = g_sxOut;
+    if (!o.busy) return 0;
+    size_t n = len;
+    if (o.hw) {
+        updateDinCredit();
+        n = g_dinCredit > 0 ? ((size_t)g_dinCredit < n ? (size_t)g_dinCredit : n) : 0;
+    }
+    if (o.usb) {
+        size_t i = 0;
+        for (; i < n; i++) {
+            uint8_t b = data[i];
+            bool last = b == 0xF7;
+            if (o.usbPendN < 2 && !last) {
+                o.usbPend[o.usbPendN++] = b;
+                continue;
+            }
+            uint8_t pkt[3] = {o.usbPend[0], o.usbPend[1], 0};
+            pkt[o.usbPendN] = b;
+            if (!usbSysExPacket(pkt, o.usbPendN + 1, last)) break;
+            o.usbPendN = 0;
+        }
+        if (i < n && o.hw) {
+            // USB full while DIN is the slow one means no host is reading.
+            // DIN never waits for it: USB is left out from here to the end
+            // of this playback.
+            o.usb = false;
+            o.usbSkip = true;
+        } else if (i == 0 && n > 0) {
+            uint32_t now = millis();
+            if (o.usbStallMs == 0) o.usbStallMs = now | 1;
+            else if (now - o.usbStallMs >= USB_STALL_MS) {
+                o.usb = false;
+                o.usbSkip = true;
+            }
+            if (o.usb) return 0;
+            i = n; // nowhere to send these
+        } else {
+            if (i > 0) o.usbStallMs = 0;
+            n = i;
+        }
+    }
+    if (o.hw && n) {
+        Serial1.write(data, n);
+        g_dinCredit -= (int)n;
+    }
+    if (n) o.ended = data[n - 1] == 0xF7;
+    return n;
+}
+
+void sysExOutEnd() {
+    SysExOut& o = g_sxOut;
+    if (!o.busy) return;
+    if (!o.ended) {
+        const uint8_t f7 = 0xF7;
+        if (o.hw) {
+            updateDinCredit();
+            Serial1.write(&f7, 1);
+            g_dinCredit--;
+        }
+        if (o.usb) {
+            uint8_t pkt[3] = {o.usbPend[0], o.usbPend[1], 0};
+            pkt[o.usbPendN] = f7;
+            usbSysExPacket(pkt, o.usbPendN + 1, true); // dropped if USB is full
+        }
+    }
+    o.busy = false;
+}
+
+bool sysExOutDrained() {
+    flushHeld();
+    if (!g_holdHw.empty() || !g_holdUsb.empty()) return false;
+    if (!hwEnabled()) return true;
+    updateDinCredit();
+    return g_dinCredit >= DIN_FIFO_BYTES;
+}
+
+void sysExOutNewPlayback() { g_sxOut.usbSkip = false; }
+
 void allNotesOffAllChannels() {
     for (int note = 0; note < 128; note++) g_noteChannelMask[note] = 0;
     // CC123 below respects the sustain pedal, so the onboard synth gets its
@@ -382,6 +609,7 @@ uint32_t outActivity() { return g_outActivity; }
 
 void setInputHandler(InputHandler handler) { g_inputHandler = handler; }
 void setSysExHandler(SysExHandler handler) { g_sysExHandler = handler; }
+void setSysExStreamHandler(SysExStreamHandler handler) { g_sysExStreamHandler = handler; }
 void setRealtimeHandler(RealtimeHandler handler) { g_realtimeHandler = handler; }
 
 } // namespace MidiOutput

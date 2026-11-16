@@ -16,10 +16,11 @@
 // Longest file/dir name (8.3 + long name) we'll keep in memory per entry.
 #define MAX_FILENAME_LEN 64
 
-// Largest single System Exclusive message (including the leading F0 and
-// trailing F7) this firmware will receive, capture or play back. The MIDI
+// Largest System Exclusive message for MIDI thru, the MIDI recorder and
+// SysEx inside a .mid (including the leading F0 and trailing F7). The MIDI
 // input instances in midi_output.cpp use this as their SysExMaxSize, one
-// buffer of this size each; longer messages are dropped.
+// buffer of this size each; longer messages are dropped there. SysEx
+// capture and .syx sending stream and have no limit.
 #define MIDI_SYSEX_MAX_LEN 1024
 
 // Root directory to browse. Change if your card stores MIDI files elsewhere.

@@ -19,6 +19,7 @@ extern std::map<std::string, std::vector<uint8_t>> g_files;
 extern long g_cardFree;
 extern bool g_syncFails;
 extern std::set<std::string> g_locked; // files that can't be removed
+extern bool g_readFails, g_seekFails;
 
 class FsFile {
 public:
@@ -51,13 +52,14 @@ public:
         return n;
     }
     int read(void* buf, size_t n) {
+        if (g_readFails) return -1;
         std::vector<uint8_t>& d = g_files[_name];
         size_t k = 0;
         for (; k < n && _pos < d.size(); k++) ((uint8_t*)buf)[k] = d[_pos++];
         return (int)k;
     }
     int read() { uint8_t b; return read(&b, 1) == 1 ? b : -1; }
-    bool seekSet(uint64_t p) { if (p > g_files[_name].size()) return false; _pos = p; return true; }
+    bool seekSet(uint64_t p) { if (g_seekFails || p > g_files[_name].size()) return false; _pos = p; return true; }
     uint64_t curPosition() const { return _pos; }
     uint64_t fileSize() const { return g_files[_name].size(); }
     bool sync() { return _open && !g_syncFails; }
