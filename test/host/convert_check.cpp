@@ -19,6 +19,10 @@
 #include "convert.h"
 #include "wav_file.h"
 #include "mp3_file.h"
+#include "midi_file.h"
+#include "it_file.h"
+#include "synth.h"
+#include "midi_output.h"
 #include <cmath>
 #include <vector>
 #include <string>
@@ -31,17 +35,31 @@ static int run(int argc, char** argv) {
     long takeAfter = argc > 6 ? atol(argv[6]) : -1;
     static WavPlayer wav;
     static Mp3Player mp3;
+    static MidiPlayer* midi = nullptr;
     WavConvertSource wavSrc(wav);
     Mp3ConvertSource mp3Src(mp3);
-    size_t len = strlen(src);
-    bool isMp3 = len > 4 && strcasecmp(src + len - 4, ".mp3") == 0;
-    ConvertSource& cs = isMp3 ? (ConvertSource&)mp3Src : (ConvertSource&)wavSrc;
+    MidiConvertSource midiSrc(midi);
+    TrackerConvertSource trackerSrc;
+    const char* dot = strrchr(src, '.');
+    FileKind kind = FILE_WAV;
+    if (dot) {
+        if (!strcasecmp(dot, ".mp3")) kind = FILE_MP3;
+        else if (!strcasecmp(dot, ".mid")) kind = FILE_MID;
+        else if (!strcasecmp(dot, ".mod")) kind = FILE_MOD;
+        else if (!strcasecmp(dot, ".s3m")) kind = FILE_S3M;
+        else if (!strcasecmp(dot, ".xm")) kind = FILE_XM;
+        else if (!strcasecmp(dot, ".it")) kind = FILE_IT;
+    }
+    trackerSrc.setKind(kind);
+    ConvertSource& cs = kind == FILE_MP3 ? (ConvertSource&)mp3Src
+                      : kind == FILE_WAV ? (ConvertSource&)wavSrc
+                      : kind == FILE_MID ? (ConvertSource&)midiSrc : (ConvertSource&)trackerSrc;
 
     // The targets the menu would list.
     ConvertFormat fmt;
-    bool probed = convertProbe(isMp3 ? FILE_MP3 : FILE_WAV, src, wav, fmt);
+    bool probed = convertProbe(kind, src, wav, fmt);
     ConvertTarget ts[4];
-    int nt = convertTargets(isMp3 ? FILE_MP3 : FILE_WAV, probed ? &fmt : nullptr, ts, 4);
+    int nt = convertTargets(kind, probed ? &fmt : nullptr, ts, 4);
     printf("targets:");
     for (int i = 0; i < nt; i++) printf(" %d(%s)", ts[i], convertTargetLabel(ts[i]));
     printf("\n");
@@ -93,7 +111,69 @@ static int run(int argc, char** argv) {
     printf("temp left: %s, output there: %s\n", tmpLeft ? "yes" : "no", outThere ? "yes" : "no");
     bool ok = !tmpLeft && outThere == (c.state() == Converter::STATE_DONE);
     printf("files %s\n", ok ? "ok" : "WRONG");
+    if (kind == FILE_MID) {
+        // After close() nothing sounds and MIDI out is as it was.
+        printf("synth after: %s, MIDI out %s, player %s\n", Synth::offlineVoicesActive() ? "voices left" : "clean",
+               MidiOutput::getTarget() == MIDI_OUT_BOTH && !MidiOutput::audioOutputEnabled() ? "put back" : "WRONG",
+               midi ? "left" : "freed");
+    }
     return ok ? 0 : 3;
+}
+
+static std::vector<int16_t> readAll(const char* path, std::vector<uint8_t>* raw);
+
+// same <ours.wav> <ref.raw|ref.wav> [mono]: compares the audio sample by
+// sample over the length both have. ref is 16-bit stereo; with mono, ours
+// is mono and ref is mixed down as Converter does it. Prints the frames
+// each has, the samples that differ, the largest difference, and the peak
+// of what the reference has past our end.
+static int same(int argc, char** argv) {
+    std::vector<uint8_t> a, b;
+    readAll(argv[2], &a);
+    readAll(argv[3], &b);
+    if (a.size() < 44) return 1;
+    bool mono = argc > 4 && !strcmp(argv[4], "mono");
+    size_t bOff = b.size() >= 44 && !memcmp(b.data(), "RIFF", 4) ? 44 : 0;
+    if (mono) {
+        // (l + r) >> 1 per frame, as Converter::putFrame() makes mono.
+        std::vector<uint8_t> m(bOff);
+        for (size_t i = bOff; i + 4 <= b.size(); i += 4) {
+            int16_t l, r;
+            memcpy(&l, &b[i], 2);
+            memcpy(&r, &b[i + 2], 2);
+            int16_t v = (int16_t)(((int32_t)l + r) >> 1);
+            m.push_back((uint8_t)v);
+            m.push_back((uint8_t)((uint16_t)v >> 8));
+            m.push_back((uint8_t)v); // as a stereo frame of two copies
+            m.push_back((uint8_t)((uint16_t)v >> 8));
+        }
+        b.swap(m);
+        // Ours as stereo too.
+        std::vector<uint8_t> o(a.begin(), a.begin() + 44);
+        for (size_t i = 44; i + 2 <= a.size(); i += 2) {
+            o.push_back(a[i]); o.push_back(a[i + 1]);
+            o.push_back(a[i]); o.push_back(a[i + 1]);
+        }
+        a.swap(o);
+    }
+    const int16_t* x = (const int16_t*)(a.data() + 44);
+    const int16_t* y = (const int16_t*)(b.data() + bOff);
+    size_t na = (a.size() - 44) / 4, nb = (b.size() - bOff) / 4;
+    size_t n = na < nb ? na : nb, diff = 0, first = SIZE_MAX;
+    int maxd = 0;
+    for (size_t i = 0; i < n * 2; i++) {
+        int d = abs((int)x[i] - (int)y[i]);
+        if (d) {
+            diff++;
+            if (first == SIZE_MAX) first = i / 2;
+        }
+        if (d > maxd) maxd = d;
+    }
+    int restPeak = 0;
+    for (size_t i = n * 2; i < nb * 2; i++) restPeak = std::max(restPeak, abs((int)y[i]));
+    printf("same: ours %zu ref %zu frames, %zu samples differ (first at frame %zd), max diff %d, ref peak past our end %d\n",
+           na, nb, diff, first == SIZE_MAX ? (ssize_t)-1 : (ssize_t)first, maxd, restPeak);
+    return 0;
 }
 
 static uint32_t le32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
@@ -194,7 +274,25 @@ static int names(int argc, char** argv) {
     f.rate = 48000; f.channels = 1;
     expect(convertTargets(FILE_MP3, &f, t, 4) == 2, "48k mono mp3: two");
     expect(convertTargets(FILE_MP3, nullptr, t, 4) == 0, "unreadable mp3: none");
-    expect(convertTargets(FILE_MID, nullptr, t, 4) == 0, "mid: none yet");
+    for (FileKind k : {FILE_MID, FILE_MOD, FILE_S3M, FILE_XM, FILE_IT}) {
+        ConvertFormat pf;
+        static WavPlayer none;
+        expect(convertProbe(k, "unused", none, pf) && pf.rate == 44100 && pf.channels == 2 && pf.playedBy, "played kind: probe");
+        expect(convertTargets(k, &pf, t, 4) == 2 && t[0] == CONVERT_WAV_44K_STEREO && t[1] == CONVERT_WAV_44K_MONO, "played kind: stereo and mono");
+    }
+    {
+        ConvertFormat pf;
+        static WavPlayer none;
+        convertProbe(FILE_MID, "unused", none, pf);
+        char tt[24], nn[48];
+        convertTargetText(CONVERT_WAV_44K_MONO, &pf, tt, sizeof(tt), nn, sizeof(nn));
+        printf("row: '%s' '%s'\n", tt, nn);
+        expect(!strcmp(tt, "WAV 44.1k MONO") && !strcmp(nn, "16-bit \x7f played by the synth"), "mid row");
+        convertProbe(FILE_IT, "unused", none, pf);
+        convertTargetText(CONVERT_WAV_44K_STEREO, &pf, tt, sizeof(tt), nn, sizeof(nn));
+        printf("row: '%s' '%s'\n", tt, nn);
+        expect(!strcmp(nn, "16-bit \x7f played by the tracker"), "it row");
+    }
     char title[24], note[48];
     f.rate = 22050; f.channels = 2;
     convertTargetText(CONVERT_WAV, &f, title, sizeof(title), note, sizeof(note));
@@ -227,6 +325,12 @@ static int rms(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    // The synth as the device starts it, and the .it sample cache beside the binary, as render uses.
+    Synth::begin();
+    setup1();
+    static std::string itDir = std::string(argv[0]).substr(0, std::string(argv[0]).find_last_of('/') + 1) + "itcache";
+    ItPlayer::cacheDir = itDir.c_str();
+    if (argc >= 4 && !strcmp(argv[1], "same")) return same(argc, argv);
     if (argc >= 3 && !strcmp(argv[1], "rms")) return rms(argc, argv);
     if (argc >= 4 && !strcmp(argv[1], "run")) return run(argc, argv);
     if (argc >= 6 && !strcmp(argv[1], "cmp")) return cmp(argc, argv);

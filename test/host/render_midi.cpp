@@ -43,6 +43,11 @@ int main(int argc, char** argv) {
     if (getenv("MT_REVERB_TYPE")) Synth::setReverbType((uint8_t)atoi(getenv("MT_REVERB_TYPE")));
     if (getenv("MT_LEVEL")) Synth::setOutputLevel((uint8_t)atoi(getenv("MT_LEVEL")));
     if (getenv("MT_VOLUME")) Synth::setVolume((uint8_t)atoi(getenv("MT_VOLUME")));
+    // Takes the settings in before the song starts (offlineBegin() applies what's
+    // queued, offlineEnd() leaves the synth as setup1() does), so the song's own
+    // messages reach the synth on the same samples as without them.
+    Synth::offlineBegin();
+    Synth::offlineEnd();
     // MT_GOVERNOR=1 runs the render governor on a modelled cycle count.
     g_hostGovernorModel = getenv("MT_GOVERNOR") && atoi(getenv("MT_GOVERNOR"));
     MidiPlayer player;

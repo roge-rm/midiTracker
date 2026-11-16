@@ -1,5 +1,8 @@
 #!/bin/bash
 # convert_check.sh <convert_check> <workdir> [mp3dir]
+# MIDI files (MIDI_SONGS, default the host build's midi/ copies) and one
+# module of each format from trackertunes/ are converted too and compared
+# sample by sample with render_midi and render beside convert_check.
 # Makes test WAVs and MP3s with ffmpeg in workdir (emptied first), converts
 # each to its targets with convert_check, and compares the output with
 # ffmpeg's conversion of the same file: header (ours and ffprobe's view),
@@ -187,5 +190,111 @@ echo "$log" | sed "s|^|  |"
 echo "$log" | grep -q "^targets:$" || bad "junk.wav has targets"
 echo "$log" | grep -q "^begin failed" || bad "junk.wav began"
 ls -a "$DIR" | grep -q '\.cvt$' && bad "junk left a temp"
+
+BINDIR=$(dirname "$BIN")
+ROOT=$(cd "$BINDIR/../.." && pwd)
+MIDI_SONGS=${MIDI_SONGS:-$BINDIR/midi}
+
+# played <src> <ref> <loops>: stereo and mono conversions of a copy of src
+# against ref (16-bit stereo, raw or WAV), which must be the same sample
+# for sample. Unless the song loops, ref must end where ours does (a MIDI
+# ref has a 5 s tail, ours stops when it's silent, so it may be shorter).
+played() {
+    local src=$1 ref=$2 loops=$3 b log out cmpl t
+    b=$(basename "$src")
+    for t in 1 2; do
+        log=$("$BIN" run "$DIR/$b" "$t" 2>&1)
+        echo "$log" | grep -E "^(targets|state|synth)" | sed "s|^|  |"
+        echo "$log" | grep -q "^targets: 1(WAV 16-bit 44.1k stereo) 2(WAV 16-bit 44.1k mono)$" || bad "$b targets"
+        echo "$log" | grep -q "^state DONE" && echo "$log" | grep -q "^files ok" || { bad "$b target $t didn't finish"; continue; }
+        case "$b" in *.mid) echo "$log" | grep -q "^synth after: clean, MIDI out put back, player freed" || bad "$b synth or MIDI out left wrong" ;; esac
+        out="$DIR/$(echo "$log" | sed -n 's/^out \([^,]*\),.*/\1/p')"
+        if [ "$t" = 1 ]; then cmpl=$("$BIN" same "$out" "$ref"); else cmpl=$("$BIN" same "$out" "$ref" mono); fi
+        echo "  $cmpl"
+        echo "$cmpl" | grep -q " 0 samples differ" || bad "$b target $t differs from the host render"
+        local na nb
+        na=$(echo "$cmpl" | sed -n 's/^same: ours \([0-9]*\) ref \([0-9]*\).*/\1/p')
+        nb=$(echo "$cmpl" | sed -n 's/^same: ours \([0-9]*\) ref \([0-9]*\).*/\2/p')
+        case "$b:$loops" in
+            *.mid:*) [ "$na" -le "$nb" ] && [ "$na" -ge $((nb - 5 * 44100)) ] || bad "$b length $na against $nb" ;;
+            *:=*) [ "$na" = "${loops#=}" ] || bad "$b length $na, should be ${loops#=}" ;;
+            *:1) [ "$na" -lt "$nb" ] || bad "$b didn't stop where it loops" ;;
+            *) [ "$na" = "$nb" ] || bad "$b length $na, the render has $nb" ;;
+        esac
+        rm -f "$out"
+    done
+    rm -f "$DIR/$b" "$ref"
+}
+
+echo "== MIDI through the synth, against render_midi (Line, volume 63)"
+n=0
+for f in "$MIDI_SONGS"/*.mid; do
+    [ -e "$f" ] || continue
+    b=$(basename "$f")
+    echo "== $b"
+    cp "$f" "$DIR/$b"
+    MT_LEVEL=2 MT_VOLUME=63 "$BINDIR/render_midi" "$DIR/$b" "$DIR/ref.wav" 3000 5 2>/dev/null
+    played "$f" "$DIR/ref.wav" 0
+    n=$((n + 1))
+done
+[ "$n" -gt 0 ] || bad "no MIDI files in $MIDI_SONGS"
+
+echo "== a MIDI convert cancelled"
+f=$(ls "$MIDI_SONGS"/*.mid | head -1)
+cp "$f" "$DIR/c.mid"
+log=$("$BIN" run "$DIR/c.mid" 1 -1 3)
+echo "$log" | grep -E "^(state|files|synth)" | sed "s|^|  |"
+echo "$log" | grep -q "^state CANCELLED" && echo "$log" | grep -q "^files ok" || bad "MIDI cancel"
+echo "$log" | grep -q "^synth after: clean, MIDI out put back, player freed" || bad "MIDI cancel left the synth or MIDI out"
+rm -f "$DIR/c.mid"
+
+echo "== modules through the trackers, against render"
+TT=$ROOT/trackertunes
+while IFS='|' read -r f loops; do
+    [ -e "$f" ] || { bad "missing $f"; continue; }
+    b=$(basename "$f")
+    echo "== $b"
+    cp "$f" "$DIR/$b"
+    "$BINDIR/render" "$DIR/$b" 1200 "$DIR/ref.raw" 2>&1 | sed "s|^.*: |  render: |"
+    played "$f" "$DIR/ref.raw" "$loops"
+done <<LIST
+$TT/various/Ronny Pries - Ping Pong.mod|0
+$TT/artists/noxw/Noxw & Svl - Anchorage 4.9.mod|1
+$TT/artists/dune/Dune - White Plastic.s3m|0
+$TT/artists/madwreck/Madwreck - Can't Wait.xm|0
+$TT/various/Jco - Hypnos Fury.it|0
+LIST
+
+echo "== a MOD whose last pattern jumps to its own order"
+# Order 0 has a pattern loop (E60 at row 4, E62 at row 8) that has to play
+# out, order 1 jumps back to itself at row 3 (B01). 64 + 10 + 4 rows of
+# 6 ticks of 882 frames, then it ends.
+python3 - "$DIR/selfjump.mod" <<'PY'
+import sys, struct
+cells = [[b'\0' * 16] * 64 for _ in range(2)]
+def cell(note, sample, fx, param):
+    return bytes([(sample & 0xF0) | (note >> 8), note & 0xFF, ((sample & 15) << 4) | fx, param]) + b'\0' * 12
+cells[0][0] = cell(428, 1, 0, 0)
+cells[0][4] = cell(0, 0, 0xE, 0x60)
+cells[0][8] = cell(0, 0, 0xE, 0x62)
+cells[1][0] = cell(320, 1, 0, 0)
+cells[1][3] = cell(0, 0, 0xB, 1)
+data = bytes([100] * 16 + [156] * 16)
+head = b'selfjump'.ljust(20, b'\0')
+head += b'square'.ljust(22, b'\0') + struct.pack('>HBBHH', len(data) // 2, 0, 64, 0, len(data) // 2)
+head += (b'\0' * 22 + struct.pack('>HBBHH', 0, 0, 0, 0, 1)) * 30
+head += bytes([2, 127]) + bytes([0, 1] + [0] * 126) + b'M.K.'
+open(sys.argv[1], 'wb').write(head + b''.join(b''.join(p) for p in cells) + data)
+PY
+"$BINDIR/render" "$DIR/selfjump.mod" 60 "$DIR/ref.raw" 2>&1 | sed "s|^.*: |  render: |"
+played "$DIR/selfjump.mod" "$DIR/ref.raw" "=$((78 * 6 * 882))"
+
+echo "== a module that won't load"
+echo "junk" > "$DIR/junk.xm"
+log=$("$BIN" run "$DIR/junk.xm" 1)
+echo "$log" | grep "^begin" | sed "s|^|  |"
+echo "$log" | grep -q "^begin failed" || bad "junk.xm began"
+ls -a "$DIR" | grep -q '\.cvt$' && bad "junk.xm left a temp"
+rm -f "$DIR/junk.xm"
 
 if [ "$FAILS" = 0 ]; then echo "convert-check: all passed"; else echo "convert-check: $FAILS failed"; exit 1; fi

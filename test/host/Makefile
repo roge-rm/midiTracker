@@ -95,18 +95,20 @@ $(OUT)/tail_check: $(CURDIR)/tail_check.cpp
 mp3-seek-check: $(OUT)/render_mp3 $(OUT)/tail_check
 	$(CURDIR)/mp3_seek_check.sh $(OUT)/render_mp3 $(OUT)/tail_check $(SEEK_DIR)
 
-# Convert check: the real convert.cpp, wav_file.cpp and mp3_file.cpp over host files.
-CONVERT_SRC := $(ROOT)/src/convert.cpp $(ROOT)/src/wav_file.cpp $(ROOT)/src/mp3_file.cpp $(ROOT)/src/shared_ram_arena.cpp \
-               $(CURDIR)/host_stubs.cpp $(CURDIR)/convert_check.cpp
+# Convert check: the real convert.cpp, convert_render.cpp, wav_file.cpp, mp3_file.cpp, the
+# tracker players and the synth with MidiPlayer (built as the MIDI target is) over host files.
+# MIDI and module conversions are checked against render_midi and render.
+CONVERT_SRC := $(ROOT)/src/convert.cpp $(ROOT)/src/convert_render.cpp $(ROOT)/src/wav_file.cpp $(ROOT)/src/mp3_file.cpp \
+               $(ROOT)/src/synth.cpp $(ROOT)/src/midi_file.cpp $(PLAYER_SRC) \
+               $(CURDIR)/midi_stubs.cpp $(CURDIR)/host_stubs.cpp $(CURDIR)/convert_check.cpp
 CONVERT_DIR ?= $(OUT)/convert
 
-$(OUT)/convert_check: $(CONVERT_SRC) $(MP3_C) $(wildcard $(HELIX)/*.h) $(wildcard $(CURDIR)/stub/*.h) $(ROOT)/include/convert.h \
-                      $(ROOT)/include/wav_file.h $(ROOT)/include/mp3_file.h $(ROOT)/include/shared_ram_arena.h
+$(OUT)/convert_check: $(CONVERT_SRC) $(MP3_C) $(wildcard $(HELIX)/*.h) $(wildcard $(CURDIR)/stub*/*.h) $(wildcard $(ROOT)/include/*.h) $(CURDIR)/midi_host.h
 	@mkdir -p $(OUT)/mp3obj-convert
 	cd $(OUT)/mp3obj-convert && gcc -O2 -g -w -DMP3_POLY_SPLIT -c $(MP3_C)
-	$(CXX) $(CXXFLAGS) -I$(HELIX) -o $@ $(CONVERT_SRC) $(OUT)/mp3obj-convert/*.o
+	$(CXX) $(MIDI_FLAGS) -DHOST_REAL_CLOCK -I$(HELIX) -o $@ $(CONVERT_SRC) $(OUT)/mp3obj-convert/*.o
 
-convert-check: $(OUT)/convert_check
+convert-check: $(OUT)/convert_check $(OUT)/render $(OUT)/render_midi $(OUT)/midi/.copied
 	$(CURDIR)/convert_check.sh $(OUT)/convert_check $(CONVERT_DIR) $(MP3_DIR)
 
 # Recorder check: the real recorders over stub-rec/'s in-memory card.

@@ -330,6 +330,8 @@ Converter* converter = nullptr;
 Converter::State lastConvertState = Converter::STATE_IDLE;
 WavConvertSource wavConvertSource(wavPlayer);
 Mp3ConvertSource mp3ConvertSource(mp3Player);
+MidiConvertSource midiConvertSource(player);
+TrackerConvertSource trackerConvertSource;
 
 // -- APP_LOOPER_TRACK_PICK / pending-import handoff state --
 // See beginLoopTrackPick() and hasPendingLooperImport()/consumeLooperImport().
@@ -2001,6 +2003,13 @@ ConvertSource* convertSourceFor(FileKind kind) {
     switch (kind) {
         case FILE_WAV: return &wavConvertSource;
         case FILE_MP3: return &mp3ConvertSource;
+        case FILE_MID: return &midiConvertSource;
+        case FILE_MOD:
+        case FILE_S3M:
+        case FILE_XM:
+        case FILE_IT:
+            trackerConvertSource.setKind(kind);
+            return &trackerConvertSource;
         default:       return nullptr;
     }
 }
@@ -2053,7 +2062,10 @@ void startConvert() {
     if (src->usesArena() && (LooperMode::tracksAllocated() || modPlayer || s3mPlayer || xmPlayer || itPlayer)) {
         converter->refuse(target, "RAM in use, can't convert");
     } else {
+        // The first open of a .it with compressed samples unpacks them to the card.
+        if (convertKind == FILE_IT) ItPlayer::progressCallback = showUnpackProgress;
         converter->begin(*src, path, convertName, target); // a failure shows on the screen
+        ItPlayer::progressCallback = nullptr;
     }
     lastConvertState = converter->state();
     appState = APP_CONVERTING;

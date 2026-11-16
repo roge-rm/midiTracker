@@ -1035,6 +1035,14 @@ void convertScreens() {
         else clearModeRow(i);
     }
     save("convert-targets-wav");
+    // A module, played by the tracker (a MIDI file says synth).
+    clearModeList();
+    const char* notes3[] = {"16-bit \x7f played by the tracker", "16-bit \x7f played by the tracker"};
+    for (int i = 0; i < 4; i++) {
+        if (i < 2) drawIconRow(i, ICON_WAVE, COLOR_WAV, titles2[i], notes3[i], i == 0);
+        else clearModeRow(i);
+    }
+    save("convert-targets-module");
 
     using namespace UiRec;
     ConvInfo c;

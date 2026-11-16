@@ -330,6 +330,25 @@ bool wavStreamTookUnderrun();
 // to see how many samples were actually dropped in a given window.
 uint32_t wavStreamUnderrunSamples();
 
+// -- Offline rendering (Convert, a MIDI file to WAV) -------------------------
+//
+// Core 0 renders the synth itself, as fast as it can. offlineBegin() parks
+// core 1 (it writes silence to I2S and leaves the synth's state and the
+// message ring alone) and waits for it, applies what's queued, then clears
+// the voices, reverb and levelers. noteOn() etc. still queue as before and
+// offlineRender() takes them per frame as core 1 would. The synth plays at
+// OFFLINE_VOLUME on Line Level, the level where its ceiling is full scale;
+// Volume and Output Level keep their settings. Nothing else may play until
+// offlineEnd(), which clears the synth again, resets every channel
+// (programs too) and hands rendering back to core 1. Core 0 only.
+const uint8_t OFFLINE_VOLUME = 63;
+void offlineBegin();
+// frames interleaved stereo frames at 44.1 kHz into out.
+void offlineRender(int16_t* out, size_t frames);
+// Whether any voice is sounding (in release too).
+bool offlineVoicesActive();
+void offlineEnd();
+
 #ifdef TRACKER_PROFILE
 // Core 1 render cost since profileReset(), in CPU cycles.
 struct SynthProfile {

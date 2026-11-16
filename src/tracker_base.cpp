@@ -62,6 +62,7 @@ void TrackerPlayer::resetSequencer(uint8_t speed, uint16_t tempo) {
 }
 
 void TrackerPlayer::close() {
+    _songEnd = nullptr;
     _sampleFiles[0].f = _sampleFiles[1].f = nullptr;
     if (_file) _file.close();
     if (_patternFile) _patternFile.close();
@@ -105,6 +106,9 @@ uint32_t TrackerPlayer::stepForHz(float hz) {
 }
 
 void TrackerPlayer::stepPosition(int rowCount, int maxBreakRow) {
+    _rowStepped = true;
+    _loopJumped = _loopJumpPending;
+    _loopJumpPending = false;
     if (_patternBreakPending || _positionJumpPending) {
         int nextOrderPos = _positionJumpPending ? _positionJumpTarget : (_orderPos + 1);
         int nextRow = _patternBreakPending ? _patternBreakRow : 0;
@@ -135,6 +139,7 @@ void TrackerPlayer::patternLoop(uint8_t& loopRow, uint8_t& loopCount, uint8_t va
         _patternBreakRow = loopRow;
         _positionJumpPending = true;
         _positionJumpTarget = _orderPos;
+        _loopJumpPending = true;
     }
 }
 
@@ -272,6 +277,7 @@ void TrackerPlayer::advanceTick() {
         } else {
             UiTap::rowBegin();
             advanceRow();
+            if (_songEnd && _state == STATE_PLAYING) checkSongEnd();
             // Every row is handed on, except a delay repeat (S3M SEx, XM
             // EEx), which comes back at the same position with no notes.
             // Pattern loops and self-jumps on one row have notes, so they go.
@@ -286,6 +292,63 @@ void TrackerPlayer::advanceTick() {
         processTickEffects();
     }
     tickEnd();
+}
+
+bool TrackerPlayer::beginOffline(TrackerSongEnd* end) {
+    if (_state != STATE_PAUSED || !end) return false;
+    memset(end->seen, 0, sizeof(end->seen));
+    end->order = -1;
+    end->row = -1;
+    end->rows = 0;
+    _loopJumpPending = _rowStepped = _loopJumped = false;
+    _songEnd = end;
+    _state = STATE_PLAYING;
+    return true;
+}
+
+// Ends the song when it gets back to an order already played, or goes back
+// to an earlier row of the same order other than by a pattern loop (a jump
+// to its own order). A repeated row (pattern delay) doesn't step.
+void TrackerPlayer::checkSongEnd() {
+    if (!_rowStepped) return;
+    _rowStepped = false;
+    bool loop = _loopJumped;
+    TrackerSongEnd& e = *_songEnd;
+    if (_orderPos != e.order) {
+        uint32_t& w = e.seen[(_orderPos >> 5) & 7];
+        uint32_t bit = 1u << (_orderPos & 31);
+        if (w & bit) {
+            _state = STATE_DONE;
+            return;
+        }
+        w |= bit;
+        e.order = _orderPos;
+        e.rows = 0;
+    } else if ((_row <= e.row && !loop) || ++e.rows >= TrackerSongEnd::MAX_ROWS) {
+        _state = STATE_DONE;
+        return;
+    }
+    e.row = _row;
+}
+
+// The same steps as one pass of update()'s loop.
+const int16_t* TrackerPlayer::mixOffline(uint32_t max, uint32_t& n) {
+    n = 0;
+    if (_state != STATE_PLAYING || !_songEnd || max == 0) return nullptr;
+    if (_samplesUntilNextTick == 0) {
+        _tailCount = 0;
+        _tailPoolUsed = 0;
+        advanceTick();
+        if (_state != STATE_PLAYING) return nullptr;
+        if (!_formatGains) applyGains();
+        _samplesUntilNextTick = tickLength();
+    }
+    n = max;
+    if (n > _samplesUntilNextTick) n = _samplesUntilNextTick;
+    if (n > BLOCK_FRAMES) n = BLOCK_FRAMES;
+    const int16_t* frames = mixBlock(n);
+    _samplesUntilNextTick -= n;
+    return frames;
 }
 
 void TrackerPlayer::attachTails(TrackerTail* tails, int count, int16_t* pool, uint32_t poolFrames) {

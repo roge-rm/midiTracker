@@ -80,6 +80,19 @@ struct TrackerTail {
     uint16_t len, left;
 };
 
+// Song end for offline rendering, see TrackerPlayer::beginOffline(): the
+// orders played so far, the one playing, the last row and the rows played
+// in it.
+struct TrackerSongEnd {
+    uint32_t seen[8];
+    int order;
+    int row;
+    uint32_t rows;
+    // Rows in one order before it counts as stuck, a backstop for pattern
+    // loops that never finish. 16 passes of a 256-row pattern.
+    static const uint32_t MAX_ROWS = 4096;
+};
+
 class TrackerPlayer {
 public:
     enum State { STATE_IDLE, STATE_PLAYING, STATE_PAUSED, STATE_DONE, STATE_ERROR };
@@ -104,6 +117,21 @@ public:
     State state() const { return _state; }
     const char* errorMessage() const { return _error; }
     uint32_t elapsedMs() const; // wall clock while playing
+
+    // Offline rendering (Convert), on core 0 like update(), without the
+    // ring. Call beginOffline() after load() instead of play(); the song
+    // then ends (STATE_DONE) at the end of the order list as usual, and
+    // also where it would loop: going back to an order already played (a
+    // MOD's restart, a jump back), going back to an earlier row of the same
+    // order other than by a pattern loop, or staying in one order for
+    // TrackerSongEnd::MAX_ROWS rows. end is the caller's, until close().
+    bool beginOffline(TrackerSongEnd* end);
+    // The next block, n frames (at most max, BLOCK_FRAMES and what's left
+    // of the tick) of interleaved stereo, valid until the next call. n is
+    // 0 at the end. Called with what's left of MAX_FRAMES_PER_UPDATE, the
+    // blocks come out as update() makes them.
+    const int16_t* mixOffline(uint32_t max, uint32_t& n);
+    static const size_t MAX_FRAMES_PER_UPDATE = 128;
 
     // Position for the UI. A tracker has no fixed length (it can loop), so
     // the screen shows the order position and row instead of a time bar.
@@ -137,7 +165,6 @@ public:
 #endif
 
 protected:
-    static const size_t MAX_FRAMES_PER_UPDATE = 128;
     static const int RAW_SCRATCH_BYTES = 1024;
 
     // Points every voice at its slice of chunkStore (chunkFrames each).
@@ -300,6 +327,11 @@ protected:
     int _patternBreakRow = 0;
     bool _positionJumpPending = false;
     int _positionJumpTarget = 0;
+    // For the offline song end: a pattern loop set the pending jump, then
+    // stepPosition() ran and whether that step was the loop going back.
+    bool _loopJumpPending = false;
+    bool _rowStepped = false;
+    bool _loopJumped = false;
 
     // Raw file bytes for one read, decoded into a voice's chunkBuf. A
     // sector over RAW_SCRATCH_BYTES, so a raw read that starts partway
@@ -332,4 +364,6 @@ private:
 
     uint32_t _elapsedMsFrozen = 0;
     uint32_t _lastResumeMicros = 0;
+    TrackerSongEnd* _songEnd = nullptr; // set while rendering offline
+    void checkSongEnd();
 };

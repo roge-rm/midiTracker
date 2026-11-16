@@ -116,6 +116,14 @@ const char* convertTargetLabel(ConvertTarget t) {
 
 bool convertProbe(FileKind kind, const char* path, WavPlayer& wav, ConvertFormat& fmt) {
     fmt = ConvertFormat();
+    if (kind == FILE_MID || kind == FILE_MOD || kind == FILE_S3M || kind == FILE_XM || kind == FILE_IT) {
+        // Played at the synth's and trackers' own rate; a broken file shows when it opens.
+        fmt.rate = OUT_RATE_44K;
+        fmt.channels = 2;
+        fmt.pcm16 = true;
+        fmt.playedBy = kind == FILE_MID ? "synth" : "tracker";
+        return true;
+    }
     if (kind == FILE_MP3) {
         bool ok = Mp3Player::probe(path, fmt.rate, fmt.channels);
         fmt.pcm16 = true; // what it decodes to
@@ -151,6 +159,15 @@ int convertTargets(FileKind kind, const ConvertFormat* fmt, ConvertTarget* out, 
             if (!(same44 && fmt->channels == 1)) add(CONVERT_WAV_44K_MONO);
             break;
         }
+        case FILE_MID:
+        case FILE_MOD:
+        case FILE_S3M:
+        case FILE_XM:
+        case FILE_IT:
+            // The synth and trackers play 44.1k stereo.
+            add(CONVERT_WAV_44K_STEREO);
+            add(CONVERT_WAV_44K_MONO);
+            break;
         default:
             break;
     }
@@ -172,7 +189,9 @@ void convertTargetText(ConvertTarget t, const ConvertFormat* fmt, char* title, s
         case CONVERT_WAV_44K_STEREO: snprintf(title, titleSize, "WAV 44.1k STEREO"); break;
         case CONVERT_WAV_44K_MONO:   snprintf(title, titleSize, "WAV 44.1k MONO"); break;
     }
-    if (known) {
+    if (known && fmt->playedBy) {
+        snprintf(note, noteSize, "16-bit \x7f played by the %s", fmt->playedBy);
+    } else if (known) {
         snprintf(note, noteSize, "16-bit \x7f file is %s %s", rate, fmt->channels == 1 ? "mono" : "stereo");
     } else {
         snprintf(note, noteSize, "16-bit");

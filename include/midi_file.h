@@ -80,6 +80,18 @@ public:
     // rewound, then the landing state. No-op if nothing is pending.
     void finishSeek();
 
+    // Offline rendering (Convert): with the clock on, time is what
+    // setOfflineMicros() last set instead of micros(), so update() fires
+    // what's due by then however fast it's called. Set it before load().
+    void setOfflineClock(bool on) { _offlineClock = on; _offlineUs = 0; }
+    void setOfflineMicros(uint32_t us) { _offlineUs = us; }
+    // The tick of the last event, read ahead on every track and put back.
+    // Call right after load().
+    uint32_t lengthTicks();
+    uint32_t currentTick() const { return _globalTick; }
+    // A track hit a read or parse error since load().
+    bool trackFailed() const { return _trackFailed; }
+
 private:
     // Read-ahead bytes per track: as much as fits in BUF_POOL_MAX across
     // all tracks, between BUF_MIN and BUF_MAX. SdFat has one sector cache
@@ -184,6 +196,10 @@ private:
     bool _seekPending = false;
     bool _seekNeedsReset = false; // a deferred step rewound
     bool _deferSeek = false;      // set during a deferred seekTo()
+
+    bool _offlineClock = false;
+    uint32_t _offlineUs = 0;
+    uint32_t nowUs() const { return _offlineClock ? _offlineUs : micros(); }
 
     State _state = STATE_IDLE;
     char _error[64] = {0};

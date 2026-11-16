@@ -3,19 +3,22 @@
 #include <stddef.h>
 #include <SdFat.h>
 #include "sd_browser.h" // FileKind
+#include "tracker_base.h" // TrackerSongEnd
 
 class WavPlayer;
 class Mp3Player;
+class MidiPlayer;
 
 // File conversion from the browser: a file goes through a ConvertSource,
 // which gives 16-bit stereo frames at its own rate, and Converter writes
 // them out as a 16-bit WAV next to the file. Core 0 only. Converter works
 // in bounded steps (step()), so the UI keeps running between them.
 //
-// Adding a kind (MIDI or a module to WAV): a ConvertSource that renders
-// it a block per read(), its targets in convertTargets(), and a case in
-// the file player's convertSourceFor(). A source with usesArena() goes
-// through the looper's free-tracks gate first.
+// Adding a kind: a ConvertSource that gives it a block per read(), its
+// targets in convertTargets(), and a case in the file player's
+// convertSourceFor(). A source with usesArena() goes through the looper's
+// free-tracks gate first. MIDI files and modules are played to make the
+// audio, see convert_render.cpp.
 
 // What a file can be turned into.
 enum ConvertTarget : uint8_t {
@@ -30,11 +33,14 @@ struct ConvertFormat {
     uint32_t rate = 0;
     uint8_t channels = 0;
     bool pcm16 = false;
+    // For a file that's played to make the audio ("synth", "tracker"), else null.
+    const char* playedBy = nullptr;
 };
 
 // Reads the format of a file of `kind` into fmt: the WAV header (through
-// wav, which must be idle) or the first MP3 frame headers. False when the
-// file can't be read or the kind needs nothing.
+// wav, which must be idle) or the first MP3 frame headers. MIDI files and
+// modules aren't read: they come out at the synth's or tracker's 44.1k
+// stereo. False when the file can't be read or the kind needs nothing.
 bool convertProbe(FileKind kind, const char* path, WavPlayer& wav, ConvertFormat& fmt);
 
 // The targets for a file of `kind`, fmt from convertProbe() or null when
@@ -103,6 +109,72 @@ private:
     const int16_t* _pcm = nullptr;
     int _frames = 0, _pos = 0;
     uint8_t _pcmChannels = 2;
+};
+
+// A MIDI file through the synth, rendered on the calling core (core 0)
+// while core 1 is parked, see Synth::offlineBegin(). MIDI out is off and
+// the synth on for the conversion; both are put back by close(). After the
+// last event it goes on until the voices and reverb are silent, at most
+// TAIL_MAX_FRAMES. p is the file player's MidiPlayer, made here if null.
+class MidiConvertSource : public ConvertSource {
+public:
+    explicit MidiConvertSource(MidiPlayer*& p) : _p(p) {}
+    bool open(const char* path) override;
+    const char* error() const override;
+    uint32_t rate() const override;
+    uint8_t channels() const override { return 2; }
+    int read(int16_t* out, int max) override;
+    void progress(uint32_t& done, uint32_t& total) const override;
+    void close() override;
+    bool usesArena() const override { return false; }
+
+    static const uint32_t TAIL_MAX_FRAMES = 5 * 44100;
+    // QUIET_FRAMES in a row within +-QUIET_LEVEL (-66 dBFS) end the tail
+    // once no voice sounds. The Lo-fi reverb can settle on a small offset.
+    static const uint32_t QUIET_FRAMES = 44100 / 4;
+    static const int QUIET_LEVEL = 16;
+    // Frames between MidiPlayer::update() calls, as the host render does it.
+    static const uint32_t UPDATE_FRAMES = 64;
+
+private:
+    MidiPlayer*& _p;
+    const char* _err = nullptr;
+    bool _offline = false; // the synth is ours and MIDI out is off
+    uint8_t _target = 0;   // MidiOutput's target and audio output, to put back
+    bool _audio = false;
+    bool _ended = false;
+    uint64_t _frames = 0;  // rendered so far
+    uint64_t _endFrame = 0;
+    uint32_t _quiet = 0;
+    uint32_t _blockLeft = 0; // frames before the next update()
+    uint32_t _lengthTicks = 0;
+};
+
+// A module (MOD, S3M, XM, IT) through its tracker player, made in
+// SharedRamArena by open() and gone after close(). Mixed on the calling
+// core as update() does, but into the conversion instead of the WAV ring,
+// so core 1 isn't involved. Plays the song once, see
+// TrackerPlayer::beginOffline(), whatever the play mode.
+class TrackerConvertSource : public ConvertSource {
+public:
+    void setKind(FileKind kind) { _kind = kind; }
+    bool open(const char* path) override;
+    const char* error() const override;
+    uint32_t rate() const override;
+    uint8_t channels() const override { return 2; }
+    int read(int16_t* out, int max) override;
+    void progress(uint32_t& done, uint32_t& total) const override;
+    void close() override;
+    bool usesArena() const override { return true; }
+
+private:
+    FileKind _kind = FILE_MOD;
+    TrackerPlayer* _p = nullptr;
+    const char* _err = nullptr;
+    TrackerSongEnd _end = {};
+    const int16_t* _block = nullptr; // the player's last block
+    uint32_t _blockFrames = 0, _blockPos = 0;
+    uint32_t _updateLeft = 0; // frames left in the update() the blocks follow
 };
 
 // Leftover temp output from a power cut: ".NAME.wav.cvt", the leaf name.

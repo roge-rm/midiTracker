@@ -182,6 +182,42 @@ void MidiPlayer::sendPendingSysEx(TrackReader& t) {
     if (ok) MidiOutput::sendSysExRaw(buf, len + off);
 }
 
+uint32_t MidiPlayer::lengthTicks() {
+    uint32_t last = 0;
+    bool failed = _trackFailed;
+    for (int i = 0; i < _numTracks; i++) {
+        TrackReader& t = _tracks[i];
+        if (t.ended) continue;
+        // What primeTrack() moves on, to put back after the scan.
+        uint32_t pos = trackPos(t), absoluteTick = t.absoluteTick, pendingTick = t.pendingTick;
+        uint32_t tempo = t.pendingTempoUsPerQuarter, sysExPos = t.pendingSysExPos, sysExLen = t.pendingSysExLen;
+        uint8_t runningStatus = t.runningStatus, kind = t.pendingKind, status = t.pendingStatus;
+        uint8_t d1 = t.pendingData1, d2 = t.pendingData2, len = t.pendingLen;
+        bool hasF0 = t.pendingSysExHasF0;
+        for (;;) {
+            if (t.pendingTick > last) last = t.pendingTick;
+            if (t.pendingKind == EV_END || !primeTrack(i)) break;
+        }
+        seekTrack(t, pos);
+        t.absoluteTick = absoluteTick;
+        t.pendingTick = pendingTick;
+        t.pendingTempoUsPerQuarter = tempo;
+        t.pendingSysExPos = sysExPos;
+        t.pendingSysExLen = sysExLen;
+        t.runningStatus = runningStatus;
+        t.pendingKind = kind;
+        t.pendingStatus = status;
+        t.pendingData1 = d1;
+        t.pendingData2 = d2;
+        t.pendingLen = len;
+        t.pendingSysExHasF0 = hasF0;
+        t.ended = false;
+    }
+    _trackFailed = failed;
+    _nextValid = false;
+    return last;
+}
+
 int MidiPlayer::findNextTrack() const {
     int best = -1;
     uint32_t bestTick = 0;
@@ -352,7 +388,7 @@ bool MidiPlayer::load(const char* path) {
     _globalTick = 0;
     _songUs = 0;
     _tickRem = 0;
-    _originMicros = micros();
+    _originMicros = nowUs();
     _pausedOffsetUs = 0;
     memset(_rpnSel, 0xFF, sizeof(_rpnSel));
     memset(_held, 0, sizeof(_held));
@@ -380,14 +416,14 @@ void MidiPlayer::close() {
 
 void MidiPlayer::play() {
     if (_state != STATE_PAUSED) return;
-    _originMicros = micros() - _pausedOffsetUs;
+    _originMicros = nowUs() - _pausedOffsetUs;
     _nextValid = false;
     _state = STATE_PLAYING;
 }
 
 void MidiPlayer::pause() {
     if (_state != STATE_PLAYING) return;
-    _pausedOffsetUs = micros() - _originMicros;
+    _pausedOffsetUs = nowUs() - _originMicros;
     _state = STATE_PAUSED;
     MidiOutput::allNotesOffAllChannels();
     memset(_held, 0, sizeof(_held));
@@ -401,7 +437,7 @@ void MidiPlayer::stop() {
 
 uint32_t MidiPlayer::elapsedMs() const {
     uint64_t us = _songUs;
-    if (_state == STATE_PLAYING) us += (uint32_t)(micros() - _originMicros);
+    if (_state == STATE_PLAYING) us += (uint32_t)(nowUs() - _originMicros);
     else if (_state == STATE_PAUSED) us += _pausedOffsetUs;
     return (uint32_t)(us / 1000);
 }
@@ -596,7 +632,7 @@ void MidiPlayer::seekTo(uint32_t targetMs, bool defer) {
         _pausedOffsetUs = 0;
         _state = STATE_DONE;
     } else if (wasPlaying) {
-        _originMicros = micros() - offset;
+        _originMicros = nowUs() - offset;
         _nextValid = false;
         _state = STATE_PLAYING;
     } else {
@@ -641,7 +677,7 @@ void MidiPlayer::update() {
     const int MAX_EVENTS_PER_CALL = 64;
 
     for (int n = 0; n < MAX_EVENTS_PER_CALL; n++) {
-        if (_nextValid && (int32_t)(micros() - _nextDue) < 0) return; // not due yet
+        if (_nextValid && (int32_t)(nowUs() - _nextDue) < 0) return; // not due yet
 
         if (!_nextValid) {
             int nt = findNextTrack();
@@ -660,7 +696,7 @@ void MidiPlayer::update() {
             _nextDeltaUs = ticksToUs(_tracks[nt].pendingTick, _nextRem);
             _nextDue = _originMicros + (uint32_t)_nextDeltaUs;
             _nextValid = true;
-            if ((int32_t)(micros() - _nextDue) < 0) return; // not due yet, try again next update()
+            if ((int32_t)(nowUs() - _nextDue) < 0) return; // not due yet, try again next update()
         }
 
         int nt = _nextTrack;

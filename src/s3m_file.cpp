@@ -714,6 +714,7 @@ void S3mPlayer::advanceRow() {
         _positionJumpPending = true;
         _positionJumpTarget = _orderPos;
         _loopPending = false;
+        _loopJumpPending = true;
     } else if (_positionJumpPending ? _positionJumpTarget != _orderPos : _patternBreakPending) {
         _loopCount = 0; // leaving the pattern
     }

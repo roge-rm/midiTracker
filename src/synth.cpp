@@ -145,8 +145,18 @@ volatile uint32_t g_msgTail = 0; // core 1 only
 
 void drainMessages(int maxMessages);
 
+// Offline rendering (Synth::offlineBegin()). Core 0 sets g_offlineRequest,
+// core 1 answers with g_offlineParked at the top of loop1() and from then
+// on only writes silence to I2S, touching no synth state, until the
+// request is cleared. g_offlineOwned: core 0 renders and drains the ring
+// itself.
+volatile bool g_offlineRequest = false;
+volatile bool g_offlineParked = false;
+bool g_offlineOwned = false;
+
 // Core 0 only. Waits while the ring is full, which takes core 1 a few
-// samples at most (it drains up to 32 a sample).
+// samples at most (it drains up to 32 a sample). While core 0 renders
+// offline it drains the ring itself, as the host build does.
 void pushMsg(uint32_t msg) {
     uint32_t head = g_msgHead;
 #if defined(TRACKER_PROFILE) && !defined(HOST_MIDI)
@@ -155,6 +165,7 @@ void pushMsg(uint32_t msg) {
     static bool told = false;
     g_trace.lastMsg0 = msg;
     g_trace.pushes0++;
+    if (g_offlineOwned && head - g_msgTail >= MSG_RING_SIZE) drainMessages(MSG_RING_SIZE);
     if (head - g_msgTail >= MSG_RING_SIZE) {
         uint32_t was = g_trace.where0, t0 = time_us_32();
         g_trace.where0 = Synth::PW0_PUSH_WAIT;
@@ -172,6 +183,8 @@ void pushMsg(uint32_t msg) {
     while (head - g_msgTail >= MSG_RING_SIZE) {
 #ifdef HOST_MIDI
         drainMessages(MSG_RING_SIZE); // host: core 1 runs on this thread
+#else
+        if (g_offlineOwned) drainMessages(MSG_RING_SIZE);
 #endif
     }
     __dmb(); // tail read before the freed slot is written
@@ -1970,12 +1983,20 @@ ALWAYS_INLINE int32_t levelerApply(const Leveler& l, int32_t x) {
     return ((x * hi) >> 8) + ((x * lo) >> 16);
 }
 
-// After a volume or output level change (core 1, not per sample).
+// After a volume or output level change (core 1, not per sample). While
+// core 0 renders offline the synth takes Synth::OFFLINE_VOLUME on Line
+// instead; the settings stay in g_masterGainQ16 and g_outputLevelShift.
 void updateSynthOutput() {
-    uint32_t g = ((g_masterGainQ16 * (uint32_t)SYNTH_MAKEUP_Q8) >> 8) >> g_outputLevelShift;
+    uint32_t master = g_masterGainQ16;
+    uint8_t shift = g_outputLevelShift;
+    if (g_offlineOwned) {
+        master = volumePercentToGainQ16(Synth::OFFLINE_VOLUME);
+        shift = OUTPUT_LEVEL_SHIFT[OUTPUT_LEVEL_LINE];
+    }
+    uint32_t g = ((master * (uint32_t)SYNTH_MAKEUP_Q8) >> 8) >> shift;
     g_synthGainHi = (int32_t)(g >> 8);
     g_synthGainLo = (int32_t)(g & 0xFF);
-    uint32_t ceiling = (((uint32_t)(SYNTH_HEADROOM * HARD_LIMIT) * (g_masterGainQ16 >> 4)) >> 12) >> g_outputLevelShift;
+    uint32_t ceiling = (((uint32_t)(SYNTH_HEADROOM * HARD_LIMIT) * (master >> 4)) >> 12) >> shift;
     if (ceiling > (uint32_t)HARD_LIMIT) ceiling = HARD_LIMIT;
     g_synthCeiling = (int32_t)ceiling;
     g_synthKnee = (int32_t)((ceiling * (uint32_t)SOFT_KNEE_START) / (uint32_t)HARD_LIMIT);
@@ -3030,6 +3051,92 @@ void drainMessages(int maxMessages) {
 
 } // namespace
 
+// -- Offline rendering (core 0, see Synth::offlineBegin()) ---------------------
+namespace {
+
+// Silence and a fresh start, as setup1() leaves things: no voices, empty
+// reverb, LFO and noise from the top, levelers at rest.
+void clearRenderState() {
+    for (int i = 0; i < NUM_VOICES; i++) g_voices[i] = Voice();
+    g_voiceStartCounter = 0;
+    g_lfoPhase = 0;
+    g_noiseState = 0xACE1u;
+    memset(g_reverbCombBuf0, 0, sizeof(g_reverbCombBuf0));
+    memset(g_reverbCombBuf1, 0, sizeof(g_reverbCombBuf1));
+    memset(g_reverbCombBuf2, 0, sizeof(g_reverbCombBuf2));
+    memset(g_reverbCombBuf3, 0, sizeof(g_reverbCombBuf3));
+    memset(g_reverbAllpassBuf0, 0, sizeof(g_reverbAllpassBuf0));
+    memset(g_reverbAllpassBuf1, 0, sizeof(g_reverbAllpassBuf1));
+    g_reverbState = {};
+    g_reverbHeldL = g_reverbHeldR = 0;
+    g_reverbDecimateCounter = 0;
+    g_reverbChorusPos = 0;
+    g_reverbChorusLfoPhase = 0;
+    reverbTypeChanged(g_reverbType); // clears the Lush or Shimmer delay line
+#ifdef MP3_PLAYER
+    g_mp3Block = false;
+    g_mp3NoVoices = false;
+    g_reverbAsleep = false;
+    g_reverbQuiet = 0;
+#endif
+    g_levelerEnvelope = 0;
+    g_levelerGainQ16 = 65536;
+    g_levelerUpdateCounter = 0;
+    g_synthLeveler = {0, 65536, 0};
+}
+
+} // namespace
+
+void Synth::offlineBegin() {
+    if (g_offlineOwned) return;
+    g_offlineRequest = true;
+#ifndef HOST_MIDI
+    while (!g_offlineParked) {
+        // Core 1 parks at its next sample.
+    }
+#endif
+    __dmb(); // core 1's last writes seen before this core takes over
+    g_offlineOwned = true;
+    drainMessages(MSG_RING_SIZE);
+    clearRenderState();
+    updateSynthOutput();
+}
+
+void Synth::offlineRender(int16_t* out, size_t frames) {
+    if (!g_offlineOwned) return;
+    // Per frame as loop1() does it, without the governor: there's no deadline.
+    for (size_t i = 0; i < frames; i++) {
+        drainMessages(32);
+        renderSample(out[i * 2], out[i * 2 + 1]);
+    }
+}
+
+bool Synth::offlineVoicesActive() {
+    for (int i = 0; i < NUM_VOICES; i++) {
+        if (g_voices[i].active) return true;
+    }
+    return false;
+}
+
+void Synth::offlineEnd() {
+    if (!g_offlineOwned) return;
+    drainMessages(MSG_RING_SIZE);
+    clearRenderState();
+    for (int i = 0; i < 16; i++) {
+        g_channelProgram[i] = 0;
+        resetChannel((uint8_t)i, true);
+    }
+    g_offlineOwned = false;
+    updateSynthOutput();
+    __dmb(); // all of the above lands before core 1 takes over again
+    g_offlineRequest = false;
+#ifndef HOST_MIDI
+    while (g_offlineParked) {
+        // Core 1 is back, so a new offlineBegin() can't see a stale park.
+    }
+#endif
+}
+
 // -- Render governor ----------------------------------------------------------
 // Core 1 times each sample's render with SysTick (the
 // Arduino core runs it on core 1 at the CPU clock, 24 bits, counting down).
@@ -3196,6 +3303,15 @@ void __not_in_flash_func(loop1Mp3)() {
 #endif
 
 void __not_in_flash_func(loop1)() {
+#ifndef HOST_MIDI
+    // Core 0 renders offline: silence, and the synth's state is left alone.
+    if (g_offlineRequest) {
+        g_offlineParked = true;
+        g_i2s.write16(0, 0);
+        return;
+    }
+    if (g_offlineParked) g_offlineParked = false;
+#endif
 #if defined(MP3_PLAYER) && !defined(HOST_MIDI)
     if (Mp3Player::core1Active()) {
         loop1Mp3();

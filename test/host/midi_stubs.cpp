@@ -11,7 +11,16 @@ HostRp2040 rp2040;
 HostSerial Serial;
 
 namespace { uint64_t g_frames = 0; }
+#ifdef HOST_REAL_CLOCK
+// convert_check: MidiPlayer runs on its offline clock, the converter's step budget on real time.
+#include <chrono>
+static auto g_start = std::chrono::steady_clock::now();
+uint32_t micros() {
+    return (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - g_start).count();
+}
+#else
 uint32_t micros() { return (uint32_t)(g_frames * 1000000ull / HOST_SAMPLE_RATE); }
+#endif
 uint32_t millis() { return micros() / 1000; }
 void hostSetFrames(uint64_t f) { g_frames = f; }
 
@@ -42,6 +51,13 @@ void sendRaw(uint8_t status, uint8_t d1, uint8_t d2, uint8_t len) {
     }
 }
 void sendSysExRaw(const uint8_t*, size_t) {}
+// Routing state only, for convert_check: the stub sends to the synth either way.
+static MidiOutTarget g_target = MIDI_OUT_BOTH;
+static bool g_audio = false;
+void setTarget(MidiOutTarget t) { g_target = t; }
+MidiOutTarget getTarget() { return g_target; }
+void setAudioOutput(bool on) { g_audio = on; }
+bool audioOutputEnabled() { return g_audio; }
 uint8_t* sysExScratch() { static uint8_t b[1100]; return b; }
 void allNotesOffAllChannels() {
     memset(g_hostNoteMask, 0, sizeof(g_hostNoteMask));
