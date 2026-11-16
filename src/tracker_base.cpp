@@ -192,6 +192,31 @@ const uint8_t* __not_in_flash_func(TrackerPlayer::readSampleBytes)(FsFile& f, ui
     return data;
 }
 
+bool __not_in_flash_func(TrackerPlayer::shareChunk)(TrackerVoice& v, uint32_t start, uint32_t minLen, uint32_t maxLen, bool sameEnd) {
+    const TrackerVoice* best = nullptr;
+    uint32_t bestAvail = 0;
+    for (int i = 0; i < _voiceCount; i++) {
+        const TrackerVoice& o = voiceAt(i);
+        if (&o == &v || o.chunkSmp != v.smp || !o.chunkWhole || start < o.chunkStart || start - o.chunkStart >= o.chunkLen) continue;
+        uint32_t avail = o.chunkLen - (start - o.chunkStart);
+        if (avail < minLen || avail <= bestAvail || (sameEnd && avail != maxLen)) continue;
+        uint32_t n = avail < maxLen ? avail : maxLen;
+        // Skip a cache that runs into v's buffer (IT lends a free voice's slot to the one below).
+        if (o.chunkBuf < v.chunkBuf + n && v.chunkBuf < o.chunkBuf + o.chunkLen) continue;
+        best = &o;
+        bestAvail = avail;
+    }
+    if (!best) return false;
+    uint32_t n = bestAvail < maxLen ? bestAvail : maxLen;
+    memcpy(v.chunkBuf, best->chunkBuf + (start - best->chunkStart), n * sizeof(int16_t));
+    v.chunkSmp = v.smp;
+    v.chunkStart = start;
+    v.chunkLen = n;
+    v.chunkAccum = best->chunkAccum;
+    v.chunkWhole = true;
+    return true;
+}
+
 void TrackerPlayer::startVoiceAt(TrackerVoice& v, uint32_t index) {
     if (!_formatGains) {
         // The note playing fades out in a tail, the new one ramps up.

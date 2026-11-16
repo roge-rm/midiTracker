@@ -721,6 +721,7 @@ int16_t __not_in_flash_func(XmPlayer::refillChunk)(TrackerVoice& v, uint32_t ind
     if (index >= limit) { v.chunkLen = 0; return 0; }
     uint32_t n = limit - index;
     if (n > (uint32_t)CHUNK_FRAMES) n = CHUNK_FRAMES;
+    if (shareChunk(v, index, n, n, true)) return v.chunkBuf[0];
     const bool cont = v.chunkSmp == v.smp && v.chunkLen && index == v.chunkStart + v.chunkLen;
     const bool prevMirror = s.pingpong && v.chunkStart >= turn;
 

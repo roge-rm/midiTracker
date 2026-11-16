@@ -338,6 +338,7 @@ int16_t __not_in_flash_func(S3mPlayer::refillChunk)(TrackerVoice& v, uint32_t in
         len = s.loopEnd - s.loopStart;
     }
     if (start + len > s.length) len = s.length - start;
+    if (shareChunk(v, start, len, len, false)) return v.chunkBuf[index - start];
     v.chunkSmp = v.smp;
     v.chunkStart = start;
     // Frames past a short read or a failed seek stay zero and cached, so a
@@ -370,6 +371,7 @@ int16_t __not_in_flash_func(S3mPlayer::refillChunk)(TrackerVoice& v, uint32_t in
         if (frames * bytesPerSample < piece) break;
     }
     for (uint32_t i = got; i < len; i++) out[i] = 0;
+    v.chunkWhole = got == len; // other voices read a short one themselves
     return out[index - start];
 }
 

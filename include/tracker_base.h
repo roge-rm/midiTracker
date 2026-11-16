@@ -55,6 +55,7 @@ struct TrackerVoice {
     uint32_t chunkStart = 0;                  // frame index of chunkBuf[0]
     uint32_t chunkLen = 0;                    // valid frames in chunkBuf
     int32_t chunkAccum = 0;                   // format decode state at chunkStart+chunkLen (XM delta)
+    bool chunkWhole = true;                   // false: a short read padded with zeros, shareChunk() skips it
 
     // Mixer gains: curL/curR are the gain now << 12 (32640 is full volume
     // on one side), moving by stepL/stepR for rampLeft more frames.
@@ -179,6 +180,14 @@ protected:
     // Fills v's cache so it holds `index` (already loop-wrapped and below
     // the sample length) and returns that frame, or 0 when the read fails.
     virtual int16_t refillChunk(TrackerVoice& v, uint32_t index) = 0;
+
+    // For refillChunk(): fills v's cache from another voice's cache of the
+    // same sample, at least minLen and up to maxLen frames from start (or
+    // exactly maxLen and ending where that cache ends, with sameEnd), from
+    // the cache that has the most. Then v's cache is what the format would
+    // have read, without the card. chunkAccum is copied too, only right
+    // with sameEnd. False if no voice has them.
+    bool shareChunk(TrackerVoice& v, uint32_t start, uint32_t minLen, uint32_t maxLen, bool sameEnd);
 
     // One cached sample frame, loop-wrapped; 0 past the end of the sample.
     inline __attribute__((always_inline)) int16_t readRawSample(TrackerVoice& v, uint32_t index) {

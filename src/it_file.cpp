@@ -1114,6 +1114,11 @@ int16_t __not_in_flash_func(ItPlayer::refillChunk)(TrackerVoice& tv, uint32_t in
     else if (tv.looping && view.loopEnd > view.loopStart && index < realLoopEnd) limit = realLoopEnd;
     else limit = dataFrames;
     if (index >= limit) { tv.chunkLen = 0; return 0; }
+    // Voices on one short sample (a loop too long for one slot, played
+    // fast) would each read the card every block, so they copy from each
+    // other. A copy that fills v's own slot leaves the free slots above alone.
+    uint32_t own = limit - index < (uint32_t)CHUNK_FRAMES ? limit - index : (uint32_t)CHUNK_FRAMES;
+    if (shareChunk(tv, index, own, own, false)) return tv.chunkBuf[0];
     int k = (int)(static_cast<ItVoice*>(&tv) - &_voices[0]);
     int run = 1;
     while (run < MAX_RUN && k + run < MAX_VOICES && _voices[k + run].channel == -1) {
@@ -1123,6 +1128,7 @@ int16_t __not_in_flash_func(ItPlayer::refillChunk)(TrackerVoice& tv, uint32_t in
     uint32_t frames = limit - index;
     if (frames > (uint32_t)(CHUNK_FRAMES * run)) frames = (uint32_t)(CHUNK_FRAMES * run);
     uint32_t realStart = mirrored ? (2 * realLoopEnd - index - frames) : index;
+    if (shareChunk(tv, index, 1, frames, false)) return tv.chunkBuf[0];
     FsFile& f = s.inCache || view.level ? _cacheFile : _file;
 #ifdef TRACKER_PROFILE
     uint32_t reads0 = profile.reads;
