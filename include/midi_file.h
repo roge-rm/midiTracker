@@ -160,6 +160,15 @@ private:
     uint32_t _originMicros = 0;
     uint32_t _pausedOffsetUs = 0;
 
+    // The next event's track, due time and ticksToUs() result, so update()
+    // calls with nothing due are a micros() compare. Cleared by anything
+    // that moves the tracks, tempo or origin.
+    bool _nextValid = false;
+    int _nextTrack = -1;
+    uint32_t _nextDue = 0;
+    uint32_t _nextRem = 0;
+    uint64_t _nextDeltaUs = 0;
+
     // Current RPN select (CC 101, 100) per channel, 0xFF = none. NRPN
     // selects set it to 0x7F 0x7F (null), since seeks don't restore NRPNs.
     uint8_t _rpnSel[16][2];

@@ -235,7 +235,10 @@ void profileMidi(const char* want) {
     }
     uint32_t u0 = Synth::wavStreamUnderrunSamples();
     Synth::profileReset();
-    uint32_t busyUs = 0, worstUs = 0;
+    // The loop below does nothing but call update(), so core0 load counts
+    // every empty poll. Calls under 20 us are counted apart as polls, the
+    // rest (events sent, SD refills, output waits) as work.
+    uint32_t busyUs = 0, worstUs = 0, calls = 0, workCalls = 0, workUs = 0;
     uint32_t t0 = micros(), win = millis();
     const uint32_t cpuMhz = F_CPU / 1000000;
     auto print = [&](const char* tag, uint32_t busy, uint32_t elapsedUs) {
@@ -243,8 +246,12 @@ void profileMidi(const char* want) {
         Synth::SynthProfile sp;
         Synth::profileGet(sp);
         int load = elapsedUs ? (int)(1000.0f * (float)busy / (float)elapsedUs) : 0;
-        Serial.printf("PROFILE %s %s: core0 load %d.%d%%, worst update %lu us, underrun samples %lu\n", tag, want,
-                      load / 10, load % 10, (unsigned long)worstUs, (unsigned long)(Synth::wavStreamUnderrunSamples() - u0));
+        int work = elapsedUs ? (int)(1000.0f * (float)workUs / (float)elapsedUs) : 0;
+        uint32_t polls = calls - workCalls;
+        uint32_t pollNs = polls ? (uint32_t)((uint64_t)(busy - workUs) * 1000u / polls) : 0;
+        Serial.printf("PROFILE %s %s: core0 load %d.%d%% (work %d.%d%% in %lu calls, %lu polls at %lu ns), worst update %lu us, underrun samples %lu\n", tag, want,
+                      load / 10, load % 10, work / 10, work % 10, (unsigned long)workCalls, (unsigned long)polls,
+                      (unsigned long)pollNs, (unsigned long)worstUs, (unsigned long)(Synth::wavStreamUnderrunSamples() - u0));
         // Budget per sample is cpu clock / SAMPLE_RATE cycles. Governor block = 32 samples,
         // limit is 90% of the block budget; sheds = voices faded out since the window start.
         Serial.printf("PROFILE %s %s: core1 cycles/sample peak %lu avg %lu (budget %lu), peak 32-sample block %lu (limit %lu), "
@@ -261,6 +268,8 @@ void profileMidi(const char* want) {
         uint32_t d = micros() - a;
         watch();
         busyUs += d;
+        calls++;
+        if (d >= 20) { workCalls++; workUs += d; }
         if (d > worstUs) worstUs = d;
         if (millis() - win >= 5000) {
             print("5s", busyUs, micros() - t0);

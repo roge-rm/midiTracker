@@ -52,6 +52,7 @@ bool MidiPlayer::readVarLen(TrackReader& t, uint32_t& value) {
 
 bool MidiPlayer::primeTrack(int idx) {
     TrackReader& t = _tracks[idx];
+    _nextValid = false;
 
     while (true) {
         if (!t.file || trackPos(t) >= t.chunkEnd) {
@@ -373,12 +374,14 @@ void MidiPlayer::close() {
         if (_tracks[i].file) _tracks[i].file.close();
     }
     _numTracks = 0;
+    _nextValid = false;
     _state = STATE_IDLE;
 }
 
 void MidiPlayer::play() {
     if (_state != STATE_PAUSED) return;
     _originMicros = micros() - _pausedOffsetUs;
+    _nextValid = false;
     _state = STATE_PLAYING;
 }
 
@@ -411,6 +414,7 @@ uint64_t MidiPlayer::ticksToUs(uint32_t tick, uint32_t& remOut) const {
 }
 
 void MidiPlayer::updateEffTick() {
+    _nextValid = false;
     _effTickNum = (uint32_t)(_tickNum / _tempoScale);
     if (_effTickNum == 0) _effTickNum = 1;
 }
@@ -593,6 +597,7 @@ void MidiPlayer::seekTo(uint32_t targetMs, bool defer) {
         _state = STATE_DONE;
     } else if (wasPlaying) {
         _originMicros = micros() - offset;
+        _nextValid = false;
         _state = STATE_PLAYING;
     } else {
         _pausedOffsetUs = offset;
@@ -636,26 +641,34 @@ void MidiPlayer::update() {
     const int MAX_EVENTS_PER_CALL = 64;
 
     for (int n = 0; n < MAX_EVENTS_PER_CALL; n++) {
-        int nt = findNextTrack();
-        if (nt < 0) {
-            // Natural end: the file's note-offs have gone out, so the last
-            // notes keep their release. Notes still on get note-offs, and
-            // a track that broke off mid-stream gets a panic. Elapsed time
-            // holds at the end.
-            releaseHeld();
-            if (_trackFailed) MidiOutput::allNotesOffAllChannels();
-            _pausedOffsetUs = 0;
-            _state = STATE_DONE;
-            return;
+        if (_nextValid && (int32_t)(micros() - _nextDue) < 0) return; // not due yet
+
+        if (!_nextValid) {
+            int nt = findNextTrack();
+            if (nt < 0) {
+                // Natural end: the file's note-offs have gone out, so the last
+                // notes keep their release. Notes still on get note-offs, and
+                // a track that broke off mid-stream gets a panic. Elapsed time
+                // holds at the end.
+                releaseHeld();
+                if (_trackFailed) MidiOutput::allNotesOffAllChannels();
+                _pausedOffsetUs = 0;
+                _state = STATE_DONE;
+                return;
+            }
+            _nextTrack = nt;
+            _nextDeltaUs = ticksToUs(_tracks[nt].pendingTick, _nextRem);
+            _nextDue = _originMicros + (uint32_t)_nextDeltaUs;
+            _nextValid = true;
+            if ((int32_t)(micros() - _nextDue) < 0) return; // not due yet, try again next update()
         }
 
+        int nt = _nextTrack;
         TrackReader& t = _tracks[nt];
-        uint32_t rem;
-        uint64_t deltaUs = ticksToUs(t.pendingTick, rem);
-        uint32_t due = _originMicros + (uint32_t)deltaUs;
-
-        uint32_t now = micros();
-        if ((int32_t)(now - due) < 0) return; // not due yet, try again next update()
+        uint32_t rem = _nextRem;
+        uint64_t deltaUs = _nextDeltaUs;
+        uint32_t due = _nextDue;
+        _nextValid = false;
 
         if (t.pendingKind == EV_TEMPO) {
             applyTempo(t.pendingTempoUsPerQuarter);
