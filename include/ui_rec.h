@@ -68,4 +68,25 @@ void sendDraw(const SendInfo& s);
 // SEND_SENDING.
 void sendLive(const SendInfo& s);
 
+// ---- convert -------------------------------------------------------------------
+
+enum ConvState : uint8_t { CONV_RUNNING, CONV_DONE, CONV_FAILED, CONV_CANCELLED };
+
+struct ConvInfo {
+    const char* name = nullptr;    // the source file
+    const char* target = nullptr;  // "WAV 16-bit 44.1k mono"
+    const char* outName = nullptr; // the new file's name
+    ConvState state = CONV_RUNNING;
+    const char* message = nullptr; // CONV_FAILED and CONV_CANCELLED, one clause
+    uint32_t elapsedMs = 0;
+    uint32_t leftMs = UINT32_MAX;  // UINT32_MAX until known
+    int permille = 0;
+};
+
+void convDraw(const ConvInfo& c);
+
+// Time, time left, percent and the bar, only what changed. Call while
+// CONV_RUNNING.
+void convLive(const ConvInfo& c);
+
 } // namespace UiRec

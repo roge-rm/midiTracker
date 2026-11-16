@@ -73,7 +73,8 @@ public:
     int nextRecNumber() const { return _maxRec + 1; }
     int nextDumpNumber() const { return _maxDump + 1; }
     // True when the last listing saw a recorder temp file (".NAME.part",
-    // see recorderTempPath()). The file player recovers those, then clears it.
+    // see recorderTempPath()) or a convert temp (".NAME.cvt"). The file
+    // player recovers or removes those, then clears it.
     bool sawTempFiles() const { return _sawTemp; }
     void clearSawTempFiles() { _sawTemp = false; }
 

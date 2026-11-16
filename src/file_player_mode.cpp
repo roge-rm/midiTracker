@@ -30,6 +30,7 @@
 #include "ui_transition.h"
 #include "ui_rec.h"
 #include "keyboard_layout.h"
+#include "convert.h"
 
 namespace FilePlayerMode {
 namespace {
@@ -76,12 +77,14 @@ enum AppState {
     // LooperMode::updateFreeTracksForFilePlayer() and act on the result;
     // see handleFreeLooperRamGateInput().
     APP_FREE_LOOPER_RAM,
+    APP_CONVERT_PICK, // "Convert": the targets that fit the selected file
+    APP_CONVERTING,   // progress screen, see beginConvert()
 };
 
 enum NamePurpose { NAME_NEW_RECORDING, NAME_NEW_SYSEX_CAPTURE, NAME_NEW_FOLDER, NAME_RENAME };
 
 enum MenuAction { MENU_OPEN, MENU_RENAME, MENU_DELETE, MENU_LOAD_TO_LOOPER, MENU_NEW_RECORDING,
-                   MENU_CAPTURE_SYSEX, MENU_NEW_FOLDER };
+                   MENU_CAPTURE_SYSEX, MENU_NEW_FOLDER, MENU_CONVERT };
 struct MenuEntry { MenuAction action; const char* label; };
 
 const char* const LOOPER_TRACK_LABELS[4] = { "Track 1", "Track 2", "Track 3", "Track 4" };
@@ -294,12 +297,30 @@ char pendingOverwritePath[224] = {0}; // the colliding path that would be remove
 bool pendingOverwriteIsDir = false;   // whether pendingOverwritePath is a directory (only reachable via NAME_RENAME)
 
 // -- entry action menu state --
-MenuEntry menuEntries[7];
+const int MENU_MAX = 8;
+MenuEntry menuEntries[MENU_MAX];
 int menuEntryCount = 0;
 int menuCursor = 0;
 char menuSubtitle[MAX_FILENAME_LEN + 8] = {0};
 
 bool deleteFailed = false;
+
+// -- APP_CONVERT_PICK / APP_CONVERTING --
+// The targets beginEntryMenu() found for the selected file, and the
+// running conversion. converter is on the heap only while APP_CONVERTING
+// (2.6 KB); the sources wrap wavPlayer and mp3Player, idle in the browser.
+const int CONVERT_MAX = 4;
+ConvertTarget convertTargetList[CONVERT_MAX];
+int convertTargetCount = 0;
+int convertCursor = 0;
+char convertSubtitle[MAX_FILENAME_LEN + 12] = {0};
+char convertName[MAX_FILENAME_LEN] = {0}; // the source's display name
+FileKind convertKind = FILE_WAV;
+bool pendingConvert = false; // the looper's free-tracks gate is up for an MP3 convert
+Converter* converter = nullptr;
+Converter::State lastConvertState = Converter::STATE_IDLE;
+WavConvertSource wavConvertSource(wavPlayer);
+Mp3ConvertSource mp3ConvertSource(mp3Player);
 
 // -- APP_LOOPER_TRACK_PICK / pending-import handoff state --
 // See beginLoopTrackPick() and hasPendingLooperImport()/consumeLooperImport().
@@ -1045,6 +1066,16 @@ void beginEntryMenu() {
     }
     if (hasSelection) {
         menuEntries[menuEntryCount++] = {MENU_OPEN, "Open"};
+        // Only when the file has a target; a WAV's depend on its format.
+        convertTargetCount = 0;
+        if (isFile) {
+            char path[224];
+            browser.buildFullPath(selectedIndex, path, sizeof(path));
+            ConvertFormat fmt;
+            bool probed = convertProbe(selected.kind, path, wavPlayer, fmt);
+            convertTargetCount = convertTargets(selected.kind, probed ? &fmt : nullptr, convertTargetList, CONVERT_MAX);
+        }
+        if (convertTargetCount > 0) menuEntries[menuEntryCount++] = {MENU_CONVERT, "Convert"};
         menuEntries[menuEntryCount++] = {MENU_RENAME, "Rename"};
         menuEntries[menuEntryCount++] = {MENU_DELETE, "Delete"};
     }
@@ -1729,9 +1760,169 @@ void moveMenuCursor(int newCursor) {
     if (newCursor == menuCursor) return;
     int prev = menuCursor;
     menuCursor = newCursor;
-    const char* labels[7];
+    const char* labels[MENU_MAX];
     for (int i = 0; i < menuEntryCount; i++) labels[i] = menuEntries[i].label;
     Ui::updateEntryMenuSelection(labels, menuEntryCount, prev, menuCursor);
+}
+
+// ---- convert -------------------------------------------------------------------
+
+// "Convert" from the entry menu: the targets beginEntryMenu() found.
+void beginConvertPick() {
+    if (selectedIndex < 0 || selectedIndex >= browser.entryCount() || convertTargetCount == 0) return;
+    const BrowserEntry& e = browser.entry(selectedIndex);
+    strncpy(convertName, e.name, sizeof(convertName) - 1);
+    convertName[sizeof(convertName) - 1] = '\0';
+    convertKind = e.kind;
+    snprintf(convertSubtitle, sizeof(convertSubtitle), "Convert %s", convertName);
+    convertCursor = 0;
+    appState = APP_CONVERT_PICK;
+    needsRedraw = true;
+}
+
+ConvertSource* convertSourceFor(FileKind kind) {
+    switch (kind) {
+        case FILE_WAV: return &wavConvertSource;
+        case FILE_MP3: return &mp3ConvertSource;
+        default:       return nullptr;
+    }
+}
+
+void fillConvInfo(UiRec::ConvInfo& c) {
+    c.name = convertName;
+    if (!converter) return;
+    c.target = convertTargetLabel(converter->target());
+    c.outName = converter->outputName();
+    switch (converter->state()) {
+        case Converter::STATE_RUNNING:   c.state = UiRec::CONV_RUNNING; break;
+        case Converter::STATE_DONE:      c.state = UiRec::CONV_DONE; break;
+        case Converter::STATE_CANCELLED: c.state = UiRec::CONV_CANCELLED; break;
+        default:                         c.state = UiRec::CONV_FAILED; break;
+    }
+    c.message = converter->message();
+    c.elapsedMs = converter->elapsedMs();
+    c.leftMs = converter->leftMs();
+    c.permille = converter->progressPermille();
+}
+
+// Starts the conversion picked in APP_CONVERT_PICK, through the looper's
+// free-tracks gate first when the source needs SharedRamArena.
+void startConvert() {
+    ConvertSource* src = convertSourceFor(convertKind);
+    if (!src || selectedIndex < 0 || selectedIndex >= browser.entryCount()) {
+        appState = APP_BROWSE;
+        needsRedraw = true;
+        return;
+    }
+    if (src->usesArena()) {
+        if (LooperMode::hasUnsavedTrackContent()) {
+            pendingConvert = true; // handleFreeLooperRamGateInput() comes back here
+            appState = APP_FREE_LOOPER_RAM;
+            needsRedraw = false; // drawn by beginFreeTracksForFilePlayer()
+            LooperMode::beginFreeTracksForFilePlayer();
+            return;
+        }
+        LooperMode::freeTracksIfAllocated();
+    }
+    if (!converter) converter = new (std::nothrow) Converter();
+    if (!converter) {
+        Ui::drawMessage("Not enough RAM", "to convert");
+        appState = APP_BROWSE;
+        return;
+    }
+    char path[224];
+    browser.buildFullPath(selectedIndex, path, sizeof(path));
+    ConvertTarget target = convertTargetList[convertCursor];
+    if (src->usesArena() && (LooperMode::tracksAllocated() || modPlayer || s3mPlayer || xmPlayer || itPlayer)) {
+        converter->refuse(target, "RAM in use, can't convert");
+    } else {
+        converter->begin(*src, path, convertName, target); // a failure shows on the screen
+    }
+    lastConvertState = converter->state();
+    appState = APP_CONVERTING;
+    needsRedraw = true;
+    Ui::transitionNext(Ui::TRANSITION_IN);
+}
+
+void handleConvertPickInput() {
+    const char* labels[CONVERT_MAX];
+    for (int i = 0; i < convertTargetCount; i++) labels[i] = convertTargetLabel(convertTargetList[i]);
+    int prev = convertCursor;
+    if (Input::justPressed(BTN_UP)) convertCursor = convertCursor > 0 ? convertCursor - 1 : convertTargetCount - 1;
+    if (Input::justPressed(BTN_DOWN)) convertCursor = convertCursor < convertTargetCount - 1 ? convertCursor + 1 : 0;
+    if (convertCursor != prev) Ui::updateEntryMenuSelection(labels, convertTargetCount, prev, convertCursor);
+    if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
+        appState = APP_ENTRY_MENU;
+        needsRedraw = true;
+        return;
+    }
+    if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) startConvert();
+}
+
+// Back to the browser from the convert screen, with the new file selected
+// when there is one.
+void leaveConvert() {
+    bool done = converter && converter->state() == Converter::STATE_DONE;
+    char newName[MAX_FILENAME_LEN] = {0};
+    if (done) {
+        strncpy(newName, converter->outputName(), sizeof(newName) - 1);
+    }
+    delete converter;
+    converter = nullptr;
+    browser.refresh();
+    int count = browser.entryCount();
+    // Looking the name up opens each entry, so not in a huge folder.
+    if (done && count <= 1024) {
+        for (int i = 0; i < count; i++) {
+            const BrowserEntry& e = browser.entry(i);
+            if (!e.isDir && strcasecmp(e.name, newName) == 0) {
+                selectedIndex = i;
+                break;
+            }
+        }
+    }
+    if (selectedIndex >= count) selectedIndex = count > 0 ? count - 1 : 0;
+    ensureSelectionVisible();
+    appState = APP_BROWSE;
+    needsRedraw = true;
+    Ui::transitionNext(Ui::TRANSITION_OUT);
+}
+
+void updateConverting() {
+    if (!converter) {
+        appState = APP_BROWSE;
+        needsRedraw = true;
+        return;
+    }
+    bool running = converter->state() == Converter::STATE_RUNNING;
+    if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
+        if (running) {
+            converter->cancel();
+        } else {
+            leaveConvert();
+            return;
+        }
+    }
+    // Bounded work, see Converter::STEP_US.
+    converter->step();
+    Converter::State st = converter->state();
+    if (st != lastConvertState) {
+        lastConvertState = st;
+        if (st == Converter::STATE_DONE) {
+            leaveConvert();
+            return;
+        }
+        needsRedraw = true; // failed or cancelled: the message shows
+        return;
+    }
+    static uint32_t lastConvTick = 0;
+    uint32_t now = millis();
+    if (st == Converter::STATE_RUNNING && now - lastConvTick >= 200) {
+        lastConvTick = now;
+        UiRec::ConvInfo c;
+        fillConvInfo(c);
+        UiRec::convLive(c);
+    }
 }
 
 void handleEntryMenuInput() {
@@ -1754,6 +1945,7 @@ void handleEntryMenuInput() {
             case MENU_NEW_RECORDING:   beginNewRecordingName(); break;
             case MENU_CAPTURE_SYSEX:   beginNewSysExCaptureName(); break;
             case MENU_NEW_FOLDER:      beginNewFolderName(); break;
+            case MENU_CONVERT:         beginConvertPick(); break;
         }
     }
 }
@@ -1868,9 +2060,15 @@ void handleLooperTrackPickInput() {
 void handleFreeLooperRamGateInput() {
     switch (LooperMode::updateFreeTracksForFilePlayer()) {
         case LooperMode::FREE_TRACKS_DONE:
-            openSelected();
+            if (pendingConvert) {
+                pendingConvert = false;
+                startConvert();
+            } else {
+                openSelected();
+            }
             break;
         case LooperMode::FREE_TRACKS_CANCELLED:
+            pendingConvert = false;
             appState = APP_BROWSE;
             needsRedraw = true;
             break;
@@ -1880,17 +2078,17 @@ void handleFreeLooperRamGateInput() {
 }
 
 // Recovers recorder temp files (".NAME.part") left in the browser's
-// folder by a power cut or a failed save, see recorderRecoverTemp(). Runs
-// from APP_BROWSE when the listing saw one, never while a recorder is
-// writing one.
+// folder by a power cut or a failed save, see recorderRecoverTemp(), and
+// removes convert temp files (".NAME.cvt"). Runs from APP_BROWSE when the
+// listing saw one, never while a recorder is writing one.
 void recoverTempTakes() {
     browser.clearSawTempFiles();
     if (recorder.state() == MidiRecorder::STATE_ARMED || recorder.state() == MidiRecorder::STATE_RECORDING ||
         sysexRecorder.state() == SysExRecorder::STATE_ARMED ||
         sysexRecorder.state() == SysExRecorder::STATE_RECORDING)
         return;
-    const int MAX_TEMPS = 8;
-    char names[MAX_TEMPS][NAME_ENTRY_MAX_LEN + 12];
+    const int MAX_TEMPS = 4; // the rest on the next listing
+    char names[MAX_TEMPS][64];
     int count = 0;
     FsFile dir;
     if (!sdOpenPath(dir, browser.currentPath(), O_RDONLY) || !dir.isDir()) return;
@@ -1898,15 +2096,17 @@ void recoverTempTakes() {
     char name[64];
     while (count < MAX_TEMPS && file.openNext(&dir, O_RDONLY)) {
         size_t len = file.getName(name, sizeof(name));
-        if (len > 6 && len < sizeof(names[0]) && name[0] == '.' && strcmp(name + len - 5, ".part") == 0 && !file.isDir())
-            strcpy(names[count++], name);
+        bool temp = (len > 6 && name[0] == '.' && strcmp(name + len - 5, ".part") == 0) || isConvertTempName(name);
+        if (temp && len < sizeof(names[0]) && !file.isDir()) strcpy(names[count++], name);
         file.close();
     }
     dir.close();
     for (int i = 0; i < count; i++) {
         char path[RECORDER_PATH_MAX + 8];
         browser.buildPath(names[i], path, sizeof(path));
-        recorderRecoverTemp(path);
+        // Half a conversion isn't worth keeping, the source is still there.
+        if (isConvertTempName(names[i])) sdRemove(path);
+        else recorderRecoverTemp(path);
     }
     browser.refresh();
     browser.clearSawTempFiles(); // one try per listing, so a stuck one doesn't loop
@@ -2448,6 +2648,14 @@ bool update() {
         case APP_FREE_LOOPER_RAM:
             handleFreeLooperRamGateInput();
             break;
+
+        case APP_CONVERT_PICK:
+            handleConvertPickInput();
+            break;
+
+        case APP_CONVERTING:
+            updateConverting();
+            break;
     }
 
     if (exitRequested) {
@@ -2520,11 +2728,27 @@ bool update() {
                 break;
 
             case APP_ENTRY_MENU: {
-                const char* labels[7];
+                const char* labels[MENU_MAX];
                 for (int i = 0; i < menuEntryCount; i++) labels[i] = menuEntries[i].label;
                 Ui::drawEntryMenu(menuSubtitle, labels, menuEntryCount, menuCursor);
                 break;
             }
+
+            case APP_CONVERT_PICK: {
+                const char* labels[CONVERT_MAX];
+                for (int i = 0; i < convertTargetCount; i++) labels[i] = convertTargetLabel(convertTargetList[i]);
+                Ui::drawEntryMenu(convertSubtitle, labels, convertTargetCount, convertCursor);
+                break;
+            }
+
+            case APP_CONVERTING:
+                Ui::transitionDraw([] {
+                    UiRec::ConvInfo c;
+                    fillConvInfo(c);
+                    UiRec::convDraw(c);
+                });
+                UiRec::invalidate();
+                break;
 
             case APP_NAME_ENTRY: {
                 const char* title = (namePurpose == NAME_NEW_RECORDING)     ? "New Recording"
@@ -2612,7 +2836,8 @@ bool screensaverAllowed() {
         case APP_CONFIRM_CANCEL_RECORDING:
         case APP_CAPTURING_SYSEX:
         case APP_CONFIRM_CANCEL_SYSEX_CAPTURE:
-        case APP_FREE_LOOPER_RAM:              return false;
+        case APP_FREE_LOOPER_RAM:
+        case APP_CONVERTING:                   return false;
         default:                               return true;
     }
 }

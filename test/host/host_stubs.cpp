@@ -79,9 +79,18 @@ int FsFile::read(void* buf, size_t n) {
     return (int)got;
 }
 
+long FsFile::writeBudget = -1;
+
 size_t FsFile::write(const void* buf, size_t n) {
     if (!_f || fseek(_f, (long)_pos, SEEK_SET) != 0) return 0;
-    size_t put = fwrite(buf, 1, n, _f);
+    size_t want = n;
+    if (writeBudget >= 0 && _pos + n > _size) {
+        // Only bytes past the end take space.
+        uint64_t grow = _pos + n - _size;
+        if ((long)grow > writeBudget) want = n - (size_t)(grow - (uint64_t)writeBudget);
+    }
+    size_t put = fwrite(buf, 1, want, _f);
+    if (writeBudget >= 0 && _pos + put > _size) writeBudget -= (long)(_pos + put - _size);
     _pos += put;
     if (_pos > _size) _size = _pos;
     return put;
@@ -145,3 +154,6 @@ const int16_t* data() { return g_out.data(); }
 #endif
 
 bool sdOpenPath(FsFile& f, const char* path, int flags) { return f.open(path, flags); }
+bool sdExists(const char* path) { struct stat st; return stat(path, &st) == 0; }
+bool sdRemove(const char* path) { return ::remove(path) == 0; }
+bool sdRename(const char* a, const char* b) { return !sdExists(b) && ::rename(a, b) == 0; }

@@ -14,6 +14,8 @@
 #                                    and render_mp3_ops (counts the decoder's long multiplies)
 #   make -C test/host rec-check      MidiRecorder, SysExRecorder and SysExPlayer on an in-memory card
 #   make -C test/host battery-check  the battery gauge on made-up voltage sequences
+#   make -C test/host convert-check CONVERT_DIR=dir   Converter on MP3s and WAVs made with ffmpeg in dir,
+#                                    against ffmpeg's own conversions (see convert_check.sh)
 ROOT   := $(abspath ../..)
 OUT    := $(ROOT)/build/host
 CXX    ?= g++
@@ -25,7 +27,7 @@ PLAYER_SRC := $(wildcard $(ROOT)/src/tracker_base.cpp) $(ROOT)/src/ui_tap.cpp $(
 HARNESS_SRC := $(CURDIR)/render.cpp $(CURDIR)/host_stubs.cpp
 SECONDS ?= 60
 
-.PHONY: all baseline check clean midi midi-baseline midi-check look players wav mp3 rec-check battery-check
+.PHONY: all baseline check clean midi midi-baseline midi-check look players wav mp3 rec-check battery-check convert-check
 all: $(OUT)/render $(OUT)/gen $(OUT)/corr
 
 $(OUT)/corr: $(CURDIR)/corr.cpp
@@ -82,6 +84,20 @@ $(OUT)/render_mp3_ops: $(MP3_DEPS)
 	@mkdir -p $(OUT)/mp3obj-ops
 	cd $(OUT)/mp3obj-ops && gcc -O2 -g -w -DMP3_COUNT_OPS -c $(MP3_C)
 	$(CXX) $(CXXFLAGS) -DMP3_COUNT_OPS -I$(HELIX) -o $@ $(MP3_SRC) $(OUT)/mp3obj-ops/*.o
+
+# Convert check: the real convert.cpp, wav_file.cpp and mp3_file.cpp over host files.
+CONVERT_SRC := $(ROOT)/src/convert.cpp $(ROOT)/src/wav_file.cpp $(ROOT)/src/mp3_file.cpp $(ROOT)/src/shared_ram_arena.cpp \
+               $(CURDIR)/host_stubs.cpp $(CURDIR)/convert_check.cpp
+CONVERT_DIR ?= $(OUT)/convert
+
+$(OUT)/convert_check: $(CONVERT_SRC) $(MP3_C) $(wildcard $(HELIX)/*.h) $(wildcard $(CURDIR)/stub/*.h) $(ROOT)/include/convert.h \
+                      $(ROOT)/include/wav_file.h $(ROOT)/include/mp3_file.h $(ROOT)/include/shared_ram_arena.h
+	@mkdir -p $(OUT)/mp3obj-convert
+	cd $(OUT)/mp3obj-convert && gcc -O2 -g -w -DMP3_POLY_SPLIT -c $(MP3_C)
+	$(CXX) $(CXXFLAGS) -I$(HELIX) -o $@ $(CONVERT_SRC) $(OUT)/mp3obj-convert/*.o
+
+convert-check: $(OUT)/convert_check
+	$(CURDIR)/convert_check.sh $(OUT)/convert_check $(CONVERT_DIR) $(MP3_DIR)
 
 # Recorder check: the real recorders over stub-rec/'s in-memory card.
 REC_SRC := $(ROOT)/src/midi_recorder.cpp $(ROOT)/src/sysex_recorder.cpp $(ROOT)/src/sysex_player.cpp $(CURDIR)/rec_check.cpp

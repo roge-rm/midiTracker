@@ -209,7 +209,8 @@ void SdBrowser::loadEntries() {
             uint8_t kind;
             if (file.getName(nameBuf, nameCap) == 0) nameBuf[0] = '\0';
             size_t nameLen = strlen(nameBuf);
-            if (nameBuf[0] == '.' && nameLen > 6 && strcmp(nameBuf + nameLen - 5, ".part") == 0 && !file.isDir())
+            if (nameBuf[0] == '.' && nameLen > 5 && !file.isDir() &&
+                ((nameLen > 6 && strcmp(nameBuf + nameLen - 5, ".part") == 0) || strcmp(nameBuf + nameLen - 4, ".cvt") == 0))
                 _sawTemp = true;
             if (classifyEntry(file, nameBuf, isDirEntry, kind)) {
                 total++;

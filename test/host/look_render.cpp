@@ -978,6 +978,57 @@ void recScreens() {
     save("sysex-send-error");
 }
 
+// ---- convert --------------------------------------------------------------------
+
+void convertScreens() {
+    // The target list, as Ui::drawEntryMenu() draws it.
+    g_tft.fillScreen(COLOR_BG);
+    Status st;
+    st.text = "Convert Night Drive (2019 remaster).mp3";
+    drawStatus(st);
+    const char* items[] = {"WAV 16-bit", "WAV 16-bit 44.1k mono"};
+    for (int i = 0; i < ROWS; i++) drawTextRow(LIST_TOP + i * LIST_ROW_H, i < 2 ? items[i] : nullptr, nullptr, 0, i == 0);
+    drawHintFooter("UP/DN move  ENTER select", nullptr);
+    save("convert-targets");
+
+    using namespace UiRec;
+    ConvInfo c;
+    c.name = "Night Drive (2019 remaster).mp3";
+    c.target = "WAV 16-bit";
+    c.outName = "Night Drive (2019 remaster).wav";
+    c.state = CONV_RUNNING;
+    c.elapsedMs = 400;
+    c.permille = 3;
+    recChrome();
+    convDraw(c);
+    save("convert-start");
+    c.elapsedMs = 61000;
+    c.leftMs = 83500;
+    c.permille = 422;
+    convLive(c);
+    save("convert-running");
+    c.state = CONV_DONE;
+    c.elapsedMs = 144000;
+    c.permille = 1000;
+    recChrome();
+    convDraw(c);
+    save("convert-done");
+    c.state = CONV_FAILED;
+    c.message = "Card full or write failed";
+    c.elapsedMs = 98000;
+    c.permille = 610;
+    c.target = "WAV 16-bit 44.1k mono";
+    c.outName = "Night Drive (2019 remaster)-2.wav";
+    recChrome();
+    convDraw(c);
+    save("convert-failed");
+    c.state = CONV_CANCELLED;
+    c.message = "Cancelled";
+    recChrome();
+    convDraw(c);
+    save("convert-cancelled");
+}
+
 int main(int argc, char** argv) {
     g_outDir = argc > 1 ? argv[1] : ".";
     crcInit();
@@ -1039,6 +1090,7 @@ int main(int argc, char** argv) {
     synthResultCard("RESET", "all sounds back to built-in", true);
     save("synthbank-reset");
     recScreens();
+    convertScreens();
     fontSheet();
     save("fonts");
     return 0;

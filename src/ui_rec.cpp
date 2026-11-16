@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
 
 using namespace Look;
 
@@ -48,7 +49,7 @@ const int ERR_LINES = 4;
 const uint16_t UNLIT = rgb(0x1A212B);
 const uint16_t REC_QUIET = rgb(0x7A1E1A); // recording, nothing arriving
 
-enum Screen : uint8_t { SCREEN_NONE, SCREEN_REC, SCREEN_SEND };
+enum Screen : uint8_t { SCREEN_NONE, SCREEN_REC, SCREEN_SEND, SCREEN_CONV };
 Screen g_screen = SCREEN_NONE;
 
 // What each live field shows now, so a tick repaints only changes.
@@ -339,6 +340,79 @@ void drawSendFooter(SendState s) {
     drawKeyFooter(k, 1);
 }
 
+// ---- convert ----------------------------------------------------------------
+
+uint16_t convTimeColor(ConvState s) {
+    return s == CONV_RUNNING ? COLOR_ACCENT : s == CONV_DONE ? COLOR_TEXT : COLOR_DIM;
+}
+
+void convLeftText(const ConvInfo& c, char* out, size_t n) {
+    if (c.state != CONV_RUNNING) snprintf(out, n, "-");
+    else if (c.leftMs == UINT32_MAX) snprintf(out, n, "--:--");
+    else formatTime(c.leftMs + 999, out, n); // rounded up, so it ends on 00:01
+}
+
+void convPctText(const ConvInfo& c, char* out, size_t n) {
+    int p = c.permille < 0 ? 0 : c.permille > 1000 ? 1000 : c.permille;
+    snprintf(out, n, "%d%%", p / 10);
+}
+
+int convFill(const ConvInfo& c) {
+    int p = c.permille < 0 ? 0 : c.permille > 1000 ? 1000 : c.permille;
+    return W * p / 1000;
+}
+
+void paintConvState(TFT_eSPI& g, const ConvInfo& c) {
+    int ty = STATE_Y + (STATE_H - 5) / 2;
+    int iy = STATE_Y + (STATE_H - 7) / 2;
+    switch (c.state) {
+        case CONV_RUNNING:
+            drawIcon(g, ICON_PLAY, X0, iy, COLOR_ACCENT);
+            drawText(g, FONT_LABEL, "CONVERTING", X0 + 12, ty, COLOR_ACCENT);
+            break;
+        case CONV_DONE:
+            g.fillRect(X0, iy, 7, 7, COLOR_TEXT);
+            drawText(g, FONT_LABEL, "FINISHED", X0 + 12, ty, COLOR_TEXT);
+            break;
+        default: {
+            uint16_t col = c.state == CONV_FAILED ? COLOR_ERROR : COLOR_DIM;
+            g.fillRect(X0, iy, 7, 7, col);
+            char buf[48];
+            fitText(FONT_TEXT, c.message ? c.message : "", W - 12, buf, sizeof(buf));
+            drawText(g, FONT_TEXT, buf, X0 + 12, STATE_Y + 2, col);
+            break;
+        }
+    }
+}
+
+// "TO" and the new file's name over the bar.
+void paintConvOut(TFT_eSPI& g, const ConvInfo& c) {
+    int x = drawText(g, FONT_LABEL, "TO", X0, PROG_Y + 1, COLOR_DIM) + 6;
+    char buf[64];
+    fitText(FONT_TEXT, c.outName ? c.outName : "", XR - x, buf, sizeof(buf));
+    drawTextRight(g, FONT_TEXT, buf, XR, PROG_Y, COLOR_TEXT);
+}
+
+// Green for what's done, an amber head while it runs.
+void paintConvBar(TFT_eSPI& g, int fill, bool head) {
+    g.fillRect(X0, BAR_Y, W, BAR_H, UNLIT);
+    if (fill > 0) g.fillRect(X0, BAR_Y, fill, BAR_H, COLOR_WAV);
+    if (head && fill > 0) {
+        int hx = fill >= 2 ? X0 + fill - 2 : X0;
+        g.fillRect(hx, BAR_Y, 2, BAR_H, COLOR_ACCENT);
+    }
+}
+
+void drawConvFooter(ConvState s) {
+    if (s == CONV_RUNNING) {
+        static const Key k[] = {{"NAV/LEFT", "cancel", TONE_ERROR}};
+        drawKeyFooter(k, 1);
+    } else {
+        static const Key k[] = {{"NAV/LEFT", "back", TONE_TEXT}};
+        drawKeyFooter(k, 1);
+    }
+}
+
 } // namespace
 
 // ---- recording and capture ---------------------------------------------------
@@ -499,6 +573,61 @@ void sendLive(const SendInfo& s) {
         g_skipped = s.skipped;
         g_junk = s.junk;
         band(0, EXTRA_Y, SCREEN_W, EXTRA_H, COLOR_BG, [&](TFT_eSPI& g) { paintExtra(g, s.skipped, s.junk); });
+    }
+}
+
+} // namespace UiRec
+
+// ---- convert -------------------------------------------------------------------
+
+namespace UiRec {
+
+void convDraw(const ConvInfo& c) {
+    g_screen = SCREEN_CONV;
+    drawStatusFor(ICON_WAVE, COLOR_WAV, "CONVERT");
+    char target[32];
+    snprintf(target, sizeof(target), "%s", c.target ? c.target : "");
+    for (char* p = target; *p; p++) *p = (char)toupper((unsigned char)*p); // Silkscreen has capitals only
+    drawTitle(c.name, target, COLOR_WAV);
+    formatTime(c.elapsedMs, g_time, sizeof(g_time));
+    convLeftText(c, g_a, sizeof(g_a));
+    convPctText(c, g_b, sizeof(g_b));
+    g_fill = convFill(c);
+    band(0, TOP_Y - 2, SCREEN_W, BODY_BOTTOM - (TOP_Y - 2), COLOR_BG, [&](TFT_eSPI& g) {
+        paintTime(g, g_time, convTimeColor(c.state));
+        paintCount(g, COL_A, "TIME LEFT", g_a, COLOR_TEXT);
+        paintCount(g, COL_B, "DONE", g_b, COLOR_TEXT);
+        g.drawFastHLine(X0, RULE1_Y, W, COLOR_RULE);
+        paintConvState(g, c);
+        g.drawFastHLine(X0, RULE2_Y, W, COLOR_RULE);
+        paintConvOut(g, c);
+        paintConvBar(g, g_fill, c.state == CONV_RUNNING);
+    });
+    drawConvFooter(c.state);
+}
+
+void convLive(const ConvInfo& c) {
+    if (g_screen != SCREEN_CONV || c.state != CONV_RUNNING) return;
+    char buf[16];
+    formatTime(c.elapsedMs, buf, sizeof(buf));
+    if (strcmp(buf, g_time) != 0) {
+        strcpy(g_time, buf);
+        drawTime(buf, convTimeColor(c.state));
+    }
+    convLeftText(c, buf, sizeof(buf));
+    if (strcmp(buf, g_a) != 0) {
+        strcpy(g_a, buf);
+        drawCountValue(COL_A, buf);
+    }
+    convPctText(c, buf, sizeof(buf));
+    if (strcmp(buf, g_b) != 0) {
+        strcpy(g_b, buf);
+        drawCountValue(COL_B, buf);
+    }
+    int fill = convFill(c);
+    if (fill != g_fill) {
+        g_fill = fill;
+        band(X0, BAR_Y, W, BAR_H, UNLIT, [&](TFT_eSPI& g) { paintConvBar(g, fill, true); });
     }
 }
 

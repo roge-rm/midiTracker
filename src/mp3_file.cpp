@@ -455,6 +455,7 @@ void Mp3Player::fillRing() {
         _filePos += (uint32_t)got;
     }
     if (got <= 0 || _filePos >= _dataEnd) {
+        if (len > 0 && got <= 0) _readFailed = true;
         _eof = true;
         MP3_DMB(); // release: the last head before eof
         g_sh.eof = true;
@@ -725,8 +726,14 @@ bool Mp3Player::startStream(uint32_t first) {
     return true;
 }
 
-bool Mp3Player::load(const char* path) {
+bool Mp3Player::load(const char* path) { return open(path, false); }
+
+bool Mp3Player::openOffline(const char* path) { return open(path, true); }
+
+bool Mp3Player::open(const char* path, bool offline) {
     close();
+    _offline = offline;
+    _readFailed = false;
     _error[0] = '\0';
     hashPath(path);
     _totalMs = _bitrate = _rate = _tagBytes = _tagMs = _vbriTable = 0;
@@ -776,6 +783,10 @@ bool Mp3Player::load(const char* path) {
     g_c1.step = (uint32_t)(((uint64_t)_rate << 16) / SAMPLE_RATE);
     g_c1.frac = 0x20000; // the first two advance() steps fill last and next
     g_c1.outPerFrame = (uint32_t)(((uint64_t)_samplesPerFrame * SAMPLE_RATE + _rate - 1) / _rate) + 2;
+    if (_offline) {
+        _state = STATE_PAUSED; // core 1 stays out, decodeNext() does the work
+        return true;
+    }
     Synth::wavStreamReset();
     _underrunBase = Synth::wavStreamUnderrunSamples();
     restartClock(0);
@@ -786,6 +797,7 @@ bool Mp3Player::load(const char* path) {
 }
 
 void Mp3Player::seekTo(uint32_t targetMs) {
+    if (_offline) return;
     if (_state != STATE_PLAYING && _state != STATE_PAUSED && _state != STATE_DONE) return;
     if (targetMs > _totalMs) targetMs = _totalMs;
     bool wasPlaying = _state == STATE_PLAYING;
@@ -877,6 +889,7 @@ void Mp3Player::growTotal(uint32_t played, uint32_t lost) {
 }
 
 void Mp3Player::update() {
+    if (_offline) return;
     if (_state != STATE_PLAYING && _state != STATE_PAUSED) return;
     if (_seekPending) {
         seekStep();
@@ -895,6 +908,7 @@ void Mp3Player::update() {
 }
 
 void Mp3Player::play() {
+    if (_offline) return;
     if (_state != STATE_PAUSED) return;
     _state = STATE_PLAYING;
     if (!_seekPending) Synth::wavStreamSetActive(true); // else when the seek finds its frame
@@ -913,8 +927,32 @@ void Mp3Player::close() {
     if (_dec) MP3FreeDecoder((HMP3Decoder)_dec);
     _dec = nullptr;
     g_c1.dec = nullptr;
-    Synth::wavStreamReset();
+    if (!_offline) Synth::wavStreamReset();
+    _offline = false;
     _state = STATE_IDLE;
+}
+
+int Mp3Player::decodeNext(const int16_t*& pcm, uint8_t& channels) {
+    if (!_offline || _state != STATE_PAUSED) return -1;
+    // fillRing() reads up to the ring's end each time, so twice tops it up.
+    fillRing();
+    fillRing();
+    DecodeResult r = decodeOne();
+    if (r == NEED_INPUT) {
+        fillRing();
+        r = decodeOne();
+    }
+    if (r == SOURCE_END) return -1;
+    if (r == NEED_INPUT) return _readFailed ? -1 : 0;
+    pcm = g_c1.pcm;
+    channels = g_c1.pcmChannels;
+    return (int)g_c1.pcmFrames;
+}
+
+void Mp3Player::inputProgress(uint32_t& done, uint32_t& total) const {
+    total = _dataEnd > _audioStart ? _dataEnd - _audioStart : 0;
+    done = _filePos > _audioStart ? _filePos - _audioStart : 0;
+    if (done > total) done = total;
 }
 
 uint32_t Mp3Player::elapsedMs() const {

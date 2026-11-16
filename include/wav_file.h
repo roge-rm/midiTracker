@@ -76,6 +76,19 @@ public:
     // Synth::wavStreamUnderrunSamples().
     uint32_t underrunSamples() const override;
 
+    // Convert: after load(), rewindSource() goes back to the first frame and
+    // readSource() reads source frames at the file's own rate, with no
+    // resampling and no WAV stream, interleaved L/R (a mono file gives L ==
+    // R). Returns the frames read, 0 at the end. readFailed() tells a card
+    // error from the end. Don't play() while using these.
+    void rewindSource();
+    size_t readSource(int16_t* out, size_t maxFrames);
+    bool readFailed() const { return _readFailed; }
+    uint32_t sourceFramesRead() const { return _srcFramesRead; }
+    uint32_t sourceFrames() const { return _totalSrcFrames; }
+    // True for 16-bit PCM, the format convert writes.
+    bool isPcm16() const { return !_isAdpcm && !_isFloat && _srcBitsPerSample == 16; }
+
     const char* typeLabel() const override { return "WAV"; }
     void formatText(char* out, size_t size) const override; // "16BIT", "4BIT" for ADPCM
 
@@ -98,6 +111,7 @@ private:
     uint32_t _totalSrcFrames = 0;
     bool _isFloat = false;          // 32-bit IEEE float samples
     bool _sourceEnded = false;      // wavStreamEnd() already signaled for this position
+    bool _readFailed = false;       // fill() got a card error
 
     // Read buffer state, offsets into SharedRamArena::scratch.bytes, and the
     // file offsets of the next byte to read and of the data chunk's end.

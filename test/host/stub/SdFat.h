@@ -41,6 +41,8 @@ public:
 
     // Count of read() calls that had to hit the backing file, for the harness.
     static unsigned long readCalls;
+    // Bytes write() may still add in all, like free space on a card; -1 is no limit.
+    static long writeBudget;
 
 private:
     FILE* _f = nullptr;

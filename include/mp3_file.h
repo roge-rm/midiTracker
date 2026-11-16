@@ -65,6 +65,18 @@ public:
     uint32_t id3Bytes() const { return _id3Bytes; }
     uint32_t samplesPerFrame() const { return _samplesPerFrame; }
 
+    // Convert: loads as load() does but leaves core 1 and the WAV stream
+    // alone. decodeNext() then decodes the next frame on the calling core
+    // (about 9 ms on the device) and points pcm at it: returns its frames,
+    // 0 for a frame with no audio (bit reservoir filling, junk), -1 at the
+    // end of the data. readFailed() tells a card error from the end. Close
+    // with close(). Core 0 only, never while another Mp3Player is loaded.
+    bool openOffline(const char* path);
+    int decodeNext(const int16_t*& pcm, uint8_t& channels);
+    bool readFailed() const { return _readFailed; }
+    // Bytes of audio data read so far and in all, for a progress bar.
+    void inputProgress(uint32_t& done, uint32_t& total) const;
+
     // Arena bytes used: decoder state, input ring, one decoded frame.
     static size_t decoderBytes();
     static size_t arenaBytes();
@@ -98,6 +110,8 @@ private:
     uint32_t _rate = 0, _bitrate = 0, _samplesPerFrame = 0, _id3Bytes = 0, _totalMs = 0;
     uint8_t _channels = 0, _version = 0;
     bool _vbr = false;
+    bool _offline = false;    // loaded by openOffline()
+    bool _readFailed = false; // fillRing() got a card error
     char _vbrTag[5] = {0};
 
     // Seek tables. _tagFrame is the file offset of the Xing/Info/VBRI
@@ -131,6 +145,7 @@ private:
     uint32_t _seekOrigin = 0, _seekNext = 0, _seekBack = 0;
 
     bool fail(const char* msg);
+    bool open(const char* path, bool offline);
     bool fillScan();       // tops the scan buffer up; false at the end of data
     // Moves _inPos to two or three layer III frames in a row at rate (any
     // rate when 0), within maxBytes. other, when given, counts the layer

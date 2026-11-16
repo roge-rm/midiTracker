@@ -96,6 +96,7 @@ bool WavPlayer::fail(const char* msg) {
 bool WavPlayer::load(const char* path) {
     close();
     _error[0] = '\0';
+    _readFailed = false;
     hashPath(path);
 
     if (!sdOpenPath(_file, path, O_RDONLY)) return fail("could not open file");
@@ -241,6 +242,7 @@ bool WavPlayer::fill(uint32_t n) {
     profile.readBytes += got > 0 ? (uint32_t)got : 0;
 #endif
     if (got <= 0) {
+        _readFailed = true;
         _dataEnd = _filePos; // a read error ends the source here
         return false;
     }
@@ -348,6 +350,18 @@ bool WavPlayer::readAdpcmFrame(int16_t& outL, int16_t& outR) {
     outR = _adpcmGroupR[_adpcmGroupPosR++];
     _srcFramesRead++;
     return true;
+}
+
+void WavPlayer::rewindSource() {
+    seekSource(0);
+    _srcFramesRead = 0;
+    _havePair = false; // update() has nothing to play until load() or seekTo()
+}
+
+size_t WavPlayer::readSource(int16_t* out, size_t maxFrames) {
+    size_t n = 0;
+    while (n < maxFrames && readSrcFrame(out[n * 2], out[n * 2 + 1])) n++;
+    return n;
 }
 
 void WavPlayer::primeInterpolationPair() {
