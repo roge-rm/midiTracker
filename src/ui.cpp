@@ -8,6 +8,8 @@
 #include "ui_look.h"
 #include "ui_player.h"
 #include "ui_modes.h"
+#include "ui_saver.h"
+#include "input.h"
 #include <ctype.h>
 #include <TFT_eSPI.h>
 #include <hardware/clocks.h>
@@ -466,8 +468,32 @@ void begin() {
 
 int visibleRows() { return rowsOnScreen(); }
 
-void drawSplash() {
-    Look::drawSplash(VERSIONNUMBER);
+namespace {
+uint32_t g_bootLastFrame;
+const uint32_t BOOT_FRAME_MS = 20; // at most one frame this often
+}
+
+void bootAnimStart() {
+    g_bootLastFrame = millis();
+    UiSaver::bootStart(VERSIONNUMBER, g_bootLastFrame);
+}
+
+bool bootAnimStep() {
+    if (UiSaver::bootDone()) return false;
+    Input::update();
+    if (Input::anyDown()) {
+        Input::muteUntilReleased();
+        UiSaver::bootSkip();
+        return false;
+    }
+    uint32_t now = millis();
+    if (now - g_bootLastFrame < BOOT_FRAME_MS) return true;
+    g_bootLastFrame = now;
+    return UiSaver::bootFrame(now);
+}
+
+void bootAnimFinish() {
+    while (bootAnimStep()) delay(1);
 }
 
 const char* shortTargetLabel(MidiOutTarget t) {

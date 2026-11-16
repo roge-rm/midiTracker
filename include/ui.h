@@ -21,9 +21,17 @@ void begin();
 // adjustment -- no "session freshness" concept here, same as MIDI Thru.
 void setBacklightBrightness(int percent);
 
-// Boot splash: "midiTracker" / "track your MIDI", centered. Just draws --
-// caller (main.cpp) is responsible for holding it on screen (e.g. delay(2000)).
-void drawSplash();
+// Boot animation (UiSaver's Pattern decode). setup() starts it, calls
+// bootAnimStep() between its load steps and bootAnimFinish() before the
+// first other screen. A key press skips to the final frame; that press is
+// then ignored until it's let go.
+void bootAnimStart();
+
+// Draws a frame if one is due. Returns true while the animation runs.
+bool bootAnimStep();
+
+// Runs the rest of the animation, under 1 s from bootAnimStart().
+void bootAnimFinish();
 
 // Full redraw of the top-level mode-select screen (the boot screen):
 // "midiTracker" header over a vertical list of mode names, `cursor`

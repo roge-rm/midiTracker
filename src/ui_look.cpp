@@ -914,21 +914,4 @@ void drawIconRow(int index, const Icon& icon, uint16_t iconColor, const char* la
     });
 }
 
-// ---- splash ---------------------------------------------------------------
-
-void drawSplash(const char* version) {
-    TFT_eSPI& g = screen();
-    hideStatus();
-    g.fillScreen(COLOR_BG);
-    const char* name = "MIDITRACKER";
-    int w = textWidth(FONT_LABEL, name, 3);
-    drawText(g, FONT_LABEL, name, (SCREEN_W - w) / 2 + 1, 96, COLOR_ACCENT, 3);
-    const char* tag = "play. record. loop.";
-    drawText(g, FONT_TEXT, tag, (SCREEN_W - textWidth(FONT_TEXT, tag)) / 2, 124, COLOR_DIM);
-    g.drawFastHLine(SCREEN_W / 2 - 40, 140, 80, COLOR_RULE);
-    char ver[24];
-    snprintf(ver, sizeof(ver), "V%s", version);
-    drawText(g, FONT_LABEL, ver, (SCREEN_W - textWidth(FONT_LABEL, ver)) / 2, 222, COLOR_DIM);
-}
-
 } // namespace Look

@@ -166,7 +166,7 @@ int statusTextRoom(const Status& st);
 void statusLeds(bool in, bool out);
 void statusBattery(int percent, bool charging);
 
-// Forgets the strip, for screens without one (splash).
+// Forgets the strip, for screens without one (boot animation).
 void hideStatus();
 
 // False on the splash and before any screen.
@@ -264,8 +264,5 @@ void drawModeRow(int index, const char* label, const char* note, bool selected);
 // A row in the same list style with one icon, drawn at double size and
 // centred in the icon space. Settings' page list uses it.
 void drawIconRow(int index, const Icon& icon, uint16_t iconColor, const char* label, const char* note, bool selected);
-
-// ---- splash ---------------------------------------------------------------
-void drawSplash(const char* version);
 
 } // namespace Look

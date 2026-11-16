@@ -692,18 +692,55 @@ int playerScreens(const std::string& dir) {
     stateScreens(dir);
     return saverScreens(dir);
 }
+
+// ---- boot animation -------------------------------------------------------------
+
+// Boot animation frames at 0 ms, part way and at the end.
+void bootScreens() {
+    g_tft.fillScreen(rgb(0xFF00FF)); // anything the animation doesn't draw shows up
+    uint32_t t0 = g_hostMs;
+    UiSaver::bootStart("0.6.0", t0);
+    save("boot-0");
+    struct { uint32_t ms; const char* name; } shots[] = {{200, "boot-rain"}, {420, "boot-mid"}, {700, "boot-late"}};
+    for (auto& s : shots) {
+        UiSaver::bootFrame(t0 + s.ms);
+        save(s.name);
+    }
+    while (UiSaver::bootFrame(t0 + 2000)) {}
+    save("boot-end");
+    g_hostMs += 2000;
+}
+
+// Every frame at 20 ms steps, as boot-NNN.png in the out dir, 2x.
+int bootFrames() {
+    g_tft.fillScreen(rgb(0xFF00FF));
+    uint32_t t0 = g_hostMs;
+    UiSaver::bootStart("0.6.0", t0);
+    int n = 0;
+    char name[32];
+    for (bool more = true; more; n++) {
+        snprintf(name, sizeof(name), "/boot-%03d.png", n);
+        writePng(g_outDir + name, 2);
+        more = UiSaver::bootFrame(t0 + (n + 1) * 20);
+    }
+    snprintf(name, sizeof(name), "/boot-%03d.png", n);
+    writePng(g_outDir + name, 2);
+    printf("%d frames in %s\n", n + 1, g_outDir.c_str());
+    return 0;
+}
+
 } // namespace
 
-// look_render <out dir> [--players <snapshot dir>]
+// look_render <out dir> [--players <snapshot dir> | --boot-frames]
 int main(int argc, char** argv) {
     g_outDir = argc > 1 ? argv[1] : ".";
     crcInit();
     setScreen(&g_tft);
     statusBattery(70, false);
     if (argc > 3 && strcmp(argv[2], "--players") == 0) return playerScreens(argv[3]);
+    if (argc > 2 && strcmp(argv[2], "--boot-frames") == 0) return bootFrames();
 
-    drawSplash("0.6.0");
-    save("splash");
+    bootScreens();
     modeScreen(false, true);
     save("modes");
     browserScreen();

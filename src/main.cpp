@@ -146,11 +146,14 @@ void setup() {
     Input::begin();
     Ui::begin();
     Battery::begin();
-    Ui::drawSplash();
-    delay(1000);
+    // The boot animation runs between the load steps below, a frame per
+    // step, and bootAnimFinish() plays out what's left.
+    Ui::bootAnimStart();
 
     MidiOutput::begin();
+    Ui::bootAnimStep();
     UsbDriveMode::begin();
+    Ui::bootAnimStep();
 
     // The MIDI and drive interfaces are added after the core has
     // enumerated the serial port, so re-enumerate for the host to see them.
@@ -160,7 +163,9 @@ void setup() {
         TinyUSBDevice.attach();
     }
 
+    Ui::bootAnimStep();
     bool sdOk = sdCardBegin();
+    Ui::bootAnimStep();
     // Only now unblock core 1's I2S/PIO init (see the comment on
     // Synth::begin()) -- it must come strictly after the SD card's own
     // PIO claim attempt above, success or not, since RP2040's 8 PIO state
@@ -171,6 +176,7 @@ void setup() {
     if (!sdOk && sdCardDetected()) {
         // The card answers but its volume doesn't mount: offer it over USB
         // until it's fixed and mounts.
+        Ui::bootAnimFinish();
         UsbDriveMode::enterMountFailed();
         do {
             Input::update();
@@ -179,20 +185,27 @@ void setup() {
         sdOk = true;
     }
     if (!sdOk) {
+        Ui::bootAnimFinish();
         Ui::drawMessage("SD card not found", "check card");
         while (true) { delay(1000); }
     }
 
 #ifdef TRACKER_PROFILE
     // Profile build: plays PROFILE_FILES and never returns, see tracker_profile.cpp.
+    Ui::bootAnimFinish();
     { extern void trackerProfileRun(); trackerProfileRun(); }
 #endif
     FilePlayerMode::begin();
+    Ui::bootAnimStep();
     SettingsMode::begin();
+    Ui::bootAnimStep();
     LooperMode::begin(); // no ordering requirement on SettingsMode anymore -- see its own comment
+    Ui::bootAnimStep();
     PariSynthMode::begin(); // after Synth::begin() above -- see its own comment on why
+    Ui::bootAnimStep();
     SynthEditor::begin(); // same ordering requirement -- loading the active bank pushes dirty-doorbell messages core 1 must already be running to drain
     PariSynthGrid::begin(); // no ordering requirement -- no-op today, kept for symmetry with SynthEditor::begin()
+    Ui::bootAnimFinish();
 }
 
 void loop() {

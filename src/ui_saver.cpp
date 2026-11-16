@@ -423,4 +423,132 @@ bool frame(const Info& info) {
     return false;
 }
 
+// ---- boot animation -----------------------------------------------------------
+
+namespace {
+
+const int BOOT_COLS = 16;
+const int BOOT_COL_W = SCREEN_W / BOOT_COLS; // 20 x 240 fits in the strip
+const int BOOT_PITCH = 12;                   // rain line height
+const char BOOT_NAME[] = "MIDITRACKER";
+const int BOOT_NAME_SCALE = 3;
+const int BOOT_NAME_Y = 96;
+const int BOOT_VER_Y = BOOT_NAME_Y + 5 * BOOT_NAME_SCALE + 10;
+const uint32_t LOCK_START_MS = 260;          // column 0 locks
+const uint32_t LOCK_STEP_MS = 30;            // then one more every step
+const uint32_t FLASH_MS = 60;                // a locked column shows bright this long
+const uint32_t VER_MS = LOCK_START_MS + (BOOT_COLS - 1) * LOCK_STEP_MS + FLASH_MS;
+const uint16_t FLASH = rgb(0xFFF0C8);
+
+// Colours taken at bootStart(), so a theme loading part way through
+// doesn't mix two palettes on the screen.
+uint16_t g_bootBg, g_bootAccent, g_bootDim;
+uint32_t g_bootT0;
+const char* g_bootVersion = "";
+uint8_t g_bootCol[BOOT_COLS]; // 0 raining, 1 drawn locked bright, 2 drawn locked
+bool g_bootVerDrawn = true;
+
+uint32_t bootHash(uint32_t a, uint32_t b) {
+    uint32_t h = a * 0x9E3779B1u ^ (b + 0x7F4A7C15u) * 0x85EBCA77u;
+    h ^= h >> 15;
+    h *= 0x2C1B3C6Du;
+    h ^= h >> 12;
+    return h;
+}
+
+// A pattern cell from a hash: a note, an instrument, an effect or dots,
+// in the player's colours, now and then a lit amber note.
+uint16_t bootCell(uint32_t h, char* t) {
+    switch ((h >> 8) % 10) {
+        case 0: case 1: case 2: case 3:
+            UiPlayer::formatNote((uint8_t)(25 + (h >> 16) % 60), t);
+            return h % 19 == 0 ? g_bootAccent : g_bootDim;
+        case 4: case 5:
+            snprintf(t, 4, "%02X", (unsigned)((h >> 16) & 0x7F));
+            return INST_DIM;
+        case 6:
+            snprintf(t, 4, "%c%02X", "0ACDEF"[(h >> 12) % 6], (unsigned)((h >> 20) & 0xFF));
+            return INST_DIM;
+        case 7:
+            strcpy(t, "===");
+            return g_bootDim;
+        default:
+            strcpy(t, "\x7f\x7f\x7f");
+            return EMPTY_CELL;
+    }
+}
+
+// Column k at t ms: lines of cells moving down at the column's own speed.
+void paintBootRain(int k, uint32_t t) {
+    int x = k * BOOT_COL_W;
+    uint32_t speed = 120 + bootHash(k, 1) % 180; // px a second
+    uint32_t off = t * speed / 1000 + bootHash(k, 2) % (BOOT_PITCH * 20);
+    int sub = (int)(off % BOOT_PITCH);
+    int32_t first = (int32_t)(off / BOOT_PITCH);
+    band(x, 0, BOOT_COL_W, SCREEN_H, g_bootBg, [&](TFT_eSPI& g) {
+        for (int i = -1; i * BOOT_PITCH + sub < SCREEN_H; i++) {
+            char t[8];
+            uint16_t c = bootCell(bootHash(k + 100, (uint32_t)(i - first)), t);
+            drawText(g, FONT_TEXT, t, x + (BOOT_COL_W - textWidth(FONT_TEXT, t)) / 2, i * BOOT_PITCH + sub + 2, c);
+        }
+    });
+}
+
+// Column k locked: blank, with its slice of the name.
+void paintBootLocked(int k, uint16_t c) {
+    int nameX = (SCREEN_W - textWidth(FONT_LABEL, BOOT_NAME, BOOT_NAME_SCALE)) / 2 + 1;
+    band(k * BOOT_COL_W, 0, BOOT_COL_W, SCREEN_H, g_bootBg, [&](TFT_eSPI& g) {
+        drawText(g, FONT_LABEL, BOOT_NAME, nameX, BOOT_NAME_Y, c, BOOT_NAME_SCALE);
+    });
+}
+
+void bootDraw(uint32_t t) {
+    for (int k = 0; k < BOOT_COLS; k++) {
+        uint32_t lockAt = LOCK_START_MS + k * LOCK_STEP_MS;
+        if (t < lockAt) {
+            paintBootRain(k, t);
+        } else if (t < lockAt + FLASH_MS) {
+            if (g_bootCol[k] < 1) paintBootLocked(k, FLASH);
+            g_bootCol[k] = 1;
+        } else if (g_bootCol[k] < 2) {
+            paintBootLocked(k, g_bootAccent);
+            g_bootCol[k] = 2;
+        }
+    }
+    if (t >= VER_MS && !g_bootVerDrawn) {
+        char ver[24];
+        snprintf(ver, sizeof(ver), "V%s", g_bootVersion);
+        band(0, BOOT_VER_Y, SCREEN_W, 8, g_bootBg, [&](TFT_eSPI& g) {
+            drawText(g, FONT_LABEL, ver, (SCREEN_W - textWidth(FONT_LABEL, ver)) / 2, BOOT_VER_Y + 1, g_bootDim);
+        });
+        g_bootVerDrawn = true;
+    }
+}
+
+} // namespace
+
+void bootStart(const char* version, uint32_t nowMs) {
+    hideStatus();
+    g_bootBg = COLOR_BG;
+    g_bootAccent = COLOR_ACCENT;
+    g_bootDim = COLOR_DIM;
+    g_bootVersion = version ? version : "";
+    g_bootT0 = nowMs;
+    memset(g_bootCol, 0, sizeof(g_bootCol));
+    g_bootVerDrawn = false;
+    bootDraw(0);
+}
+
+bool bootFrame(uint32_t nowMs) {
+    if (g_bootVerDrawn) return false;
+    bootDraw(nowMs - g_bootT0);
+    return !g_bootVerDrawn;
+}
+
+void bootSkip() {
+    if (!g_bootVerDrawn) bootDraw(VER_MS);
+}
+
+bool bootDone() { return g_bootVerDrawn; }
+
 } // namespace UiSaver
