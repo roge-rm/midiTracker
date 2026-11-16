@@ -10,8 +10,8 @@ namespace {
 
 // Cross-core message format, one 32-bit word per event in the message
 // ring (see pushMsg()). The top nibble tags the message type, leaving 28
-// payload bits. 0xC-0xE are free for channel messages (CC, pitch bend,
-// aftertouch). PANIC_MSG/RESET_PROGRAMS_MSG (top nibble 0xF) are reserved
+// payload bits. 0xC-0xE carry channel messages (CC, pitch bend, channel
+// pressure). PANIC_MSG/RESET_PROGRAMS_MSG (top nibble 0xF) are reserved
 // sentinels.
 const uint32_t MSG_TYPE_NOTE = 0x0u;
 const uint32_t MSG_TYPE_PROGRAM = 0x1u;
@@ -30,8 +30,12 @@ const uint32_t MSG_TYPE_DRUM_PRESET_DIRTY = 0x8u;
 const uint32_t MSG_TYPE_LFO_RATE = 0x9u;
 const uint32_t MSG_TYPE_LFO_VOICES = 0xAu;
 const uint32_t MSG_TYPE_STEREO_SPREAD = 0xBu;
+const uint32_t MSG_TYPE_CC = 0xCu;
+const uint32_t MSG_TYPE_BEND = 0xDu;
+const uint32_t MSG_TYPE_PRESSURE = 0xEu;
 const uint32_t PANIC_MSG = 0xFFFFFFFFu;
 const uint32_t RESET_PROGRAMS_MSG = 0xFFFFFFFEu;
+const uint32_t RESET_CONTROLLERS_MSG = 0xFFFFFFFDu;
 
 // velocity == 0 means "off" -- the same note-on-with-zero-velocity-is-a-
 // note-off convention already used elsewhere in this codebase (see
@@ -74,6 +78,16 @@ inline uint32_t packLfoVoicesMsg(uint8_t maxVoices) {
 }
 inline uint32_t packStereoSpreadMsg(uint8_t percent) {
     return (MSG_TYPE_STEREO_SPREAD << 28) | percent;
+}
+inline uint32_t packCcMsg(uint8_t channel, uint8_t cc, uint8_t value) {
+    return (MSG_TYPE_CC << 28) | ((uint32_t)(channel & 0x0F) << 16) | ((uint32_t)(cc & 0x7F) << 8) | (value & 0x7F);
+}
+// bend14 is the raw 14-bit value, 8192 = centre.
+inline uint32_t packBendMsg(uint8_t channel, uint16_t bend14) {
+    return (MSG_TYPE_BEND << 28) | ((uint32_t)(channel & 0x0F) << 16) | (bend14 & 0x3FFF);
+}
+inline uint32_t packPressureMsg(uint8_t channel, uint8_t pressure) {
+    return (MSG_TYPE_PRESSURE << 28) | ((uint32_t)(channel & 0x0F) << 16) | (pressure & 0x7F);
 }
 
 // Set by Synth::begin() on core 0, polled by setup1() on core 1 -- see
@@ -184,9 +198,9 @@ uint32_t g_lfoPhase = 0;
 bool g_lfoEnabled = true;
 
 // Settings "Stereo Spread" -- see Synth::setStereoSpread() and its use in
-// startMelodicVoice() below. 0 = every melodic channel centered (mono
+// spreadPan() below, for channels that never sent CC10. 0 = every melodic channel centered (mono
 // panning-wise -- drums already always are, see startPercussionVoice()),
-// 100 = startMelodicVoice()'s alternating-by-channel-parity mapping at
+// 100 = spreadPan()'s alternating-by-channel-parity mapping at
 // its full +-96 width (see that function's own comment for why it
 // alternates sides rather than ramping linearly by channel number, which
 // used to put every commonly-used low channel on the same side). This
@@ -299,6 +313,9 @@ struct Voice {
     uint8_t note = 0;
     Waveform waveform = WAVE_SINE;
     uint8_t channel = 0;   // MIDI channel 0-15 that started it, for note-off matching
+    uint8_t family = 0;    // preset family at note-on, for recomputing vibratoRange on bend/mod
+    bool held = false;     // note-off arrived while sustain (or sostenuto, see sostLatched) held it
+    bool sostLatched = false; // was sounding when CC66 went down
     uint32_t startOrder = 0; // g_voiceStartCounter at note-on, for oldest-voice stealing
 
     uint32_t phase = 0;    // 32-bit accumulator, one full cycle == 2^32
@@ -347,16 +364,13 @@ struct Voice {
     uint32_t tremoloDepthQ16 = 0;
     uint32_t pwmDepthQ16 = 0;
 
-    // Stereo pan, 0-255 (0=full left, 128=center, 255=full right) -- same
-    // convention/split (L uses 255-pan, R uses pan, both >>8) the S3M/XM/
-    // MOD mixers already use for their own per-channel panning, reused
-    // here for consistency. Set once at note-start from the MIDI channel
-    // (melodic) or fixed center (percussion, see startPercussionVoice()) --
-    // not a live-updating CC10 response, just a per-part spread so
-    // simultaneous tracks/channels are spatially distinguishable, the same
-    // "make different parts distinguishable" goal the filter/vibrato
-    // presets already serve.
-    int32_t pan = 128;
+    // Q15 gains, set from the channel's volume, expression, pan and reverb
+    // send at note-on and when one of those CCs arrives (see
+    // applyChannelGains()). sendGain is Q14 so CC91 above 40 can go past
+    // unity.
+    uint16_t gainL = 0;
+    uint16_t gainR = 0;
+    uint16_t sendGain = 0;
 };
 
 // Both pools in one array so renderSample() renders them in one loop
@@ -374,6 +388,31 @@ I2S g_i2s(OUTPUT, AUDIO_BCLK, AUDIO_SDATA); // LRCLK is implicitly AUDIO_BCLK+1,
 // PRESETS below). Program 0 (Acoustic Grand Piano family) by default,
 // matching GM's own default.
 uint8_t g_channelProgram[16] = {0};
+
+// Per-channel controller state, 16 B a channel. Core 1 only: core 0 sends
+// CC, bend and pressure as ring messages and handleMessage() applies them
+// here, so nothing is shared across cores.
+struct ChannelState {
+    uint8_t volume;      // CC7
+    uint8_t expression;  // CC11
+    uint8_t pan;         // CC10, used only once panSet
+    uint8_t reverbSend;  // CC91
+    uint8_t mod;         // CC1
+    uint8_t pressure;    // channel aftertouch, adds to mod
+    uint8_t bendRange;   // RPN 0 MSB, semitones (capped at 24)
+    uint8_t bendCents;   // RPN 0 LSB
+    uint8_t rpnMsb;      // CC101, 127 = null
+    uint8_t rpnLsb;      // CC100
+    bool sustain;        // CC64
+    bool sostenuto;      // CC66
+    bool soft;           // CC67
+    bool panSet;         // a CC10 arrived, so Stereo Spread no longer applies
+    int16_t bend;        // -8192..8191
+};
+ChannelState g_chan[16];
+// Pitch ratio from bend and bend range, Q28 (1 << 28 = no bend), worked
+// out when either changes.
+uint32_t g_chanBendQ28[16];
 
 uint32_t g_noiseState = 0xACE1u; // xorshift32 seed, any nonzero value
 
@@ -600,6 +639,55 @@ const uint32_t NOTE_PHASE_INC[128] = {
     815363807u, 863847862u, 915214929u, 969636441u, 1027294024u, 1088380105u, 1153098554u, 1221665363u,
 };
 static_assert(SAMPLE_RATE == 44100, "NOTE_PHASE_INC is for 44.1 kHz");
+
+// GM's 40 log curve, round(32768 * (i / 127)^2), for velocity, CC7 and CC11.
+const uint16_t GM_CURVE_Q15[128] = {
+    0, 2, 8, 18, 33, 51, 73, 100, 130, 165, 203, 246, 293, 343, 398, 457,
+    520, 587, 658, 733, 813, 896, 983, 1075, 1170, 1270, 1373, 1481, 1593, 1709, 1828, 1952,
+    2080, 2212, 2349, 2489, 2633, 2781, 2934, 3090, 3251, 3415, 3584, 3756, 3933, 4114, 4299, 4488,
+    4681, 4878, 5079, 5284, 5494, 5707, 5924, 6146, 6371, 6601, 6834, 7072, 7314, 7560, 7810, 8064,
+    8322, 8584, 8850, 9120, 9394, 9673, 9955, 10241, 10532, 10827, 11125, 11428, 11735, 12045, 12360, 12679,
+    13002, 13329, 13661, 13996, 14335, 14678, 15026, 15377, 15733, 16092, 16456, 16824, 17196, 17571, 17951, 18335,
+    18723, 19116, 19512, 19912, 20316, 20725, 21137, 21553, 21974, 22399, 22827, 23260, 23697, 24138, 24583, 25032,
+    25485, 25942, 26403, 26868, 27337, 27811, 28288, 28770, 29255, 29745, 30239, 30736, 31238, 31744, 32254, 32768,
+};
+// Equal-power pan, round(32768 * sin(max(i - 1, 0) / 126 * pi / 2)). Right
+// gain is [pan], left is [128 - max(pan, 1)], so 0 and 1 are hard left and 64
+// is centre (0.707 each side).
+const uint16_t PAN_SIN_Q15[128] = {
+    0, 0, 408, 817, 1225, 1633, 2041, 2449, 2856, 3263, 3669, 4074, 4480, 4884, 5287, 5690,
+    6092, 6493, 6893, 7292, 7689, 8086, 8481, 8875, 9267, 9659, 10048, 10436, 10823, 11207, 11590, 11971,
+    12351, 12728, 13104, 13477, 13848, 14218, 14584, 14949, 15311, 15671, 16029, 16384, 16736, 17086, 17434, 17778,
+    18120, 18459, 18795, 19128, 19458, 19785, 20110, 20431, 20748, 21063, 21374, 21682, 21987, 22288, 22586, 22880,
+    23170, 23458, 23741, 24021, 24297, 24569, 24837, 25102, 25362, 25619, 25872, 26120, 26365, 26606, 26842, 27074,
+    27302, 27526, 27745, 27961, 28171, 28378, 28580, 28778, 28971, 29159, 29343, 29523, 29698, 29868, 30034, 30195,
+    30351, 30503, 30650, 30792, 30929, 31062, 31189, 31312, 31430, 31543, 31651, 31755, 31853, 31946, 32035, 32118,
+    32197, 32270, 32339, 32402, 32460, 32514, 32562, 32605, 32643, 32676, 32704, 32727, 32745, 32758, 32765, 32768,
+};
+// 2^(s / 12) for s = 0..11 and 2^(c / 1200) for c = 0..99, Q30, for pitch bend.
+const uint32_t SEMI_RATIO_Q30[12] = {
+    1073741824, 1137589835, 1205234447, 1276901417, 1352829926, 1433273380,
+    1518500250, 1608794974, 1704458901, 1805811301, 1913190429, 2026954652,
+};
+const uint32_t CENT_RATIO_Q30[100] = {
+    1073741824, 1074362221, 1074982976, 1075604090, 1076225563, 1076847394,
+    1077469586, 1078092136, 1078715047, 1079338317, 1079961947, 1080585938,
+    1081210289, 1081835001, 1082460074, 1083085508, 1083711303, 1084337460,
+    1084963979, 1085590860, 1086218103, 1086845708, 1087473676, 1088102007,
+    1088730701, 1089359758, 1089989179, 1090618963, 1091249112, 1091879624,
+    1092510500, 1093141742, 1093773347, 1094405318, 1095037654, 1095670355,
+    1096303422, 1096936855, 1097570653, 1098204818, 1098839349, 1099474247,
+    1100109512, 1100745144, 1101381143, 1102017509, 1102654243, 1103291345,
+    1103928816, 1104566654, 1105204861, 1105843437, 1106482382, 1107121695,
+    1107761379, 1108401432, 1109041854, 1109682647, 1110323810, 1110965344,
+    1111607248, 1112249523, 1112892169, 1113535186, 1114178575, 1114822336,
+    1115466468, 1116110973, 1116755850, 1117401100, 1118046723, 1118692719,
+    1119339088, 1119985830, 1120632946, 1121280436, 1121928300, 1122576538,
+    1123225151, 1123874139, 1124523502, 1125173240, 1125823353, 1126473842,
+    1127124707, 1127775947, 1128427564, 1129079558, 1129731928, 1130384676,
+    1131037800, 1131691302, 1132345181, 1132999438, 1133654074, 1134309087,
+    1134964479, 1135620249, 1136276399, 1136932927,
+};
 
 // Per-sample Q16 fraction for an exponential stage that falls 40 dB in
 // `samples` (the time the editor shows), about how long the old linear
@@ -872,6 +960,231 @@ int activeModulatedVoiceCount(const Voice* exclude) {
     return count;
 }
 
+void releaseVoice(Voice& v);
+
+// -- Channel controllers (core 1) ------------------------------------------
+// All of this runs from handleMessage() or at note-on, never per sample:
+// a CC, bend or pressure change works out the new per-voice gains, phaseInc
+// and vibratoRange once, and renderVoice() just uses them.
+
+const uint8_t BEND_RANGE_MAX = 24; // semitones; keeps the bend ratio under 4 (Q28 fits)
+const uint32_t BEND_UNITY_Q28 = 1u << 28;
+// vibratoRange * (lfoValue >> 5) has to fit int32, |lfoValue >> 5| <= 1000.
+const uint32_t VIBRATO_RANGE_MAX = 2100000;
+
+// Melodic Stereo Spread position for a channel that never sent CC10, as a
+// 0..127 pan. Even channels left, odd right, fanning out as the channel
+// number rises, so the common low channels sit near centre. +-96 of 255 at
+// 100% spread; g_stereoSpreadPercent scales it around centre.
+uint8_t spreadPan(uint8_t channel) {
+    int32_t rank = channel / 2; // 0..7 -- distance from center, in steps
+    int32_t side = (channel % 2 == 0) ? -1 : 1; // even = left, odd = right
+    int32_t magnitude = (2 * rank + 1) * 96 / 15; // 6..96, odd steps so rank 0 isn't dead center
+    int32_t pan255 = 128 + (side * magnitude * g_stereoSpreadPercent) / 100;
+    return (uint8_t)(pan255 >> 1);
+}
+
+// Sets v's gains from its channel's volume, expression, pan and reverb send.
+// Drums sit in the centre until CC10 moves them.
+void applyChannelGains(Voice& v, bool drum) {
+    const ChannelState& c = g_chan[v.channel];
+    uint32_t g = ((uint32_t)GM_CURVE_Q15[c.volume] * GM_CURVE_Q15[c.expression]) >> 15; // <= 32768
+    uint8_t pan = c.panSet ? c.pan : (drum ? 64 : spreadPan(v.channel));
+    v.gainL = (uint16_t)((g * PAN_SIN_Q15[128 - (pan ? pan : 1)]) >> 15);
+    v.gainR = (uint16_t)((g * PAN_SIN_Q15[pan]) >> 15);
+    // CC91 40 (the GM default) sends 0.707 in Q14, the same as the voice's
+    // own level in each channel at centre, which is what the whole mix sent
+    // before per-channel sends. 9268 / 32 = 0.707 * 16384 / 40.
+    uint32_t k = ((uint32_t)c.reverbSend * 9268) >> 5; // <= 36782
+    v.sendGain = (uint16_t)((g * k) >> 15);
+}
+
+// Mod wheel plus channel pressure, 127 = 50 cents of vibrato (fluidsynth's
+// default depth for both), as a Q16 fraction of pitch like the preset's.
+uint32_t modDepthQ16(uint8_t channel) {
+    uint32_t m = (uint32_t)g_chan[channel].mod + g_chan[channel].pressure;
+    if (m > 127) m = 127;
+    return (m * 1935) >> 7; // 127 -> 1919, 2^(50/1200) - 1
+}
+
+// Melodic voices only: phaseInc from the note and the channel's bend, and
+// vibratoRange from that and the preset plus mod depth.
+void applyPitch(Voice& v) {
+    uint32_t inc = NOTE_PHASE_INC[v.note & 0x7F];
+    uint32_t r = g_chanBendQ28[v.channel];
+    if (r != BEND_UNITY_Q28) {
+        uint64_t bent = ((uint64_t)inc * r) >> 28;
+        inc = bent > 0x7FFFFFFFu ? 0x7FFFFFFFu : (uint32_t)bent; // Nyquist
+    }
+    v.phaseInc = inc;
+    uint32_t depth = g_presetVibratoDepthQ16[v.family] + modDepthQ16(v.channel);
+    // >>24, 8 bits more than Q16, so renderVoice()'s multiply stays int32.
+    uint64_t range = ((uint64_t)inc * depth) >> 24;
+    v.vibratoRange = range > VIBRATO_RANGE_MAX ? VIBRATO_RANGE_MAX : (uint32_t)range;
+}
+
+void updateBendRatio(uint8_t channel) {
+    const ChannelState& c = g_chan[channel];
+    int32_t rangeCents = (int32_t)c.bendRange * 100 + c.bendCents;
+    if (rangeCents > BEND_RANGE_MAX * 100) rangeCents = BEND_RANGE_MAX * 100;
+    int32_t cents = ((int32_t)c.bend * rangeCents) >> 13; // -2400..2399
+    if (cents == 0) { g_chanBendQ28[channel] = BEND_UNITY_Q28; return; }
+    uint32_t u = (uint32_t)(cents + 2400); // 0..4799, 2400 = unity
+    uint32_t oct = u / 1200, rem = u - oct * 1200;
+    uint32_t r30 = (uint32_t)(((uint64_t)SEMI_RATIO_Q30[rem / 100] * CENT_RATIO_Q30[rem % 100]) >> 30);
+    g_chanBendQ28[channel] = r30 >> (4 - oct); // 2^(oct - 2) * r30 / 2^30, in Q28
+}
+
+void updateChannelVoices(uint8_t channel, bool gains, bool pitch) {
+    for (int i = 0; i < NUM_VOICES; i++) {
+        Voice& v = g_voices[i];
+        if (!v.active || v.channel != channel) continue;
+        bool drum = i >= NUM_MELODIC_VOICES;
+        if (gains) applyChannelGains(v, drum);
+        if (pitch && !drum) applyPitch(v);
+    }
+}
+
+void startRelease(Voice& v) {
+    v.held = false;
+    if (v.stage == ENV_RELEASE) return;
+    v.stage = ENV_RELEASE;
+    v.envFloor = envStageFloor(v.amplitude);
+}
+
+// A note-off for a melodic voice: held while the sustain pedal is down, or
+// while sostenuto is down and it was sounding when the pedal went down.
+void noteOffVoice(Voice& v) {
+    const ChannelState& c = g_chan[v.channel];
+    if (v.stage == ENV_RELEASE || v.held) return;
+    if (c.sustain || (c.sostenuto && v.sostLatched)) v.held = true;
+    else startRelease(v);
+}
+
+// After a pedal comes up: releases held voices nothing holds any more.
+void releaseUnheld(uint8_t channel) {
+    const ChannelState& c = g_chan[channel];
+    for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
+        Voice& v = g_melodicVoices[i];
+        if (!v.active || v.channel != channel || !v.held) continue;
+        if (c.sustain || (c.sostenuto && v.sostLatched)) continue;
+        startRelease(v);
+    }
+}
+
+void setSostenuto(uint8_t channel, bool on) {
+    ChannelState& c = g_chan[channel];
+    if (on == c.sostenuto) return;
+    c.sostenuto = on;
+    for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
+        Voice& v = g_melodicVoices[i];
+        if (!v.active || v.channel != channel) continue;
+        if (on) v.sostLatched = v.stage != ENV_RELEASE && !v.held; // key still down
+    }
+    if (!on) {
+        releaseUnheld(channel);
+        for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
+            if (g_melodicVoices[i].channel == channel) g_melodicVoices[i].sostLatched = false;
+        }
+    }
+}
+
+// CC121 (full = false) resets what RP-015 lists: expression, mod,
+// pressure, bend, pedals and the RPN select, leaving volume, pan, reverb
+// send and bend range. A full reset (setup, new song, mode changes) also
+// puts those back: volume 100, pan to Stereo Spread, range 2, send 40.
+void resetChannel(uint8_t channel, bool full) {
+    ChannelState& c = g_chan[channel];
+    if (full) {
+        c.volume = 100;
+        c.pan = 64;
+        c.panSet = false;
+        c.bendRange = 2;
+        c.bendCents = 0;
+        c.reverbSend = 40;
+    }
+    c.expression = 127;
+    c.mod = 0;
+    c.pressure = 0;
+    c.bend = 0;
+    c.rpnMsb = c.rpnLsb = 127;
+    c.soft = false;
+    c.sustain = false;
+    setSostenuto(channel, false);
+    releaseUnheld(channel);
+    g_chanBendQ28[channel] = BEND_UNITY_Q28;
+    updateChannelVoices(channel, true, true);
+}
+
+void handleControlChange(uint8_t channel, uint8_t cc, uint8_t value) {
+    ChannelState& c = g_chan[channel];
+    switch (cc) {
+        case 1: c.mod = value; updateChannelVoices(channel, false, true); break;
+        case 7: c.volume = value; updateChannelVoices(channel, true, false); break;
+        case 10: c.pan = value; c.panSet = true; updateChannelVoices(channel, true, false); break;
+        case 11: c.expression = value; updateChannelVoices(channel, true, false); break;
+        case 91: c.reverbSend = value; updateChannelVoices(channel, true, false); break;
+        case 64: {
+            bool on = value >= 64;
+            if (on == c.sustain) break;
+            c.sustain = on;
+            if (!on) releaseUnheld(channel);
+            break;
+        }
+        case 66: setSostenuto(channel, value >= 64); break;
+        case 67: c.soft = value >= 64; break;
+        case 101: c.rpnMsb = value; break;
+        case 100: c.rpnLsb = value; break;
+        case 99: case 98: c.rpnMsb = c.rpnLsb = 127; break; // NRPN: data entry isn't ours
+        case 6:
+            if (c.rpnMsb == 0 && c.rpnLsb == 0) {
+                c.bendRange = value > BEND_RANGE_MAX ? BEND_RANGE_MAX : value;
+                c.bendCents = 0;
+                updateBendRatio(channel);
+                updateChannelVoices(channel, false, true);
+            }
+            break;
+        case 38:
+            if (c.rpnMsb == 0 && c.rpnLsb == 0) {
+                c.bendCents = value > 99 ? 99 : value;
+                updateBendRatio(channel);
+                updateChannelVoices(channel, false, true);
+            }
+            break;
+        case 120: // All Sound Off: fast release, pedals or not
+            for (int i = 0; i < NUM_VOICES; i++) {
+                Voice& v = g_voices[i];
+                if (v.channel != channel) continue;
+                v.held = false;
+                v.sostLatched = false;
+                releaseVoice(v);
+            }
+            break;
+        case 121: resetChannel(channel, false); break;
+        case 123: case 124: case 125: case 126: case 127: // All Notes Off, and the mode messages that imply it
+            for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
+                Voice& v = g_melodicVoices[i];
+                if (v.active && v.channel == channel) noteOffVoice(v);
+            }
+            break;
+        default: break;
+    }
+}
+
+void handlePitchBend(uint8_t channel, uint16_t bend14) {
+    int16_t bend = (int16_t)((int32_t)(bend14 & 0x3FFF) - 8192);
+    if (bend == g_chan[channel].bend) return;
+    g_chan[channel].bend = bend;
+    updateBendRatio(channel);
+    updateChannelVoices(channel, false, true);
+}
+
+void handleChannelPressure(uint8_t channel, uint8_t pressure) {
+    if (pressure == g_chan[channel].pressure) return;
+    g_chan[channel].pressure = pressure;
+    updateChannelVoices(channel, false, true);
+}
+
 void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity) {
     // Retriggering an already-sounding note, or stealing a busy voice
     // (more notes than NUM_MELODIC_VOICES at once), means `v.amplitude`
@@ -890,20 +1203,16 @@ void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity
     v.active = true;
     v.note = note;
     v.channel = channel;
+    v.family = family;
+    v.held = false;
+    v.sostLatched = false;
     v.startOrder = ++g_voiceStartCounter;
     v.waveform = preset.waveform;
     if (!wasActive) { v.phase = 0; v.filterState = 0; }
-    v.phaseInc = NOTE_PHASE_INC[note & 0x7F];
     v.pitchDrop = 0;
     v.pitchDropStep = 0;
     v.filterAlpha = g_presetFilterAlpha[family];
-    // >>8 extra, on top of the usual >>16, pre-shrinks this for the
-    // per-sample runtime multiply in renderVoice() to stay a plain int32
-    // multiply instead of needing int64_t -- see that call site's comment.
-    // This is a one-time note-start computation (a 64-bit multiply here
-    // costs nothing, unlike doing it every sample), so precision is only
-    // sacrificed where it doesn't cost anything to keep.
-    v.vibratoRange = (uint32_t)(((uint64_t)v.phaseInc * g_presetVibratoDepthQ16[family]) >> 24);
+    applyPitch(v); // phaseInc and vibratoRange, with the channel's bend and mod
     v.tremoloDepthQ16 = g_presetTremoloDepthQ16[family];
     v.pwmDepthQ16 = g_presetPwmDepthQ16[family];
     // See g_maxModulatedVoices' own comment: cap how many voices wobble at
@@ -915,31 +1224,12 @@ void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity
         v.tremoloDepthQ16 = 0;
         v.pwmDepthQ16 = 0;
     }
-    // Spread channels 0-15 across the stereo field, but not hard to the
-    // extremes (+-96 out of the 0..255 range's +-127 half-width at full
-    // Stereo Spread) -- a channel fully isolated to one ear is fatiguing
-    // on headphones/earbuds, which is exactly what most listeners here
-    // will be using (see this file's whole Volume/Output Level history).
-    //
-    // Alternating by parity (even channels left, odd right), fanning both
-    // sides out together as channel number increases, rather than a
-    // straight left-to-right ramp across channel number -- see
-    // g_stereoSpreadPercent's own comment for why a plain linear ramp was
-    // a real bug, not just a width preference: real GM files fill
-    // channels upward from 1 with channel 10 reserved for drums, so a
-    // linear mapping put every commonly-used low channel on the *same*
-    // side. Channels 0/1 (the most commonly used pair) now sit close
-    // together near center with only gentle separation; only the rarely-
-    // used high channels reach the full +-96 extremes. fullOffset is this
-    // channel's position at 100% spread; g_stereoSpreadPercent scales it
-    // around center (pan 128).
-    int32_t rank = channel / 2; // 0..7 -- distance from center, in steps
-    int32_t side = (channel % 2 == 0) ? -1 : 1; // even = left, odd = right
-    int32_t magnitude = (2 * rank + 1) * 96 / 15; // 6..96, odd steps so rank 0 isn't dead center
-    int32_t fullOffset = side * magnitude;
-    v.pan = 128 + (fullOffset * g_stereoSpreadPercent) / 100;
+    applyChannelGains(v, false);
 
-    int32_t peak = ((int32_t)VOICE_PEAK * velocity) / 127;
+    // CC67 soft pedal: about 0.7 of the velocity.
+    if (g_chan[channel].soft) velocity = (uint8_t)((velocity * 179) >> 8);
+    int32_t peak = ((int32_t)VOICE_PEAK * GM_CURVE_Q15[velocity & 0x7F]) >> 15;
+    if (peak < 1) peak = 1;
     v.peakLevel = peak << 16;
     v.sustainLevel = ((peak * preset.sustainPercent) / 100) << 16;
     v.decayK = g_presetDecayK[family];
@@ -967,7 +1257,9 @@ void startPercussionVoice(Voice& v, uint8_t note, uint8_t velocity) {
     v.startOrder = ++g_voiceStartCounter;
     v.waveform = p.waveform;
     v.filterAlpha = g_drumFilterAlpha[drumType];
-    v.pan = 128; // drums stay centered, matching how real kits are usually mixed
+    v.held = false;
+    v.sostLatched = false;
+    applyChannelGains(v, true); // centred unless channel 10 sent CC10
     v.phaseInc = g_drumPhaseInc[drumType];
     v.pitchDrop = g_drumPitchDrop[drumType];
     v.pitchDropStep = g_drumPitchDropStep[drumType];
@@ -984,7 +1276,8 @@ void startPercussionVoice(Voice& v, uint8_t note, uint8_t velocity) {
     // and centered/mono-summed content reads as more forward than panned
     // content even at equal amplitude). Reduce further (or drop this
     // entirely) if it's still too hot.
-    int32_t peak = ((int32_t)VOICE_PEAK * velocity) / 127;
+    int32_t peak = ((int32_t)VOICE_PEAK * GM_CURVE_Q15[velocity & 0x7F]) >> 15;
+    if (peak < 1) peak = 1;
     // Hats skip the general boost below entirely and then get two
     // successive -25% cuts on top of that (~0.56x/-5dB combined): high-
     // frequency noise is already perceptually piercing on its own (equal-
@@ -1065,7 +1358,10 @@ void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
         Voice& v = g_melodicVoices[i];
         if (v.active && v.note == note && v.channel == channel) {
+            // A retriggered note keeps its sostenuto latch while the pedal is down.
+            bool latch = v.sostLatched && g_chan[channel].sostenuto;
             startMelodicVoice(v, channel, note, velocity);
+            v.sostLatched = latch;
             return;
         }
     }
@@ -1084,14 +1380,12 @@ void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
 void handleNoteOff(uint8_t channel, uint8_t note) {
     for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
         Voice& v = g_melodicVoices[i];
-        if (v.active && v.note == note && v.channel == channel && v.stage != ENV_RELEASE) {
-            v.stage = ENV_RELEASE;
-            v.envFloor = envStageFloor(v.amplitude);
-        }
+        if (v.active && v.note == note && v.channel == channel) noteOffVoice(v);
     }
 }
 
 void releaseVoice(Voice& v) {
+    v.held = false;
     if (!v.active) return;
     v.stage = ENV_RELEASE;
     v.releaseK = PANIC_RELEASE_K;
@@ -1106,8 +1400,8 @@ void handlePanic() {
 // Renders one voice's current sample and advances its phase/envelope by
 // one sample. Returns its contribution to the mix (0 if inactive). Shared
 // by both voice pools so the envelope state machine only exists once.
-ALWAYS_INLINE void __not_in_flash_func(renderVoice)(Voice& v, int16_t lfoValue, int32_t& outL, int32_t& outR) {
-    if (!v.active) { outL = 0; outR = 0; return; }
+ALWAYS_INLINE void __not_in_flash_func(renderVoice)(Voice& v, int16_t lfoValue, int32_t& outL, int32_t& outR, int32_t& outSend) {
+    if (!v.active) { outL = 0; outR = 0; outSend = 0; return; }
 
     // pitchDrop (percussion pitch sweep, >= 0) and the shared vibrato LFO
     // (either sign) nudge phaseInc. Plain uint32 adds: a negative nudge
@@ -1166,10 +1460,11 @@ ALWAYS_INLINE void __not_in_flash_func(renderVoice)(Voice& v, int16_t lfoValue, 
         int32_t tremMod = ((int32_t)v.tremoloDepthQ16 * lfoValue) >> 15;
         contribution = ((contribution >> 2) * (65536 + tremMod)) >> 14;
     }
-    // Same pan split (255-pan for L, pan for R, both >>8) the S3M/XM/MOD
-    // mixers already use -- see Voice::pan's comment.
-    outL = (contribution * (255 - v.pan)) >> 8;
-    outR = (contribution * v.pan) >> 8;
+    // Channel gains (see applyChannelGains()). contribution is under ~46100
+    // (drum peak 2880), so Q15 gains and the Q14 send (<= 36782) fit int32.
+    outL = (contribution * (int32_t)v.gainL) >> 15;
+    outR = (contribution * (int32_t)v.gainR) >> 15;
+    outSend = (contribution * (int32_t)v.sendGain) >> 14;
     v.phase += effectivePhaseInc;
 
     if (v.pitchDropStep != 0) {
@@ -1231,8 +1526,8 @@ int32_t __not_in_flash_func(softLimit)(int32_t mix) {
 // -- Lo-fi reverb -----------------------------------------------------------
 // A small mono Freeverb-style tank (4 parallel comb filters + 2 series
 // allpass filters) fed from the onboard MIDI synth's own voices only --
-// see renderSample()'s synthMixL/R, captured before WAV/tracker content is
-// mixed in -- so a WAV or tracker file playing back never reaches the
+// see renderSample()'s sendSum, built from the voices before WAV/tracker
+// content is mixed in -- so a WAV or tracker file playing back never reaches the
 // tank, only actual synth notes do. The wet output still gets added into
 // the full (WAV-included) mix afterward, since there's nowhere else for
 // it to go once everything's combined into one output signal. Comb/
@@ -1544,9 +1839,8 @@ void reverbTypeChanged(uint8_t newType) {
 }
 
 // Fills outLeft/outRight with this sample's mixed output. Each synth
-// voice contributes to mixL/mixR according to its own Voice::pan (melodic
-// voices spread across the stereo field by MIDI channel, drums centered --
-// see startMelodicVoice()/startPercussionVoice()), and a WAV stream
+// voice contributes to mixL/mixR according to its own gainL/gainR (its
+// channel's CC7, CC11 and CC10, see applyChannelGains()), and a WAV stream
 // (genuinely stereo -- see popWavFrame()) adds in on top of that; softLimit()/
 // the leveler/volume then apply per-channel.
 void __not_in_flash_func(renderSample)(int16_t& outLeft, int16_t& outRight) {
@@ -1564,18 +1858,14 @@ void __not_in_flash_func(renderSample)(int16_t& outLeft, int16_t& outRight) {
         g_lfoPhase += g_lfoPhaseInc;
     }
 
-    int32_t mixL = 0, mixR = 0;
+    // sendSum is the reverb send, each voice at its channel's CC91. Only
+    // synth voices feed it, so WAV and tracker playback never reach the tank.
+    int32_t mixL = 0, mixR = 0, sendSum = 0;
     for (int i = 0; i < NUM_VOICES; i++) {
-        int32_t l, r;
-        renderVoice(g_voices[i], lfoValue, l, r);
-        mixL += l; mixR += r;
+        int32_t l, r, snd;
+        renderVoice(g_voices[i], lfoValue, l, r, snd);
+        mixL += l; mixR += r; sendSum += snd;
     }
-
-    // Reverb sends from the synth voices only (see reverbProcess()'s
-    // header comment) -- captured before WAV/tracker content is mixed in
-    // below, so a WAV/tracker file playing back never feeds the tank, only
-    // the onboard MIDI synth's own voices do.
-    int32_t synthMixL = mixL, synthMixR = mixR;
 
     if (g_wavActive) {
         int16_t wl, wr;
@@ -1590,8 +1880,8 @@ void __not_in_flash_func(renderSample)(int16_t& outLeft, int16_t& outRight) {
         }
     }
 
-    // Reverb send: mono sum of the synth-only mix (see synthMixL/R above)
-    // feeds the tank (see reverbProcess()'s header comment); which
+    // Reverb send: the per-channel send sum (see sendSum above) feeds the
+    // tank (see reverbProcess()'s header comment); which
     // post-processing runs on the tank's output depends on Reverb Type
     // (see g_reverbType's own comment for why all three share one tank).
     // The wet signal gets added back identically to both (full,
@@ -1603,7 +1893,7 @@ void __not_in_flash_func(renderSample)(int16_t& outLeft, int16_t& outRight) {
     // cold (silent) tank rather than resuming a stale one, unnoticeable
     // for an ambience effect like this.
     if (g_reverbEnabled) {
-        int32_t monoSend = (synthMixL + synthMixR) >> 1;
+        int32_t monoSend = sendSum;
         int32_t wetSignal;
 
         if (g_reverbType == REVERB_TYPE_SHIMMER) {
@@ -1725,8 +2015,27 @@ void Synth::programChange(uint8_t channel, uint8_t program) {
     pushMsg(packProgramMsg(channel, program));
 }
 
+void Synth::controlChange(uint8_t channel, uint8_t controller, uint8_t value) {
+    pushMsg(packCcMsg(channel, controller, value));
+}
+
+void Synth::pitchBend(uint8_t channel, int16_t bend) {
+    int32_t b = (int32_t)bend + 8192;
+    if (b < 0) b = 0;
+    if (b > 16383) b = 16383;
+    pushMsg(packBendMsg(channel, (uint16_t)b));
+}
+
+void Synth::channelPressure(uint8_t channel, uint8_t pressure) {
+    pushMsg(packPressureMsg(channel, pressure));
+}
+
 void Synth::resetPrograms() {
     pushMsg(RESET_PROGRAMS_MSG);
+}
+
+void Synth::resetControllers() {
+    pushMsg(RESET_CONTROLLERS_MSG);
 }
 
 void Synth::allNotesOff() {
@@ -1954,6 +2263,7 @@ void setup1() {
     g_reverbChorusLfoPhaseInc = hzToPhaseInc(REVERB_CHORUS_LFO_RATE_HZ);
     g_masterGainQ16 = volumePercentToGainQ16(80); // matches the previous default percent
     g_reverbMixQ16 = reverbMixPercentToQ16(70); // matches the level this effect first shipped at
+    for (int i = 0; i < 16; i++) resetChannel((uint8_t)i, true);
 
     // 8 x 256 words, ~46 ms. The per-sample render path (loop1(),
     // renderSample() and what they call) runs from RAM. What's left in flash
@@ -1975,7 +2285,14 @@ __attribute__((noinline)) void handleMessage(uint32_t msg) {
         return;
     }
     if (msg == RESET_PROGRAMS_MSG) {
-        for (int i = 0; i < 16; i++) g_channelProgram[i] = 0;
+        for (int i = 0; i < 16; i++) {
+            g_channelProgram[i] = 0;
+            resetChannel((uint8_t)i, true);
+        }
+        return;
+    }
+    if (msg == RESET_CONTROLLERS_MSG) {
+        for (int i = 0; i < 16; i++) resetChannel((uint8_t)i, true);
         return;
     }
     uint32_t type = msg >> 28;
@@ -2032,6 +2349,18 @@ __attribute__((noinline)) void handleMessage(uint32_t msg) {
     uint8_t channel = (msg >> 16) & 0x0F;
     if (type == MSG_TYPE_PROGRAM) {
         g_channelProgram[channel] = (uint8_t)(msg & 0xFF);
+        return;
+    }
+    if (type == MSG_TYPE_CC) {
+        handleControlChange(channel, (uint8_t)((msg >> 8) & 0x7F), (uint8_t)(msg & 0x7F));
+        return;
+    }
+    if (type == MSG_TYPE_BEND) {
+        handlePitchBend(channel, (uint16_t)(msg & 0x3FFF));
+        return;
+    }
+    if (type == MSG_TYPE_PRESSURE) {
+        handleChannelPressure(channel, (uint8_t)(msg & 0x7F));
         return;
     }
     uint8_t note = msg & 0xFF;

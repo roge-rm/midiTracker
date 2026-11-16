@@ -163,6 +163,9 @@ struct LoopTrack {
     uint16_t soundingNotes[MAX_SOUNDING_NOTES];
     uint8_t soundingCount = 0;
     bool soundingOverflow = false;
+    // Output channels whose sustain pedal (CC64) this track's playback
+    // left down, so allNotesOffForTrack() can lift it.
+    uint16_t sustainMask = 0;
 
     LoopEvent events[MAX_EVENTS_PER_TRACK];
     int eventCount = 0;
@@ -655,9 +658,15 @@ void resumeFromStop(LoopTrack& t) {
 // advance (silently) so unmuting doesn't have to "catch up". EMPTY,
 // STOPPED, PAUSED, and ARMED (whether fresh or waiting to overdub) tracks
 // are skipped entirely -- see elapsedRunMs().
-// Keeps t.soundingNotes in step with a message playback just sent.
+// Keeps t.soundingNotes and t.sustainMask in step with a message playback just sent.
 void trackSounding(LoopTrack& t, uint8_t status, uint8_t data1, uint8_t data2) {
     uint8_t type = status & 0xF0;
+    if (type == 0xB0 && (data1 == 64 || data1 == 121)) {
+        uint16_t bit = (uint16_t)(1u << (status & 0x0F));
+        if (data1 == 64 && data2 >= 64) t.sustainMask |= bit;
+        else t.sustainMask &= (uint16_t)~bit;
+        return;
+    }
     if (type != 0x80 && type != 0x90) return;
     uint16_t key = (uint16_t)(((status & 0x0F) << 7) | (data1 & 0x7F));
     int idx = -1;
@@ -729,6 +738,12 @@ void allNotesOffForTrack(LoopTrack& t) {
         MidiOutput::sendNoteOff((uint8_t)(key >> 7), (uint8_t)(key & 0x7F), 0);
     }
     t.soundingCount = 0;
+    // Note-offs and CC123 both respect the pedal, so lift any this track
+    // left down, the same pedal-up external gear would get.
+    for (uint8_t ch = 0; ch < 16; ch++) {
+        if (t.sustainMask & (1u << ch)) MidiOutput::sendControlChange(ch, 64, 0);
+    }
+    t.sustainMask = 0;
     if (t.soundingOverflow) {
         if (t.channelOut != CHANNEL_AS_RECORDED) {
             MidiOutput::sendControlChange(t.channelOut, 123, 0);
@@ -1829,6 +1844,7 @@ void resetTrack(LoopTrack& t) {
     t.droppedCount = 0;
     t.soundingCount = 0;
     t.soundingOverflow = false;
+    t.sustainMask = 0;
     t.epochMs = 0;
     t.recordStartMs = 0;
     t.stopAccumMs = 0;
@@ -4324,6 +4340,7 @@ void enter() {
     }
     MidiOutput::setInputHandler(handleIncomingMidi);
     MidiOutput::setRealtimeHandler(handleMidiRealtime);
+    Synth::resetControllers(); // no CC7, CC10 or pedal left over from another mode
     // Always land on the main screen with a track (not the BPM row or a
     // leftover confirm/menu screen) selected -- same "reset to home on
     // entry" convention FilePlayerMode uses for its own screen state.
@@ -4368,6 +4385,7 @@ bool update() {
     if (exitRequested) {
         MidiOutput::setInputHandler(nullptr); // enter() registers both again
         MidiOutput::setRealtimeHandler(nullptr);
+        Synth::resetControllers();
         return true;
     }
 

@@ -103,11 +103,16 @@ void handleIncomingMidi(uint8_t status, uint8_t data1, uint8_t data2, uint8_t le
             Synth::programChange(channel, data1);
             cellDirty |= (uint16_t)(1u << channel);
             break;
-        default:
-            // CC/PitchBend/AfterTouch: no backing DSP for any of these yet
-            // (no sustain-hold state, no runtime-modulatable depth) -- see
-            // pari_synth_mode.h's header comment. Deliberately ignored
-            // rather than half-wired.
+        case 0xB0: // Control Change, see Synth::controlChange() for which the synth uses
+            Synth::controlChange(channel, data1, data2);
+            break;
+        case 0xD0: // Channel Pressure
+            Synth::channelPressure(channel, data1);
+            break;
+        case 0xE0: // Pitch Bend
+            Synth::pitchBend(channel, (int16_t)((((uint16_t)data2 << 7) | data1) - 8192));
+            break;
+        default: // poly aftertouch: not used by the synth
             break;
     }
 }
@@ -189,6 +194,7 @@ bool update() {
         // purpose -- see its own header comment on why FilePlayerMode's
         // use of the same component must NOT do this.
         MidiOutput::allNotesOffAllChannels();
+        Synth::resetControllers(); // a held pedal or CC7 doesn't carry into the next mode
         return true;
     }
 

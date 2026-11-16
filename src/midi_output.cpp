@@ -245,6 +245,9 @@ void sendNoteOff(uint8_t channel, uint8_t note, uint8_t velocity) {
 }
 
 void sendControlChange(uint8_t channel, uint8_t controller, uint8_t value) {
+    // Controllers always reach the synth so its channel state stays current
+    // while audio is off; only notes are gated.
+    Synth::controlChange(channel, controller, value);
     if (hwEnabled())  MIDIHW.sendControlChange(controller, value, channel + 1);
     if (usbEnabled()) MIDIUSB.sendControlChange(controller, value, channel + 1);
 }
@@ -258,11 +261,13 @@ void sendProgramChange(uint8_t channel, uint8_t program) {
 }
 
 void sendPitchBend(uint8_t channel, int16_t bend) {
+    Synth::pitchBend(channel, bend); // ungated, see sendControlChange()
     if (hwEnabled())  MIDIHW.sendPitchBend(bend, channel + 1);
     if (usbEnabled()) MIDIUSB.sendPitchBend(bend, channel + 1);
 }
 
 void sendAfterTouch(uint8_t channel, uint8_t pressure) {
+    Synth::channelPressure(channel, pressure); // ungated, see sendControlChange()
     if (hwEnabled())  MIDIHW.sendAfterTouch(pressure, channel + 1);
     if (usbEnabled()) MIDIUSB.sendAfterTouch(pressure, channel + 1);
 }
@@ -311,9 +316,8 @@ uint8_t* sysExScratch() { return g_sysExScratch; }
 
 void allNotesOffAllChannels() {
     for (int note = 0; note < 128; note++) g_noteChannelMask[note] = 0;
-    // The onboard synth doesn't parse CC 120/123 (it has no CC handling at
-    // all yet), so it needs its own explicit panic -- otherwise stopping
-    // playback would leave it sounding stuck notes indefinitely.
+    // CC123 below respects the sustain pedal, so the onboard synth gets its
+    // own panic first, which releases every voice whatever the pedals say.
     Synth::allNotesOff();
     for (uint8_t ch = 0; ch < 16; ch++) {
         sendControlChange(ch, 120, 0); // All Sound Off

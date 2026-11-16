@@ -52,16 +52,28 @@ void noteOff(uint8_t channel, uint8_t note); // releases `note` on `channel` onl
 // instead, per the GM drum key map.
 void programChange(uint8_t channel, uint8_t program);
 
-// Resets every channel back to program 0 (Acoustic Grand Piano family).
+// Channel controllers. The synth uses CC1 mod, CC6/38 with RPN 0 (bend
+// range), CC7 volume, CC10 pan, CC11 expression, CC64 sustain, CC66
+// sostenuto, CC67 soft, CC91 reverb send, CC98-101, CC120 all sound off,
+// CC121 reset controllers and CC123 all notes off; others are ignored.
+void controlChange(uint8_t channel, uint8_t controller, uint8_t value);
+void pitchBend(uint8_t channel, int16_t bend); // -8192..8191, 0 = centre
+void channelPressure(uint8_t channel, uint8_t pressure); // adds vibrato like CC1
+
+// Resets every channel back to program 0 (Acoustic Grand Piano family)
+// and every controller to its default (CC121's set plus reverb send 40).
 // Call this whenever a genuinely new playback session starts (a fresh
 // load(), not a pause/resume) so a previous file's instrument choices
 // don't bleed into the next one before it sends its own Program Change.
 void resetPrograms();
 
-// Fast-releases every currently-sounding voice. Called alongside
-// MidiOutput::allNotesOffAllChannels() (stop/pause/panic) so the synth
-// doesn't leave notes stuck on when playback halts -- unlike a real MIDI
-// receiver, it has no CC 120/123 parser to catch those messages otherwise.
+// The controller half of resetPrograms(), programs kept. For mode changes
+// and file stop, so a held pedal or a CC7 0 doesn't carry over.
+void resetControllers();
+
+// Fast-releases every currently-sounding voice, sustained ones too.
+// Called alongside MidiOutput::allNotesOffAllChannels() (stop/pause/panic)
+// so the synth doesn't leave notes stuck on when playback halts.
 void allNotesOff();
 
 // Master output volume, 0-100. Applied as a final attenuation after the

@@ -2267,7 +2267,10 @@ bool update() {
             break;
     }
 
-    if (exitRequested) return true;
+    if (exitRequested) {
+        Synth::resetControllers(); // nothing from a file carries into the next mode
+        return true;
+    }
 
     if (needsRedraw) {
         needsRedraw = false;

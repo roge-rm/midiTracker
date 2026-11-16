@@ -1,6 +1,7 @@
 #include "midi_file.h"
 #include "sd_card.h"
 #include "midi_output.h"
+#include "synth.h"
 #include "smf.h"
 #include <string.h>
 #include <new>
@@ -391,6 +392,7 @@ void MidiPlayer::pause() {
 
 void MidiPlayer::stop() {
     MidiOutput::allNotesOffAllChannels();
+    Synth::resetControllers();
     close();
 }
 
@@ -427,6 +429,9 @@ void MidiPlayer::trackRpnSelect(uint8_t ch, uint8_t cc, uint8_t value) {
 }
 
 void MidiPlayer::resetChannels() {
+    // CC121 leaves volume and pan alone (RP-015), so the synth gets a full
+    // controller reset too; seek then sends the landing point's values.
+    Synth::resetControllers();
     for (uint8_t ch = 0; ch < 16; ch++) {
         MidiOutput::sendRaw(0xB0 | ch, 121, 0, 3);   // Reset All Controllers
         MidiOutput::sendRaw(0xE0 | ch, 0, 0x40, 3);  // bend centre

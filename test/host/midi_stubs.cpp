@@ -14,18 +14,26 @@ uint32_t millis() { return micros() / 1000; }
 void hostSetFrames(uint64_t f) { g_frames = f; }
 
 namespace MidiOutput {
-// Same routing as midi_output.cpp's sendRaw() for the internal synth: notes
-// and program changes only.
+// Same routing as midi_output.cpp's sendRaw() for the internal synth.
 void sendRaw(uint8_t status, uint8_t d1, uint8_t d2, uint8_t len) {
     uint8_t ch = status & 0x0F;
     switch (status & 0xF0) {
         case 0x80: Synth::noteOff(ch, d1); break;
         case 0x90: Synth::noteOn(ch, d1, d2); break;
+        case 0xB0: Synth::controlChange(ch, d1, d2); break;
         case 0xC0: Synth::programChange(ch, d1); break;
+        case 0xD0: Synth::channelPressure(ch, d1); break;
+        case 0xE0: Synth::pitchBend(ch, (int16_t)((((uint16_t)d2 << 7) | d1) - 8192)); break;
         default: break;
     }
 }
 void sendSysExRaw(const uint8_t*, size_t) {}
 uint8_t* sysExScratch() { static uint8_t b[1100]; return b; }
-void allNotesOffAllChannels() { Synth::allNotesOff(); }
+void allNotesOffAllChannels() {
+    Synth::allNotesOff();
+    for (uint8_t ch = 0; ch < 16; ch++) {
+        Synth::controlChange(ch, 120, 0);
+        Synth::controlChange(ch, 123, 0);
+    }
+}
 }
