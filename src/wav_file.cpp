@@ -2,6 +2,7 @@
 #include "sd_card.h"
 #include "synth.h"
 #include "pins.h" // SAMPLE_RATE
+#include "shared_ram_arena.h"
 #include <string.h>
 
 namespace {
@@ -17,8 +18,30 @@ bool readChunkHeader(FsFile& f, char id[5], uint32_t& length) {
 }
 
 const uint16_t WAVE_FORMAT_PCM = 1;
+const uint16_t WAVE_FORMAT_IEEE_FLOAT = 3;
 const uint16_t WAVE_FORMAT_IMA_ADPCM = 0x0011;
 const uint16_t WAVE_FORMAT_EXTENSIBLE = 0xFFFE;
+// An EXTENSIBLE subformat GUID is the format code in its first two bytes
+// followed by these 14.
+const uint8_t KSDATAFORMAT_TAIL[14] = {0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71};
+
+// The read buffer is SharedRamArena::scratch: up to READ_AT unread bytes
+// carried over from the last read, then READ_BYTES of new data, so each
+// read starts on a sector boundary (after the first) and stays whole sectors.
+const uint32_t READ_AT = 16;
+const uint32_t READ_BYTES = 1536;
+static_assert(READ_AT + READ_BYTES <= SharedRamArena::SCRATCH_SIZE, "WAV read buffer no longer fits SharedRamArena::scratch");
+
+// IEEE 754 single to int16 (v * 32768, clamped), in integer maths so core 0
+// doesn't pay for soft float on every sample. Truncates toward zero.
+int16_t floatToS16(uint32_t b) {
+    int e = (int)((b >> 23) & 0xFF);
+    bool neg = (b >> 31) != 0;
+    if (e >= 127) return neg ? -32768 : 32767; // |v| >= 1, inf and NaN
+    if (e < 112) return 0;                     // |v| < 2^-15
+    int32_t v = (int32_t)(((b & 0x7FFFFF) | 0x800000) >> (135 - e));
+    return (int16_t)(neg ? -v : v);
+}
 
 // Standard IMA ADPCM step-size and step-index tables -- same constants
 // used by essentially every IMA ADPCM decoder (originally from the
@@ -61,30 +84,31 @@ int16_t decodeImaNibble(int32_t& predictor, int& stepIndex, uint8_t nibble) {
 
 } // namespace
 
+bool WavPlayer::fail(const char* msg) {
+    strncpy(_error, msg, sizeof(_error) - 1);
+    _error[sizeof(_error) - 1] = '\0';
+    if (_file) _file.close();
+    _state = STATE_ERROR;
+    return false;
+}
+
 bool WavPlayer::load(const char* path) {
     close();
     _error[0] = '\0';
     _pathKey = 2166136261u;
     for (const char* c = path; c && *c; c++) _pathKey = (_pathKey ^ (uint8_t)*c) * 16777619u;
 
-    if (!sdOpenPath(_file, path, O_RDONLY)) {
-        strncpy(_error, "could not open file", sizeof(_error) - 1);
-        _state = STATE_ERROR;
-        return false;
-    }
+    if (!sdOpenPath(_file, path, O_RDONLY)) return fail("could not open file");
 
     char id[5];
     uint32_t riffLen;
     uint8_t waveId[4];
     if (!readChunkHeader(_file, id, riffLen) || strncmp(id, "RIFF", 4) != 0 ||
         _file.read(waveId, 4) != 4 || strncmp((const char*)waveId, "WAVE", 4) != 0) {
-        strncpy(_error, "not a WAV file", sizeof(_error) - 1);
-        _file.close();
-        _state = STATE_ERROR;
-        return false;
+        return fail("not a WAV file");
     }
 
-    bool haveFmt = false;
+    bool haveFmt = false, extensibleOk = true;
     uint16_t formatTag = 0, channels = 0, bitsPerSample = 0, blockAlign = 0, samplesPerBlock = 0;
     uint32_t sampleRate = 0;
     _dataChunkStart = 0;
@@ -99,28 +123,24 @@ bool WavPlayer::load(const char* path) {
         uint32_t chunkDataStart = _file.curPosition();
 
         if (strncmp(cid, "fmt ", 4) == 0) {
-            uint8_t fb[16];
-            if (clen < 16 || _file.read(fb, 16) != 16) {
-                strncpy(_error, "invalid WAV file", sizeof(_error) - 1);
-                _file.close();
-                _state = STATE_ERROR;
-                return false;
-            }
+            // 16 basic bytes, then cbSize and its extra bytes: IMA ADPCM's
+            // samplesPerBlock, or EXTENSIBLE's valid bits, channel mask and
+            // subformat GUID (40 bytes in all).
+            uint8_t fb[40];
+            uint32_t want = clen < sizeof(fb) ? clen : sizeof(fb);
+            if (clen < 16 || _file.read(fb, want) != (int)want) return fail("invalid WAV file");
             formatTag = (uint16_t)fb[0] | ((uint16_t)fb[1] << 8);
             channels = (uint16_t)fb[2] | ((uint16_t)fb[3] << 8);
             sampleRate = (uint32_t)fb[4] | ((uint32_t)fb[5] << 8) | ((uint32_t)fb[6] << 16) | ((uint32_t)fb[7] << 24);
             blockAlign = (uint16_t)fb[12] | ((uint16_t)fb[13] << 8);
             bitsPerSample = (uint16_t)fb[14] | ((uint16_t)fb[15] << 8);
-
-            // IMA ADPCM's fmt chunk carries two extra fields past the
-            // basic 16 bytes: a 2-byte cbSize (extra-bytes count, == 2)
-            // then a 2-byte wSamplesPerBlock -- the file's own authority
-            // on its block layout, so this is read rather than derived.
-            if (formatTag == WAVE_FORMAT_IMA_ADPCM && clen >= 20) {
-                uint8_t extra[4];
-                if (_file.read(extra, 4) == 4) {
-                    samplesPerBlock = (uint16_t)extra[2] | ((uint16_t)extra[3] << 8);
-                }
+            if (formatTag == WAVE_FORMAT_IMA_ADPCM && want >= 20) {
+                samplesPerBlock = (uint16_t)fb[18] | ((uint16_t)fb[19] << 8);
+            }
+            if (formatTag == WAVE_FORMAT_EXTENSIBLE) {
+                // The real format is the subformat GUID's code.
+                extensibleOk = want >= 40 && memcmp(fb + 26, KSDATAFORMAT_TAIL, sizeof(KSDATAFORMAT_TAIL)) == 0;
+                formatTag = (uint16_t)fb[24] | ((uint16_t)fb[25] << 8);
             }
             haveFmt = true;
         } else if (strncmp(cid, "data", 4) == 0) {
@@ -135,76 +155,44 @@ bool WavPlayer::load(const char* path) {
         if (!_file.seekSet((uint32_t)next64)) break;
     }
 
-    if (!haveFmt || _dataChunkLen == 0) {
-        strncpy(_error, "invalid WAV file", sizeof(_error) - 1);
-        _file.close();
-        _state = STATE_ERROR;
-        return false;
-    }
-    if (formatTag == WAVE_FORMAT_EXTENSIBLE) {
-        strncpy(_error, "unsupported format", sizeof(_error) - 1);
-        _file.close();
-        _state = STATE_ERROR;
-        return false;
-    }
+    if (!haveFmt || _dataChunkLen == 0) return fail("invalid WAV file");
+    if (!extensibleOk) return fail("unsupported format");
     bool isAdpcm = (formatTag == WAVE_FORMAT_IMA_ADPCM);
-    if (formatTag != WAVE_FORMAT_PCM && !isAdpcm) {
-        strncpy(_error, "unsupported codec", sizeof(_error) - 1);
-        _file.close();
-        _state = STATE_ERROR;
-        return false;
-    }
-    if (channels == 0 || channels > 2) {
-        strncpy(_error, channels > 2 ? "too many channels" : "invalid WAV file", sizeof(_error) - 1);
-        _file.close();
-        _state = STATE_ERROR;
-        return false;
-    }
+    bool isFloat = (formatTag == WAVE_FORMAT_IEEE_FLOAT);
+    if (formatTag != WAVE_FORMAT_PCM && !isAdpcm && !isFloat) return fail("unsupported codec");
+    if (channels == 0 || channels > 2) return fail(channels > 2 ? "too many channels" : "invalid WAV file");
     if (isAdpcm) {
-        // A block needs at least one 4-byte header per channel; anything
-        // smaller, or a missing/zero samplesPerBlock (the fmt chunk's
-        // extra field wasn't readable), can't be decoded.
-        uint16_t minBlockAlign = (channels == 2) ? 8 : 4;
-        if (bitsPerSample != 4 || samplesPerBlock == 0 || blockAlign < minBlockAlign) {
-            strncpy(_error, "invalid WAV file", sizeof(_error) - 1);
-            _file.close();
-            _state = STATE_ERROR;
-            return false;
-        }
-    } else if (bitsPerSample != 8 && bitsPerSample != 16) {
-        strncpy(_error, "unsupported bit depth", sizeof(_error) - 1);
-        _file.close();
-        _state = STATE_ERROR;
-        return false;
+        // A block is a 4-byte header per channel and then the nibbles, which
+        // stereo groups in 4 bytes per channel. Its first sample is in the
+        // header, then 2 per byte per channel.
+        uint32_t headerBytes = 4u * channels;
+        bool layoutOk = blockAlign > headerBytes && (channels == 1 || (blockAlign - headerBytes) % 8 == 0);
+        uint32_t expected = layoutOk ? (blockAlign - headerBytes) * 2 / channels + 1 : 0;
+        if (bitsPerSample != 4 || !layoutOk || samplesPerBlock != expected) return fail("invalid WAV file");
+    } else if (isFloat ? bitsPerSample != 32
+                       : (bitsPerSample != 8 && bitsPerSample != 16 && bitsPerSample != 24 && bitsPerSample != 32)) {
+        return fail("unsupported bit depth");
     }
-    if (sampleRate < 4000 || sampleRate > 192000) {
-        strncpy(_error, "invalid WAV file", sizeof(_error) - 1);
-        _file.close();
-        _state = STATE_ERROR;
-        return false;
-    }
+    if (sampleRate < 4000 || sampleRate > 192000) return fail("invalid WAV file");
 
     _isAdpcm = isAdpcm;
+    _isFloat = isFloat;
     _srcSampleRate = sampleRate;
     _srcChannels = (uint8_t)channels;
     _srcBitsPerSample = (uint8_t)bitsPerSample;
     _blockAlign = blockAlign;
     _samplesPerBlock = samplesPerBlock;
     _bytesPerSrcFrame = isAdpcm ? 0 : (uint32_t)_srcChannels * (_srcBitsPerSample / 8);
+    // Only complete ADPCM blocks are decoded; a short trailing block is
+    // ignored, as most decoders do.
+    _totalSrcFrames = isAdpcm ? (_dataChunkLen / _blockAlign) * _samplesPerBlock : _dataChunkLen / _bytesPerSrcFrame;
 
-    _file.seekSet(_dataChunkStart);
+    seekSource(0);
     _srcFramesRead = 0;
-    _sourceEnded = false;
-    _adpcmBlockBytesLeft = 0; // force a fresh block-header read on the first readAdpcmFrame() call
-    _adpcmHavePendingMonoSample = false;
-    _adpcmGroupPosL = _adpcmGroupPosR = 8;
-
+    _underrunBase = Synth::wavStreamUnderrunSamples();
     _resampleStep = (uint32_t)(((uint64_t)_srcSampleRate << 16) / SAMPLE_RATE);
-    _resampleFrac = 0;
     primeInterpolationPair();
-
-    _elapsedMsFrozen = 0;
-    _lastResumeMicros = micros();
+    restartClock(0);
     _state = STATE_PAUSED;
     return true;
 }
@@ -215,76 +203,99 @@ void WavPlayer::close() {
     _state = STATE_IDLE;
 }
 
-uint32_t WavPlayer::totalSrcFrames() const {
-    if (_isAdpcm) {
-        // Only complete blocks are decodable -- a short trailing partial
-        // block (dataChunkLen not an exact multiple of blockAlign) is
-        // silently ignored, same as most IMA ADPCM decoders.
-        if (_blockAlign == 0) return 0;
-        return (_dataChunkLen / _blockAlign) * _samplesPerBlock;
+void WavPlayer::seekSource(uint32_t byteOffset) {
+    _filePos = _dataChunkStart + byteOffset;
+    _dataEnd = _dataChunkStart + _dataChunkLen;
+    if (_filePos > _dataEnd || !_file.seekSet(_filePos)) _filePos = _dataEnd;
+    _bufPos = _bufLen = READ_AT;
+    _sourceEnded = false;
+    _adpcmBlockBytesLeft = 0; // the next readAdpcmFrame() reads a fresh block header
+    _adpcmHavePendingMonoSample = false;
+    _adpcmGroupPosL = _adpcmGroupPosR = 8;
+}
+
+void WavPlayer::restartClock(uint32_t ms) {
+    _startMs = ms;
+    _ringBase = Synth::wavStreamWritten();
+}
+
+bool WavPlayer::fill(uint32_t n) {
+    uint32_t have = _bufLen - _bufPos;
+    if (have >= n) return true;
+    uint8_t* buf = SharedRamArena::scratch.bytes;
+    memmove(buf + READ_AT - have, buf + _bufPos, have);
+    _bufPos = READ_AT - have;
+    _bufLen = READ_AT;
+    uint32_t len = READ_BYTES;
+    uint32_t end = (_filePos + len) & ~511u;
+    if (end > _filePos) len = end - _filePos; // end on a sector boundary
+    if (len > _dataEnd - _filePos) len = _dataEnd - _filePos;
+    if (len == 0) return false;
+#ifdef TRACKER_PROFILE
+    uint32_t t0 = micros();
+#endif
+    int got = _file.read(buf + READ_AT, len);
+#ifdef TRACKER_PROFILE
+    profile.readUs += micros() - t0;
+    profile.reads++;
+    profile.readBytes += got > 0 ? (uint32_t)got : 0;
+#endif
+    if (got <= 0) {
+        _dataEnd = _filePos; // a read error ends the source here
+        return false;
     }
-    return _bytesPerSrcFrame > 0 ? _dataChunkLen / _bytesPerSrcFrame : 0;
+    _filePos += (uint32_t)got;
+    _bufLen = READ_AT + (uint32_t)got;
+    return _bufLen - _bufPos >= n;
+}
+
+int16_t WavPlayer::pcmSample(const uint8_t* p) const {
+    switch (_srcBitsPerSample) {
+        case 8: return (int16_t)(((int)p[0] - 128) << 8); // 8-bit PCM is unsigned, 128 is silence
+        case 16: return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+        case 24: return (int16_t)((uint16_t)p[1] | ((uint16_t)p[2] << 8)); // top 16 bits
+        default: {
+            if (_isFloat) return floatToS16((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+            return (int16_t)((uint16_t)p[2] | ((uint16_t)p[3] << 8));
+        }
+    }
 }
 
 bool WavPlayer::readSrcFrame(int16_t& outL, int16_t& outR) {
+    if (_srcFramesRead >= _totalSrcFrames) return false;
     if (_isAdpcm) return readAdpcmFrame(outL, outR);
 
-    if (_srcFramesRead >= totalSrcFrames()) return false;
-
-    uint8_t raw[4]; // max 2 channels * 2 bytes
-    if (_file.read(raw, _bytesPerSrcFrame) != (int)_bytesPerSrcFrame) return false;
+    if (!fill(_bytesPerSrcFrame)) return false;
+    const uint8_t* p = SharedRamArena::scratch.bytes + _bufPos;
+    _bufPos += _bytesPerSrcFrame;
     _srcFramesRead++;
-
-    if (_srcBitsPerSample == 16) {
-        int16_t l = (int16_t)((uint16_t)raw[0] | ((uint16_t)raw[1] << 8));
-        if (_srcChannels == 2) {
-            outL = l;
-            outR = (int16_t)((uint16_t)raw[2] | ((uint16_t)raw[3] << 8));
-        } else {
-            outL = outR = l;
-        }
-    } else {
-        // 8-bit PCM is unsigned (0..255, 128 == silence) per the WAV
-        // spec, unlike 16-bit's signed convention -- shift up to int16
-        // range after centering.
-        int16_t l = (int16_t)(((int)raw[0] - 128) << 8);
-        if (_srcChannels == 2) {
-            outL = l;
-            outR = (int16_t)(((int)raw[1] - 128) << 8);
-        } else {
-            outL = outR = l;
-        }
-    }
+    outL = pcmSample(p);
+    outR = _srcChannels == 2 ? pcmSample(p + _srcBitsPerSample / 8) : outL;
     return true;
 }
 
 bool WavPlayer::readAdpcmFrame(int16_t& outL, int16_t& outR) {
-    if (_srcFramesRead >= totalSrcFrames()) return false;
+    const uint8_t* buf = SharedRamArena::scratch.bytes;
 
     // A new block starts only once this one's bytes and its decoded but
     // unplayed samples (the mono pending nibble, the stereo groups) are used.
     if (_adpcmBlockBytesLeft == 0 && !_adpcmHavePendingMonoSample && _adpcmGroupPosL >= 8) {
-        // Start of a new block: each channel's own 4-byte header (a raw
-        // int16 predictor + step index + reserved byte) directly gives
-        // this block's first sample and initial decode state -- no
-        // nibble decode needed for it.
-        uint8_t hdr[4];
-        if (_file.read(hdr, 4) != 4) return false;
+        // Each channel's 4-byte header (int16 predictor, step index,
+        // reserved) is the block's first sample and its decode state.
+        uint32_t headerBytes = 4u * _srcChannels;
+        if (!fill(headerBytes)) return false;
+        const uint8_t* hdr = buf + _bufPos;
+        _bufPos += headerBytes;
         _adpcmPredictorL = (int16_t)((uint16_t)hdr[0] | ((uint16_t)hdr[1] << 8));
         _adpcmStepIndexL = hdr[2];
         if (_adpcmStepIndexL > 88) _adpcmStepIndexL = 88;
         int16_t sampleL = (int16_t)_adpcmPredictorL;
         int16_t sampleR = sampleL;
-
-        uint32_t headerBytes = 4;
         if (_srcChannels == 2) {
-            uint8_t hdrR[4];
-            if (_file.read(hdrR, 4) != 4) return false;
-            _adpcmPredictorR = (int16_t)((uint16_t)hdrR[0] | ((uint16_t)hdrR[1] << 8));
-            _adpcmStepIndexR = hdrR[2];
+            _adpcmPredictorR = (int16_t)((uint16_t)hdr[4] | ((uint16_t)hdr[5] << 8));
+            _adpcmStepIndexR = hdr[6];
             if (_adpcmStepIndexR > 88) _adpcmStepIndexR = 88;
             sampleR = (int16_t)_adpcmPredictorR;
-            headerBytes = 8;
         }
 
         _adpcmBlockBytesLeft = _blockAlign - headerBytes;
@@ -304,8 +315,8 @@ bool WavPlayer::readAdpcmFrame(int16_t& outL, int16_t& outR) {
             _srcFramesRead++;
             return true;
         }
-        uint8_t b;
-        if (_adpcmBlockBytesLeft == 0 || _file.read(&b, 1) != 1) return false;
+        if (_adpcmBlockBytesLeft == 0 || !fill(1)) return false;
+        uint8_t b = buf[_bufPos++];
         _adpcmBlockBytesLeft--;
         int16_t s0 = decodeImaNibble(_adpcmPredictorL, _adpcmStepIndexL, b & 0x0F);
         int16_t s1 = decodeImaNibble(_adpcmPredictorL, _adpcmStepIndexL, (b >> 4) & 0x0F);
@@ -316,30 +327,21 @@ bool WavPlayer::readAdpcmFrame(int16_t& outL, int16_t& outR) {
         return true;
     }
 
-    // Stereo: nibbles arrive as interleaved 4-byte/8-sample groups, L
-    // then R, repeating -- both channels' group positions always advance
-    // in lockstep (one sample each per call below), so they always run
-    // out on the same call, which is what keeps refilling them in this
-    // fixed L-then-R order correctly matched to the file's own byte order.
+    // Stereo: nibbles come in 4-byte (8-sample) groups, L then R. Both
+    // channels take one sample per call, so their groups run out together
+    // and are refilled in the file's L, R order.
     if (_adpcmGroupPosL >= 8) {
-        uint8_t g[4];
-        if (_adpcmBlockBytesLeft < 4 || _file.read(g, 4) != 4) return false;
-        _adpcmBlockBytesLeft -= 4;
+        if (_adpcmBlockBytesLeft < 8 || !fill(8)) return false;
+        const uint8_t* g = buf + _bufPos;
+        _bufPos += 8;
+        _adpcmBlockBytesLeft -= 8;
         for (int i = 0; i < 4; i++) {
             _adpcmGroupL[i * 2]     = decodeImaNibble(_adpcmPredictorL, _adpcmStepIndexL, g[i] & 0x0F);
             _adpcmGroupL[i * 2 + 1] = decodeImaNibble(_adpcmPredictorL, _adpcmStepIndexL, (g[i] >> 4) & 0x0F);
+            _adpcmGroupR[i * 2]     = decodeImaNibble(_adpcmPredictorR, _adpcmStepIndexR, g[4 + i] & 0x0F);
+            _adpcmGroupR[i * 2 + 1] = decodeImaNibble(_adpcmPredictorR, _adpcmStepIndexR, (g[4 + i] >> 4) & 0x0F);
         }
-        _adpcmGroupPosL = 0;
-    }
-    if (_adpcmGroupPosR >= 8) {
-        uint8_t g[4];
-        if (_adpcmBlockBytesLeft < 4 || _file.read(g, 4) != 4) return false;
-        _adpcmBlockBytesLeft -= 4;
-        for (int i = 0; i < 4; i++) {
-            _adpcmGroupR[i * 2]     = decodeImaNibble(_adpcmPredictorR, _adpcmStepIndexR, g[i] & 0x0F);
-            _adpcmGroupR[i * 2 + 1] = decodeImaNibble(_adpcmPredictorR, _adpcmStepIndexR, (g[i] >> 4) & 0x0F);
-        }
-        _adpcmGroupPosR = 0;
+        _adpcmGroupPosL = _adpcmGroupPosR = 0;
     }
 
     outL = _adpcmGroupL[_adpcmGroupPosL++];
@@ -364,44 +366,59 @@ void WavPlayer::primeInterpolationPair() {
 }
 
 void WavPlayer::refillFromSource() {
-    if (!_havePair) return; // nothing left to resample from
-
     const size_t MAX_FRAMES_PER_TICK = 1024; // bound per-update() work
-    size_t produced = 0;
+    const size_t BATCH = 32;                 // frames per ring write
+    int16_t out[BATCH * 2];
+    size_t budget = MAX_FRAMES_PER_TICK;
 
-    while (produced < MAX_FRAMES_PER_TICK) {
-        if (Synth::wavStreamFree() == 0) break;
+    while (_havePair && budget > 0) {
+        size_t n = Synth::wavStreamFree();
+        if (n > BATCH) n = BATCH;
+        if (n > budget) n = budget;
+        if (n == 0) break;
 
-        int32_t diffL = (int32_t)_nextSrcL - (int32_t)_lastSrcL;
-        int32_t diffR = (int32_t)_nextSrcR - (int32_t)_lastSrcR;
-        uint16_t frac16 = (uint16_t)(_resampleFrac & 0xFFFF);
-        int16_t outFrame[2] = {
-            (int16_t)(_lastSrcL + ((diffL * (int32_t)frac16) >> 16)),
-            (int16_t)(_lastSrcR + ((diffR * (int32_t)frac16) >> 16)),
-        };
+        size_t k = 0;
+        bool ended = false;
+        while (k < n) {
+            int32_t diffL = (int32_t)_nextSrcL - (int32_t)_lastSrcL;
+            int32_t diffR = (int32_t)_nextSrcR - (int32_t)_lastSrcR;
+            // 15-bit fraction so |diff| (up to 65535) times it fits in int32.
+            int32_t frac15 = (int32_t)((_resampleFrac & 0xFFFF) >> 1);
+            out[k * 2] = (int16_t)(_lastSrcL + ((diffL * frac15) >> 15));
+            out[k * 2 + 1] = (int16_t)(_lastSrcR + ((diffR * frac15) >> 15));
+            k++;
 
-        if (Synth::wavStreamWrite(outFrame, 1) == 0) break; // ring buffer filled since the check above
-        produced++;
-
-        _resampleFrac += _resampleStep;
-        while (_resampleFrac >= 0x10000) {
-            _resampleFrac -= 0x10000;
-            _lastSrcL = _nextSrcL;
-            _lastSrcR = _nextSrcR;
-            if (!readSrcFrame(_nextSrcL, _nextSrcR)) {
-                // Source exhausted -- keep repeating the final frame so
-                // interpolation stays well-defined, and signal EOF once.
-                _nextSrcL = _lastSrcL;
-                _nextSrcR = _lastSrcR;
-                if (!_sourceEnded) {
-                    Synth::wavStreamEnd();
-                    _sourceEnded = true;
+            _resampleFrac += _resampleStep;
+            while (_resampleFrac >= 0x10000) {
+                _resampleFrac -= 0x10000;
+                _lastSrcL = _nextSrcL;
+                _lastSrcR = _nextSrcR;
+                if (!readSrcFrame(_nextSrcL, _nextSrcR)) {
+                    _nextSrcL = _lastSrcL;
+                    _nextSrcR = _lastSrcR;
+                    ended = true;
+                    break;
                 }
-                _havePair = false;
-                return;
             }
+            if (ended) break;
+        }
+        // Only the producer adds to the ring, so all k frames fit.
+        Synth::wavStreamWrite(out, k);
+        budget -= k;
+        if (ended) {
+            // After the last write, so core 1 never sees an empty ended
+            // ring with frames still to come.
+            Synth::wavStreamEnd();
+            _sourceEnded = true;
+            _havePair = false;
         }
     }
+}
+
+bool WavPlayer::ringDrained() const {
+    // Core 1 stops mixing an ended stream once it finds the ring empty.
+    if (!Synth::wavStreamIsActive() && Synth::wavStreamIsEnded()) return true;
+    return (int32_t)(Synth::wavStreamPlayed() - Synth::wavStreamWritten()) >= 0;
 }
 
 void WavPlayer::update() {
@@ -409,27 +426,21 @@ void WavPlayer::update() {
 
     refillFromSource();
 
-    // Wall-clock based: the ring buffer runs up to its capacity ahead of
-    // what's actually audible, so "all source data read" doesn't mean
-    // "done playing" yet -- wait for elapsedMs() to actually catch up to
-    // totalMs() before switching to STATE_DONE, matching what's audible.
-    if (_state == STATE_PLAYING && _sourceEnded && elapsedMs() >= totalMs()) {
-        _elapsedMsFrozen = totalMs();
-        _lastResumeMicros = micros();
+    // The ring runs up to ~186 ms ahead of what's heard, so the song ends
+    // once the source is read and the ring has played out.
+    if (_state == STATE_PLAYING && _sourceEnded && ringDrained()) {
         _state = STATE_DONE;
     }
 }
 
 void WavPlayer::play() {
     if (_state != STATE_PAUSED) return;
-    _lastResumeMicros = micros();
     _state = STATE_PLAYING;
     Synth::wavStreamSetActive(true);
 }
 
 void WavPlayer::pause() {
     if (_state != STATE_PLAYING) return;
-    _elapsedMsFrozen += (micros() - _lastResumeMicros) / 1000;
     _state = STATE_PAUSED;
     Synth::wavStreamSetActive(false);
 }
@@ -439,13 +450,17 @@ void WavPlayer::stop() {
 }
 
 uint32_t WavPlayer::elapsedMs() const {
-    uint32_t extra = (_state == STATE_PLAYING) ? (micros() - _lastResumeMicros) / 1000 : 0;
-    return _elapsedMsFrozen + extra;
+    if (_state == STATE_DONE) return totalMs();
+    if (_state != STATE_PLAYING && _state != STATE_PAUSED) return 0;
+    uint32_t played = Synth::wavStreamPlayed() - _ringBase;
+    uint32_t ms = _startMs + (uint32_t)((uint64_t)played * 1000u / SAMPLE_RATE);
+    uint32_t total = totalMs();
+    return ms < total ? ms : total;
 }
 
 uint32_t WavPlayer::totalMs() const {
     if (_srcSampleRate == 0) return 0;
-    return (uint32_t)(((uint64_t)totalSrcFrames() * 1000ULL) / _srcSampleRate);
+    return (uint32_t)(((uint64_t)_totalSrcFrames * 1000ULL) / _srcSampleRate);
 }
 
 void WavPlayer::seekTo(uint32_t targetMs) {
@@ -457,37 +472,29 @@ void WavPlayer::seekTo(uint32_t targetMs) {
     uint32_t targetSrcFrame = (uint32_t)(((uint64_t)targetMs * _srcSampleRate) / 1000);
 
     if (_isAdpcm) {
-        // No random access into a compressed block -- jump to the target
-        // block's own boundary (real seekSet(), no reopen) and decode-
-        // and-discard forward to the exact sample within it. See this
-        // class's header comment for the cost characterization.
+        // No random access inside a compressed block: start at the block's
+        // header and decode and drop up to the target sample.
         uint32_t blockIndex = targetSrcFrame / _samplesPerBlock;
         uint32_t withinBlock = targetSrcFrame % _samplesPerBlock;
-        _file.seekSet(_dataChunkStart + (uint64_t)blockIndex * _blockAlign);
+        seekSource(blockIndex * (uint32_t)_blockAlign);
         _srcFramesRead = blockIndex * _samplesPerBlock;
-        _adpcmBlockBytesLeft = 0; // force a fresh block-header read on the next readAdpcmFrame() call
-        _adpcmHavePendingMonoSample = false;
-        _adpcmGroupPosL = _adpcmGroupPosR = 8;
 
         int16_t discardL, discardR;
         for (uint32_t i = 0; i < withinBlock; i++) {
-            if (!readAdpcmFrame(discardL, discardR)) break;
+            if (!readSrcFrame(discardL, discardR)) break;
         }
     } else {
-        _file.seekSet(_dataChunkStart + targetSrcFrame * _bytesPerSrcFrame);
+        seekSource(targetSrcFrame * _bytesPerSrcFrame);
         _srcFramesRead = targetSrcFrame;
     }
-    _sourceEnded = false;
 
     Synth::wavStreamReset(); // discard stale pre-seek audio; update() refills from here
-    _resampleFrac = 0;
     primeInterpolationPair();
 
     bool wasPlaying = (_state == STATE_PLAYING);
-    _elapsedMsFrozen = targetMs;
-    _lastResumeMicros = micros();
+    restartClock(targetMs);
 
-    bool atEnd = (targetSrcFrame >= totalSrcFrames());
+    bool atEnd = (targetSrcFrame >= _totalSrcFrames);
     if (atEnd) {
         _state = STATE_DONE;
     } else {
@@ -496,6 +503,10 @@ void WavPlayer::seekTo(uint32_t targetMs) {
     }
 }
 
-bool WavPlayer::underrun() const {
-    return Synth::wavStreamTookUnderrun();
+uint32_t WavPlayer::underrunSamples() const {
+    return Synth::wavStreamUnderrunSamples() - _underrunBase;
 }
+
+#ifdef TRACKER_PROFILE
+WavPlayer::Profile WavPlayer::profile;
+#endif

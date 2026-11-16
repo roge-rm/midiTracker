@@ -42,10 +42,12 @@ void* data();
 // A small block shared by short-lived lists that are never in use together:
 // Settings' Load Theme list, SynthEditor's Load Bank list and LooperMode's
 // saved session list (nameList), and LooperMode's MIDI import track readers
-// (bytes, only alive inside one importMidiEvents() call). The name lists
+// (bytes, only alive inside one importMidiEvents() call), and WavPlayer's
+// read buffer (bytes, while a WAV is open in the file player). The name lists
 // are each in a different mode, only one mode runs at a time, each list is
 // rescanned from the card every time its screen opens, and an import never
-// runs from one of those screens.
+// runs from one of those screens. A WAV only plays on the file player's WAV
+// screen, which none of the others are reachable from.
 constexpr int NAME_LIST_COUNT = 64;
 constexpr int NAME_LIST_LEN = 17; // 16 chars + terminator
 constexpr size_t SCRATCH_SIZE = 1728;

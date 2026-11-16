@@ -9,6 +9,8 @@ void wavStreamSetActive(bool active);
 size_t wavStreamWrite(const int16_t* frames, size_t count);
 size_t wavStreamFree();
 void wavStreamEnd();
+bool wavStreamIsActive();
+bool wavStreamIsEnded();
 bool wavStreamTookUnderrun();
 uint32_t wavStreamUnderrunSamples();
 uint32_t wavStreamWritten();

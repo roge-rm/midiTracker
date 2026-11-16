@@ -9,9 +9,14 @@
 // after load() (the `data` chunk's byte length gives it directly, no
 // prescan).
 //
-// Supports uncompressed PCM (8-bit unsigned or 16-bit signed) and IMA
-// ADPCM (4-bit, ~4:1 compressed). Not supported: Microsoft ADPCM or any
-// other non-PCM codec, WAVE_FORMAT_EXTENSIBLE, more than 2 channels.
+// Supports PCM (8-bit unsigned, 16, 24 or 32-bit signed), 32-bit float
+// and IMA ADPCM (4-bit, ~4:1 compressed), plain or WAVE_FORMAT_EXTENSIBLE.
+// Not supported: Microsoft ADPCM or any other codec, 64-bit float, more
+// than 2 channels. 24 and 32-bit samples play at their top 16 bits.
+//
+// The data chunk is read in blocks of about 1.5 KB into
+// SharedRamArena::scratch (see fill()), which nothing else uses while a
+// WAV plays. Core 0 only: load(), update() and seekTo() all read the card.
 //
 // seekTo() cost differs by format: PCM is real O(1) byte-offset
 // arithmetic (no reopen/rescan, contrast MidiPlayer::seekTo()); ADPCM
@@ -53,8 +58,9 @@ public:
     State state() const { return _state; }
     const char* errorMessage() const { return _error; }
 
-    uint32_t elapsedMs() const; // wall-clock based, deliberately independent of
-                                  // how far ahead the ring buffer has been filled
+    // Position of what's being heard: frames core 1 has taken from the
+    // ring since the last load or seek, so it stops during an underrun.
+    uint32_t elapsedMs() const;
     uint32_t totalMs() const;    // known immediately after load() -- no prescan needed
     uint32_t pathKey() const { return _pathKey; } // hash of the loaded path, for the UI's waveform cache
 
@@ -70,9 +76,15 @@ public:
     uint8_t channels() const { return _srcChannels; }
     uint8_t bitsPerSample() const { return _srcBitsPerSample; } // 4 for ADPCM
 
-    // Mirrors Synth::wavStreamTookUnderrun() -- meant to be polled once
-    // per UI tick for a small on-screen indicator.
-    bool underrun() const;
+    // Samples core 1 found the ring empty since load(), from
+    // Synth::wavStreamUnderrunSamples().
+    uint32_t underrunSamples() const;
+
+#ifdef TRACKER_PROFILE
+    // Card reads since the profile run last cleared it (tracker_profile.cpp).
+    struct Profile { uint32_t reads, readBytes, readUs; };
+    static Profile profile;
+#endif
 
 private:
     FsFile _file;
@@ -87,7 +99,14 @@ private:
     uint8_t _srcBitsPerSample = 0;
     uint32_t _bytesPerSrcFrame = 0; // channels * (bitsPerSample/8) -- PCM only, meaningless (0) for ADPCM
     uint32_t _srcFramesRead = 0;    // read cursor, in source frames from data start
+    uint32_t _totalSrcFrames = 0;
+    bool _isFloat = false;          // 32-bit IEEE float samples
     bool _sourceEnded = false;      // wavStreamEnd() already signaled for this position
+
+    // Read buffer state, offsets into SharedRamArena::scratch.bytes, and the
+    // file offsets of the next byte to read and of the data chunk's end.
+    uint32_t _bufPos = 0, _bufLen = 0;
+    uint32_t _filePos = 0, _dataEnd = 0;
 
     // IMA ADPCM (format tag 0x0011) -- see readAdpcmFrame() in wav_file.cpp
     // for the block/decode-state shape these describe.
@@ -108,11 +127,11 @@ private:
     int16_t _adpcmGroupL[8], _adpcmGroupR[8];
     int _adpcmGroupPosL = 8, _adpcmGroupPosR = 8;
 
-    // Wall-clock playback position -- same _elapsedMsFrozen/
-    // _lastResumeMicros pattern MidiPlayer uses, deliberately decoupled
-    // from _srcFramesRead (see elapsedMs()'s comment).
-    uint32_t _elapsedMsFrozen = 0;
-    uint32_t _lastResumeMicros = 0;
+    // elapsedMs() is _startMs plus the frames played since the ring held
+    // _ringBase frames written (the last load or seek).
+    uint32_t _startMs = 0;
+    uint32_t _ringBase = 0;
+    uint32_t _underrunBase = 0;
 
     // Linear-interpolation resample state, carried across update() calls.
     uint32_t _resampleStep = 0;  // 16.16 fixed-point, srcSampleRate/44100
@@ -121,7 +140,12 @@ private:
     int16_t _nextSrcL = 0, _nextSrcR = 0;
     bool _havePair = false; // false until primeInterpolationPair() has read the first two source frames
 
-    uint32_t totalSrcFrames() const;
+    bool fail(const char* msg);            // closes the file, sets STATE_ERROR and the message
+    void seekSource(uint32_t byteOffset);  // moves the read cursor in the data chunk, empties the buffer
+    void restartClock(uint32_t ms);        // elapsedMs() counts from ms and the ring's current write count
+    bool fill(uint32_t n);                 // makes n (<= 16) bytes ready at _bufPos; false at the end of data
+    int16_t pcmSample(const uint8_t* p) const;
+    bool ringDrained() const;
     bool readSrcFrame(int16_t& outL, int16_t& outR); // dispatches to the raw-PCM or readAdpcmFrame() path, advances _srcFramesRead
     bool readAdpcmFrame(int16_t& outL, int16_t& outR); // IMA ADPCM block/nibble decode, see the field comments above
     void primeInterpolationPair(); // re-reads _lastSrc/_nextSrc right after load()/seekTo()

@@ -9,6 +9,7 @@
 #   openmpt_compare.sh <list> <outdir> [secs]   correlate .it renders with openmpt123 (uses build/host/corr)
 #   make -C test/host look OUT_DIR=dir   render the M12 screens to PNGs in dir (default build/host/look)
 #   make -C test/host players OUT_DIR=dir   the player screens, drawn from host renders of real songs
+#   make -C test/host wav            build build/host/render_wav (WavPlayer over the host ring)
 ROOT   := $(abspath ../..)
 OUT    := $(ROOT)/build/host
 CXX    ?= g++
@@ -20,7 +21,7 @@ PLAYER_SRC := $(wildcard $(ROOT)/src/tracker_base.cpp) $(ROOT)/src/ui_tap.cpp $(
 HARNESS_SRC := $(CURDIR)/render.cpp $(CURDIR)/host_stubs.cpp
 SECONDS ?= 60
 
-.PHONY: all baseline check clean midi midi-baseline midi-check look players
+.PHONY: all baseline check clean midi midi-baseline midi-check look players wav
 all: $(OUT)/render $(OUT)/gen $(OUT)/corr
 
 $(OUT)/corr: $(CURDIR)/corr.cpp
@@ -50,6 +51,14 @@ check: all $(OUT)/files.txt
 
 clean:
 	rm -rf $(OUT)
+
+# WAV target: the real wav_file.cpp over the host ring and FsFile.
+WAV_SRC := $(ROOT)/src/wav_file.cpp $(ROOT)/src/shared_ram_arena.cpp $(CURDIR)/host_stubs.cpp $(CURDIR)/render_wav.cpp
+wav: $(OUT)/render_wav
+
+$(OUT)/render_wav: $(WAV_SRC) $(wildcard $(CURDIR)/stub/*.h) $(ROOT)/include/wav_file.h $(ROOT)/include/shared_ram_arena.h
+	@mkdir -p $(OUT)
+	$(CXX) $(CXXFLAGS) -o $@ $(WAV_SRC)
 
 # MIDI target: the real synth.cpp and midi_file.cpp with a stub MidiOutput and I2S.
 MIDI_SRC := $(ROOT)/src/synth.cpp $(ROOT)/src/midi_file.cpp $(ROOT)/src/ui_tap.cpp $(CURDIR)/midi_stubs.cpp $(CURDIR)/render_midi.cpp $(CURDIR)/host_stubs.cpp

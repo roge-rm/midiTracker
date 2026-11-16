@@ -2394,7 +2394,10 @@ void __not_in_flash_func(renderSample)(int16_t& outLeft, int16_t& outRight) {
             wavL = wl;
             wavR = wr;
         } else if (g_wavEnded) {
-            g_wavActive = false; // fully drained after EOF -- stop checking every sample
+            // Core 0 may have written its last frames just before the end
+            // flag, so look at head again after seeing it.
+            __dmb(); // acquire: g_wavEnded read before head
+            if (g_wavHead == g_wavTail) g_wavActive = false; // fully drained after EOF -- stop checking every sample
         } else {
             g_wavUnderrun = true;
             g_wavUnderrunSamples++;
@@ -2802,6 +2805,7 @@ bool Synth::wavStreamIsActive() { return g_wavActive; }
 bool Synth::wavStreamIsEnded() { return g_wavEnded; }
 
 void Synth::wavStreamEnd() {
+    __dmb(); // release: the last head published before the end flag
     g_wavEnded = true;
 }
 

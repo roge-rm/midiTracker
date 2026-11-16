@@ -103,14 +103,16 @@ namespace {
 const size_t RING_FRAMES = 8192; // same as the firmware's WAV ring
 std::vector<int16_t> g_out;
 size_t g_pending = 0; // frames written since the last drain
+bool g_active = false, g_ended = false;
 }
 
 namespace Synth {
 void wavStreamReset() {
     g_out.resize(g_out.size() - g_pending * 2);
     g_pending = 0;
+    g_active = g_ended = false;
 }
-void wavStreamSetActive(bool) {}
+void wavStreamSetActive(bool a) { g_active = a; }
 size_t wavStreamWrite(const int16_t* frames, size_t count) {
     size_t room = RING_FRAMES - g_pending;
     if (count > room) count = room;
@@ -119,7 +121,10 @@ size_t wavStreamWrite(const int16_t* frames, size_t count) {
     return count;
 }
 size_t wavStreamFree() { return RING_FRAMES - g_pending; }
-void wavStreamEnd() {}
+void wavStreamEnd() { g_ended = true; }
+// The harness's consumer never stops on its own, so an active stream stays active.
+bool wavStreamIsActive() { return g_active; }
+bool wavStreamIsEnded() { return g_ended; }
 bool wavStreamTookUnderrun() { return false; }
 uint32_t wavStreamUnderrunSamples() { return 0; }
 uint32_t wavStreamWritten() { return (uint32_t)(g_out.size() / 2); }

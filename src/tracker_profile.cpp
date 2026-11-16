@@ -11,6 +11,8 @@
 // The card searches and each .mid run under a 5 s watchdog, kicked while
 // core 1 keeps looping, with a heartbeat line every second. After a watchdog reset the hang trace
 // (see Synth::ProfileTrace) prints every 2 s and nothing else runs.
+// PROFILE_WAV_FILES (same format, default "") names .wav files to play
+// through WavPlayer; those print core 0 load, card reads and underruns.
 // With -D PROFILE_SAVER the trackers play with the screensaver's Pattern
 // rain drawing, and each report adds the share of real time it took.
 #ifdef TRACKER_PROFILE
@@ -25,6 +27,7 @@
 #include "xm_file.h"
 #include "it_file.h"
 #include "midi_file.h"
+#include "wav_file.h"
 #include "midi_output.h"
 #include "pins.h" // SAMPLE_RATE
 #include <hardware/watchdog.h>
@@ -43,6 +46,9 @@
 #endif
 #ifndef PROFILE_MIDI_FILES
 #define PROFILE_MIDI_FILES ""
+#endif
+#ifndef PROFILE_WAV_FILES
+#define PROFILE_WAV_FILES ""
 #endif
 #ifndef PROFILE_SECONDS
 #define PROFILE_SECONDS 30
@@ -73,6 +79,13 @@ bool isMidi(const char* name) {
     const char* dot = strrchr(name, '.');
     return dot && !strcasecmp(dot, ".mid");
 }
+
+bool isWav(const char* name) {
+    const char* dot = strrchr(name, '.');
+    return dot && !strcasecmp(dot, ".wav");
+}
+
+enum FindKind { FIND_TRACKER, FIND_MIDI, FIND_WAV };
 
 // Core 0's stack is the top of SCRATCH_Y (4 KB) and grows down into
 // SCRATCH_X, whose top is core 1's stack. Both get painted at boot and the
@@ -128,9 +141,8 @@ void listMidi(FsFile& dir, char* path, size_t cap, int depth, int& count, int ma
     }
 }
 
-// Depth-first search for a file whose name contains want, a .mid one if
-// midi is set, else a tracker file.
-bool findFile(FsFile& dir, char* path, size_t cap, const char* want, int depth, bool midi = false) {
+// Depth-first search for a file of the given kind whose name contains want.
+bool findFile(FsFile& dir, char* path, size_t cap, const char* want, int depth, FindKind kind = FIND_TRACKER) {
     FsFile e;
     size_t base = strlen(path);
     while (e.openNext(&dir, O_RDONLY)) {
@@ -142,8 +154,9 @@ bool findFile(FsFile& dir, char* path, size_t cap, const char* want, int depth, 
             path[base] = '/';
             strcpy(path + base + 1, name);
             if (isDir && depth < 6) {
-                if (findFile(e, path, cap, want, depth + 1, midi)) { e.close(); return true; }
-            } else if (!isDir && strstr(name, want) && (midi ? isMidi(name) : isTracker(name))) {
+                if (findFile(e, path, cap, want, depth + 1, kind)) { e.close(); return true; }
+            } else if (!isDir && strstr(name, want) &&
+                       (kind == FIND_MIDI ? isMidi(name) : kind == FIND_WAV ? isWav(name) : isTracker(name))) {
                 e.close();
                 return true;
             }
@@ -244,7 +257,7 @@ void profileMidi(const char* want) {
     char path[256] = "";
     FsFile root;
     root.open("/");
-    bool found = findFile(root, path, sizeof(path), want, 0, true);
+    bool found = findFile(root, path, sizeof(path), want, 0, FIND_MIDI);
     root.close();
     if (!found) { Serial.printf("PROFILE notfound %s\n", want); return; }
     printStacks("after findFile");
@@ -323,11 +336,71 @@ void profileMidi(const char* want) {
     tr.where0 = Synth::PW0_IDLE;
 }
 
+// Plays a .wav like the file player does (update() every loop) and
+// prints core 0 load, card reads and underruns per 5 s and for the run.
+void profileWav(const char* want) {
+    char path[256] = "";
+    FsFile root;
+    root.open("/");
+    bool found = findFile(root, path, sizeof(path), want, 0, FIND_WAV);
+    root.close();
+    if (!found) { Serial.printf("PROFILE notfound %s\n", want); return; }
+    static WavPlayer p;
+    if (!p.load(path)) {
+        Serial.printf("PROFILE loadfail %s: %s\n", path, p.errorMessage());
+        return;
+    }
+    Serial.printf("PROFILE playing %s (%lu Hz, %d bit, %d ch)\n", path, (unsigned long)p.sampleRate(), p.bitsPerSample(), p.channels());
+    p.play();
+    uint32_t start = millis();
+    while (millis() - start < 1000 && p.state() == WavPlayer::STATE_PLAYING) p.update();
+    uint32_t u0 = p.underrunSamples(), e0 = p.elapsedMs();
+    uint32_t busyUs = 0, worstUs = 0, winWorst = 0, winBusy = 0, winU0 = u0;
+    uint32_t t0 = micros(), win = millis(), winT0 = t0;
+    WavPlayer::Profile total = {};
+    WavPlayer::profile = {};
+    auto print = [&](const char* tag, uint32_t busy, uint32_t us, uint32_t worst, const WavPlayer::Profile& r, uint32_t underruns) {
+        int load = us ? (int)(1000.0f * (float)busy / (float)us) : 0;
+        Serial.printf("PROFILE %s %s: core0 load %d.%d%%, worst update %lu us, reads %lu (%lu KB, %lu ms), underrun samples %lu\n",
+                      tag, want, load / 10, load % 10, (unsigned long)worst, (unsigned long)r.reads,
+                      (unsigned long)(r.readBytes / 1024), (unsigned long)(r.readUs / 1000), (unsigned long)underruns);
+    };
+    while (millis() - start < 1000u + PROFILE_SECONDS * 1000u && p.state() == WavPlayer::STATE_PLAYING) {
+        uint32_t a = micros();
+        p.update();
+        uint32_t d = micros() - a;
+        busyUs += d;
+        winBusy += d;
+        if (d > worstUs) worstUs = d;
+        if (d > winWorst) winWorst = d;
+        if (millis() - win >= 5000) {
+            WavPlayer::Profile& c = WavPlayer::profile;
+            uint32_t now = micros();
+            print("5s", winBusy, now - winT0, winWorst, c, p.underrunSamples() - winU0);
+            total.reads += c.reads; total.readBytes += c.readBytes; total.readUs += c.readUs;
+            c = {};
+            winBusy = 0;
+            winWorst = 0;
+            winT0 = now;
+            winU0 = p.underrunSamples();
+            win = millis();
+        }
+    }
+    WavPlayer::Profile& c = WavPlayer::profile;
+    total.reads += c.reads; total.readBytes += c.readBytes; total.readUs += c.readUs;
+    uint32_t us = micros() - t0;
+    print("RESULT", busyUs, us, worstUs, total, p.underrunSamples() - u0);
+    // The elapsed time should move with real time when nothing underran.
+    Serial.printf("PROFILE RESULT %s: elapsed moved %lu ms in %lu ms\n", want, (unsigned long)(p.elapsedMs() - e0), (unsigned long)(us / 1000));
+    p.stop();
+}
+
 } // namespace
 
 void trackerProfileRun() {
     static const char list[] = PROFILE_FILES;
     static const char midiList[] = PROFILE_MIDI_FILES;
+    static const char wavList[] = PROFILE_WAV_FILES;
     // A trace left by a watchdog reset during a .mid: print it every 2 s
     // and run nothing else.
     Synth::ProfileTrace& tr = Synth::profileTrace();
@@ -371,6 +444,16 @@ void trackerProfileRun() {
             profileMidi(want);
         }
         disarmWatchdog();
+        for (const char* w = wavList; *w;) {
+            const char* bar = strchr(w, '|');
+            size_t n = bar ? (size_t)(bar - w) : strlen(w);
+            char want[64];
+            if (n >= sizeof(want)) n = sizeof(want) - 1;
+            memcpy(want, w, n);
+            want[n] = 0;
+            w += n + (bar ? 1 : 0);
+            profileWav(want);
+        }
         const char* w = list;
         while (*w) {
             const char* bar = strchr(w, '|');
