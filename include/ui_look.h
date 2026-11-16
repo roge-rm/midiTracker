@@ -96,6 +96,7 @@ extern const Icon ICON_NOTE;      // 10x10, MIDI
 extern const Icon ICON_WAVE;      // 10x10, WAV
 extern const Icon ICON_REC;       // 10x10
 extern const Icon ICON_WARNING;   // 12x12
+extern const Icon ICON_METRONOME; // 12x12
 extern const Icon ICON_PLAY;      // 7x7
 extern const Icon ICON_DIR;       // 3x5, folder badge
 
@@ -259,6 +260,10 @@ void drawCard(const Card& c);
 // ---- mode select ----------------------------------------------------------
 // One of the four rows of the mode list, index from the top.
 void drawModeRow(int index, const char* label, const char* note, bool selected);
+
+// A row in the same list style with one icon, drawn at double size and
+// centred in the icon space. Settings' page list uses it.
+void drawIconRow(int index, const Icon& icon, uint16_t iconColor, const char* label, const char* note, bool selected);
 
 // ---- splash ---------------------------------------------------------------
 void drawSplash(const char* version);

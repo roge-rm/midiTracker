@@ -190,6 +190,21 @@ const uint16_t WARNING_ROWS[] = {
     0xFFF0, // ############
     0x0000, // ............
 };
+// 12x12
+const uint16_t METRONOME_ROWS[] = {
+    0x0610, // .....##....#
+    0x0960, // ....#..#.##.
+    0x0960, // ....#..#.##.
+    0x10C0, // ...#....##..
+    0x1080, // ...#....#...
+    0x1180, // ...#...##...
+    0x2140, // ..#....#.#..
+    0x2240, // ..#...#..#..
+    0x2640, // ..#..##..#..
+    0x4020, // .#........#.
+    0x7FE0, // .##########.
+    0x0000, // ............
+};
 // 7x7
 const uint16_t PLAY_ROWS[] = {
     0xC000, // ##.....
@@ -222,6 +237,7 @@ const Icon ICON_NOTE = {10, 10, NOTE_ROWS};
 const Icon ICON_WAVE = {10, 10, WAVE_ROWS};
 const Icon ICON_REC = {10, 10, REC_ROWS};
 const Icon ICON_WARNING = {12, 12, WARNING_ROWS};
+const Icon ICON_METRONOME = {12, 12, METRONOME_ROWS};
 const Icon ICON_PLAY = {7, 7, PLAY_ROWS};
 const Icon ICON_DIR = {3, 5, DIR_ROWS};
 
@@ -848,7 +864,11 @@ void clearModeList() {
     }
 }
 
-void drawModeRow(int index, const char* label, const char* note, bool selected) {
+namespace {
+// One row of the list: frame, the icon drawn by drawIconFn(g, x, y) in a
+// 24 px square, label, note and the play arrow when selected.
+template <typename F>
+void listRow(int index, const char* label, const char* note, bool selected, F drawIconFn) {
     int x = MODE_X, w = MODE_W, h = MODE_ROW_H;
     int y = MODE_Y + index * (MODE_ROW_H + MODE_GAP);
     uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_SURFACE;
@@ -860,15 +880,7 @@ void drawModeRow(int index, const char* label, const char* note, bool selected) 
             g.drawRect(x, y, w, h, COLOR_RULE);
         }
         int ix = x + 12, iy = y + (h - 24) / 2;
-        switch (index) {
-            case 0: drawIcon(g, ICON_FILES, ix, iy, COLOR_SELECT, 2); break;
-            case 1: drawIcon(g, ICON_LOOPER, ix, iy, COLOR_ACCENT, 2); break;
-            case 2: drawIcon(g, ICON_PARISYNTH, ix, iy, COLOR_MIDI, 2); break;
-            default:
-                drawIcon(g, ICON_SLIDERS, ix, iy, COLOR_DIM, 2);
-                drawIcon(g, ICON_KNOBS, ix, iy, COLOR_TEXT, 2);
-                break;
-        }
+        drawIconFn(g, ix, iy);
         // Label caps 10 px, 5 px gap, note caps 7 px: 22 px centred on the icon.
         int tx = ix + 24 + 12, ty = y + (h - 22) / 2;
         drawText(g, FONT_LABEL, label, tx, ty, selected ? COLOR_SELECT : COLOR_TEXT, 2);
@@ -878,6 +890,27 @@ void drawModeRow(int index, const char* label, const char* note, bool selected) 
             drawText(g, FONT_TEXT, buf, tx, ty + 15, COLOR_DIM);
         }
         if (selected) drawIcon(g, ICON_PLAY, x + w - 14, y + (h - 7) / 2, COLOR_SELECT);
+    });
+}
+} // namespace
+
+void drawModeRow(int index, const char* label, const char* note, bool selected) {
+    listRow(index, label, note, selected, [&](TFT_eSPI& g, int ix, int iy) {
+        switch (index) {
+            case 0: drawIcon(g, ICON_FILES, ix, iy, COLOR_SELECT, 2); break;
+            case 1: drawIcon(g, ICON_LOOPER, ix, iy, COLOR_ACCENT, 2); break;
+            case 2: drawIcon(g, ICON_PARISYNTH, ix, iy, COLOR_MIDI, 2); break;
+            default:
+                drawIcon(g, ICON_SLIDERS, ix, iy, COLOR_DIM, 2);
+                drawIcon(g, ICON_KNOBS, ix, iy, COLOR_TEXT, 2);
+                break;
+        }
+    });
+}
+
+void drawIconRow(int index, const Icon& icon, uint16_t iconColor, const char* label, const char* note, bool selected) {
+    listRow(index, label, note, selected, [&](TFT_eSPI& g, int ix, int iy) {
+        drawIcon(g, icon, ix + (24 - 2 * icon.w) / 2, iy + (24 - 2 * icon.h) / 2, iconColor, 2);
     });
 }
 

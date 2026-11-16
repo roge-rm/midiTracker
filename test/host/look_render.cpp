@@ -235,7 +235,26 @@ void settingsScreen() {
     for (int i = 0; i < ROWS; i++)
         drawTextRow(y0 + i * LIST_ROW_H, labels[i], values[i], 180, i == 5);
     drawScrollbar(y0, ROWS, 10, 0);
-    drawHintFooter("UD move  LR page", "EDIT+LR change");
+    drawHintFooter("UD move  LEFT back", "EDIT+LR change");
+}
+
+void settingsListScreen() {
+    g_tft.fillScreen(COLOR_BG);
+    Status st;
+    st.icon = &ICON_SLIDERS;
+    st.iconColor = COLOR_DIM;
+    st.title = "SETTINGS";
+    drawStatus(st);
+    drawIcon(g_tft, ICON_KNOBS, 6, (STATUS_H - 12) / 2, COLOR_TEXT);
+    clearModeList();
+    const char* labels[] = {"AUDIO", "LOOPER", "METRONOME", "MIDI/SYSTEM"};
+    const char* notes[] = {"level \x7f reverb \x7f LFO \x7f stereo", "tempo \x7f time signature \x7f bars \x7f sync",
+                           "click \x7f volume \x7f count-in", "clock \x7f thru \x7f display \x7f theme \x7f USB"};
+    const Icon* icons[] = {&ICON_WAVE, &ICON_LOOPER, &ICON_METRONOME, &ICON_NOTE};
+    uint16_t colors[] = {COLOR_SELECT, COLOR_ACCENT, COLOR_TEXT, COLOR_MIDI};
+    for (int i = 0; i < 4; i++) drawIconRow(i, *icons[i], colors[i], labels[i], notes[i], i == 3);
+    static const Key keys[] = {{"UD", "move", TONE_TEXT}, {"RIGHT/ENT", "open", TONE_SELECT}};
+    drawKeyFooter(keys, 2);
 }
 
 void dialogScreen() {
@@ -695,6 +714,8 @@ int main(int argc, char** argv) {
     save("dialog-message");
     menuScreen();
     save("menu");
+    settingsListScreen();
+    save("settings-list");
     settingsScreen();
     save("settings");
     playerChrome();

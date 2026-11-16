@@ -55,14 +55,8 @@ namespace SettingsMode
             SETTING_COUNT,
         };
 
-        // Settings is split into a handful of themed pages rather than one long
-        // scrolling list -- RIGHT (without EDIT held, so it doesn't collide with
-        // EDIT+RIGHT's "adjust value" meaning) advances to the next page,
-        // looping back to page 0 from the last one; LEFT steps back a page at
-        // a time, and (since page 0 has nowhere further back to go) exits the
-        // screen from page 0 itself, same as it always has. BTN_NAV remains an
-        // unconditional "exit from anywhere" shortcut regardless of page. See
-        // handleInput()/switchPage().
+        // Settings opens on a list of these pages; RIGHT, ENTER or PLAY opens
+        // one and LEFT goes back to the list. See handleInput().
         enum SettingsPage
         {
             PAGE_AUDIO,
@@ -73,6 +67,13 @@ namespace SettingsMode
         };
 
         const char *PAGE_TITLES[PAGE_COUNT] = {"Audio", "Looper", "Metronome", "MIDI/System"};
+        const char *PAGE_LIST_LABELS[PAGE_COUNT] = {"AUDIO", "LOOPER", "METRONOME", "MIDI/SYSTEM"};
+        const char *PAGE_LIST_NOTES[PAGE_COUNT] = {
+            "level \x7f reverb \x7f LFO \x7f stereo",
+            "tempo \x7f time signature \x7f bars \x7f sync",
+            "click \x7f volume \x7f count-in",
+            "clock \x7f thru \x7f display \x7f theme \x7f USB",
+        };
 
         const SettingIndex PAGE_AUDIO_ITEMS[] = {SETTING_OUTPUT_LEVEL, SETTING_DEFAULT_VOLUME, SETTING_REVERB, SETTING_REVERB_MIX, SETTING_REVERB_TYPE, SETTING_SYNTH_AUDIO, SETTING_LFO_RATE, SETTING_LFO_VOICES, SETTING_STEREO_SPREAD};
         const SettingIndex PAGE_LOOPER_ITEMS[] = {SETTING_BPM, SETTING_TIME_SIGNATURE, SETTING_BAR_LENGTH, SETTING_SYNC};
@@ -82,7 +83,12 @@ namespace SettingsMode
         const SettingIndex *PAGE_ITEMS[PAGE_COUNT] = {PAGE_AUDIO_ITEMS, PAGE_LOOPER_ITEMS, PAGE_METRONOME_ITEMS, PAGE_MIDI_SYSTEM_ITEMS};
         const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {9, 4, 4, 10};
 
+        // Kept while the device is on, so Settings reopens on the last page.
         int currentPage = 0;
+        // The page list is up rather than a page's settings.
+        bool inPageList = true;
+        // RIGHT was pressed on the page list; it opens on release.
+        bool pageListRight = false;
 
         // -- Theme editor state --------------------------------------------------
         // Entirely separate from `cursor`/`scrollOffset` below (the generic
@@ -1212,15 +1218,54 @@ namespace SettingsMode
             }
         }
 
-        // Switches to `newPage` and resets cursor/scroll -- a full redraw is
-        // unavoidable here (the whole item list changes), unlike moveCursor()'s
-        // cheap partial-update path within a page.
-        void switchPage(int newPage)
+        void movePageCursor(int to)
         {
-            currentPage = newPage;
+            int prev = currentPage;
+            currentPage = to;
+            Ui::updateSettingsPageListCursor(PAGE_LIST_LABELS, PAGE_LIST_NOTES, PAGE_COUNT, prev, currentPage);
+        }
+
+        void openPage()
+        {
+            inPageList = false;
             cursor = 0;
             scrollOffset = 0;
+            Ui::transitionNext(Ui::TRANSITION_IN);
             needsRedraw = true;
+        }
+
+        void backToPageList()
+        {
+            inPageList = true;
+            Ui::transitionNext(Ui::TRANSITION_OUT);
+            needsRedraw = true;
+        }
+
+        // UP/DOWN move and wrap, RIGHT (on release, if pressed here), ENTER or
+        // PLAY opens, LEFT or NAV leaves Settings. True when leaving.
+        bool handlePageListInput()
+        {
+            if (Input::justPressed(BTN_UP))
+                movePageCursor(currentPage > 0 ? currentPage - 1 : PAGE_COUNT - 1);
+            if (Input::justPressed(BTN_DOWN))
+                movePageCursor(currentPage < PAGE_COUNT - 1 ? currentPage + 1 : 0);
+            if (Input::justPressed(BTN_RIGHT))
+                pageListRight = true;
+            bool rightRelease = Input::justReleased(BTN_RIGHT) && pageListRight;
+            if (Input::justReleased(BTN_RIGHT))
+                pageListRight = false;
+            if (rightRelease || Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY))
+            {
+                pageListRight = false;
+                openPage();
+                return false;
+            }
+            if (Input::justPressed(BTN_LEFT) || Input::justPressed(BTN_NAV))
+            {
+                saveSettings();
+                return true;
+            }
+            return false;
         }
 
         // Opens the Theme editor from a tap of ENTER on its row (see
@@ -1788,7 +1833,7 @@ namespace SettingsMode
 
             // Bare arrow keys freely navigate: UP/DOWN moves between colors,
             // LEFT/RIGHT moves between that color's R/G/B fields -- both wrap.
-            // Nothing here claims LEFT for "back"/page-nav the way the generic
+            // Nothing here claims LEFT for "back" the way the generic
             // pages' LEFT does; NAV is this editor's only exit, precisely so
             // these four keys stay free to just be a 2D cursor.
             if (Input::justPressed(BTN_UP))
@@ -1840,6 +1885,9 @@ namespace SettingsMode
                 return false;
             }
 
+            if (inPageList)
+                return handlePageListInput();
+
             handleBootloaderHold();
             handleEditTap();
 
@@ -1878,29 +1926,11 @@ namespace SettingsMode
             {
                 moveCursor(cursor < currentPageItemCount() - 1 ? cursor + 1 : 0);
             }
-            // RIGHT/LEFT (without EDIT, which handleAdjust() above already
-            // claimed) page-navigate instead of adjusting a value: RIGHT
-            // advances a page and loops back to page 0 from the last page;
-            // LEFT steps back a page at a time, and -- since page 0 has
-            // nowhere further back to go -- exits the whole screen from
-            // page 0 itself, the same behavior LEFT always had before there
-            // were multiple pages. BTN_NAV is the unconditional "exit from
-            // anywhere" shortcut regardless of page.
-            if (Input::justPressed(BTN_RIGHT))
-            {
-                switchPage((currentPage + 1) % PAGE_COUNT);
-            }
+            // Bare RIGHT does nothing here; EDIT+RIGHT is handled above.
             if (Input::justPressed(BTN_LEFT))
             {
-                if (currentPage > 0)
-                {
-                    switchPage(currentPage - 1);
-                }
-                else
-                {
-                    saveSettings();
-                    return true;
-                }
+                backToPageList();
+                return false;
             }
             if (Input::justPressed(BTN_NAV))
             {
@@ -1943,7 +1973,8 @@ namespace SettingsMode
 
     void enter()
     {
-        currentPage = 0;
+        inPageList = true;
+        pageListRight = false;
         cursor = 0;
         scrollOffset = 0;
         needsRedraw = true;
@@ -1998,6 +2029,11 @@ namespace SettingsMode
                     Ui::drawMessage(themeFlashMsg, nullptr);
                     break;
                 }
+            }
+            else if (inPageList)
+            {
+                Ui::transitionDraw([]
+                                   { Ui::drawSettingsPageList(PAGE_LIST_LABELS, PAGE_LIST_NOTES, PAGE_COUNT, currentPage); });
             }
             else
             {

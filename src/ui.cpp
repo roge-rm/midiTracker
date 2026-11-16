@@ -1351,6 +1351,33 @@ void settingsStatus(const char* pageTitle) {
     Look::drawIcon(tft, Look::ICON_KNOBS, 6, (Look::STATUS_H - 12) / 2, COLOR_TEXT);
 }
 
+// Icons for Settings' pages, by position.
+void drawSettingsPageRow(const char* const* labels, const char* const* notes, int count, int i, bool selected) {
+    if (i < 0 || i >= count || i >= 4) return;
+    switch (i) {
+        case 0: Look::drawIconRow(i, Look::ICON_WAVE, COLOR_SELECT, labels[i], notes[i], selected); break;
+        case 1: Look::drawIconRow(i, Look::ICON_LOOPER, COLOR_ACCENT, labels[i], notes[i], selected); break;
+        case 2: Look::drawIconRow(i, Look::ICON_METRONOME, COLOR_TEXT, labels[i], notes[i], selected); break;
+        default: Look::drawIconRow(i, Look::ICON_NOTE, COLOR_MIDI, labels[i], notes[i], selected); break;
+    }
+}
+
+void drawSettingsPageList(const char* const* labels, const char* const* notes, int count, int cursor) {
+    settingsStatus(nullptr);
+    Look::clearModeList();
+    for (int i = 0; i < count && i < 4; i++) drawSettingsPageRow(labels, notes, count, i, i == cursor);
+    static const Look::Key keys[] = {
+        {"UD", "move", Look::TONE_TEXT},
+        {"RIGHT/ENT", "open", Look::TONE_SELECT},
+    };
+    Look::drawKeyFooter(keys, 2);
+}
+
+void updateSettingsPageListCursor(const char* const* labels, const char* const* notes, int count, int prevCursor, int newCursor) {
+    drawSettingsPageRow(labels, notes, count, prevCursor, false);
+    drawSettingsPageRow(labels, notes, count, newCursor, true);
+}
+
 void drawSettings(const char* const* labels, const char* const* values, int count, int cursor,
                    int scrollOffset, const char* pageTitle,
                    const char* footerLine1, const char* footerLine2) {
