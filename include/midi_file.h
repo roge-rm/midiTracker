@@ -7,8 +7,9 @@
 // and merges all tracks into a single playback timeline, without ever
 // loading the whole file into RAM. Each track keeps its own open file
 // handle + a small amount of read-ahead state ("primed" next event).
+// Ticks are either PPQ (tempo meta events apply) or SMPTE frames.
 //
-// Not supported: format 2 (independent sequences), SMPTE time division.
+// Not supported: format 2 (independent sequences).
 class MidiPlayer {
 public:
     enum State { STATE_IDLE, STATE_PLAYING, STATE_PAUSED, STATE_DONE, STATE_ERROR };
@@ -19,6 +20,7 @@ public:
     MidiPlayer& operator=(const MidiPlayer&) = delete;
 
     // Opens and parses `path`, priming every track's first event.
+    // Sends CC 121 and bend centre on all channels (see resetChannels()).
     // Leaves the player in STATE_PAUSED (ready to play()) on success,
     // or STATE_ERROR (see errorMessage()) on failure.
     bool load(const char* path);
@@ -59,35 +61,43 @@ public:
 
     // Jumps playback to `targetMs`. If currently playing, keeps playing
     // from the new position; if paused, stays paused there; either way,
-    // silences whatever's currently sounding first. There is no known
-    // total duration (see this class's header comment -- nothing
-    // prescans the file), so a `targetMs` beyond the end of the file
-    // just lands at EOF (STATE_DONE) instead.
+    // silences whatever's currently sounding first. A `targetMs` beyond
+    // the end of the file lands at the end (STATE_DONE).
     //
-    // Forward seeks (targetMs >= elapsedMs()) continue scanning from the
-    // current track cursors -- cheap, proportional to the seek distance.
-    // Backward seeks (or seeking after STATE_DONE) have no random-access
-    // index to jump to, so they reopen the file and re-scan every track
-    // from the start up to targetMs -- cost is proportional to how far
-    // into the file the target is, not to the seek distance. Either way,
-    // every Set Tempo/Program Change/Control Change/Pitch Bend/Pressure
-    // event passed over is still applied (so the landing point's
-    // instrument/tempo state is correct) -- only Note On/Off is
-    // suppressed, and SysEx is skipped entirely (not re-sent).
-    void seekTo(uint32_t targetMs);
+    // Forward seeks continue scanning from the current track cursors.
+    // Backward seeks (or seeking after STATE_DONE) reopen the file and
+    // re-scan from the start, so the cost grows with how far in the target
+    // is. Tempo events passed over are applied; notes, SysEx and pressure
+    // are skipped. The last bank, program, RPN 0-2, CC 1/7/10/11/64/91/93
+    // and pitch bend of each channel passed over are sent once at the
+    // landing point.
+    //
+    // With `defer` (scrubbing), only the notes this player holds are
+    // released and the reset and landing state wait for finishSeek(), so
+    // each step doesn't block on DIN.
+    void seekTo(uint32_t targetMs, bool defer = false);
+    // Sends what deferred seeks held back: a panic, the reset if a step
+    // rewound, then the landing state. No-op if nothing is pending.
+    void finishSeek();
 
 private:
-    // Bytes each track reads ahead. SdFat has one sector cache per volume,
-    // so reading byte by byte from several tracks in turn re-reads a
-    // sector on every switch; this cuts that to once per buffer.
-    static const uint8_t TRACK_READ_BUF = 32;
+    // Read-ahead bytes per track: as much as fits in BUF_POOL_MAX across
+    // all tracks, between BUF_MIN and BUF_MAX. SdFat has one sector cache
+    // per volume, so reading byte by byte from several tracks in turn
+    // re-reads a sector on every switch; this cuts that to once per buffer.
+    static const uint16_t BUF_POOL_MAX = 2048;
+    static const uint8_t BUF_MIN = 32, BUF_MAX = 128;
+
+    // What a track has staged in its pending* fields.
+    enum EventKind : uint8_t { EV_CHANNEL, EV_TEMPO, EV_SYSEX, EV_END };
 
     struct TrackReader {
         FsFile file;
         uint32_t chunkEnd = 0;
-        // Read-ahead: buf[0] is at file offset bufFilePos, bufPos is the
-        // next unread byte. The FsFile cursor sits at the end of buf.
-        uint8_t buf[TRACK_READ_BUF];
+        // Read-ahead: buf (_bufSize bytes in _bufPool) holds file bytes
+        // from bufFilePos, bufPos is the next unread byte. The FsFile
+        // cursor sits at the end of buf.
+        uint8_t* buf = nullptr;
         uint32_t bufFilePos = 0;
         uint8_t bufLen = 0;
         uint8_t bufPos = 0;
@@ -95,64 +105,110 @@ private:
         uint8_t runningStatus = 0;
         bool ended = false;
 
-        // Next staged (not-yet-fired) event for this track.
+        // Next staged (not-yet-fired) event for this track. EV_END is the
+        // End of Track meta, kept as a timed event so its delta counts.
         uint32_t pendingTick = 0;
-        bool pendingIsTempo = false;
-        uint32_t pendingTempoUsPerQuarter = 500000;
+        uint8_t pendingKind = EV_CHANNEL;
         uint8_t pendingStatus = 0, pendingData1 = 0, pendingData2 = 0, pendingLen = 0;
-        // Set instead of the channel-voice fields above for a staged SysEx
-        // event -- pendingSysExPos/Len locate the payload within `file`
-        // (position of the first byte after the length field, and its
-        // byte count including the trailing F7) rather than holding the
-        // bytes themselves, since a SysEx payload can be arbitrarily long.
-        // Re-read from disk on dispatch (see sendPendingSysEx()).
-        bool pendingIsSysEx = false;
+        uint32_t pendingTempoUsPerQuarter = 500000;
+        // EV_SYSEX: pendingSysExPos/Len locate the payload in `file` (first
+        // byte after the length field, and its byte count including the
+        // trailing F7). Re-read from disk on dispatch (see sendPendingSysEx()).
         bool pendingSysExHasF0 = false; // false for an F7 escape: its bytes go out as they are
         uint32_t pendingSysExPos = 0;
         uint32_t pendingSysExLen = 0;
     };
 
-    // Heap array sized to the file's track count by load(), kept and
+    // Last values per channel gathered by a seek, 0xFF = not seen.
+    struct SeekChannel {
+        uint8_t bank0, bank32, program, bendLsb, bendMsb;
+        uint8_t progBank0, progBank32; // bank current at the last program change
+        uint8_t cc[7]; // SEEK_CCS order
+        uint8_t rpn0Msb, rpn0Lsb, rpn1Msb, rpn1Lsb, rpn2Msb;
+        bool rpnTouched; // an RPN select or data entry was passed
+    };
+
+    // Heap arrays sized to the file's track count by load(), kept and
     // reused while big enough.
     TrackReader* _tracks = nullptr;
     uint16_t _trackCapacity = 0;
+    uint8_t* _bufPool = nullptr;
+    uint16_t _bufPoolSize = 0;
+    uint8_t _bufSize = BUF_MIN;
     uint16_t _numTracks = 0;
     uint16_t _format = 0;
-    uint16_t _division = 480; // ticks per quarter note
+    uint16_t _division = 480; // raw header word
     uint32_t _usPerQuarter = 500000; // tempo, default 120 BPM
     float _tempoScale = 1.0f;        // user speed multiplier, see adjustTempoScale()
+
+    // A tick lasts _tickNum / _tickDen µs: _usPerQuarter / PPQ, or
+    // 1e6 / (fps * ticks per frame) for SMPTE (29 fps means 29.97).
+    // _effTickNum is _tickNum / _tempoScale.
+    bool _smpte = false;
+    uint32_t _tickNum = 500000;
+    uint32_t _tickDen = 480;
+    uint32_t _effTickNum = 500000;
+
+    // Position: _globalTick is the last fired event, _songUs its time in
+    // µs of playback (tempo scale included) and _tickRem the leftover
+    // fraction of a µs in 1/_tickDen units, so rounding doesn't drift.
+    // While playing, _globalTick fell due at micros() == _originMicros;
+    // while paused, _pausedOffsetUs is how far past it playback had got.
     uint32_t _globalTick = 0;
-
-    // Timeline origin used to convert the next due tick to a micros()
-    // deadline; reset after every event so the extrapolated delta (and
-    // thus rounding error) stays small.
-    uint32_t _originTick = 0;
+    uint64_t _songUs = 0;
+    uint32_t _tickRem = 0;
     uint32_t _originMicros = 0;
+    uint32_t _pausedOffsetUs = 0;
 
-    uint32_t _elapsedMsFrozen = 0;
-    uint32_t _lastResumeMicros = 0;
+    // Current RPN select (CC 101, 100) per channel, 0xFF = none. NRPN
+    // selects set it to 0x7F 0x7F (null), since seeks don't restore NRPNs.
+    uint8_t _rpnSel[16][2];
+
+    // Notes on per channel, bit n of word n/32, so a natural end can
+    // release notes whose note-offs never came.
+    uint32_t _held[16][4];
+    // A track stopped on a parse failure rather than End of Track.
+    bool _trackFailed = false;
+
+    // Landing state gathered by seeks and not yet sent, see finishSeek().
+    SeekChannel _seek[16];
+    bool _seekPending = false;
+    bool _seekNeedsReset = false; // a deferred step rewound
+    bool _deferSeek = false;      // set during a deferred seekTo()
 
     State _state = STATE_IDLE;
     char _error[64] = {0};
     char _path[192] = {0}; // set by load(); lets seekTo() reopen without the caller re-supplying it
 
-    static bool readVarLen(TrackReader& t, uint32_t& value);
+    bool readVarLen(TrackReader& t, uint32_t& value);
 
     // Buffered reads on a track (see TrackReader's buf).
-    static int readByte(TrackReader& t);
-    static bool readBytes(TrackReader& t, uint8_t* dst, uint32_t n);
-    static void skipBytes(TrackReader& t, uint32_t n);
+    int readByte(TrackReader& t);
+    bool readBytes(TrackReader& t, uint8_t* dst, uint32_t n);
+    void skipBytes(TrackReader& t, uint32_t n);
     static void seekTrack(TrackReader& t, uint32_t pos);
     static uint32_t trackPos(const TrackReader& t) { return t.bufFilePos + t.bufPos; }
 
-    // Reads events for track idx until one worth stopping on (a channel
-    // voice message or a tempo meta) is staged in `pending*`, or the
-    // track chunk ends. Returns false and sets ended=true in the latter
-    // case.
+    // Reads events for track idx until one worth stopping on (channel
+    // message, tempo, SysEx or End of Track) is staged in `pending*`.
+    // Returns false and sets ended=true if the chunk ends without one.
     bool primeTrack(int idx);
 
     // Index of the un-ended track with the smallest pendingTick, or -1.
     int findNextTrack() const;
+
+    // µs from _globalTick to `tick`, carrying _tickRem; the new remainder
+    // goes to remOut (committed when the event fires).
+    uint64_t ticksToUs(uint32_t tick, uint32_t& remOut) const;
+    void updateEffTick();
+
+    // Applies a fired tempo meta, or tracks an RPN select.
+    void applyTempo(uint32_t usPerQuarter);
+    void trackRpnSelect(uint8_t ch, uint8_t cc, uint8_t value);
+
+    // CC 121 and bend centre on all channels, so external synths drop
+    // the previous song's state.
+    static void resetChannels();
 
     // Re-reads t's staged SysEx payload from disk (see TrackReader's
     // pendingSysExPos/Len comment) and sends it. Restores the file's read
@@ -162,15 +218,15 @@ private:
     // config.h's comment on that cap) rather than sent truncated.
     void sendPendingSysEx(TrackReader& t);
 
-    // Used by seekTo(): advances _globalTick/_usPerQuarter/track cursors
-    // from wherever they currently are, up to `targetMs` of *virtual*
-    // elapsed time -- same event-merge logic update() uses, just driven
-    // by a simulated clock instead of real time, with Note On/Off
-    // suppressed (see seekTo()'s comment). Sets `reachedEnd` and returns
-    // early if EOF is hit before targetMs (nothing further to simulate);
-    // otherwise returns targetMs itself, since the position clock should
-    // read exactly where it was asked to land even if no event happens
-    // to fall exactly there (same as ordinary playback's elapsedMs(),
-    // which advances continuously between events, not just when one fires).
-    uint32_t advanceSilentlyTo(uint32_t targetMs, bool& reachedEnd);
+    // Used by seekTo(): fires events from the current position up to
+    // targetMs of playback time without real time passing. Notes, SysEx
+    // and pressure are dropped; the channel state passed over goes into
+    // _seek. Sets reachedEnd if every track ended first.
+    void advanceSilentlyTo(uint32_t targetMs, bool& reachedEnd);
+    void gatherSeekEvent(const TrackReader& t);
+    void sendSeekState();
+    void clearSeekState();
+    // Note-offs for every note in _held, then clears it.
+    void releaseHeld();
+    void trackHeld(uint8_t status, uint8_t note, uint8_t velocity);
 };

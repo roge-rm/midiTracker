@@ -1150,6 +1150,19 @@ void handleVolumeHold() {
 // against here. No-ops outside PLAYING/PAUSED/DONE (nothing loaded, or
 // already showing the error layout).
 void handleSeekHold() {
+    // Steps defer the reset and landing state (see MidiPlayer::seekTo());
+    // they go out once the scrub stops, on release or after a pause in steps.
+    static bool scrubPending = false;
+    static uint32_t lastStepMs = 0;
+    const uint32_t SCRUB_SETTLE_MS = 150;
+    if (scrubPending) {
+        bool held = Input::isDown(BTN_ENTER) &&
+                    (Input::isDown(BTN_LEFT) || Input::isDown(BTN_RIGHT));
+        if (!held || millis() - lastStepMs > SCRUB_SETTLE_MS + 60) {
+            player->finishSeek();
+            scrubPending = false;
+        }
+    }
     if (!Input::isDown(BTN_ENTER)) return;
     MidiPlayer::State st = player->state();
     if (st != MidiPlayer::STATE_PLAYING && st != MidiPlayer::STATE_PAUSED &&
@@ -1177,7 +1190,7 @@ void handleSeekHold() {
         bool accel = now - rightPressedAtMs >= ACCEL_AFTER_MS;
         uint32_t interval = accel ? FAST_INTERVAL_MS : NORMAL_INTERVAL_MS;
         if (Input::justPressed(BTN_RIGHT) || now - lastRightStep >= interval) {
-            player->seekTo(player->elapsedMs() + (accel ? FAST_STEP_MS : NORMAL_STEP_MS));
+            player->seekTo(player->elapsedMs() + (accel ? FAST_STEP_MS : NORMAL_STEP_MS), true);
             lastRightStep = now;
             changed = true;
         }
@@ -1188,12 +1201,14 @@ void handleSeekHold() {
         if (Input::justPressed(BTN_LEFT) || now - lastLeftStep >= interval) {
             uint32_t step = accel ? FAST_STEP_MS : NORMAL_STEP_MS;
             uint32_t current = player->elapsedMs();
-            player->seekTo(current > step ? current - step : 0);
+            player->seekTo(current > step ? current - step : 0, true);
             lastLeftStep = now;
             changed = true;
         }
     }
     if (changed) {
+        scrubPending = true;
+        lastStepMs = now;
         // A deliberate reposition, not a NAV "stop" -- if this lands on
         // PAUSED (e.g. seeking backward out of STATE_DONE), it should
         // read "Paused", not inherit a stale "Stopped" from an earlier
@@ -1532,7 +1547,9 @@ void handlePlayInput() {
         } else if (player->state() == MidiPlayer::STATE_DONE) {
             // selectedIndex/browser haven't changed since this file was
             // opened (nothing mutates them while in APP_PLAY), so
-            // restartFromTop() still points at the same entry.
+            // restartFromTop() still points at the same entry. Notes may
+            // still be ringing from the end, as on NAV.
+            MidiOutput::allNotesOffAllChannels();
             if (restartFromTop()) player->play();
             stoppedViaNav = false;
             // A restart resets far more than State (Time, Tempo, possibly

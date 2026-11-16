@@ -5,11 +5,16 @@
 #include <string.h>
 #include <new>
 
+namespace {
+// Controllers a seek gathers and sends after bank, program and RPNs.
+const uint8_t SEEK_CCS[7] = { 1, 7, 10, 11, 64, 91, 93 };
+}
+
 int MidiPlayer::readByte(TrackReader& t) {
     if (t.bufPos >= t.bufLen) {
         t.bufFilePos += t.bufLen;
         t.bufPos = 0;
-        int n = t.file.read(t.buf, TRACK_READ_BUF);
+        int n = t.file.read(t.buf, _bufSize);
         t.bufLen = n > 0 ? (uint8_t)n : 0;
         if (t.bufLen == 0) return -1;
     }
@@ -41,7 +46,7 @@ void MidiPlayer::seekTrack(TrackReader& t, uint32_t pos) {
 }
 
 bool MidiPlayer::readVarLen(TrackReader& t, uint32_t& value) {
-    return Smf::readVarLen([&t]() { return readByte(t); }, value);
+    return Smf::readVarLen([this, &t]() { return readByte(t); }, value);
 }
 
 bool MidiPlayer::primeTrack(int idx) {
@@ -49,16 +54,16 @@ bool MidiPlayer::primeTrack(int idx) {
 
     while (true) {
         if (!t.file || trackPos(t) >= t.chunkEnd) {
-            t.ended = true;
+            t.ended = true; _trackFailed = true;
             return false;
         }
 
         uint32_t delta;
-        if (!readVarLen(t, delta)) { t.ended = true; return false; }
+        if (!readVarLen(t, delta)) { t.ended = true; _trackFailed = true; return false; }
         t.absoluteTick += delta;
 
         int b0i = readByte(t);
-        if (b0i < 0) { t.ended = true; return false; }
+        if (b0i < 0) { t.ended = true; _trackFailed = true; return false; }
         uint8_t b0 = (uint8_t)b0i;
 
         uint8_t status;
@@ -73,29 +78,29 @@ bool MidiPlayer::primeTrack(int idx) {
             status = t.runningStatus;
             firstDataByte = b0;
             haveFirstDataByte = true;
-            if (status == 0) { t.ended = true; return false; } // malformed stream
+            if (status == 0) { t.ended = true; _trackFailed = true; return false; } // malformed stream
         }
 
         if (status == 0xFF) {
             // Meta event: FF <type> <varlen> <data...>
             int metaTypeI = readByte(t);
-            if (metaTypeI < 0) { t.ended = true; return false; }
+            if (metaTypeI < 0) { t.ended = true; _trackFailed = true; return false; }
             uint8_t metaType = (uint8_t)metaTypeI;
             uint32_t len;
-            if (!readVarLen(t, len)) { t.ended = true; return false; }
+            if (!readVarLen(t, len)) { t.ended = true; _trackFailed = true; return false; }
 
             if (metaType == 0x51 && len == 3) { // Set Tempo
                 uint8_t d[3];
-                if (!readBytes(t, d, 3)) { t.ended = true; return false; }
+                if (!readBytes(t, d, 3)) { t.ended = true; _trackFailed = true; return false; }
                 t.pendingTick = t.absoluteTick;
-                t.pendingIsTempo = true;
-                t.pendingIsSysEx = false;
+                t.pendingKind = EV_TEMPO;
                 t.pendingTempoUsPerQuarter =
                     ((uint32_t)d[0] << 16) | ((uint32_t)d[1] << 8) | d[2];
                 return true;
-            } else if (metaType == 0x2F) { // End of Track
-                t.ended = true;
-                return false;
+            } else if (metaType == 0x2F) { // End of Track, fired at its own time
+                t.pendingTick = t.absoluteTick;
+                t.pendingKind = EV_END;
+                return true;
             } else {
                 if (len > 0) skipBytes(t, len);
                 continue; // not playable, keep scanning
@@ -107,10 +112,9 @@ bool MidiPlayer::primeTrack(int idx) {
             // be arbitrarily long, unlike a channel-voice event's fixed
             // 1-2 data bytes.
             uint32_t len;
-            if (!readVarLen(t, len)) { t.ended = true; return false; }
+            if (!readVarLen(t, len)) { t.ended = true; _trackFailed = true; return false; }
             t.pendingTick = t.absoluteTick;
-            t.pendingIsTempo = false;
-            t.pendingIsSysEx = true;
+            t.pendingKind = EV_SYSEX;
             t.pendingSysExHasF0 = (status == 0xF0);
             t.pendingSysExPos = trackPos(t);
             t.pendingSysExLen = len;
@@ -125,25 +129,24 @@ bool MidiPlayer::primeTrack(int idx) {
                 d1 = firstDataByte;
                 if (need >= 2) {
                     int r = readByte(t);
-                    if (r < 0) { t.ended = true; return false; }
+                    if (r < 0) { t.ended = true; _trackFailed = true; return false; }
                     d2 = (uint8_t)r;
                 }
             } else {
                 if (need >= 1) {
                     int r = readByte(t);
-                    if (r < 0) { t.ended = true; return false; }
+                    if (r < 0) { t.ended = true; _trackFailed = true; return false; }
                     d1 = (uint8_t)r;
                 }
                 if (need >= 2) {
                     int r = readByte(t);
-                    if (r < 0) { t.ended = true; return false; }
+                    if (r < 0) { t.ended = true; _trackFailed = true; return false; }
                     d2 = (uint8_t)r;
                 }
             }
 
             t.pendingTick = t.absoluteTick;
-            t.pendingIsTempo = false;
-            t.pendingIsSysEx = false;
+            t.pendingKind = EV_CHANNEL;
             t.pendingStatus = status;
             t.pendingData1 = d1;
             t.pendingData2 = d2;
@@ -153,7 +156,7 @@ bool MidiPlayer::primeTrack(int idx) {
             // Other system messages (0xF1-0xF6, 0xF8-0xFE) shouldn't
             // appear in a standard MIDI file; bail on this track rather
             // than risk mis-parsing the rest of the stream.
-            t.ended = true;
+            t.ended = true; _trackFailed = true;
             return false;
         }
     }
@@ -193,6 +196,7 @@ int MidiPlayer::findNextTrack() const {
 MidiPlayer::~MidiPlayer() {
     close();
     delete[] _tracks;
+    delete[] _bufPool;
 }
 
 bool MidiPlayer::load(const char* path) {
@@ -239,11 +243,22 @@ bool MidiPlayer::load(const char* path) {
         _state = STATE_ERROR;
         return false;
     }
-    if (_division & 0x8000) {
-        strncpy(_error, "SMPTE time division not supported", sizeof(_error) - 1);
-        hdr.close();
-        _state = STATE_ERROR;
-        return false;
+    _smpte = (_division & 0x8000) != 0;
+    if (_smpte) {
+        // High byte is -fps (24, 25, 29 = 29.97 drop frame, 30), low byte ticks per frame.
+        uint32_t fps = (uint32_t)(-(int8_t)(_division >> 8));
+        uint32_t tpf = _division & 0xFF;
+        if (fps == 0 || fps > 127 || tpf == 0) {
+            strncpy(_error, "invalid time division", sizeof(_error) - 1);
+            hdr.close();
+            _state = STATE_ERROR;
+            return false;
+        }
+        _tickNum = fps == 29 ? 1001000 : 1000000; // 29.97 = 30000/1001
+        _tickDen = (fps == 29 ? 30 : fps) * tpf;
+    } else {
+        _tickNum = 500000; // 120 BPM until a tempo meta says otherwise
+        _tickDen = _division;
     }
     if (_format == 2) {
         strncpy(_error, "format 2 files not supported", sizeof(_error) - 1);
@@ -268,6 +283,22 @@ bool MidiPlayer::load(const char* path) {
             return false;
         }
     }
+    uint8_t bufSize = (uint8_t)(ntrks ? (BUF_POOL_MAX / ntrks > BUF_MAX ? BUF_MAX
+                                  : BUF_POOL_MAX / ntrks < BUF_MIN ? BUF_MIN : BUF_POOL_MAX / ntrks)
+                                  : BUF_MAX);
+    uint32_t poolNeed = (uint32_t)ntrks * bufSize;
+    if (poolNeed > _bufPoolSize) {
+        delete[] _bufPool;
+        _bufPool = new (std::nothrow) uint8_t[poolNeed];
+        _bufPoolSize = _bufPool ? (uint16_t)poolNeed : 0;
+        if (!_bufPool) {
+            strncpy(_error, "not enough memory", sizeof(_error) - 1);
+            hdr.close();
+            _state = STATE_ERROR;
+            return false;
+        }
+    }
+    _bufSize = bufSize;
     if (len > 6) hdr.seekCur(len - 6); // tolerate padded header chunks
 
     _numTracks = 0;
@@ -284,6 +315,7 @@ bool MidiPlayer::load(const char* path) {
 
         TrackReader& t = _tracks[_numTracks];
         t = TrackReader(); // reset in case this slot was used previously
+        t.buf = _bufPool + (uint32_t)_numTracks * _bufSize;
         if (!sdOpenPath(t.file, path, O_RDONLY)) {
             hdr.seekCur(tlen);
             continue;
@@ -293,7 +325,8 @@ bool MidiPlayer::load(const char* path) {
 
         hdr.seekSet(trackStart + tlen); // advance master cursor past this track
 
-        if (primeTrack(_numTracks)) {
+        // A track holding only End of Track at tick 0 is left out.
+        if (primeTrack(_numTracks) && !(t.pendingKind == EV_END && t.pendingTick == 0)) {
             _numTracks++;
         } else {
             t.file.close();
@@ -313,11 +346,23 @@ bool MidiPlayer::load(const char* path) {
     // _tempoScale is deliberately NOT reset here -- see the header comment
     // on adjustTempoScale(). Callers doing a fresh (not restart) open call
     // setTempoScale(1.0f) themselves.
+    updateEffTick();
     _globalTick = 0;
-    _originTick = 0;
+    _songUs = 0;
+    _tickRem = 0;
     _originMicros = micros();
-    _elapsedMsFrozen = 0;
-    _lastResumeMicros = micros();
+    _pausedOffsetUs = 0;
+    memset(_rpnSel, 0xFF, sizeof(_rpnSel));
+    memset(_held, 0, sizeof(_held));
+    _trackFailed = false; // tracks dropped above sent nothing
+    clearSeekState();
+    if (_deferSeek) {
+        _seekNeedsReset = true;
+        _seekPending = true;
+    } else {
+        _seekNeedsReset = false;
+        resetChannels();
+    }
     _state = STATE_PAUSED;
     return true;
 }
@@ -332,17 +377,16 @@ void MidiPlayer::close() {
 
 void MidiPlayer::play() {
     if (_state != STATE_PAUSED) return;
-    _originTick = _globalTick;
-    _originMicros = micros();
-    _lastResumeMicros = micros();
+    _originMicros = micros() - _pausedOffsetUs;
     _state = STATE_PLAYING;
 }
 
 void MidiPlayer::pause() {
     if (_state != STATE_PLAYING) return;
-    _elapsedMsFrozen += (micros() - _lastResumeMicros) / 1000;
+    _pausedOffsetUs = micros() - _originMicros;
     _state = STATE_PAUSED;
     MidiOutput::allNotesOffAllChannels();
+    memset(_held, 0, sizeof(_held));
 }
 
 void MidiPlayer::stop() {
@@ -351,50 +395,173 @@ void MidiPlayer::stop() {
 }
 
 uint32_t MidiPlayer::elapsedMs() const {
-    uint32_t extra = (_state == STATE_PLAYING) ? (micros() - _lastResumeMicros) / 1000 : 0;
-    return _elapsedMsFrozen + extra;
+    uint64_t us = _songUs;
+    if (_state == STATE_PLAYING) us += (uint32_t)(micros() - _originMicros);
+    else if (_state == STATE_PAUSED) us += _pausedOffsetUs;
+    return (uint32_t)(us / 1000);
 }
 
-uint32_t MidiPlayer::advanceSilentlyTo(uint32_t targetMs, bool& reachedEnd) {
+uint64_t MidiPlayer::ticksToUs(uint32_t tick, uint32_t& remOut) const {
+    uint64_t num = (uint64_t)(tick - _globalTick) * _effTickNum + _tickRem;
+    uint64_t us = num / _tickDen;
+    remOut = (uint32_t)(num - us * _tickDen);
+    return us;
+}
+
+void MidiPlayer::updateEffTick() {
+    _effTickNum = (uint32_t)(_tickNum / _tempoScale);
+    if (_effTickNum == 0) _effTickNum = 1;
+}
+
+void MidiPlayer::applyTempo(uint32_t usPerQuarter) {
+    if (_smpte || usPerQuarter == 0) return; // SMPTE ticks are fixed
+    _usPerQuarter = usPerQuarter;
+    _tickNum = usPerQuarter;
+    updateEffTick();
+}
+
+void MidiPlayer::trackRpnSelect(uint8_t ch, uint8_t cc, uint8_t value) {
+    if (cc == 101) _rpnSel[ch][0] = value & 0x7F;
+    else if (cc == 100) _rpnSel[ch][1] = value & 0x7F;
+    else if (cc == 99 || cc == 98) _rpnSel[ch][0] = _rpnSel[ch][1] = 0x7F;
+}
+
+void MidiPlayer::resetChannels() {
+    for (uint8_t ch = 0; ch < 16; ch++) {
+        MidiOutput::sendRaw(0xB0 | ch, 121, 0, 3);   // Reset All Controllers
+        MidiOutput::sendRaw(0xE0 | ch, 0, 0x40, 3);  // bend centre
+    }
+}
+
+void MidiPlayer::gatherSeekEvent(const TrackReader& t) {
+    uint8_t ch = t.pendingStatus & 0x0F;
+    uint8_t d1 = t.pendingData1 & 0x7F, d2 = t.pendingData2 & 0x7F;
+    SeekChannel& c = _seek[ch];
+    switch (t.pendingStatus & 0xF0) {
+        case 0xC0: c.program = d1; c.progBank0 = c.bank0; c.progBank32 = c.bank32; break;
+        case 0xE0: c.bendLsb = d1; c.bendMsb = d2; break;
+        case 0xB0: {
+            if (d1 == 0) { c.bank0 = d2; break; }
+            if (d1 == 32) { c.bank32 = d2; break; }
+            if (d1 >= 98 && d1 <= 101) { trackRpnSelect(ch, d1, d2); c.rpnTouched = true; break; }
+            if (d1 == 6 || d1 == 38) {
+                uint8_t m = _rpnSel[ch][0], l = _rpnSel[ch][1];
+                if (m != 0) break; // none, null or not RPN 0-2
+                bool msb = d1 == 6;
+                if (l == 0) { if (msb) c.rpn0Msb = d2; else c.rpn0Lsb = d2; }
+                else if (l == 1) { if (msb) c.rpn1Msb = d2; else c.rpn1Lsb = d2; }
+                else if (l == 2) { if (msb) c.rpn2Msb = d2; }
+                else break;
+                c.rpnTouched = true;
+                break;
+            }
+            for (int i = 0; i < 7; i++) {
+                if (SEEK_CCS[i] == d1) { c.cc[i] = d2; break; }
+            }
+            break;
+        }
+        default: break; // notes and pressure are dropped
+    }
+}
+
+void MidiPlayer::clearSeekState() {
+    memset(_seek, 0xFF, sizeof(_seek));
+    for (auto& c : _seek) c.rpnTouched = false;
+}
+
+void MidiPlayer::sendSeekState() {
+    for (uint8_t ch = 0; ch < 16; ch++) {
+        const SeekChannel& c = _seek[ch];
+        const uint8_t cc = 0xB0 | ch;
+        // The program goes out with the bank it was chosen under; a bank
+        // set after it follows, for the file's next program change.
+        // 0xFF progBank means the bank was set before the seek began.
+        uint8_t sent0 = 0xFF, sent32 = 0xFF;
+        if (c.program != 0xFF) {
+            sent0 = c.progBank0;
+            sent32 = c.progBank32;
+            if (sent0 != 0xFF) MidiOutput::sendRaw(cc, 0, sent0, 3);
+            if (sent32 != 0xFF) MidiOutput::sendRaw(cc, 32, sent32, 3);
+            MidiOutput::sendRaw(0xC0 | ch, c.program, 0, 2);
+        }
+        if (c.bank0 != 0xFF && c.bank0 != sent0) MidiOutput::sendRaw(cc, 0, c.bank0, 3);
+        if (c.bank32 != 0xFF && c.bank32 != sent32) MidiOutput::sendRaw(cc, 32, c.bank32, 3);
+        if (c.rpnTouched) {
+            const uint8_t msb[3] = { c.rpn0Msb, c.rpn1Msb, c.rpn2Msb };
+            const uint8_t lsb[3] = { c.rpn0Lsb, c.rpn1Lsb, 0xFF };
+            for (uint8_t r = 0; r < 3; r++) {
+                if (msb[r] == 0xFF && lsb[r] == 0xFF) continue;
+                MidiOutput::sendRaw(cc, 101, 0, 3);
+                MidiOutput::sendRaw(cc, 100, r, 3);
+                if (msb[r] != 0xFF) MidiOutput::sendRaw(cc, 6, msb[r], 3);
+                if (lsb[r] != 0xFF) MidiOutput::sendRaw(cc, 38, lsb[r], 3);
+            }
+            // Leave the file's own select in place, or null if it had none.
+            uint8_t m = _rpnSel[ch][0], l = _rpnSel[ch][1];
+            MidiOutput::sendRaw(cc, 101, m == 0xFF ? 0x7F : m, 3);
+            MidiOutput::sendRaw(cc, 100, l == 0xFF ? 0x7F : l, 3);
+        }
+        for (int i = 0; i < 7; i++) {
+            if (c.cc[i] != 0xFF) MidiOutput::sendRaw(cc, SEEK_CCS[i], c.cc[i], 3);
+        }
+        if (c.bendMsb != 0xFF) MidiOutput::sendRaw(0xE0 | ch, c.bendLsb, c.bendMsb, 3);
+    }
+}
+
+void MidiPlayer::trackHeld(uint8_t status, uint8_t note, uint8_t velocity) {
+    uint8_t type = status & 0xF0, ch = status & 0x0F;
+    if (type != 0x80 && type != 0x90) return;
+    note &= 0x7F;
+    uint32_t bit = 1u << (note & 31);
+    if (type == 0x90 && velocity > 0) _held[ch][note >> 5] |= bit;
+    else _held[ch][note >> 5] &= ~bit;
+}
+
+void MidiPlayer::releaseHeld() {
+    for (uint8_t ch = 0; ch < 16; ch++) {
+        for (uint8_t w = 0; w < 4; w++) {
+            uint32_t bits = _held[ch][w];
+            while (bits) {
+                uint8_t b = (uint8_t)__builtin_ctz(bits);
+                bits &= bits - 1;
+                MidiOutput::sendRaw(0x80 | ch, (uint8_t)(w * 32 + b), 0, 3);
+            }
+            _held[ch][w] = 0;
+        }
+    }
+}
+
+void MidiPlayer::advanceSilentlyTo(uint32_t targetMs, bool& reachedEnd) {
     uint64_t targetUs = (uint64_t)targetMs * 1000;
-    uint64_t simulatedUs = (uint64_t)elapsedMs() * 1000;
     reachedEnd = false;
 
     for (;;) {
         int nt = findNextTrack();
-        if (nt < 0) { reachedEnd = true; break; }
+        if (nt < 0) { reachedEnd = true; return; }
 
         TrackReader& t = _tracks[nt];
-        uint32_t deltaTicks = t.pendingTick - _globalTick;
-        uint32_t effectiveUsPerQuarter = (uint32_t)(_usPerQuarter / _tempoScale);
-        uint64_t deltaUs = ((uint64_t)deltaTicks * effectiveUsPerQuarter) / _division;
+        uint32_t rem;
+        uint64_t deltaUs = ticksToUs(t.pendingTick, rem);
+        if (_songUs + deltaUs >= targetUs) return; // events at the target fire in play
 
-        if (simulatedUs + deltaUs > targetUs) break; // next event is past the target -- stop here
-
-        simulatedUs += deltaUs;
+        _songUs += deltaUs;
+        _tickRem = rem;
         _globalTick = t.pendingTick;
 
-        if (t.pendingIsTempo) {
-            _usPerQuarter = t.pendingTempoUsPerQuarter;
-        } else if (!t.pendingIsSysEx) {
-            uint8_t type = t.pendingStatus & 0xF0;
-            if (type != 0x80 && type != 0x90) { // suppress Note On/Off only
-                MidiOutput::sendRaw(t.pendingStatus, t.pendingData1, t.pendingData2, t.pendingLen);
-            }
-        }
-        // SysEx: skipped entirely during a seek, not re-sent (see header comment).
+        if (t.pendingKind == EV_TEMPO) applyTempo(t.pendingTempoUsPerQuarter);
+        else if (t.pendingKind == EV_CHANNEL) gatherSeekEvent(t);
+        // SysEx is skipped during a seek, not re-sent.
 
-        primeTrack(nt);
+        if (t.pendingKind == EV_END) t.ended = true;
+        else primeTrack(nt);
     }
-
-    return reachedEnd ? (uint32_t)(simulatedUs / 1000) : targetMs;
 }
 
-void MidiPlayer::seekTo(uint32_t targetMs) {
+void MidiPlayer::seekTo(uint32_t targetMs, bool defer) {
     if (_state != STATE_PLAYING && _state != STATE_PAUSED && _state != STATE_DONE) return;
 
     bool wasPlaying = (_state == STATE_PLAYING);
-    MidiOutput::allNotesOffAllChannels();
+    releaseHeld(); // the full panic comes with finishSeek()
 
     // No random-access index exists (see header comment) -- a backward
     // seek, or one starting from STATE_DONE (every track already ended),
@@ -402,17 +569,41 @@ void MidiPlayer::seekTo(uint32_t targetMs) {
     // seek instead just continues from the current track cursors.
     bool needsRewind = (_state == STATE_DONE) || (targetMs < elapsedMs());
     if (needsRewind) {
-        if (!load(_path)) return; // failure leaves _state == STATE_ERROR, same as restartFromTop()
+        _deferSeek = defer;
+        bool ok = load(_path); // clears _seek, and sends or defers the reset
+        _deferSeek = false;
+        if (!ok) return; // failure leaves _state == STATE_ERROR, same as restartFromTop()
     }
 
     bool reachedEnd = false;
-    uint32_t reachedMs = advanceSilentlyTo(targetMs, reachedEnd);
+    advanceSilentlyTo(targetMs, reachedEnd);
+    _seekPending = true;
+    if (!defer) finishSeek();
 
-    _originTick = _globalTick;
-    _originMicros = micros();
-    _elapsedMsFrozen = reachedMs;
-    _lastResumeMicros = micros();
-    _state = reachedEnd ? STATE_DONE : (wasPlaying ? STATE_PLAYING : STATE_PAUSED);
+    // Time past the last event passed, up to the target.
+    uint64_t targetUs = (uint64_t)targetMs * 1000;
+    uint32_t offset = reachedEnd || targetUs < _songUs ? 0 : (uint32_t)(targetUs - _songUs);
+    if (reachedEnd) {
+        _pausedOffsetUs = 0;
+        _state = STATE_DONE;
+    } else if (wasPlaying) {
+        _originMicros = micros() - offset;
+        _state = STATE_PLAYING;
+    } else {
+        _pausedOffsetUs = offset;
+        _state = STATE_PAUSED;
+    }
+}
+
+void MidiPlayer::finishSeek() {
+    if (!_seekPending) return;
+    MidiOutput::allNotesOffAllChannels();
+    memset(_held, 0, sizeof(_held));
+    if (_seekNeedsReset) resetChannels();
+    sendSeekState();
+    clearSeekState();
+    _seekPending = false;
+    _seekNeedsReset = false;
 }
 
 void MidiPlayer::adjustTempoScale(float delta) {
@@ -423,10 +614,11 @@ void MidiPlayer::setTempoScale(float scale) {
     if (scale < 0.5f) scale = 0.5f;
     if (scale > 2.0f) scale = 2.0f;
     _tempoScale = scale;
+    updateEffTick();
 }
 
 uint16_t MidiPlayer::currentBPM() const {
-    uint32_t effectiveUs = (uint32_t)(_usPerQuarter / _tempoScale);
+    uint32_t effectiveUs = _smpte ? (uint32_t)(500000 / _tempoScale) : (uint32_t)(_usPerQuarter / _tempoScale);
     if (effectiveUs == 0) return 0;
     return (uint16_t)(60000000UL / effectiveUs);
 }
@@ -441,32 +633,41 @@ void MidiPlayer::update() {
     for (int n = 0; n < MAX_EVENTS_PER_CALL; n++) {
         int nt = findNextTrack();
         if (nt < 0) {
+            // Natural end: the file's note-offs have gone out, so the last
+            // notes keep their release. Notes still on get note-offs, and
+            // a track that broke off mid-stream gets a panic. Elapsed time
+            // holds at the end.
+            releaseHeld();
+            if (_trackFailed) MidiOutput::allNotesOffAllChannels();
+            _pausedOffsetUs = 0;
             _state = STATE_DONE;
-            MidiOutput::allNotesOffAllChannels();
             return;
         }
 
         TrackReader& t = _tracks[nt];
-        uint32_t deltaTicks = t.pendingTick - _originTick;
-        uint32_t effectiveUsPerQuarter = (uint32_t)(_usPerQuarter / _tempoScale);
-        uint32_t due = _originMicros +
-                       (uint32_t)(((uint64_t)deltaTicks * effectiveUsPerQuarter) / _division);
+        uint32_t rem;
+        uint64_t deltaUs = ticksToUs(t.pendingTick, rem);
+        uint32_t due = _originMicros + (uint32_t)deltaUs;
 
         uint32_t now = micros();
         if ((int32_t)(now - due) < 0) return; // not due yet, try again next update()
 
-        if (t.pendingIsTempo) {
-            _usPerQuarter = t.pendingTempoUsPerQuarter;
-        } else if (t.pendingIsSysEx) {
+        if (t.pendingKind == EV_TEMPO) {
+            applyTempo(t.pendingTempoUsPerQuarter);
+        } else if (t.pendingKind == EV_SYSEX) {
             sendPendingSysEx(t);
-        } else {
+        } else if (t.pendingKind == EV_CHANNEL) {
+            if ((t.pendingStatus & 0xF0) == 0xB0) trackRpnSelect(t.pendingStatus & 0x0F, t.pendingData1, t.pendingData2);
+            trackHeld(t.pendingStatus, t.pendingData1, t.pendingData2);
             MidiOutput::sendRaw(t.pendingStatus, t.pendingData1, t.pendingData2, t.pendingLen);
         }
 
         _globalTick = t.pendingTick;
-        _originTick = t.pendingTick;
+        _tickRem = rem;
+        _songUs += deltaUs;
         _originMicros = due;
 
-        primeTrack(nt);
+        if (t.pendingKind == EV_END) t.ended = true;
+        else primeTrack(nt);
     }
 }
