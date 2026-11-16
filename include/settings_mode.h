@@ -1,4 +1,5 @@
 #pragma once
+#include "play_mode.h"
 
 // Owns the top-level Settings screen: a scrollable list of user-
 // changeable defaults, adjusted with EDIT+LEFT/RIGHT. Every change is
@@ -25,6 +26,7 @@ bool update();
 // -- accessors, read by LooperMode::begin()/enter() -----------------------
 int defaultOutputLevel();    // 0=HP Low, 1=HP High, 2=Line Level -- see Synth::setOutputLevel()
 int defaultVolume();         // percent, 0-100 -- see FilePlayerMode's `volume`/Synth::setVolume()
+PlayMode defaultPlayMode();  // the file player's play mode at boot
 bool reverbEnabled();        // see Synth::setReverbEnabled()
 int reverbMix();             // percent, 0-100 -- see Synth::setReverbMix()
 int reverbType();            // 0-2, see Synth::setReverbType()

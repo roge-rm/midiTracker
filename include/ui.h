@@ -9,6 +9,7 @@
 #include "sysex_recorder.h"
 #include "sysex_player.h"
 #include "ui_modes.h"
+#include "play_mode.h"
 
 namespace Ui {
 
@@ -77,6 +78,11 @@ void updatePlayerLive(const MidiPlayer& player);
 
 // The volume readout on whichever player screen is up.
 void updateVolume(int volume);
+
+// The play mode tag on the player screens, for their next draw.
+void setPlayMode(PlayMode mode);
+// The same, drawn now. Only while a player screen is up.
+void updatePlayMode(PlayMode mode);
 
 // The play state in the status strip, after PLAY or NAV. Not across a
 // change into or out of STATE_ERROR, which needs drawPlayer().

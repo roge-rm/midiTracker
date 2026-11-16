@@ -27,6 +27,7 @@ namespace SettingsMode
         {
             SETTING_OUTPUT_LEVEL,
             SETTING_DEFAULT_VOLUME,
+            SETTING_PLAY_MODE,
             SETTING_REVERB,
             SETTING_REVERB_MIX,
             SETTING_REVERB_TYPE,
@@ -75,13 +76,13 @@ namespace SettingsMode
             "clock \x7f thru \x7f display \x7f theme \x7f USB",
         };
 
-        const SettingIndex PAGE_AUDIO_ITEMS[] = {SETTING_OUTPUT_LEVEL, SETTING_DEFAULT_VOLUME, SETTING_REVERB, SETTING_REVERB_MIX, SETTING_REVERB_TYPE, SETTING_SYNTH_AUDIO, SETTING_LFO_RATE, SETTING_LFO_VOICES, SETTING_STEREO_SPREAD};
+        const SettingIndex PAGE_AUDIO_ITEMS[] = {SETTING_OUTPUT_LEVEL, SETTING_DEFAULT_VOLUME, SETTING_PLAY_MODE, SETTING_REVERB, SETTING_REVERB_MIX, SETTING_REVERB_TYPE, SETTING_SYNTH_AUDIO, SETTING_LFO_RATE, SETTING_LFO_VOICES, SETTING_STEREO_SPREAD};
         const SettingIndex PAGE_LOOPER_ITEMS[] = {SETTING_BPM, SETTING_TIME_SIGNATURE, SETTING_BAR_LENGTH, SETTING_SYNC};
         const SettingIndex PAGE_METRONOME_ITEMS[] = {SETTING_METRONOME, SETTING_METRONOME_VOLUME, SETTING_COUNT_IN, SETTING_COUNT_IN_BARS};
         const SettingIndex PAGE_MIDI_SYSTEM_ITEMS[] = {SETTING_CLOCK_SOURCE, SETTING_MIDI_TRANSPORT, SETTING_MIDI_THRU, SETTING_BRIGHTNESS, SETTING_TRANSITIONS, SETTING_SCREENSAVER, SETTING_SCREENSAVER_STYLE, SETTING_THEME_EDITOR, SETTING_USB_DRIVE, SETTING_REBOOT_BOOTLOADER};
 
         const SettingIndex *PAGE_ITEMS[PAGE_COUNT] = {PAGE_AUDIO_ITEMS, PAGE_LOOPER_ITEMS, PAGE_METRONOME_ITEMS, PAGE_MIDI_SYSTEM_ITEMS};
-        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {9, 4, 4, 10};
+        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {10, 4, 4, 10};
 
         // Kept while the device is on, so Settings reopens on the last page.
         int currentPage = 0;
@@ -178,6 +179,7 @@ namespace SettingsMode
         // default.
         int g_defaultOutputLevel = 0;
         int g_defaultVolume = 75; // percent -- see FilePlayerMode's `volume`
+        int g_playMode = PLAY_ONCE; // a PlayMode, the file player's starting play mode
         bool g_reverbEnabled = true;  // see Synth::setReverbEnabled()
         int g_reverbMix = 70;         // percent -- see Synth::setReverbMix()
         int g_reverbType = 0;         // 0=Lo-fi, 1=Lush, 2=Shimmer -- see Synth::setReverbType()
@@ -314,6 +316,8 @@ namespace SettingsMode
                 return "Output Level";
             case SETTING_DEFAULT_VOLUME:
                 return "Default Volume";
+            case SETTING_PLAY_MODE:
+                return "Default Play Mode";
             case SETTING_REVERB:
                 return "Reverb";
             case SETTING_REVERB_MIX:
@@ -381,6 +385,9 @@ namespace SettingsMode
                 break;
             case SETTING_DEFAULT_VOLUME:
                 snprintf(out, outSize, "%d%%", g_defaultVolume);
+                break;
+            case SETTING_PLAY_MODE:
+                snprintf(out, outSize, "%s", playModeName((PlayMode)g_playMode));
                 break;
             case SETTING_REVERB:
                 snprintf(out, outSize, "%s", g_reverbEnabled ? "On" : "Off");
@@ -513,6 +520,13 @@ namespace SettingsMode
                     g_defaultVolume = 0;
                 if (g_defaultVolume > 100)
                     g_defaultVolume = 100;
+                break;
+            case SETTING_PLAY_MODE:
+                g_playMode += direction;
+                if (g_playMode < 0)
+                    g_playMode = 0;
+                if (g_playMode >= PLAY_MODE_COUNT)
+                    g_playMode = PLAY_MODE_COUNT - 1;
                 break;
             case SETTING_REVERB:
                 g_reverbEnabled = (direction > 0);
@@ -734,6 +748,8 @@ namespace SettingsMode
             file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "defaultVolume=%d\n", g_defaultVolume);
             file.write((const uint8_t *)line, n);
+            n = snprintf(line, sizeof(line), "playMode=%d\n", g_playMode);
+            file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "reverbEnabled=%d\n", g_reverbEnabled ? 1 : 0);
             file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "reverbMix=%d\n", g_reverbMix);
@@ -950,6 +966,13 @@ namespace SettingsMode
                     g_displayBrightness = 100;
                 return;
             }
+            if (strncmp(line, "playMode=", 9) == 0)
+            {
+                g_playMode = atoi(line + 9);
+                if (g_playMode < 0 || g_playMode >= PLAY_MODE_COUNT)
+                    g_playMode = PLAY_ONCE;
+                return;
+            }
             if (strncmp(line, "transitions=", 12) == 0)
             {
                 g_transitions = atoi(line + 12);
@@ -1101,7 +1124,7 @@ namespace SettingsMode
         // True for settings that pick from a fixed list of options.
         bool isListSetting(int index)
         {
-            return isBoolSetting(index) || index == SETTING_OUTPUT_LEVEL || index == SETTING_REVERB_TYPE ||
+            return isBoolSetting(index) || index == SETTING_OUTPUT_LEVEL || index == SETTING_REVERB_TYPE || index == SETTING_PLAY_MODE ||
                    index == SETTING_TIME_SIGNATURE || index == SETTING_BAR_LENGTH || index == SETTING_MIDI_THRU ||
                    index == SETTING_TRANSITIONS || index == SETTING_SCREENSAVER || index == SETTING_SCREENSAVER_STYLE;
         }
@@ -2050,6 +2073,7 @@ namespace SettingsMode
 
     int defaultOutputLevel() { return g_defaultOutputLevel; }
     int defaultVolume() { return g_defaultVolume; }
+    PlayMode defaultPlayMode() { return (PlayMode)g_playMode; }
     bool reverbEnabled() { return g_reverbEnabled; }
     int reverbMix() { return g_reverbMix; }
     int reverbType() { return g_reverbType; }

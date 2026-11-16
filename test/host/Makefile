@@ -14,6 +14,7 @@
 #                                    and render_mp3_ops (counts the decoder's long multiplies)
 #   make -C test/host rec-check      MidiRecorder, SysExRecorder and SysExPlayer on an in-memory card
 #   make -C test/host battery-check  the battery gauge on made-up voltage sequences
+#   make -C test/host play-mode-check  Folder play mode's next-file choice on made-up folders
 #   make -C test/host mp3-seek-check SEEK_DIR=dir   seeks in LAME-tagged MP3s made with ffmpeg in dir, then
 #                                    checks the end against ffmpeg's decode (see mp3_seek_check.sh)
 #   make -C test/host convert-check CONVERT_DIR=dir   Converter on MP3s and WAVs made with ffmpeg in dir,
@@ -29,7 +30,7 @@ PLAYER_SRC := $(wildcard $(ROOT)/src/tracker_base.cpp) $(ROOT)/src/ui_tap.cpp $(
 HARNESS_SRC := $(CURDIR)/render.cpp $(CURDIR)/host_stubs.cpp
 SECONDS ?= 60
 
-.PHONY: all baseline check clean midi midi-baseline midi-check look players wav mp3 rec-check battery-check convert-check mp3-seek-check
+.PHONY: all baseline check clean midi midi-baseline midi-check look players wav mp3 rec-check battery-check play-mode-check convert-check mp3-seek-check
 all: $(OUT)/render $(OUT)/gen $(OUT)/corr
 
 $(OUT)/corr: $(CURDIR)/corr.cpp
@@ -122,6 +123,13 @@ rec-check: $(OUT)/rec_check
 $(OUT)/battery_check: $(ROOT)/src/battery_gauge.cpp $(CURDIR)/battery_check.cpp $(ROOT)/include/battery_gauge.h
 	@mkdir -p $(OUT)
 	$(CXX) -std=gnu++17 -O1 -g -Wall -Wextra -I$(ROOT)/include -o $@ $(ROOT)/src/battery_gauge.cpp $(CURDIR)/battery_check.cpp
+
+play-mode-check: $(OUT)/play_mode_check
+	$(OUT)/play_mode_check
+
+$(OUT)/play_mode_check: $(CURDIR)/play_mode_check.cpp $(ROOT)/include/play_mode.h $(ROOT)/include/file_kind.h
+	@mkdir -p $(OUT)
+	$(CXX) -std=gnu++17 -O2 -Wall -Wextra -I$(ROOT)/include -o $@ $<
 
 battery-check: $(OUT)/battery_check
 	$(OUT)/battery_check

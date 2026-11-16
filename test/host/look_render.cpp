@@ -239,6 +239,26 @@ void settingsScreen() {
     drawHintFooter("UD move  LEFT back", "EDIT+LR change");
 }
 
+// The Audio page, for the longest label next to its value.
+void settingsAudioScreen() {
+    g_tft.fillScreen(COLOR_BG);
+    Status st;
+    st.icon = &ICON_SLIDERS;
+    st.iconColor = COLOR_DIM;
+    st.title = "SETTINGS";
+    st.text = "Audio";
+    drawStatus(st);
+    drawIcon(g_tft, ICON_KNOBS, 6, (STATUS_H - 12) / 2, COLOR_TEXT);
+    const char* labels[] = {"Output Level", "Default Volume", "Default Play Mode", "Reverb", "Reverb Mix",
+                            "Reverb Type", "Synth Audio", "LFO Rate", "LFO Voices", "Stereo Spread"};
+    const char* values[] = {"HP Low", "75%", "Folder", "On", "70%", "Lo-fi", "Off", "5.5Hz", "3", "30%"};
+    int y0 = HEADER_H + 4;
+    for (int i = 0; i < ROWS; i++)
+        drawTextRow(y0 + i * LIST_ROW_H, labels[i], values[i], 180, i == 2);
+    drawScrollbar(y0, ROWS, 10, 0);
+    drawHintFooter("UD move  LEFT back", "EDIT+LR change");
+}
+
 void settingsListScreen() {
     g_tft.fillScreen(COLOR_BG);
     Status st;
@@ -783,12 +803,16 @@ int playerScreens(const std::string& dir) {
         {"xm", "Kenetic & Seenix - Our Little Fantasy.xm"},
         {"it", "Katie Cadet - Lucky Star.it"},
     };
+    // Each play mode's tag on a screen or two.
+    UiPlayer::setPlayMode("ONCE", false);
     for (auto& tr : trackers) {
         if (!trackerScreen(dir, tr.base, tr.name, 80)) return 1;
         save((std::string("tracker-") + tr.base).c_str());
     }
+    UiPlayer::setPlayMode("RPT", true);
     if (!midiScreen(dir, "mid", "busy_schedule.mid")) return 1;
     save("midi");
+    UiPlayer::setPlayMode("DIR", true);
     if (!wavScreen(dir, "s3m", "the reflex render.wav")) return 1;
     save("wav");
     if (!wavScreen(dir, "s3m", "the reflex render.mp3", "MP3", "245K VBR")) return 1;
@@ -1073,6 +1097,8 @@ int main(int argc, char** argv) {
     save("settings-list");
     settingsScreen();
     save("settings");
+    settingsAudioScreen();
+    save("settings-audio");
     playerChrome();
     save("tracker-chrome");
     looperScreens();

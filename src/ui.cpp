@@ -524,6 +524,14 @@ void updateVolume(int volume) {
     UiPlayer::setVolume(volume);
 }
 
+void setPlayMode(PlayMode mode) {
+    UiPlayer::setPlayMode(playModeTag(mode), mode != PLAY_ONCE);
+}
+
+void updatePlayMode(PlayMode mode) {
+    UiPlayer::setPlayMode(playModeTag(mode), mode != PLAY_ONCE, true);
+}
+
 void updatePlayerState(MidiPlayer::State state, bool stopped) {
     g_playerStopped = stopped;
     UiPlayer::midiState(playState(state, stopped));

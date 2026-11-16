@@ -31,6 +31,7 @@
 #include "ui_rec.h"
 #include "keyboard_layout.h"
 #include "convert.h"
+#include "play_mode.h"
 
 namespace FilePlayerMode {
 namespace {
@@ -225,6 +226,13 @@ int volume = 80; // percent, see Synth::setVolume(); mirrored here so the UI can
 // this only happens once, not on every (re-)entry into this mode.
 bool volumeSeededFromSettings = false;
 bool audioSeededFromSettings = false;
+// What happens when a file ends, kept for the session and seeded from
+// Settings once per boot like volume. See handleFileEnd().
+PlayMode playMode = PLAY_ONCE;
+bool playModeSeededFromSettings = false;
+// handleFileEnd()'s guard against files that end as soon as they start.
+uint32_t lastAutoEndMs = 0;
+int quickEnds = 0;
 
 char nowPlayingName[MAX_FILENAME_LEN] = {0};
 char nowRecordingName[MAX_FILENAME_LEN] = {0}; // base name of the in-progress recording
@@ -364,6 +372,45 @@ void toggleAudio() {
         // too would be an unrelated, unwanted side effect.
         Synth::allNotesOff();
     }
+}
+
+// RIGHT on a player screen.
+void cyclePlayMode() {
+    playMode = nextPlayMode(playMode);
+    Ui::updatePlayMode(playMode);
+}
+
+// LEFT (back) and RIGHT (play mode) on the player screens act on release,
+// and only for a press made on this screen with ENTER up the whole time,
+// since ENTER+LEFT/RIGHT is seek. Set once a tick by trackArrowTaps(), at
+// the top of each player screen's input handler.
+bool leftArmed = false, rightArmed = false;
+bool leftTap = false, rightTap = false;
+
+void disarmArrowTaps() {
+    leftArmed = rightArmed = false;
+    leftTap = rightTap = false;
+}
+
+void trackArrowTaps() {
+    if (Input::justPressed(BTN_LEFT)) leftArmed = true;
+    if (Input::justPressed(BTN_RIGHT)) rightArmed = true;
+    if (Input::isDown(BTN_ENTER)) leftArmed = rightArmed = false;
+    leftTap = leftArmed && Input::justReleased(BTN_LEFT);
+    rightTap = rightArmed && Input::justReleased(BTN_RIGHT);
+    if (!Input::isDown(BTN_LEFT)) leftArmed = false;
+    if (!Input::isDown(BTN_RIGHT)) rightArmed = false;
+}
+
+// A scrub that landed on the end waits for ENTER and RIGHT to come up
+// before the play mode acts, see handleFileEnd().
+bool scrubbedToEnd = false;
+
+// RIGHT tap on any player screen. PLAY, NAV and RIGHT also clear
+// handleFileEnd()'s stop.
+void handlePlayModeKey() {
+    if (Input::justPressed(BTN_PLAY) || Input::justPressed(BTN_NAV) || Input::justPressed(BTN_RIGHT)) quickEnds = 0;
+    if (rightTap) cyclePlayMode();
 }
 
 void adjustVolume(int delta) {
@@ -541,6 +588,8 @@ static void showUnpackProgress(int percent) {
 }
 
 void openSelected() {
+    disarmArrowTaps(); // a key down now was pressed on another screen
+    scrubbedToEnd = false;
     int count = browser.entryCount();
     if (selectedIndex < 0 || selectedIndex >= count) return;
 
@@ -1123,6 +1172,7 @@ bool handleBrowseInput() {
 
     if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_RIGHT) ||
         Input::justPressed(BTN_PLAY)) {
+        quickEnds = 0;
         openSelected();
         if (appState != APP_BROWSE) return false;
     }
@@ -1296,7 +1346,8 @@ void handleSeekHold() {
     if (Input::isDown(BTN_RIGHT)) {
         bool accel = now - rightPressedAtMs >= ACCEL_AFTER_MS;
         uint32_t interval = accel ? FAST_INTERVAL_MS : NORMAL_INTERVAL_MS;
-        if (Input::justPressed(BTN_RIGHT) || now - lastRightStep >= interval) {
+        // Stops at the end: the play mode acts once the keys are up.
+        if (st != MidiPlayer::STATE_DONE && (Input::justPressed(BTN_RIGHT) || now - lastRightStep >= interval)) {
             player->seekTo(player->elapsedMs() + (accel ? FAST_STEP_MS : NORMAL_STEP_MS), true);
             lastRightStep = now;
             changed = true;
@@ -1316,6 +1367,7 @@ void handleSeekHold() {
     if (changed) {
         scrubPending = true;
         lastStepMs = now;
+        scrubbedToEnd = player->state() == MidiPlayer::STATE_DONE;
         // A deliberate reposition, not a NAV "stop" -- if this lands on
         // PAUSED (e.g. seeking backward out of STATE_DONE), it should
         // read "Paused", not inherit a stale "Stopped" from an earlier
@@ -1361,7 +1413,8 @@ void handleWavSeekHold() {
     if (Input::isDown(BTN_RIGHT)) {
         bool accel = now - rightPressedAtMs >= ACCEL_AFTER_MS;
         uint32_t interval = accel ? FAST_INTERVAL_MS : NORMAL_INTERVAL_MS;
-        if (Input::justPressed(BTN_RIGHT) || now - lastRightStep >= interval) {
+        // Stops at the end: the play mode acts once the keys are up.
+        if (st != StreamPlayer::STATE_DONE && (Input::justPressed(BTN_RIGHT) || now - lastRightStep >= interval)) {
             audio->seekTo(audio->elapsedMs() + (accel ? FAST_STEP_MS : NORMAL_STEP_MS));
             lastRightStep = now;
             changed = true;
@@ -1379,6 +1432,7 @@ void handleWavSeekHold() {
         }
     }
     if (changed) {
+        scrubbedToEnd = audio->state() == StreamPlayer::STATE_DONE;
         stoppedViaNav = false;
         Ui::updateWavPlayerState(audio->state(), stoppedViaNav);
         Ui::updateWavPlayerLive(*audio);
@@ -1386,6 +1440,7 @@ void handleWavSeekHold() {
 }
 
 void handlePlayWavInput() {
+    trackArrowTaps();
     if (Input::justPressed(BTN_PLAY)) {
         if (audio->state() == StreamPlayer::STATE_PLAYING) {
             audio->pause();
@@ -1403,8 +1458,8 @@ void handlePlayWavInput() {
             Ui::updateWavPlayerLive(*audio);
         }
     }
-    // ENTER held excludes this -- ENTER+LEFT is scrub-back (see handleWavSeekHold()).
-    if (Input::justPressed(BTN_LEFT) && !Input::isDown(BTN_ENTER)) {
+    // A LEFT tap, not ENTER+LEFT scrub-back (see trackArrowTaps()).
+    if (leftTap) {
         audio->stop();
         appState = APP_BROWSE;
         needsRedraw = true;
@@ -1431,6 +1486,7 @@ void handlePlayWavInput() {
     // action exists on this screen (WAV playback is always audible, no
     // separate on/off toggle), so editUsedAsModifier's tap-vs-hold
     // disambiguation is simply unused here, harmlessly.
+    handlePlayModeKey();
     handleVolumeHold();
     handleWavSeekHold();
 }
@@ -1447,6 +1503,7 @@ bool restartModFromTop() {
 }
 
 void handlePlayModInput() {
+    trackArrowTaps();
     if (Input::justPressed(BTN_PLAY)) {
         if (modPlayer->state() == ModPlayer::STATE_PLAYING) {
             modPlayer->pause();
@@ -1465,7 +1522,7 @@ void handlePlayModInput() {
             needsRedraw = true;
         }
     }
-    if (Input::justPressed(BTN_LEFT)) {
+    if (leftTap) {
         modPlayer->stop(); // already closes SD handles internally -- safe to destroy right after
         modPlayer->~ModPlayer(); // not heap-owned (see SharedRamArena) -- no delete
         modPlayer = nullptr;
@@ -1487,6 +1544,7 @@ void handlePlayModInput() {
     // EDIT+UP/DOWN volume, reused as-is -- same reasoning as the WAV
     // screen (only touches shared volume state, no player coupling). No
     // seek (ModPlayer doesn't support it) and no ALT/MIDI-target.
+    handlePlayModeKey();
     handleVolumeHold();
 }
 
@@ -1500,6 +1558,7 @@ bool restartS3mFromTop() {
 }
 
 void handlePlayS3mInput() {
+    trackArrowTaps();
     if (Input::justPressed(BTN_PLAY)) {
         if (s3mPlayer->state() == S3mPlayer::STATE_PLAYING) {
             s3mPlayer->pause();
@@ -1518,7 +1577,7 @@ void handlePlayS3mInput() {
             needsRedraw = true;
         }
     }
-    if (Input::justPressed(BTN_LEFT)) {
+    if (leftTap) {
         s3mPlayer->stop(); // already closes SD handles internally -- safe to destroy right after
         s3mPlayer->~S3mPlayer(); // not heap-owned (see SharedRamArena) -- no delete
         s3mPlayer = nullptr;
@@ -1539,6 +1598,7 @@ void handlePlayS3mInput() {
     }
     // EDIT+UP/DOWN volume, reused as-is -- same reasoning as the MOD
     // screen. No seek (S3mPlayer doesn't support it) and no ALT/MIDI-target.
+    handlePlayModeKey();
     handleVolumeHold();
 }
 
@@ -1555,6 +1615,7 @@ bool restartXmFromTop() {
 // player and nulls `p`.
 template <class P>
 void handleTrackerInput(P*& p, bool (*restartFromTop)()) {
+    trackArrowTaps();
     P* player = p;
     if (Input::justPressed(BTN_PLAY)) {
         if (player->state() == P::STATE_PLAYING) {
@@ -1574,7 +1635,7 @@ void handleTrackerInput(P*& p, bool (*restartFromTop)()) {
             needsRedraw = true;
         }
     }
-    if (Input::justPressed(BTN_LEFT)) {
+    if (leftTap) {
         player->stop(); // already closes SD handles internally -- safe to destroy right after
         player->~P(); // not heap-owned (see SharedRamArena) -- no delete
         p = nullptr;
@@ -1595,6 +1656,7 @@ void handleTrackerInput(P*& p, bool (*restartFromTop)()) {
     }
     // EDIT+UP/DOWN volume, reused as-is -- same reasoning as the MOD/S3M
     // screens. No seek (XmPlayer doesn't support it) and no ALT/MIDI-target.
+    handlePlayModeKey();
     handleVolumeHold();
 }
 
@@ -1638,6 +1700,7 @@ bool restartFromTop() {
 }
 
 void handlePlayInput() {
+    trackArrowTaps();
     if (Input::justPressed(BTN_PLAY)) {
         if (player->state() == MidiPlayer::STATE_PLAYING) {
             player->pause();
@@ -1663,9 +1726,9 @@ void handlePlayInput() {
             needsRedraw = true;
         }
     }
-    // ENTER held excludes this -- ENTER+LEFT is scrub-back (see
-    // handleSeekHold()), not "back to browser".
-    if (Input::justPressed(BTN_LEFT) && !Input::isDown(BTN_ENTER)) {
+    // A LEFT tap, not ENTER+LEFT scrub-back (see trackArrowTaps() and
+    // handleSeekHold()).
+    if (leftTap) {
         player->stop(); // already closes SD handles internally -- safe to delete right after
         delete player;
         player = nullptr;
@@ -1750,9 +1813,148 @@ void handlePlayInput() {
         if (player->state() == MidiPlayer::STATE_ERROR) needsRedraw = true;
         else Ui::updatePlayerAudioState(audioOn);
     }
+    handlePlayModeKey();
     handleTempoHold();
     handleVolumeHold();
     handleSeekHold();
+}
+
+// ---- play mode: what happens when a file ends ------------------------------
+
+// Closes whichever player is open, as its LEFT does, but stays in the
+// player state so the next open replaces it.
+void closeOpenPlayer() {
+    switch (appState) {
+        case APP_PLAY:
+            if (player) {
+                MidiOutput::allNotesOffAllChannels();
+                player->stop();
+                delete player;
+                player = nullptr;
+            }
+            break;
+        case APP_PLAY_WAV: audio->stop(); break;
+        case APP_PLAY_MOD:
+            if (modPlayer) { modPlayer->stop(); modPlayer->~ModPlayer(); modPlayer = nullptr; }
+            break;
+        case APP_PLAY_S3M:
+            if (s3mPlayer) { s3mPlayer->stop(); s3mPlayer->~S3mPlayer(); s3mPlayer = nullptr; }
+            break;
+        case APP_PLAY_XM:
+            if (xmPlayer) { xmPlayer->stop(); xmPlayer->~XmPlayer(); xmPlayer = nullptr; }
+            break;
+        case APP_PLAY_IT:
+            if (itPlayer) { itPlayer->stop(); itPlayer->~ItPlayer(); itPlayer = nullptr; }
+            break;
+        default: break;
+    }
+}
+
+// Opens browser entry idx in place of the open file, for advanceFolder():
+// 1 when it plays, 0 when it failed to load, -1 when the looper's
+// free-tracks gate took the screen, as when opening it from the browser.
+int openForFolder(int idx) {
+    closeOpenPlayer();
+    selectedIndex = idx;
+    appState = APP_BROWSE;
+    openSelected();
+    switch (appState) {
+        case APP_PLAY:     return player->state() == MidiPlayer::STATE_ERROR ? 0 : 1;
+        case APP_PLAY_WAV: return audio->state() == StreamPlayer::STATE_ERROR ? 0 : 1;
+        case APP_PLAY_MOD: return modPlayer->state() == TrackerPlayer::STATE_ERROR ? 0 : 1;
+        case APP_PLAY_S3M: return s3mPlayer->state() == TrackerPlayer::STATE_ERROR ? 0 : 1;
+        case APP_PLAY_XM:  return xmPlayer->state() == TrackerPlayer::STATE_ERROR ? 0 : 1;
+        case APP_PLAY_IT:  return itPlayer->state() == TrackerPlayer::STATE_ERROR ? 0 : 1;
+        case APP_FREE_LOOPER_RAM: return -1;
+        default: return 0; // no RAM for the MIDI player, still in the browser
+    }
+}
+
+// Folder mode: the next playable file in the browser's list, wrapping.
+// Files that fail to load are passed over; if none plays, the last one's
+// error stays up: on its player screen, or for no RAM for the MIDI player,
+// openSelected()'s message over the browser, as when opening it there.
+void playNextInFolder() {
+    bool played = false;
+    int last = advanceFolder(
+        browser.entryCount(), selectedIndex,
+        [](int i) { return !browser.entryIsDir(i) && playModeKind(browser.entryKind(i)); },
+        openForFolder, played);
+    if (last < 0 || appState == APP_FREE_LOOPER_RAM) return;
+    ensureSelectionVisible();
+    if (appState == APP_BROWSE) {
+        // No RAM for the MIDI player: the browser under the message, as
+        // when opening the file there.
+        Ui::drawBrowser(browser, selectedIndex, scrollOffset);
+        Ui::drawMessage("Not enough RAM", "to open this file");
+        needsRedraw = false;
+    } else {
+        needsRedraw = true;
+    }
+}
+
+// Repeat mode: the open file again from the start.
+void repeatOpenFile() {
+    stoppedViaNav = false;
+    switch (appState) {
+        case APP_PLAY:
+            MidiOutput::allNotesOffAllChannels();
+            if (restartFromTop()) player->play();
+            needsRedraw = true;
+            break;
+        case APP_SYNTH_EDIT: {
+            // Under the synth overlay: no redraw, and the programs stay as
+            // they are so the channel being edited keeps its instrument.
+            // The file sends its own program changes again from the top.
+            MidiOutput::allNotesOffAllChannels();
+            char path[192];
+            browser.buildFullPath(selectedIndex, path, sizeof(path));
+            if (player->load(path)) player->play();
+            break;
+        }
+        case APP_PLAY_WAV:
+            audio->seekTo(0);
+            audio->play();
+            Ui::updateWavPlayerState(audio->state(), stoppedViaNav);
+            Ui::updateWavPlayerLive(*audio);
+            break;
+        case APP_PLAY_MOD: if (restartModFromTop()) modPlayer->play(); needsRedraw = true; break;
+        case APP_PLAY_S3M: if (restartS3mFromTop()) s3mPlayer->play(); needsRedraw = true; break;
+        case APP_PLAY_XM:  if (restartXmFromTop()) xmPlayer->play(); needsRedraw = true; break;
+        case APP_PLAY_IT:  if (restartItFromTop()) itPlayer->play(); needsRedraw = true; break;
+        default: break;
+    }
+}
+
+// Called every tick on a player screen while its file is at the end
+// (STATE_DONE, also after seeking past the end). Once leaves it there.
+// Files that end straight away (empty, or a song with no rows) would
+// restart every tick, so after a run of those it stops until a key on the
+// player screen clears quickEnds.
+void handleFileEnd() {
+    if (playMode == PLAY_ONCE) return;
+    // Folder waits for the synth overlay to close: a new file would reset
+    // the programs being edited.
+    if (appState == APP_SYNTH_EDIT && playMode != PLAY_REPEAT) return;
+    if (scrubbedToEnd) {
+        if (Input::isDown(BTN_ENTER) || Input::isDown(BTN_RIGHT)) return;
+        scrubbedToEnd = false;
+    }
+    int limit = browser.entryCount() + 2;
+    if (limit < 8) limit = 8;
+    if (quickEnds >= limit) return;
+    uint32_t now = millis();
+    quickEnds = now - lastAutoEndMs < 50 ? quickEnds + 1 : 0;
+    lastAutoEndMs = now;
+    if (quickEnds >= limit) return;
+    if (playMode == PLAY_REPEAT) repeatOpenFile();
+    else playNextInFolder();
+}
+
+// A tracker's state goes to STATE_DONE when the song ends, while up to
+// ~186 ms of it is still in the ring. True once that has played out.
+bool streamPlayedOut() {
+    return (int32_t)(Synth::wavStreamPlayed() - Synth::wavStreamWritten()) >= 0;
 }
 
 // Repaints only the two affected rows instead of the whole screen.
@@ -2311,6 +2513,11 @@ void enter() {
         volume = SettingsMode::defaultVolume();
         volumeSeededFromSettings = true;
     }
+    if (!playModeSeededFromSettings) {
+        playMode = SettingsMode::defaultPlayMode();
+        playModeSeededFromSettings = true;
+    }
+    Ui::setPlayMode(playMode);
     Synth::setVolume((uint8_t)volume);
 
     // Normally the browser's list just stays valid across a mode switch
@@ -2378,10 +2585,12 @@ bool update() {
                 Ui::updatePlayerLive(*player);
                 Ui::setDrawPump(nullptr);
             }
+            if (player->state() == MidiPlayer::STATE_DONE) handleFileEnd();
             break;
         }
 
         case APP_SYNTH_EDIT: {
+            if (player->state() == MidiPlayer::STATE_DONE) handleFileEnd();
             if (synthEditShowingGrid) {
                 // Own input/redraw here, same shape as APP_PLAY's own
                 // handling just above -- see PariSynthGrid::update().
@@ -2463,6 +2672,7 @@ bool update() {
                 Ui::updateWavPlayerLive(*audio);
                 Ui::setDrawPump(nullptr);
             }
+            if (audio->state() == StreamPlayer::STATE_DONE) handleFileEnd();
             break;
         }
 
@@ -2481,6 +2691,7 @@ bool update() {
                 Ui::updateTrackerPlayerLive(*modPlayer);
                 Ui::setDrawPump(nullptr);
             }
+            if (modPlayer->state() == TrackerPlayer::STATE_DONE && streamPlayedOut()) handleFileEnd();
             break;
         }
 
@@ -2499,6 +2710,7 @@ bool update() {
                 Ui::updateTrackerPlayerLive(*s3mPlayer);
                 Ui::setDrawPump(nullptr);
             }
+            if (s3mPlayer->state() == TrackerPlayer::STATE_DONE && streamPlayedOut()) handleFileEnd();
             break;
         }
 
@@ -2517,6 +2729,7 @@ bool update() {
                 Ui::updateTrackerPlayerLive(*xmPlayer);
                 Ui::setDrawPump(nullptr);
             }
+            if (xmPlayer->state() == TrackerPlayer::STATE_DONE && streamPlayedOut()) handleFileEnd();
             break;
         }
 
@@ -2534,6 +2747,7 @@ bool update() {
                 Ui::updateTrackerPlayerLive(*itPlayer);
                 Ui::setDrawPump(nullptr);
             }
+            if (itPlayer->state() == TrackerPlayer::STATE_DONE && streamPlayedOut()) handleFileEnd();
             break;
         }
 

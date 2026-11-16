@@ -75,6 +75,12 @@ bool liveSettled();
 // The volume readout on whichever player screen is up.
 void setVolume(int volume);
 
+// The play mode tag in the status strip ("ONCE", "RPT", "DIR"), lit for a
+// mode that goes on past the end, kept for the next draw*(). With redraw,
+// also drawn now on the player screen that was drawn last, so only pass it
+// while that screen is up. nullptr shows none.
+void setPlayMode(const char* tag, bool lit, bool redraw = false);
+
 // The .mid screen's keybed somewhere else (pariSynth): y and h take in its
 // two rule lines. keybedDraw() puts it up with the notes down now, and
 // keybedUpdate() repaints only the keys that changed since. Drawing a

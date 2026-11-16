@@ -3,10 +3,7 @@
 #include <SdFat.h> // FsFile, used by classifyEntry()'s private signature below
 #include "config.h"
 
-// Meaningless for directories. FILE_MID/FILE_SYX/FILE_WAV/FILE_MOD/
-// FILE_S3M/FILE_XM/FILE_IT/FILE_MP3, see isMidiFilename()/isSysExFilename()/isWavFilename()/
-// isModFilename()/isS3mFilename()/isXmFilename()/isItFilename()/isMp3Filename().
-enum FileKind { FILE_MID, FILE_SYX, FILE_WAV, FILE_MOD, FILE_S3M, FILE_XM, FILE_IT, FILE_MP3 };
+#include "file_kind.h"
 
 struct BrowserEntry {
     char name[MAX_FILENAME_LEN]; // display name: ASCII, shortened to fit with its extension kept. Use buildFullPath() to open an entry
@@ -44,6 +41,9 @@ public:
 
     int entryCount() const { return _count; }
     const BrowserEntry& entry(int idx) const;
+    // From the index, without opening the entry. Kind is meaningless for a folder.
+    bool entryIsDir(int idx) const { return idx >= 0 && idx < _count && _index[idx].isDir; }
+    FileKind entryKind(int idx) const { return idx >= 0 && idx < _count ? (FileKind)_index[idx].kind : FILE_MID; }
     const char* currentPath() const { return _path; }
 
     // Re-reads the current directory's contents (e.g. after SD insert).
