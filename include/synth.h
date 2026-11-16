@@ -296,6 +296,13 @@ size_t wavStreamWrite(const int16_t* frames, size_t count);
 // partially rejected.
 size_t wavStreamFree();
 
+// Ring size in frames, and whether core 1 is mixing the stream in (playing,
+// not paused or stopped). The UI uses these to tell when the ring runs low.
+size_t wavStreamCapacity();
+bool wavStreamIsActive();
+// True after wavStreamEnd(), until the next reset: the ring drains on purpose.
+bool wavStreamIsEnded();
+
 // No more source data coming (EOF reached). Once the consumer drains
 // what's already buffered, it stops mixing WAV audio in on its own --
 // this is a normal, expected drain, not treated as an underrun.

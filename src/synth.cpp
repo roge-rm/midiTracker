@@ -2774,6 +2774,12 @@ size_t Synth::wavStreamFree() {
     return WAV_RING_FRAMES - (g_wavHead - wavStreamProducerTail());
 }
 
+size_t Synth::wavStreamCapacity() { return WAV_RING_FRAMES; }
+
+bool Synth::wavStreamIsActive() { return g_wavActive; }
+
+bool Synth::wavStreamIsEnded() { return g_wavEnded; }
+
 void Synth::wavStreamEnd() {
     g_wavEnded = true;
 }

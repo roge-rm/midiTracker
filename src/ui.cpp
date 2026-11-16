@@ -4,11 +4,20 @@
 #include "keyboard_layout.h"
 #include "version.h"
 #include "synth.h" // pariSynth play screen -- see drawPariSynthPlay()
+#include "ui_strip.h"
 #include <TFT_eSPI.h>
+#include <hardware/clocks.h>
 #include <string.h>
 #include <stdio.h>
 
 namespace {
+
+using Ui::stripBegin;
+using Ui::stripMaxRows;
+using Ui::stripSend;
+using Ui::sliceAllows;
+using Ui::SliceTimer;
+using Ui::DRAW_METER;
 
 TFT_eSPI tft = TFT_eSPI();
 
@@ -27,13 +36,16 @@ uint16_t COLOR_TEXT      = TFT_WHITE;
 uint16_t COLOR_DIM       = TFT_DARKGREY;
 uint16_t COLOR_HILITE_BG = TFT_MAROON;
 uint16_t COLOR_ACCENT    = TFT_GREEN;
-uint16_t COLOR_ERROR     = TFT_BLUE;
+// Record and error red, #FF3B30 as RGB565.
+const uint16_t RGB565_RED = 0xF9C6;
+
+uint16_t COLOR_ERROR     = RGB565_RED;
 
 // Looper track state badges (see loopStateColor()) -- EMPTY/MUTED
 // deliberately still use COLOR_DIM above rather than getting their own,
 // same as every other "nothing notable happening" indicator in the app.
 uint16_t COLOR_TRACK_ARMED     = TFT_SKYBLUE;
-uint16_t COLOR_TRACK_RECORDING = TFT_BLUE;
+uint16_t COLOR_TRACK_RECORDING = RGB565_RED;
 uint16_t COLOR_TRACK_PLAYING   = TFT_GREEN;
 uint16_t COLOR_TRACK_STOPPED   = TFT_CYAN;
 uint16_t COLOR_TRACK_PAUSED    = TFT_YELLOW;
@@ -75,9 +87,9 @@ ThemeColorEntry THEME_COLORS[] = {
     {"Dim",        &COLOR_DIM,       TFT_DARKGREY},
     {"Highlight",  &COLOR_HILITE_BG, TFT_MAROON},
     {"Accent",     &COLOR_ACCENT,    TFT_GREEN},
-    {"Error",      &COLOR_ERROR,     TFT_BLUE},
+    {"Error",      &COLOR_ERROR,     RGB565_RED},
     {"Armed",      &COLOR_TRACK_ARMED,     TFT_SKYBLUE},
-    {"Recording",  &COLOR_TRACK_RECORDING, TFT_BLUE},
+    {"Recording",  &COLOR_TRACK_RECORDING, RGB565_RED},
     {"Playing",    &COLOR_TRACK_PLAYING,   TFT_GREEN},
     {"Stopped",    &COLOR_TRACK_STOPPED,   TFT_CYAN},
     {"Paused",     &COLOR_TRACK_PAUSED,    TFT_YELLOW},
@@ -302,6 +314,10 @@ void drawScrollbar(int count, int scrollOffset, int rows, int trackY) {
 uint16_t g_stripKey[PIANO_HI - PIANO_LO + 1];
 
 void drawNoteStrip(int y, int height = STRIP_HEIGHT, bool full = false) {
+    // A meter: skipped while the slice is spent or the ring is low. The
+    // column cache catches up on the next pass that runs.
+    if (!full && !sliceAllows(DRAW_METER)) return;
+    SliceTimer timer;
     int span = PIANO_HI - PIANO_LO + 1;
     int colWidth = tft.width() / span;
     if (colWidth < 1) colWidth = 1;
@@ -339,6 +355,24 @@ void drawNoteStrip(int y, int height = STRIP_HEIGHT, bool full = false) {
     }
 }
 
+// Clears a w x h box at x, y to bg and draws `text` in font 2 at tx along
+// from x, top aligned, through the strip canvas. A box taller than one strip
+// at that width goes out in bands, the text clipped to each.
+void stripText(int x, int y, int w, int h, const char* text, int tx, uint16_t fg, uint16_t bg) {
+    if (x + w > tft.width()) w = tft.width() - x;
+    if (w <= 0 || h <= 0) return;
+    int rows = stripMaxRows(w);
+    for (int by = 0; by < h; by += rows) {
+        int bh = (h - by < rows) ? h - by : rows;
+        TFT_eSprite& s = stripBegin(x, y + by, w, bh, bg);
+        if (text && text[0]) {
+            s.setTextColor(fg, bg);
+            s.drawString(text, tx, -by);
+        }
+        stripSend();
+    }
+}
+
 // Draws one stat row: `left` at x=8, and, if non-null, `right` at
 // STAT_COL2_X. Used for rows whose content never changes after the
 // initial draw (State, Tracks, Volume, MIDI/Sound) -- see updateStatValue()
@@ -354,10 +388,7 @@ void drawStatRow(int y, const char* left, const char* right) {
 // live-update path never touches -- see Ui::updateVolume()). Safe here
 // specifically because Volume/MIDI-target strings are short and bounded.
 void updateStatRight(int y, const char* text) {
-    tft.fillRect(STAT_COL2_X, y, tft.width() - STAT_COL2_X, ROW_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString(text, STAT_COL2_X, y);
+    stripText(STAT_COL2_X, y, tft.width() - STAT_COL2_X, ROW_HEIGHT, text, 0, COLOR_DIM, COLOR_BG);
 }
 
 // Cached last-drawn value strings for Time and Tempo, the two fields
@@ -393,10 +424,7 @@ void updateStatValue(int x, int y, const char* value, char* cache, size_t cacheS
     int newWidth = tft.textWidth(value);
     int clearWidth = (oldWidth > newWidth ? oldWidth : newWidth) + 2;
 
-    tft.fillRect(x, y, clearWidth, ROW_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString(value, x, y);
+    stripText(x, y, clearWidth, ROW_HEIGHT, value, 0, COLOR_DIM, COLOR_BG);
 
     strncpy(cache, value, cacheSize - 1);
     cache[cacheSize - 1] = '\0';
@@ -419,10 +447,7 @@ char g_lastStateStr[16] = {0};
 // specifically because MIDI-target strings are short and bounded well
 // under the STAT_COL2_X boundary.
 void updateStatLeft(int y, const char* text) {
-    tft.fillRect(8, y, STAT_COL2_X - 8 - 4, ROW_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString(text, 8, y);
+    stripText(8, y, STAT_COL2_X - 8 - 4, ROW_HEIGHT, text, 0, COLOR_DIM, COLOR_BG);
 }
 
 // Right-aligned "midiTracker" branding in the header bar, drawn over
@@ -650,10 +675,7 @@ void drawSysExProgress(const SysExPlayer& player, bool full) {
         }
     }
     if (strcmp(buf, g_sysexLabel) != 0) {
-        tft.fillRect(0, SYSEX_PROGRESS_LABEL_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-        tft.setTextColor(COLOR_DIM, COLOR_BG);
-        tft.setTextDatum(TL_DATUM);
-        tft.drawString(buf, 8, SYSEX_PROGRESS_LABEL_Y);
+        stripText(0, SYSEX_PROGRESS_LABEL_Y, tft.width(), ROW_HEIGHT, buf, 8, COLOR_DIM, COLOR_BG);
         strcpy(g_sysexLabel, buf);
     }
 
@@ -791,7 +813,23 @@ void begin() {
     pinMode(DISPLAY_BACKLIGHT, OUTPUT);
     setBacklightBrightness(0); // stay dark until the screen is cleared, so GRAM garbage never reaches the eye
 
+    // SPI clock: the SPI block divides clk_peri by an even prescale (2 or
+    // more) times a whole number. The core's set_sys_clock_khz(200 MHz)
+    // leaves clk_peri on the 48 MHz USB PLL, so without DISPLAY_FAST_PERI
+    // any SPI_FREQUENCY over 24 MHz gives 24 MHz (48 / 2). With it,
+    // clk_peri runs from clk_sys (200 MHz), switched here before anything
+    // opens SPI or a UART, and the 50 MHz request gives exactly 200 / 4 =
+    // 50 MHz, the fastest clean step under the ST7789's 62.5 MHz write
+    // limit (16 ns cycle). The next steps down are 33.3 and 25 MHz.
+    // Serial1 (MIDI) starts after this and works out its baud from
+    // clk_peri, which divides exactly either way: 400 at 200 MHz, 96 at 48.
+#if defined(DISPLAY_FAST_PERI) && DISPLAY_FAST_PERI
+    clock_configure_undivided(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS,
+                              clock_get_hz(clk_sys));
+#endif
+
     tft.init();
+    stripInit(tft);
     tft.setRotation(3);
     tft.fillScreen(COLOR_BG);
     tft.setTextFont(2);
@@ -1232,6 +1270,8 @@ void drawWavProgressBar(const WavPlayer& player, bool full) {
     int fillW = total > 0 ? (int)(((uint64_t)barW * elapsed) / total) : 0;
     if (full) g_wavFill = -1;
     if (fillW == g_wavFill) return;
+    if (g_wavFill >= 0 && !sliceAllows(DRAW_METER)) return;
+    SliceTimer timer;
     paintBarDelta(barX, WAV_BAR_Y, WAV_BAR_H, barW, fillW, g_wavFill, COLOR_ACCENT, false);
     g_wavFill = fillW;
 }
@@ -1733,14 +1773,12 @@ void drawLiveRows(const char* elapsed, const char* count, int dot) {
     tft.setTextColor(COLOR_DIM, COLOR_BG);
     tft.setTextDatum(TL_DATUM);
     if (strcmp(elapsed, g_liveElapsed) != 0) {
-        tft.fillRect(0, REC_ELAPSED_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-        tft.drawString(elapsed, 8, REC_ELAPSED_Y);
+        stripText(0, REC_ELAPSED_Y, tft.width(), ROW_HEIGHT, elapsed, 8, COLOR_DIM, COLOR_BG);
         strlcpy(g_liveElapsed, elapsed, sizeof(g_liveElapsed));
     }
     bool countChanged = strcmp(count, g_liveCount) != 0;
     if (countChanged) {
-        tft.fillRect(0, REC_EVENTS_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-        tft.drawString(count, 8, REC_EVENTS_Y);
+        stripText(0, REC_EVENTS_Y, tft.width(), ROW_HEIGHT, count, 8, COLOR_DIM, COLOR_BG);
         strlcpy(g_liveCount, count, sizeof(g_liveCount));
     }
     if (dot >= 0 && (countChanged || g_liveDot != (int8_t)dot)) {
@@ -2103,10 +2141,15 @@ void drawLooperTrackLength(const LoopTrackView& t, int idx, bool selected) {
 // except the progress bar and activity dot, which updateLooperPositions()
 // owns separately so they can be refreshed on their own at a faster tick
 // without re-drawing this text.
+// What each track's activity dots last showed: bit 0 record lit, bit 1
+// play lit, bit 2 selected row background. -1 forces a repaint.
+int8_t g_looperActivityKey[4] = {-1, -1, -1, -1};
+
 void drawLooperTrackLabel(const LoopTrackView& t, int idx, bool selected) {
     int y = LOOPER_FIRST_ROW_Y + idx * LOOPER_ROW_HEIGHT;
     uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
     tft.fillRect(0, y, tft.width(), LOOPER_ROW_HEIGHT - 4, bg);
+    g_looperActivityKey[idx] = -1; // the fill above covers the dots
     // The trailing 4px between this row and the next is a deliberate gap
     // (breathing room, and where a selected row's highlight visibly ends
     // before the next row starts) -- always background regardless of
@@ -2195,6 +2238,11 @@ void drawLooperTrackBar(const LoopTrackView& t, int idx, bool force) {
     uint16_t color = loopStateColor(t.state);
     if (force) g_looperBarFill[idx] = -1;
     if (fillW == g_looperBarFill[idx] && (fillW == 0 || color == g_looperBarColor[idx])) return;
+    // Only a moving bar can wait for a later tick; a paused or stopped
+    // one draws straight away so it never stays stale.
+    bool moving = t.state == LOOP_TRACK_PLAYING || t.state == LOOP_TRACK_RECORDING;
+    if (!force && moving && g_looperBarFill[idx] >= 0 && !sliceAllows(DRAW_METER)) return;
+    SliceTimer timer;
     paintBarDelta(8, y, LOOPER_BAR_HEIGHT, barW, fillW, g_looperBarFill[idx], color,
                   color != g_looperBarColor[idx]);
     g_looperBarFill[idx] = (int16_t)fillW;
@@ -2202,7 +2250,10 @@ void drawLooperTrackBar(const LoopTrackView& t, int idx, bool force) {
 }
 
 void resetLooperBarCache() {
-    for (int i = 0; i < 4; i++) g_looperBarFill[i] = -1;
+    for (int i = 0; i < 4; i++) {
+        g_looperBarFill[i] = -1;
+        g_looperActivityKey[i] = -1;
+    }
 }
 
 // Draws (or clears) track idx's two MIDI-activity dots -- record (red)
@@ -2216,6 +2267,9 @@ void resetLooperBarCache() {
 void drawLooperTrackActivity(const LoopTrackView& t, int idx, bool selected) {
     int y = LOOPER_FIRST_ROW_Y + idx * LOOPER_ROW_HEIGHT;
     uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
+    int8_t key = (int8_t)((t.recordActive ? 1 : 0) | (t.playActive ? 2 : 0) | (selected ? 4 : 0));
+    if (key == g_looperActivityKey[idx]) return;
+    g_looperActivityKey[idx] = key;
     tft.fillCircle(LOOPER_ACTIVITY_X, y + 8, 4, t.recordActive ? COLOR_TRACK_RECORDING : bg);
     tft.fillCircle(LOOPER_ACTIVITY_X + LOOPER_ACTIVITY_SPACING, y + 8, 4, t.playActive ? COLOR_TRACK_PLAYING : bg);
 }
@@ -2831,13 +2885,30 @@ void drawMessage(const char* line1, const char* line2) {
 // button-hint text is left-aligned starting at x=4 and, even at its
 // widest ("R mute/ALT in/EDIT bar  ENT menu  NAV stop" in drawLooper()),
 // stays well clear of this corner, so it's free across every screen.
-// Called on main.cpp's own ~1s timer (not tied to Battery::update()'s
-// much slower ~15s actual sample rate) so the icon reappears quickly
-// after any screen transition wipes the footer, without paying that
-// cost anywhere near once per loop() iteration -- see main.cpp.
-// Redrawn from scratch every call (clear + outline + fill) rather than
-// diffed against the previous state: at a ~1s cadence and this size,
-// there's no meaningful cost to just always repainting it outright.
+//
+// What it shows comes down to the fill height and colour; g_batteryKey
+// holds the last one drawn (fill height in the low byte, colour above).
+uint32_t g_batteryKey = 0xFFFFFFFF;
+
+static uint32_t batteryKey(int& filledH, uint16_t& fillColor) {
+    const int interiorH = 16 - 2;
+    uint8_t pct = Battery::percentage();
+    fillColor = COLOR_TEXT;
+    if (Battery::isCharging()) {
+        fillColor = COLOR_ACCENT;
+    } else if (pct <= 15) {
+        fillColor = COLOR_ERROR;
+    } else if (pct <= 30) {
+        fillColor = COLOR_DIM;
+    }
+    // Fill grows from the bottom, matching a physical battery's usual
+    // orientation with the terminal on top.
+    filledH = (interiorH * pct) / 100;
+    if (pct > 0 && filledH == 0) filledH = 1; // always show *something* above 0%
+    return ((uint32_t)fillColor << 8) | (uint32_t)filledH;
+}
+
+// Full draw: clear, outline and fill. Every screen's footer draw calls this.
 void drawBatteryMeter() {
     const int bodyW = 10, bodyH = 16;
     const int termW = 4, termH = 2;
@@ -2850,31 +2921,24 @@ void drawBatteryMeter() {
     int termY = topY;
     int bodyY = topY + termH;
 
-    uint8_t pct = Battery::percentage();
-    bool charging = Battery::isCharging();
+    int filledH;
+    uint16_t fillColor;
+    g_batteryKey = batteryKey(filledH, fillColor);
 
     tft.fillRect(bodyX - 1, topY - 1, bodyW + 2, bodyH + termH + 2, COLOR_BG);
-
-    uint16_t fillColor = COLOR_TEXT;
-    if (charging) {
-        fillColor = COLOR_ACCENT;
-    } else if (pct <= 15) {
-        fillColor = COLOR_ERROR;
-    } else if (pct <= 30) {
-        fillColor = COLOR_DIM;
-    }
-
     tft.drawRect(bodyX, bodyY, bodyW, bodyH, COLOR_DIM);
     tft.fillRect(termX, termY, termW, termH, COLOR_DIM);
 
-    // Fill grows from the bottom, matching a physical battery's usual
-    // orientation with the terminal on top.
     const int interiorH = bodyH - 2;
-    int filledH = (interiorH * pct) / 100;
-    if (pct > 0 && filledH == 0) filledH = 1; // always show *something* above 0%
     if (filledH > 0) {
         tft.fillRect(bodyX + 1, bodyY + 1 + (interiorH - filledH), bodyW - 2, filledH, fillColor);
     }
+}
+
+void updateBatteryMeter() {
+    int filledH;
+    uint16_t fillColor;
+    if (batteryKey(filledH, fillColor) != g_batteryKey) drawBatteryMeter();
 }
 
 } // namespace Ui

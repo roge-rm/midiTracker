@@ -524,8 +524,10 @@ void updateThemeSelection(int prevCursor, int newCursor, int channelCursor, int 
 // Small vertical battery gauge, bottom-right corner, drawn over whatever
 // screen is currently up. See Battery (battery.h) for the underlying
 // percentage/charging read -- this just paints the current cached value.
-// Call on a slow independent timer (main.cpp does, ~1s); cheap enough
-// not to need its own dirty-tracking.
+// drawBatteryMeter() always draws (screens call it with their footer);
+// updateBatteryMeter() draws only when the shown fill or colour changed,
+// and main.cpp calls it every loop.
 void drawBatteryMeter();
+void updateBatteryMeter();
 
 } // namespace Ui

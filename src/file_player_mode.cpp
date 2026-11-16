@@ -25,6 +25,7 @@
 #include "pari_synth_grid.h"
 #include "input.h"
 #include "ui.h"
+#include "ui_strip.h"
 #include "keyboard_layout.h"
 
 namespace FilePlayerMode {
@@ -152,6 +153,23 @@ void pushMidiLogEntry(const Ui::MidiLogEntry& e) {
 }
 
 AppState appState = APP_BROWSE;
+
+// Draw pump (see Ui::setDrawPump()): keeps the playing file's ring or MIDI
+// schedule going while a strip goes out. Only set around the live ticks,
+// where the player is in a steady state.
+void pumpPlayer() {
+    switch (appState) {
+        case APP_PLAY:
+        case APP_SYNTH_EDIT: if (player) player->update(); break;
+        case APP_PLAY_WAV:   wavPlayer.update(); break;
+        case APP_PLAY_MOD:   if (modPlayer) modPlayer->update(); break;
+        case APP_PLAY_S3M:   if (s3mPlayer) s3mPlayer->update(); break;
+        case APP_PLAY_XM:    if (xmPlayer) xmPlayer->update(); break;
+        case APP_PLAY_IT:    if (itPlayer) itPlayer->update(); break;
+        default: break;
+    }
+}
+
 int selectedIndex = 0;
 int scrollOffset = 0;
 bool needsRedraw = true;
@@ -1999,7 +2017,18 @@ bool update() {
             // Once the file finishes, keep showing the final "Finished"
             // screen until the user presses a button to go back.
             handlePlayInput();
-            if (appState != APP_PLAY) break;
+            static bool midiWasPlaying = false;
+            if (appState != APP_PLAY) { midiWasPlaying = false; break; }
+
+            // A meter skipped on the last tick before a pause or stop would
+            // stay stale, so draw everything once on the change.
+            bool midiPlaying = player->state() == MidiPlayer::STATE_PLAYING;
+            if (midiWasPlaying && !midiPlaying && player->state() != MidiPlayer::STATE_ERROR) {
+                Ui::sliceForceMeters(true);
+                Ui::updatePlayerLive(*player);
+                Ui::sliceForceMeters(false);
+            }
+            midiWasPlaying = midiPlaying;
 
             // Elapsed time and the note-activity strip change continuously
             // while playing. Rather than trigger a full-screen needsRedraw,
@@ -2008,7 +2037,9 @@ bool update() {
             uint32_t now = millis();
             if (player->state() == MidiPlayer::STATE_PLAYING && now - lastPlayTick >= 50) {
                 lastPlayTick = now;
+                Ui::setDrawPump(pumpPlayer);
                 Ui::updatePlayerLive(*player);
+                Ui::setDrawPump(nullptr);
             }
             break;
         }
@@ -2072,13 +2103,25 @@ bool update() {
         case APP_PLAY_WAV: {
             wavPlayer.update();
             handlePlayWavInput();
-            if (appState != APP_PLAY_WAV) break;
+            static bool wavWasPlaying = false;
+            if (appState != APP_PLAY_WAV) { wavWasPlaying = false; break; }
+
+            // Same as APP_PLAY: one full meter draw on a pause, stop or end.
+            bool wavPlaying = wavPlayer.state() == WavPlayer::STATE_PLAYING;
+            if (wavWasPlaying && !wavPlaying && wavPlayer.state() != WavPlayer::STATE_ERROR) {
+                Ui::sliceForceMeters(true);
+                Ui::updateWavPlayerLive(wavPlayer);
+                Ui::sliceForceMeters(false);
+            }
+            wavWasPlaying = wavPlaying;
 
             static uint32_t lastWavPlayTick = 0;
             uint32_t now = millis();
             if (wavPlayer.state() == WavPlayer::STATE_PLAYING && now - lastWavPlayTick >= 50) {
                 lastWavPlayTick = now;
+                Ui::setDrawPump(pumpPlayer);
                 Ui::updateWavPlayerLive(wavPlayer);
+                Ui::setDrawPump(nullptr);
             }
             break;
         }
@@ -2094,7 +2137,9 @@ bool update() {
             uint32_t now = millis();
             if (modPlayer->state() == ModPlayer::STATE_PLAYING && now - lastModPlayTick >= 200) {
                 lastModPlayTick = now;
+                Ui::setDrawPump(pumpPlayer);
                 Ui::updateTrackerPlayerLive(*modPlayer);
+                Ui::setDrawPump(nullptr);
             }
             break;
         }
@@ -2112,7 +2157,9 @@ bool update() {
             uint32_t now = millis();
             if (s3mPlayer->state() == S3mPlayer::STATE_PLAYING && now - lastS3mPlayTick >= 200) {
                 lastS3mPlayTick = now;
+                Ui::setDrawPump(pumpPlayer);
                 Ui::updateTrackerPlayerLive(*s3mPlayer);
+                Ui::setDrawPump(nullptr);
             }
             break;
         }
@@ -2128,7 +2175,9 @@ bool update() {
             uint32_t now = millis();
             if (xmPlayer->state() == XmPlayer::STATE_PLAYING && now - lastXmPlayTick >= 200) {
                 lastXmPlayTick = now;
+                Ui::setDrawPump(pumpPlayer);
                 Ui::updateTrackerPlayerLive(*xmPlayer);
+                Ui::setDrawPump(nullptr);
             }
             break;
         }
@@ -2142,7 +2191,9 @@ bool update() {
             uint32_t now = millis();
             if (itPlayer->state() == ItPlayer::STATE_PLAYING && now - lastItPlayTick >= 200) {
                 lastItPlayTick = now;
+                Ui::setDrawPump(pumpPlayer);
                 Ui::updateTrackerPlayerLive(*itPlayer);
+                Ui::setDrawPump(nullptr);
             }
             break;
         }
