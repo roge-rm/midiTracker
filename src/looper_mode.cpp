@@ -4359,6 +4359,8 @@ void refreshLaneDots() {
 
 } // namespace
 
+bool tracksAllocated() { return tracks != nullptr; }
+
 bool hasUnsavedTrackContent() {
     return tracks != nullptr && anyTrackHasContent();
 }

@@ -9,6 +9,7 @@
 #include "sd_browser.h"
 #include "midi_file.h"
 #include "wav_file.h"
+#include "mp3_file.h"
 #include "mod_file.h"
 #include "s3m_file.h"
 #include "xm_file.h"
@@ -37,7 +38,7 @@ enum AppState {
     APP_BROWSE,
     APP_PLAY,
     APP_PLAY_SYSEX,   // sending a .syx dump back out (see openSelected())
-    APP_PLAY_WAV,     // playing back a .wav file (see openSelected())
+    APP_PLAY_WAV,     // playing back a .wav or .mp3 file through `audio` (see openSelected())
     APP_PLAY_MOD,     // playing back a .mod file (see openSelected())
     APP_PLAY_S3M,     // playing back a .s3m file (see openSelected())
     APP_PLAY_XM,      // playing back a .xm file (see openSelected())
@@ -111,6 +112,11 @@ SdBrowser browser;
 // block.
 MidiPlayer* player = nullptr;
 WavPlayer wavPlayer;
+// Holds its decoder in SharedRamArena while loaded, so it goes through the
+// same free-tracks gate as the tracker players.
+Mp3Player mp3Player;
+// Whichever of the two APP_PLAY_WAV plays.
+StreamPlayer* audio = &wavPlayer;
 ModPlayer* modPlayer = nullptr;
 S3mPlayer* s3mPlayer = nullptr;
 XmPlayer* xmPlayer = nullptr;
@@ -169,7 +175,7 @@ void pumpPlayer() {
     switch (appState) {
         case APP_PLAY:
         case APP_SYNTH_EDIT: if (player) player->update(); break;
-        case APP_PLAY_WAV:   wavPlayer.update(); break;
+        case APP_PLAY_WAV:   audio->update(); break;
         case APP_PLAY_MOD:   if (modPlayer) modPlayer->update(); break;
         case APP_PLAY_S3M:   if (s3mPlayer) s3mPlayer->update(); break;
         case APP_PLAY_XM:    if (xmPlayer) xmPlayer->update(); break;
@@ -553,19 +559,20 @@ void openSelected() {
     stoppedViaNav = false; // a fresh open is never "stopped", see its own comment
 
     if (e.kind == FILE_WAV) {
-        if (wavPlayer.load(path)) wavPlayer.play();
-        // On failure, wavPlayer.state() == STATE_ERROR and drawWavPlayer()
-        // shows wavPlayer.errorMessage() -- still switch screens so the
+        audio = &wavPlayer;
+        if (audio->load(path)) audio->play();
+        // On failure, audio->state() == STATE_ERROR and drawWavPlayer()
+        // shows audio->errorMessage() -- still switch screens so the
         // user sees it, same convention as the MIDI branch below.
         appState = APP_PLAY_WAV;
         needsRedraw = true;
         return;
     }
 
-    if (e.kind == FILE_MOD || e.kind == FILE_S3M || e.kind == FILE_XM || e.kind == FILE_IT) {
-        // The big tracker-format players are the only reason File Player
-        // needs LooperMode's tracks[] RAM back -- browsing, MIDI preview,
-        // and WAV playback never hit this. Only worth the interactive gate
+    if (e.kind == FILE_MOD || e.kind == FILE_S3M || e.kind == FILE_XM || e.kind == FILE_IT || e.kind == FILE_MP3) {
+        // The big tracker-format players and the MP3 decoder are the only
+        // reason File Player needs LooperMode's tracks[] RAM back --
+        // browsing, MIDI preview, and WAV playback never hit this. Only worth the interactive gate
         // if there's actually something to lose; otherwise free (a no-op
         // if tracks was never allocated) and fall straight through below,
         // same as always. See APP_FREE_LOOPER_RAM's declaration and
@@ -580,6 +587,21 @@ void openSelected() {
             return;
         }
         LooperMode::freeTracksIfAllocated();
+    }
+
+    if (e.kind == FILE_MP3) {
+        // The decoder takes the start of SharedRamArena. The tracker
+        // players free it on their way back to the browser, and the gate
+        // above freed tracks[].
+        audio = &mp3Player;
+        if (LooperMode::tracksAllocated() || modPlayer || s3mPlayer || xmPlayer || itPlayer) {
+            mp3Player.refuse("RAM in use, can't open");
+        } else if (mp3Player.load(path)) {
+            mp3Player.play();
+        }
+        appState = APP_PLAY_WAV;
+        needsRedraw = true;
+        return;
     }
 
     if (e.kind == FILE_MOD) {
@@ -731,6 +753,7 @@ const char* extensionForKind(FileKind kind) {
     switch (kind) {
         case FILE_SYX: return ".syx";
         case FILE_WAV: return ".wav";
+        case FILE_MP3: return ".mp3";
         case FILE_MOD: return ".mod";
         case FILE_S3M: return ".s3m";
         case FILE_XM:  return ".xm";
@@ -1277,18 +1300,14 @@ void handleSeekHold() {
 }
 
 // ENTER + LEFT/RIGHT, held: same idea as handleSeekHold() above, for the
-// WAV player screen. WavPlayer::seekTo() is real O(1) byte math (see
-// wav_file.h) rather than MIDI's reopen-and-rescan, so there's no
-// meaningful cost difference between a small and a large jump here --
-// still uses the same step-size-grows-too shape for consistency/muscle
-// memory with the MIDI player's scrub, not because WAV needs it for
-// performance reasons. Can never produce STATE_ERROR (no file reopen
-// happens), unlike the MIDI version.
+// WAV and MP3 player screen. Both seek without reopening the file (see
+// WavPlayer::seekTo() and Mp3Player::seekTo()), so this never gives
+// STATE_ERROR, unlike the MIDI version.
 void handleWavSeekHold() {
     if (!Input::isDown(BTN_ENTER)) return;
-    WavPlayer::State st = wavPlayer.state();
-    if (st != WavPlayer::STATE_PLAYING && st != WavPlayer::STATE_PAUSED &&
-        st != WavPlayer::STATE_DONE) {
+    StreamPlayer::State st = audio->state();
+    if (st != StreamPlayer::STATE_PLAYING && st != StreamPlayer::STATE_PAUSED &&
+        st != StreamPlayer::STATE_DONE) {
         return;
     }
 
@@ -1312,7 +1331,7 @@ void handleWavSeekHold() {
         bool accel = now - rightPressedAtMs >= ACCEL_AFTER_MS;
         uint32_t interval = accel ? FAST_INTERVAL_MS : NORMAL_INTERVAL_MS;
         if (Input::justPressed(BTN_RIGHT) || now - lastRightStep >= interval) {
-            wavPlayer.seekTo(wavPlayer.elapsedMs() + (accel ? FAST_STEP_MS : NORMAL_STEP_MS));
+            audio->seekTo(audio->elapsedMs() + (accel ? FAST_STEP_MS : NORMAL_STEP_MS));
             lastRightStep = now;
             changed = true;
         }
@@ -1322,40 +1341,40 @@ void handleWavSeekHold() {
         uint32_t interval = accel ? FAST_INTERVAL_MS : NORMAL_INTERVAL_MS;
         if (Input::justPressed(BTN_LEFT) || now - lastLeftStep >= interval) {
             uint32_t step = accel ? FAST_STEP_MS : NORMAL_STEP_MS;
-            uint32_t current = wavPlayer.elapsedMs();
-            wavPlayer.seekTo(current > step ? current - step : 0);
+            uint32_t current = audio->elapsedMs();
+            audio->seekTo(current > step ? current - step : 0);
             lastLeftStep = now;
             changed = true;
         }
     }
     if (changed) {
         stoppedViaNav = false;
-        Ui::updateWavPlayerState(wavPlayer.state(), stoppedViaNav);
-        Ui::updateWavPlayerLive(wavPlayer);
+        Ui::updateWavPlayerState(audio->state(), stoppedViaNav);
+        Ui::updateWavPlayerLive(*audio);
     }
 }
 
 void handlePlayWavInput() {
     if (Input::justPressed(BTN_PLAY)) {
-        if (wavPlayer.state() == WavPlayer::STATE_PLAYING) {
-            wavPlayer.pause();
+        if (audio->state() == StreamPlayer::STATE_PLAYING) {
+            audio->pause();
             stoppedViaNav = false;
-            Ui::updateWavPlayerState(wavPlayer.state(), stoppedViaNav);
-        } else if (wavPlayer.state() == WavPlayer::STATE_PAUSED) {
-            wavPlayer.play();
+            Ui::updateWavPlayerState(audio->state(), stoppedViaNav);
+        } else if (audio->state() == StreamPlayer::STATE_PAUSED) {
+            audio->play();
             stoppedViaNav = false;
-            Ui::updateWavPlayerState(wavPlayer.state(), stoppedViaNav);
-        } else if (wavPlayer.state() == WavPlayer::STATE_DONE) {
-            wavPlayer.seekTo(0);
-            wavPlayer.play();
+            Ui::updateWavPlayerState(audio->state(), stoppedViaNav);
+        } else if (audio->state() == StreamPlayer::STATE_DONE) {
+            audio->seekTo(0);
+            audio->play();
             stoppedViaNav = false;
-            Ui::updateWavPlayerState(wavPlayer.state(), stoppedViaNav);
-            Ui::updateWavPlayerLive(wavPlayer);
+            Ui::updateWavPlayerState(audio->state(), stoppedViaNav);
+            Ui::updateWavPlayerLive(*audio);
         }
     }
     // ENTER held excludes this -- ENTER+LEFT is scrub-back (see handleWavSeekHold()).
     if (Input::justPressed(BTN_LEFT) && !Input::isDown(BTN_ENTER)) {
-        wavPlayer.stop();
+        audio->stop();
         appState = APP_BROWSE;
         needsRedraw = true;
         return;
@@ -1366,14 +1385,14 @@ void handlePlayWavInput() {
     // plain seekTo(0), which preserves PLAYING) -- that's what makes this
     // "Stop" rather than "seek to the start".
     if (Input::justPressed(BTN_NAV)) {
-        if (wavPlayer.state() == WavPlayer::STATE_PLAYING ||
-            wavPlayer.state() == WavPlayer::STATE_PAUSED ||
-            wavPlayer.state() == WavPlayer::STATE_DONE) {
-            wavPlayer.seekTo(0);
-            wavPlayer.pause(); // no-op if seekTo() already landed on PAUSED/DONE
+        if (audio->state() == StreamPlayer::STATE_PLAYING ||
+            audio->state() == StreamPlayer::STATE_PAUSED ||
+            audio->state() == StreamPlayer::STATE_DONE) {
+            audio->seekTo(0);
+            audio->pause(); // no-op if seekTo() already landed on PAUSED/DONE
             stoppedViaNav = true;
-            Ui::updateWavPlayerState(wavPlayer.state(), stoppedViaNav);
-            Ui::updateWavPlayerLive(wavPlayer);
+            Ui::updateWavPlayerState(audio->state(), stoppedViaNav);
+            Ui::updateWavPlayerLive(*audio);
         }
     }
     // EDIT+UP/DOWN volume, reused as-is: only touches the shared
@@ -2200,28 +2219,28 @@ bool update() {
         }
 
         case APP_PLAY_WAV: {
-            wavPlayer.update();
+            audio->update();
             handlePlayWavInput();
             static bool wavWasPlaying = false;
             if (appState != APP_PLAY_WAV) { wavWasPlaying = false; break; }
 
             // Same as APP_PLAY: one full meter draw on a pause, stop or end.
-            bool wavPlaying = wavPlayer.state() == WavPlayer::STATE_PLAYING;
-            if (wavWasPlaying && !wavPlaying && wavPlayer.state() != WavPlayer::STATE_ERROR) {
+            bool wavPlaying = audio->state() == StreamPlayer::STATE_PLAYING;
+            if (wavWasPlaying && !wavPlaying && audio->state() != StreamPlayer::STATE_ERROR) {
                 Ui::sliceForceMeters(true);
-                Ui::updateWavPlayerLive(wavPlayer);
+                Ui::updateWavPlayerLive(*audio);
                 Ui::sliceForceMeters(false);
             }
             wavWasPlaying = wavPlaying;
 
             static uint32_t lastWavPlayTick = 0;
             uint32_t now = millis();
-            if ((wavPlayer.state() == WavPlayer::STATE_PLAYING ||
-                 (wavPlayer.state() == WavPlayer::STATE_DONE && !Ui::playerLiveSettled())) &&
+            if ((audio->state() == StreamPlayer::STATE_PLAYING ||
+                 (audio->state() == StreamPlayer::STATE_DONE && !Ui::playerLiveSettled())) &&
                 now - lastWavPlayTick >= LIVE_MS) {
                 lastWavPlayTick = now;
                 Ui::setDrawPump(pumpPlayer);
-                Ui::updateWavPlayerLive(wavPlayer);
+                Ui::updateWavPlayerLive(*audio);
                 Ui::setDrawPump(nullptr);
             }
             break;
@@ -2481,7 +2500,7 @@ bool update() {
                 break;
 
             case APP_PLAY_WAV:
-                Ui::drawWavPlayer(nowPlayingName, wavPlayer, volume, stoppedViaNav);
+                Ui::drawWavPlayer(nowPlayingName, *audio, volume, stoppedViaNav);
                 break;
 
             case APP_PLAY_MOD:
@@ -2625,10 +2644,10 @@ void screensaverInfo(UiSaver::Info& info, void (*&pump)()) {
         info.src = UiSaver::SRC_MIDI_FILE;
         info.elapsedMs = player->elapsedMs();
     } else if (appState == APP_PLAY_WAV) {
-        if (wavPlayer.state() != WavPlayer::STATE_PLAYING) return;
+        if (audio->state() != StreamPlayer::STATE_PLAYING) return;
         info.src = UiSaver::SRC_WAV;
-        info.elapsedMs = wavPlayer.elapsedMs();
-        uint32_t total = wavPlayer.totalMs();
+        info.elapsedMs = audio->elapsedMs();
+        uint32_t total = audio->totalMs();
         if (total) info.progress = (int)((uint64_t)info.elapsedMs * 1000 / total);
     } else if (appState == APP_PLAY_SYSEX) {
         if (sysexPlayer.state() != SysExPlayer::STATE_SENDING) return;

@@ -976,11 +976,12 @@ void drawWav(const WavInfo& w) {
     g_wav.head = wavColumn(w.elapsedMs, w.totalMs);
     g_wav.segs[0] = g_wav.segs[1] = 0;
 
-    drawStatusFor(ICON_WAVE, COLOR_WAV, "WAV");
+    drawStatusFor(ICON_WAVE, COLOR_WAV, w.type ? w.type : "WAV");
     drawChip(w.state);
-    char info[40];
-    snprintf(info, sizeof(info), "%lu.%luK %s %dBIT %s %s", (unsigned long)(w.sampleRate / 1000),
-             (unsigned long)(w.sampleRate % 1000 / 100), MIDDOT, w.bits, MIDDOT, w.channels == 2 ? "STEREO" : "MONO");
+    char info[48];
+    snprintf(info, sizeof(info), "%lu.%luK %s %s %s %s", (unsigned long)(w.sampleRate / 1000),
+             (unsigned long)(w.sampleRate % 1000 / 100), MIDDOT, w.format ? w.format : "", MIDDOT,
+             w.channels == 2 ? "STEREO" : "MONO");
     band(0, HEADER_H, SCREEN_W, TOP_Y - 2 - HEADER_H, COLOR_BG,
          [&](TFT_eSPI& g) { paintTitle(g, w.name, w.state == PS_ERROR ? nullptr : info); });
     if (w.state == PS_ERROR) {

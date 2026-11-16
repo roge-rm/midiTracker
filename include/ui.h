@@ -2,7 +2,7 @@
 #include <Arduino.h>
 #include "sd_browser.h"
 #include "midi_file.h"
-#include "wav_file.h"
+#include "stream_player.h"
 #include "tracker_base.h"
 #include "midi_output.h"
 #include "midi_recorder.h"
@@ -111,16 +111,17 @@ void updatePariSynthSelection(int prevChannel, int newChannel, bool prevActive, 
 // back after a full drawPariSynthPlay() while it should still show.
 void updatePariSynthVolumeOverlay(int volume);
 
-// The WAV player screen (ui_player.cpp): time and length, a waveform that
-// fills in as it plays, and peak meters. `stopped` as drawPlayer().
-void drawWavPlayer(const char* filename, const WavPlayer& player, int volume, bool stopped);
+// The WAV and MP3 player screen (ui_player.cpp): time and length, a
+// waveform that fills in as it plays, and peak meters. `stopped` as
+// drawPlayer().
+void drawWavPlayer(const char* filename, const StreamPlayer& player, int volume, bool stopped);
 
 // The play state, same rules as updatePlayerState().
-void updateWavPlayerState(WavPlayer::State state, bool stopped);
+void updateWavPlayerState(StreamPlayer::State state, bool stopped);
 
 // Time, waveform and peak meters. Call as often as every loop while
 // playing, and once after a seek or stop.
-void updateWavPlayerLive(const WavPlayer& player);
+void updateWavPlayerLive(const StreamPlayer& player);
 
 // The tracker player screen (MOD, S3M, XM, IT; ui_player.cpp): time,
 // scope, speed and tempo, channel lanes with a row trail and meters, and

@@ -160,6 +160,7 @@ void drawBrowserRow(const SdBrowser& browser, int idx, int scrollOffset, bool se
             case FILE_MID: r.type = Look::ROW_MIDI;    r.typeLabel = "MID"; break;
             case FILE_SYX: r.type = Look::ROW_SYX;     r.typeLabel = "SYX"; break;
             case FILE_WAV: r.type = Look::ROW_WAV;     r.typeLabel = "WAV"; break;
+            case FILE_MP3: r.type = Look::ROW_WAV;     r.typeLabel = "MP3"; break;
             case FILE_MOD: r.type = Look::ROW_TRACKER; r.typeLabel = "MOD"; break;
             case FILE_S3M: r.type = Look::ROW_TRACKER; r.typeLabel = "S3M"; break;
             case FILE_XM:  r.type = Look::ROW_TRACKER; r.typeLabel = "XM"; break;
@@ -444,7 +445,7 @@ void updateBrowserHeader(const SdBrowser& browser) {
 
 void drawBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffset) {
     drawBrowserHeaderPath(browser, "FILES", true);
-    drawBrowserList(browser, selectedIndex, scrollOffset, "no .mid .syx .wav .mod .s3m .xm .it files");
+    drawBrowserList(browser, selectedIndex, scrollOffset, "no .mid .syx .wav .mp3 .mod .s3m .xm .it files");
     // PLAY and RIGHT open too. ALT held with UP/DOWN pages.
     static const Look::Key row1[] = {
         {"UP", "up", Look::TONE_TEXT},
@@ -580,12 +581,12 @@ void updatePariSynthVolumeOverlay(int volume) { UiModes::synthVolume(volume); }
 
 // -- WAV and tracker player screens (ui_player.cpp) ----------------------
 
-UiPlayer::PlayState playState(WavPlayer::State s, bool stopped) {
+UiPlayer::PlayState playState(StreamPlayer::State s, bool stopped) {
     switch (s) {
-        case WavPlayer::STATE_PLAYING: return UiPlayer::PS_PLAYING;
-        case WavPlayer::STATE_PAUSED:  return stopped ? UiPlayer::PS_STOPPED : UiPlayer::PS_PAUSED;
-        case WavPlayer::STATE_DONE:    return UiPlayer::PS_DONE;
-        case WavPlayer::STATE_ERROR:   return UiPlayer::PS_ERROR;
+        case StreamPlayer::STATE_PLAYING: return UiPlayer::PS_PLAYING;
+        case StreamPlayer::STATE_PAUSED:  return stopped ? UiPlayer::PS_STOPPED : UiPlayer::PS_PAUSED;
+        case StreamPlayer::STATE_DONE:    return UiPlayer::PS_DONE;
+        case StreamPlayer::STATE_ERROR:   return UiPlayer::PS_ERROR;
         default:                       return UiPlayer::PS_IDLE;
     }
 }
@@ -600,33 +601,36 @@ UiPlayer::PlayState playState(TrackerPlayer::State s, bool stopped) {
     }
 }
 
-UiPlayer::WavInfo wavInfo(const char* filename, const WavPlayer& player) {
+UiPlayer::WavInfo wavInfo(const char* filename, const StreamPlayer& player) {
+    static char format[16];
+    player.formatText(format, sizeof(format));
     UiPlayer::WavInfo w;
     w.name = filename;
     w.fileKey = player.pathKey();
     w.elapsedMs = player.elapsedMs();
     w.totalMs = player.totalMs();
     w.sampleRate = player.sampleRate();
-    w.bits = player.bitsPerSample();
     w.channels = player.channels();
+    w.type = player.typeLabel();
+    w.format = format;
     w.state = playState(player.state(), g_playerStopped);
     w.error = player.errorMessage();
     w.volume = g_playerVolume;
     return w;
 }
 
-void drawWavPlayer(const char* filename, const WavPlayer& player, int volume, bool stopped) {
+void drawWavPlayer(const char* filename, const StreamPlayer& player, int volume, bool stopped) {
     g_playerVolume = volume;
     g_playerStopped = stopped;
     UiPlayer::drawWav(wavInfo(filename, player));
 }
 
-void updateWavPlayerState(WavPlayer::State state, bool stopped) {
+void updateWavPlayerState(StreamPlayer::State state, bool stopped) {
     g_playerStopped = stopped;
     UiPlayer::wavState(playState(state, stopped));
 }
 
-void updateWavPlayerLive(const WavPlayer& player) {
+void updateWavPlayerLive(const StreamPlayer& player) {
     UiPlayer::wavLive(wavInfo(nullptr, player));
 }
 

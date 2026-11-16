@@ -349,7 +349,7 @@ void xmp3_PolyDot(const int *v, const int *k, int *out, int n);
 
 #if defined(__ARM_ARCH_6M__) && defined(__thumb__)
 /* About 17 cycles a tap. Runs from RAM (.time_critical), it is the
- * decoder's inner loop. A0..A26 live in r8, r11, r10, r9. */
+ * decoder's inner loop. A0, A10, A16 and A26 live in r8, r9, r10 and r11. */
 #define PD_TAP(voff, koff) \
 	"ldr r2, [r0, #" #voff "]\n" \
 	"ldr r4, [r1, #" #koff "]\n" \
@@ -368,7 +368,7 @@ void xmp3_PolyDot(const int *v, const int *k, int *out, int n);
 	"add r10, r3\n"
 
 __asm__(
-	".section .time_critical.xmp3_PolyDot, \"ax\", %progbits\n"
+	".pushsection .time_critical.xmp3_PolyDot, \"ax\", %progbits\n"
 	".syntax unified\n"
 	".thumb\n"
 	".align 2\n"
@@ -434,7 +434,7 @@ __asm__(
 	"mov r11, r7\n"
 	"pop {r4-r7, pc}\n"
 	".size xmp3_PolyDot, . - xmp3_PolyDot\n"
-	".text\n"
+	".popsection\n"
 );
 #else
 /* The same sums in C, for checking the method on the host. */

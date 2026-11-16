@@ -27,6 +27,13 @@ bool SdBrowser::isWavFilename(const char* name) {
     return strcasecmp(ext, ".wav") == 0;
 }
 
+bool SdBrowser::isMp3Filename(const char* name) {
+    size_t len = strlen(name);
+    if (len < 4) return false;
+    const char* ext = name + (len - 4);
+    return strcasecmp(ext, ".mp3") == 0;
+}
+
 bool SdBrowser::isModFilename(const char* name) {
     size_t len = strlen(name);
     if (len < 4) return false;
@@ -104,7 +111,7 @@ void SdBrowser::displayNameOf(FsFile& f, char* out, size_t outSize) {
 
 // Shared by both loadEntries() scan passes so they agree on exactly which
 // entries qualify -- skips hidden/dotfiles, accepts any directory, and
-// accepts a file only if its extension is one of the seven recognized
+// accepts a file only if its extension is one of the eight recognized
 // kinds. `file` must already be freshly opened via openNext() (or
 // otherwise positioned) so isHidden()/isDir() are meaningful.
 bool SdBrowser::classifyEntry(FsFile& file, const char* name, bool& isDirOut, uint8_t& kindOut) {
@@ -116,6 +123,7 @@ bool SdBrowser::classifyEntry(FsFile& file, const char* name, bool& isDirOut, ui
     }
     if (isSysExFilename(name)) { kindOut = FILE_SYX; return true; }
     if (isWavFilename(name))   { kindOut = FILE_WAV; return true; }
+    if (isMp3Filename(name))   { kindOut = FILE_MP3; return true; }
     if (isModFilename(name))   { kindOut = FILE_MOD; return true; }
     if (isS3mFilename(name))   { kindOut = FILE_S3M; return true; }
     if (isXmFilename(name))    { kindOut = FILE_XM;  return true; }

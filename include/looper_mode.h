@@ -64,6 +64,9 @@ bool hasUnsavedTrackContent();
 // user has chosen Discard).
 void freeTracksIfAllocated();
 
+// True while tracks[] holds SharedRamArena.
+bool tracksAllocated();
+
 // Starts the interactive "free this RAM for File Player" gate: a 3-item
 // menu (Save & Continue / Discard & Continue / Cancel), drawn via the
 // same look SCREEN_MENU already uses. Only meant to be called when

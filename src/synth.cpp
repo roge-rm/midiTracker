@@ -2328,9 +2328,11 @@ void reverbTypeChanged(uint8_t newType) {
         g_shimmerReadPosQ16[1] = 0;
         g_shimmerGrainPos[0] = 0;
         g_shimmerGrainPos[1] = SHIMMER_GRAIN_LEN / 2;
-        g_shimmerFeedbackHeld = 0;
-        g_shimmerDcQ8 = 0;
     }
+    // Cleared on the way in and out of Shimmer: only Shimmer reads it, and
+    // the MP3 block output's reverb sleep check needs it at 0.
+    g_shimmerFeedbackHeld = 0;
+    g_shimmerDcQ8 = 0;
     g_reverbType = newType;
 }
 

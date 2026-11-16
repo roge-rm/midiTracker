@@ -4,9 +4,9 @@
 #include "config.h"
 
 // Meaningless for directories. FILE_MID/FILE_SYX/FILE_WAV/FILE_MOD/
-// FILE_S3M/FILE_XM/FILE_IT, see isMidiFilename()/isSysExFilename()/isWavFilename()/
-// isModFilename()/isS3mFilename()/isXmFilename()/isItFilename().
-enum FileKind { FILE_MID, FILE_SYX, FILE_WAV, FILE_MOD, FILE_S3M, FILE_XM, FILE_IT };
+// FILE_S3M/FILE_XM/FILE_IT/FILE_MP3, see isMidiFilename()/isSysExFilename()/isWavFilename()/
+// isModFilename()/isS3mFilename()/isXmFilename()/isItFilename()/isMp3Filename().
+enum FileKind { FILE_MID, FILE_SYX, FILE_WAV, FILE_MOD, FILE_S3M, FILE_XM, FILE_IT, FILE_MP3 };
 
 struct BrowserEntry {
     char name[MAX_FILENAME_LEN]; // display name: ASCII, shortened to fit with its extension kept. Use buildFullPath() to open an entry
@@ -16,7 +16,7 @@ struct BrowserEntry {
 };
 
 // Lists and navigates directories on the SD card, filtering to
-// directories and *.mid/*.MID/*.syx/*.SYX/*.wav/*.WAV/*.mod/*.MOD/*.s3m/
+// directories and *.mid/*.MID/*.syx/*.SYX/*.wav/*.WAV/*.mp3/*.MP3/*.mod/*.MOD/*.s3m/
 // *.S3M/*.xm/*.XM files. Call begin() once after sdCardBegin() succeeds.
 //
 // A folder can hold far more entries than comfortably fits in RAM as full
@@ -203,6 +203,7 @@ private:
     static bool isMidiFilename(const char* name);
     static bool isSysExFilename(const char* name);
     static bool isWavFilename(const char* name);
+    static bool isMp3Filename(const char* name);
     static bool isModFilename(const char* name);
     static bool isS3mFilename(const char* name);
     static bool isXmFilename(const char* name);

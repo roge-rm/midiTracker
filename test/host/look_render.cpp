@@ -174,7 +174,7 @@ void browserScreen() {
         {"loop01.wav", ROW_WAV, "WAV", 1260000},
         {"axelf.mod", ROW_TRACKER, "MOD", 61 * 1024},
         {"juno patch.syx", ROW_SYX, "SYX", 4 * 1024},
-        {"ping pong.mod", ROW_TRACKER, "MOD", 92 * 1024},
+        {"night drive.mp3", ROW_WAV, "MP3", 7340000},
         {"a very long file name that will not fit in the row.mid", ROW_MIDI, "MID", 1200},
     };
     for (int i = 0; i < ROWS; i++) drawFileRow(LIST_TOP + i * LIST_ROW_H, &rows[i], i == 1);
@@ -623,14 +623,17 @@ bool midiScreen(const std::string& dir, const char* base, const char* name) {
 
 // The WAV screen with a render as the file, played to 60% so the waveform
 // has filled in that far.
-bool wavScreen(const std::string& dir, const char* base, const char* name) {
+// type and format as WavPlayer or Mp3Player give them.
+bool wavScreen(const std::string& dir, const char* base, const char* name, const char* type = "WAV",
+               const char* format = "16BIT") {
     if (!readFile(dir + "/" + base + ".raw", g_raw)) return false;
     UiPlayer::WavInfo w = {};
     w.name = name;
     w.fileKey = 1;
     w.totalMs = (uint32_t)((uint64_t)(g_raw.size() / 2) * 1000 / RATE);
     w.sampleRate = RATE;
-    w.bits = 16;
+    w.type = type;
+    w.format = format;
     w.channels = 2;
     w.state = UiPlayer::PS_PLAYING;
     w.volume = 80;
@@ -788,6 +791,20 @@ int playerScreens(const std::string& dir) {
     save("midi");
     if (!wavScreen(dir, "s3m", "the reflex render.wav")) return 1;
     save("wav");
+    if (!wavScreen(dir, "s3m", "the reflex render.mp3", "MP3", "245K VBR")) return 1;
+    save("mp3");
+    UiPlayer::wavState(UiPlayer::PS_PAUSED);
+    save("mp3-paused");
+    UiPlayer::WavInfo e = {};
+    e.name = "old radio show.mp3";
+    e.type = "MP3";
+    e.format = "0K CBR";
+    e.state = UiPlayer::PS_ERROR;
+    e.error = "layer I/II not supported";
+    e.volume = 80;
+    g_tft.fillScreen(COLOR_BG);
+    UiPlayer::drawWav(e);
+    save("mp3-error");
     stateScreens(dir);
     return saverScreens(dir);
 }

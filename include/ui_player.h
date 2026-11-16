@@ -46,7 +46,9 @@ struct WavInfo {
     uint32_t fileKey; // a hash of the full path
     uint32_t elapsedMs, totalMs;
     uint32_t sampleRate;
-    int bits, channels;
+    int channels;
+    const char* type;   // "WAV" or "MP3", in the status strip
+    const char* format; // after the rate: "16BIT", "320K CBR"
     PlayState state;
     const char* error;
     int volume;

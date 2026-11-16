@@ -1,52 +1,67 @@
 #pragma once
 #include <Arduino.h>
 #include <SdFat.h>
+#include "stream_player.h"
 
 // Plays an MP3 file off the card into Synth's WAV stream (the same ring
 // WavPlayer feeds), decoded with the Helix fixed-point decoder in
-// lib/helix_mp3. Trial code for the profile build: play/stop/pause only,
-// no seek.
+// lib/helix_mp3.
 //
-// MPEG 1/2/2.5 layer III, mono or stereo, CBR or VBR. A leading ID3v2 tag
-// is skipped, a Xing/Info header frame gives the length and isn't played,
-// a trailing ID3v1 tag isn't read. Rates other than SAMPLE_RATE are
+// MPEG 1/2/2.5 layer III, mono or stereo, CBR or VBR. Layer I/II and free
+// format files are refused at load. A leading ID3v2 tag is skipped, a
+// Xing/Info or VBRI header frame gives the length and seek table and isn't
+// played, a trailing ID3v1 tag isn't read. Rates other than SAMPLE_RATE are
 // resampled linearly, as WavPlayer does.
+//
+// seekTo() finds the byte position from the Xing TOC or the VBRI table when
+// there's one, else in proportion to the length, then looks for two or
+// three frame headers in a row. The decoder starts fresh there, so the
+// frames whose bit reservoir is missing give no audio, and the first frame
+// that decodes is dropped too.
 //
 // Uses the start of SharedRamArena::data() for the decoder state, the
 // compressed input ring and one decoded frame (see arenaBytes()), so nothing
 // else may hold the arena while an MP3 is loaded. Only one Mp3Player may be
 // loaded at a time, and nothing else may feed the WAV stream meanwhile.
 //
-// Two cores: core 0 calls load(), update(), play(), pause() and close(),
+// Two cores: core 0 calls everything public except the core1*() functions,
 // and is the only one that reads the card. update() tops up the input ring.
 // Core 1 calls core1Push() and core1Decode() from loop1(): they decode
 // from the input ring into the WAV stream, so core 1 is the WAV stream's
-// producer while an MP3 is loaded. close() waits for core 1 to leave them
-// before it frees the decoder.
-class Mp3Player {
+// producer while an MP3 is loaded. seekTo() and close() wait for core 1 to
+// leave them first.
+struct Mp3OtherFrames; // mp3_file.cpp
+
+class Mp3Player : public StreamPlayer {
 public:
-    enum State { STATE_IDLE, STATE_PLAYING, STATE_PAUSED, STATE_DONE, STATE_ERROR };
+    bool load(const char* path) override;
+    void close() override;
+    void update() override;
+    void play() override;
+    void pause() override;
+    void stop() override { close(); }
+    void seekTo(uint32_t targetMs) override;
 
-    bool load(const char* path); // STATE_PAUSED on success, STATE_ERROR otherwise
-    void close();
-    void update(); // call every loop
-    void play();
-    void pause();
-    void stop() { close(); }
+    // Puts the player in STATE_ERROR with msg, for when load() can't be
+    // called (the arena is in use).
+    void refuse(const char* msg);
 
-    State state() const { return _state; }
-    const char* errorMessage() const { return _error; }
+    uint32_t elapsedMs() const override;
+    // From the Xing/VBRI header, else estimated from the bitrate. Grows to
+    // the elapsed time if playing runs past an estimate.
+    uint32_t totalMs() const override { return _totalMs; }
+    uint32_t sampleRate() const override { return _rate; }
+    uint8_t channels() const override { return _channels; }
+    uint32_t underrunSamples() const override;
+    const char* typeLabel() const override { return "MP3"; }
+    void formatText(char* out, size_t size) const override; // "320K CBR", "245K VBR"
 
-    uint32_t elapsedMs() const;
-    uint32_t totalMs() const { return _totalMs; } // from the Xing header, else estimated from the first frame's bitrate
-    uint32_t sampleRate() const { return _rate; }
-    uint8_t channels() const { return _channels; }
-    uint32_t bitrate() const { return _bitrate; } // first audio frame's, in bits/s
+    uint32_t bitrate() const { return _bitrate; } // bits/s: the average for VBR, else the first audio frame's
+    bool isVbr() const { return _vbr; }
     uint8_t mpegVersion() const { return _version; } // 1, 2 or 25 (2.5)
     const char* vbrTag() const { return _vbrTag; } // "Xing", "Info", "VBRI" or "" when there's none
     uint32_t id3Bytes() const { return _id3Bytes; }
     uint32_t samplesPerFrame() const { return _samplesPerFrame; }
-    uint32_t underrunSamples() const;
 
     // Arena bytes used: decoder state, input ring, one decoded frame.
     static size_t decoderBytes();
@@ -61,6 +76,7 @@ public:
     static bool core1Push();
     static void core1Decode();
     // True while an MP3 is loaded and core 1 feeds it (any core may ask).
+    // Off for a moment during a seek.
     static bool core1Active();
 
 #ifdef TRACKER_PROFILE
@@ -75,26 +91,45 @@ public:
 
 private:
     FsFile _file;
-    State _state = STATE_IDLE;
-    char _error[64] = {0};
     void* _dec = nullptr; // HMP3Decoder
 
     uint32_t _rate = 0, _bitrate = 0, _samplesPerFrame = 0, _id3Bytes = 0, _totalMs = 0;
     uint8_t _channels = 0, _version = 0;
+    bool _vbr = false;
     char _vbrTag[5] = {0};
 
-    // load()'s linear scan buffer (the start of the input ring's bytes):
-    // bytes [_inPos, _inLen) are unread.
+    // Seek tables. _tagFrame is the file offset of the Xing/Info/VBRI
+    // frame, which both tables count from, _audioStart that of the first
+    // audio frame. The VBRI table stays on the card and is read at a seek.
+    uint32_t _tagFrame = 0, _audioStart = 0, _tagBytes = 0;
+    uint32_t _tagMs = 0; // the length the header gives, which the TOC is in proportion to
+    bool _hasToc = false;
+    uint8_t _toc[100];
+    uint32_t _vbriTable = 0; // file offset, 0 when there's none
+    uint16_t _vbriEntries = 0, _vbriScale = 0, _vbriEntryBytes = 0, _vbriFramesPerEntry = 0;
+
+    // load()'s and seekTo()'s linear scan buffer (the start of the input
+    // ring's bytes): bytes [_inPos, _inLen) are unread.
     uint32_t _inPos = 0, _inLen = 0;
     uint32_t _filePos = 0, _dataEnd = 0;
     bool _eof = false;
 
-    uint32_t _ringBase = 0, _underrunBase = 0;
+    // elapsedMs() is _startMs plus the frames played since the ring held
+    // _ringBase frames written (the last load or seek).
+    uint32_t _startMs = 0, _ringBase = 0, _underrunBase = 0;
 
     bool fail(const char* msg);
-    bool fillScan();       // load() only: tops the scan buffer up; false at the end of data
+    bool fillScan();       // tops the scan buffer up; false at the end of data
+    // Moves _inPos to two or three layer III frames in a row at rate (any
+    // rate when 0), within maxBytes. other, when given, counts the layer
+    // I/II and free format frames seen on the way.
+    bool syncScan(uint32_t maxBytes, uint32_t rate, Mp3OtherFrames* other);
     bool findFirstFrame(); // skips to the first frame, reads its format and any Xing/Info/VBRI header
+    bool testDecode();     // load() only: decodes the first few frames on core 0
+    uint32_t seekOffset(uint32_t ms); // file offset to look for a frame from
+    bool startStream(uint32_t pos);   // input ring from pos, core 1 stopped; false when no frame is found
     void fillRing();       // one card read into the input ring when it has room
     void stopCore1();      // waits until core 1 is out of core1Push()/core1Decode() and stays out
+    void restartClock(uint32_t ms);
     bool ringDrained() const;
 };

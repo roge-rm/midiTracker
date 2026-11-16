@@ -4,6 +4,7 @@
 #include "pins.h" // SAMPLE_RATE
 #include "shared_ram_arena.h"
 #include <string.h>
+#include <stdio.h>
 
 namespace {
 
@@ -95,8 +96,7 @@ bool WavPlayer::fail(const char* msg) {
 bool WavPlayer::load(const char* path) {
     close();
     _error[0] = '\0';
-    _pathKey = 2166136261u;
-    for (const char* c = path; c && *c; c++) _pathKey = (_pathKey ^ (uint8_t)*c) * 16777619u;
+    hashPath(path);
 
     if (!sdOpenPath(_file, path, O_RDONLY)) return fail("could not open file");
 
@@ -501,6 +501,10 @@ void WavPlayer::seekTo(uint32_t targetMs) {
         _state = wasPlaying ? STATE_PLAYING : STATE_PAUSED;
         Synth::wavStreamSetActive(wasPlaying);
     }
+}
+
+void WavPlayer::formatText(char* out, size_t size) const {
+    snprintf(out, size, "%dBIT", _srcBitsPerSample);
 }
 
 uint32_t WavPlayer::underrunSamples() const {

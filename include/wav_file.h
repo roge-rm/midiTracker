@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <SdFat.h>
+#include "stream_player.h"
 
 // Streams a RIFF/WAVE file directly off the SD card and feeds it to
 // Synth's WAV playback stream (see Synth::wavStream*() in synth.h) --
@@ -27,9 +28,8 @@
 // within that one block -- bounded by a single block's sample count
 // (typically a few hundred to a few thousand), not by file size, so still
 // nowhere near MidiPlayer's whole-file rescan cost.
-class WavPlayer {
+class WavPlayer : public StreamPlayer {
 public:
-    enum State { STATE_IDLE, STATE_PLAYING, STATE_PAUSED, STATE_DONE, STATE_ERROR };
 
     // Parses the RIFF/WAVE container, walking chunks until both 'fmt '
     // and 'data' are found (skipping anything else -- LIST/fact/JUNK/etc,
@@ -37,32 +37,28 @@ public:
     // STATE_PAUSED (ready to play()) on success, or STATE_ERROR (see
     // errorMessage()) on failure. Does not touch Synth's stream at all --
     // that only starts once play() is first called (see play()'s comment).
-    bool load(const char* path);
+    bool load(const char* path) override;
 
     // Closes the file handle and resets to STATE_IDLE. Also resets
     // Synth's WAV stream (see Synth::wavStreamReset()) so nothing from
     // this file keeps sounding after it's closed.
-    void close();
+    void close() override;
 
     // Call every loop() iteration regardless of play/pause state -- keeps
     // Synth's ring buffer topped up (see synth.h's comment on why this is
     // deliberately not gated on STATE_PLAYING) by reading/converting/
     // resampling a bounded chunk from SD when there's room for it. Cheap
     // no-op when the buffer's already full or nothing's loaded.
-    void update();
+    void update() override;
 
-    void play();  // resume/start -- unmutes Synth's stream (see Synth::wavStreamSetActive())
-    void pause(); // hold in place, mutes Synth's stream without discarding buffered audio
-    void stop();  // stop + close()
-
-    State state() const { return _state; }
-    const char* errorMessage() const { return _error; }
+    void play() override;  // resume/start -- unmutes Synth's stream (see Synth::wavStreamSetActive())
+    void pause() override; // hold in place, mutes Synth's stream without discarding buffered audio
+    void stop() override;  // stop + close()
 
     // Position of what's being heard: frames core 1 has taken from the
     // ring since the last load or seek, so it stops during an underrun.
-    uint32_t elapsedMs() const;
-    uint32_t totalMs() const;    // known immediately after load() -- no prescan needed
-    uint32_t pathKey() const { return _pathKey; } // hash of the loaded path, for the UI's waveform cache
+    uint32_t elapsedMs() const override;
+    uint32_t totalMs() const override; // known immediately after load() -- no prescan needed
 
     // See this class's header comment for PCM-vs-ADPCM cost. Either way,
     // no file reopen. Discards whatever's currently buffered
@@ -70,15 +66,18 @@ public:
     // position; update() refills it on subsequent ticks. Clamped to
     // [0, totalMs()]. Preserves whether playback was PLAYING or PAUSED;
     // lands on STATE_DONE instead if the target is at/past the end.
-    void seekTo(uint32_t targetMs);
+    void seekTo(uint32_t targetMs) override;
 
-    uint32_t sampleRate() const { return _srcSampleRate; }
-    uint8_t channels() const { return _srcChannels; }
+    uint32_t sampleRate() const override { return _srcSampleRate; }
+    uint8_t channels() const override { return _srcChannels; }
     uint8_t bitsPerSample() const { return _srcBitsPerSample; } // 4 for ADPCM
 
     // Samples core 1 found the ring empty since load(), from
     // Synth::wavStreamUnderrunSamples().
-    uint32_t underrunSamples() const;
+    uint32_t underrunSamples() const override;
+
+    const char* typeLabel() const override { return "WAV"; }
+    void formatText(char* out, size_t size) const override; // "16BIT", "4BIT" for ADPCM
 
 #ifdef TRACKER_PROFILE
     // Card reads since the profile run last cleared it (tracker_profile.cpp).
@@ -88,10 +87,7 @@ public:
 
 private:
     FsFile _file;
-    State _state = STATE_IDLE;
-    char _error[64] = {0};
 
-    uint32_t _pathKey = 0;
     uint32_t _dataChunkStart = 0;
     uint32_t _dataChunkLen = 0;
     uint32_t _srcSampleRate = 0;

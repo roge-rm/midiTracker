@@ -4,7 +4,17 @@
 #include "pins.h" // SAMPLE_RATE
 #include "shared_ram_arena.h"
 #include <string.h>
+#include <stdio.h>
 #include "mp3dec.h"
+
+// What load() saw while looking for layer III frames, to say why it found
+// none: layer I or II frames with the next frame's header where it should
+// be, and free format layer III headers (no bitrate, so no length) that
+// repeat the first one's version, rate and mode.
+struct Mp3OtherFrames {
+    uint32_t layer12 = 0, freeFormat = 0;
+    uint8_t freeSig[3] = {0, 0, 0};
+};
 
 namespace {
 
@@ -57,6 +67,7 @@ struct Core1 {
     uint32_t step, frac;
     int16_t lastL, lastR, nextL, nextR;
     bool starving;
+    uint8_t skip; // decoded frames still to drop, see Mp3Player::seekTo()
 };
 Core1 g_c1;
 
@@ -94,6 +105,38 @@ void noteDecode(uint32_t us) {
 size_t poolBytes() { return ((size_t)MP3PoolBytes() + 15) & ~(size_t)15; }
 
 uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
+uint32_t be16(const uint8_t* p) { return ((uint32_t)p[0] << 8) | p[1]; }
+
+// Bytes in a layer I or II frame, 0 if h isn't one.
+uint32_t otherFrameBytes(const uint8_t* h) {
+    static const uint16_t L1V1[15] = {0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448};
+    static const uint16_t L2V1[15] = {0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384};
+    static const uint16_t L1V2[15] = {0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256};
+    static const uint16_t L2V2[15] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160};
+    static const uint16_t RATES[3] = {44100, 48000, 32000};
+    if (h[0] != 0xFF || (h[1] & 0xE0) != 0xE0) return 0;
+    int ver = (h[1] >> 3) & 3, layer = (h[1] >> 1) & 3;
+    int bi = h[2] >> 4, ri = (h[2] >> 2) & 3;
+    if (ver == 1 || layer < 2 || bi == 0 || bi == 15 || ri == 3) return 0;
+    uint32_t rate = RATES[ri] >> (ver == 3 ? 0 : ver == 2 ? 1 : 2);
+    uint32_t pad = (h[2] >> 1) & 1;
+    if (layer == 3) return (12000u * (ver == 3 ? L1V1[bi] : L1V2[bi]) / rate + pad) * 4;
+    return 144000u * (ver == 3 ? L2V1[bi] : L2V2[bi]) / rate + pad;
+}
+
+void countOther(const uint8_t* h, int avail, Mp3OtherFrames& o) {
+    uint32_t len = otherFrameBytes(h);
+    if (len) {
+        if ((int)len + 4 <= avail && otherFrameBytes(h + len) && ((h[1] ^ h[len + 1]) & 0x0E) == 0) o.layer12++;
+        return;
+    }
+    if (h[0] != 0xFF || (h[1] & 0xE0) != 0xE0) return;
+    int ver = (h[1] >> 3) & 3, layer = (h[1] >> 1) & 3, ri = (h[2] >> 2) & 3;
+    if (ver == 1 || layer != 1 || (h[2] >> 4) != 0 || ri == 3) return;
+    uint8_t sig[3] = {(uint8_t)(h[1] & 0xFE), (uint8_t)(h[2] & 0xFC), (uint8_t)(h[3] & 0xC0)};
+    if (o.freeFormat == 0) memcpy(o.freeSig, sig, 3);
+    if (!memcmp(sig, o.freeSig, 3)) o.freeFormat++;
+}
 
 // Bytes in a layer III frame from its 4-byte header, 0 if it isn't one.
 uint32_t frameBytes(const uint8_t* h, uint32_t& rate, uint32_t& kbps, uint8_t& version, bool& mono) {
@@ -252,6 +295,10 @@ DecodeResult decodeOne() {
         }
         consume(w.tail, w.len - (uint32_t)left);
         if (err) return DECODED; // no audio: bit reservoir not filled yet, or a bad frame
+        if (g_c1.skip) {
+            g_c1.skip--;
+            return DECODED;
+        }
         MP3FrameInfo fi;
         MP3GetLastFrameInfo((HMP3Decoder)g_c1.dec, &fi);
         g_c1.pcmChannels = (uint8_t)fi.nChans;
@@ -313,6 +360,7 @@ void Mp3Player::core1Decode() {
     leave();
 }
 
+
 // ---- core 0 ----
 
 size_t Mp3Player::decoderBytes() { return (size_t)MP3PoolBytes(); }
@@ -324,6 +372,15 @@ bool Mp3Player::fail(const char* msg) {
     if (_file) _file.close();
     _state = STATE_ERROR;
     return false;
+}
+
+void Mp3Player::refuse(const char* msg) {
+    close();
+    fail(msg);
+}
+
+void Mp3Player::formatText(char* out, size_t size) const {
+    snprintf(out, size, "%luK %s", (unsigned long)(_bitrate / 1000), _vbr ? "VBR" : "CBR");
 }
 
 bool Mp3Player::fillScan() {
@@ -401,9 +458,244 @@ void Mp3Player::stopCore1() {
     MP3_DMB(); // acquire: core 1's writes before it left
 }
 
+void Mp3Player::restartClock(uint32_t ms) {
+    _startMs = ms;
+    _ringBase = Synth::wavStreamWritten();
+}
+
+bool Mp3Player::syncScan(uint32_t maxBytes, uint32_t want, Mp3OtherFrames* other) {
+    uint32_t searched = 0;
+    while (searched < maxBytes) {
+        fillScan();
+        uint8_t* p = g_c1.ring + _inPos;
+        int avail = (int)(_inLen - _inPos);
+        if (avail < 4) return false;
+        int off = MP3FindSyncWord(p, avail);
+        if (off < 0) {
+            searched += avail - 3;
+            _inPos = _inLen - 3;
+            continue;
+        }
+        _inPos += off;
+        searched += off;
+        p += off;
+        avail -= off;
+        if (avail < 4) continue;
+        uint32_t rate, kbps, rate2, kbps2;
+        uint8_t ver, ver2;
+        bool mono, mono2;
+        uint32_t len = frameBytes(p, rate, kbps, ver, mono);
+        if (len == 0 && other) countOther(p, avail, *other);
+        bool ok = len != 0 && (!want || rate == want) && (int)len + 4 <= avail;
+        uint32_t len2 = ok ? frameBytes(p + len, rate2, kbps2, ver2, mono2) : 0;
+        ok = len2 != 0 && rate2 == rate && ver2 == ver;
+        // A third header when the buffer holds it.
+        if (ok && (int)(len + len2 + 4) <= avail) ok = frameBytes(p + len + len2, rate2, kbps2, ver2, mono2) != 0 && rate2 == rate;
+        if (ok) return true;
+        _inPos++;
+        searched++;
+    }
+    return false;
+}
+
+bool Mp3Player::findFirstFrame() {
+    Mp3OtherFrames other;
+    if (!syncScan(65536, 0, &other)) {
+        // A stray header or two turns up in any file, a real one has many.
+        if (other.layer12 >= 4 && other.layer12 >= other.freeFormat) return fail("layer I/II not supported");
+        if (other.freeFormat >= 8) return fail("free format not supported");
+        return fail("not an MP3 file");
+    }
+    uint8_t* p = g_c1.ring + _inPos;
+    int avail = (int)(_inLen - _inPos);
+    const uint8_t* bufEnd = p + avail;
+    uint32_t rate, kbps;
+    uint8_t ver;
+    bool mono;
+    uint32_t len = frameBytes(p, rate, kbps, ver, mono);
+    _rate = rate;
+    _version = ver;
+    _channels = mono ? 1 : 2;
+    _samplesPerFrame = ver == 1 ? 1152 : 576;
+    _bitrate = kbps * 1000;
+    _tagFrame = _filePos - (_inLen - _inPos);
+
+    // A Xing/Info header sits after the side info, a VBRI 32 bytes after the header.
+    uint32_t side = ver == 1 ? (mono ? 17 : 32) : (mono ? 9 : 17);
+    const uint8_t* x = p + 4 + side;
+    const uint8_t* v = p + 4 + 32;
+    uint32_t frames = 0;
+    _vbrTag[0] = 0;
+    if (x + 8 <= bufEnd && (!memcmp(x, "Xing", 4) || !memcmp(x, "Info", 4))) {
+        memcpy(_vbrTag, x, 4);
+        _vbr = x[0] == 'X';
+        uint32_t flags = be32(x + 4);
+        const uint8_t* q = x + 8;
+        if ((flags & 1) && q + 4 <= bufEnd) { frames = be32(q); q += 4; }
+        if ((flags & 2) && q + 4 <= bufEnd) { _tagBytes = be32(q); q += 4; }
+        if ((flags & 4) && q + 100 <= bufEnd) {
+            memcpy(_toc, q, 100);
+            _hasToc = true;
+            for (int i = 1; i < 100; i++) {
+                if (_toc[i] < _toc[i - 1]) _hasToc = false; // not a usable table
+            }
+        }
+    } else if (v + 26 <= bufEnd && !memcmp(v, "VBRI", 4)) {
+        memcpy(_vbrTag, v, 4);
+        _vbr = true;
+        _tagBytes = be32(v + 10);
+        frames = be32(v + 14);
+        uint32_t entries = be16(v + 18), scale = be16(v + 20), entryBytes = be16(v + 22), perEntry = be16(v + 24);
+        if (entries && scale && entryBytes >= 1 && entryBytes <= 4 && perEntry) {
+            _vbriTable = _tagFrame + 36 + 26;
+            _vbriEntries = (uint16_t)entries;
+            _vbriScale = (uint16_t)scale;
+            _vbriEntryBytes = (uint16_t)entryBytes;
+            _vbriFramesPerEntry = (uint16_t)perEntry;
+        }
+    }
+    _vbrTag[4] = 0;
+    if (_vbrTag[0]) _inPos += len; // the header frame holds no audio
+    _audioStart = _filePos - (_inLen - _inPos);
+
+    if (frames) {
+        _totalMs = (uint32_t)((uint64_t)frames * _samplesPerFrame * 1000 / _rate);
+        _tagMs = _totalMs;
+        if (_tagBytes && _totalMs) _bitrate = (uint32_t)((uint64_t)_tagBytes * 8000 / _totalMs);
+        // A cut file holds less than the header says.
+        uint32_t have = _dataEnd - _tagFrame;
+        if (_tagBytes > have + 4096) _totalMs = (uint32_t)((uint64_t)_totalMs * have / _tagBytes);
+    } else {
+        // The first frames in the buffer: their average bitrate, and VBR
+        // when they differ.
+        const uint8_t* f = g_c1.ring + _inPos;
+        uint32_t sum = 0, n = 0, first = 0;
+        while (n < 16 && f + 4 <= bufEnd) {
+            uint32_t r, k;
+            uint8_t vv;
+            bool m;
+            uint32_t l = frameBytes(f, r, k, vv, m);
+            if (l == 0 || r != _rate) break;
+            if (n == 0) first = k;
+            else if (k != first) _vbr = true;
+            sum += k;
+            n++;
+            f += l;
+        }
+        if (n) _bitrate = sum * 1000 / n;
+        _totalMs = _bitrate ? (uint32_t)((uint64_t)(_dataEnd - _audioStart) * 8000 / _bitrate) : 0;
+    }
+    return true;
+}
+
+bool Mp3Player::testDecode() {
+    // Top the scan buffer up so it holds a few frames.
+    uint32_t have = _inLen - _inPos;
+    if (!_eof && have < SCAN_SIZE) {
+        memmove(g_c1.ring, g_c1.ring + _inPos, have);
+        _inPos = 0;
+        _inLen = have;
+        uint32_t len = SCAN_SIZE - have;
+        if (len > _dataEnd - _filePos) len = _dataEnd - _filePos;
+        int got = len ? _file.read(g_c1.ring + have, len) : 0;
+        if (got > 0) {
+            _filePos += (uint32_t)got;
+            _inLen += (uint32_t)got;
+        }
+    }
+    unsigned char* p = g_c1.ring + _inPos;
+    int left = (int)(_inLen - _inPos);
+    int good = 0, bad = 0;
+    for (int i = 0; i < 6 && good == 0 && bad < 3; i++) {
+        int off = MP3FindSyncWord(p, left);
+        if (off < 0) break;
+        p += off;
+        left -= off;
+        unsigned char* before = p;
+        int err = MP3Decode((HMP3Decoder)_dec, &p, &left, g_c1.pcm, 0);
+        if (err == ERR_MP3_NONE) good++;
+        else if (err == ERR_MP3_INDATA_UNDERFLOW) break; // end of the buffer
+        else if (err != ERR_MP3_MAINDATA_UNDERFLOW) bad++; // that one is the bit reservoir filling
+        if (p == before) { // not moved on, step past this sync word
+            p++;
+            left--;
+        }
+    }
+    _dec = MP3InitDecoder(); // fresh state for playing
+    g_c1.dec = _dec;
+    return good > 0 || bad == 0;
+}
+
+uint32_t Mp3Player::seekOffset(uint32_t ms) {
+    if (!_totalMs) return _audioStart;
+    if (_hasToc && _tagMs) {
+        // The TOC gives the byte position at each whole percent, in 256ths.
+        uint32_t q = (uint32_t)((uint64_t)ms * 100000 / _tagMs); // thousandths of a percent
+        if (q > 99999) q = 99999;
+        uint32_t i = q / 1000, frac = q % 1000;
+        uint32_t a = _toc[i], b = i < 99 ? _toc[i + 1] : 256;
+        uint32_t x = a * 1000 + (b - a) * frac; // 256000ths of the stream
+        uint32_t bytes = _tagBytes ? _tagBytes : _dataEnd - _tagFrame;
+        return _tagFrame + (uint32_t)((uint64_t)x * bytes / 256000);
+    }
+    if (_vbriTable) {
+        // Each entry is the bytes of the next _vbriFramesPerEntry frames.
+        uint32_t target = (uint32_t)((uint64_t)ms * _rate / 1000 / _samplesPerFrame);
+        uint32_t pos = 0, frames = 0;
+        uint8_t buf[64];
+        uint32_t per = _vbriEntryBytes, inBuf = 0, at = 0;
+        if (!_file.seekSet(_vbriTable)) return _audioStart;
+        for (uint32_t i = 0; i < _vbriEntries; i++) {
+            if (at + per > inBuf) {
+                uint32_t want = (_vbriEntries - i) * per;
+                if (want > sizeof(buf) / per * per) want = sizeof(buf) / per * per;
+                int got = _file.read(buf, want);
+                if (got < (int)per) break;
+                inBuf = (uint32_t)got;
+                at = 0;
+            }
+            uint32_t e = 0;
+            for (uint32_t k = 0; k < per; k++) e = (e << 8) | buf[at + k];
+            at += per;
+            uint32_t bytes = e * _vbriScale;
+            if (frames + _vbriFramesPerEntry > target) {
+                pos += (uint32_t)((uint64_t)bytes * (target - frames) / _vbriFramesPerEntry);
+                return _tagFrame + pos;
+            }
+            pos += bytes;
+            frames += _vbriFramesPerEntry;
+        }
+        return _tagFrame + pos;
+    }
+    return _audioStart + (uint32_t)((uint64_t)(_dataEnd - _audioStart) * ms / _totalMs);
+}
+
+bool Mp3Player::startStream(uint32_t pos) {
+    if (pos < _audioStart) pos = _audioStart;
+    if (pos >= _dataEnd || !_file.seekSet(pos)) return false;
+    _filePos = pos;
+    _inPos = _inLen = 0;
+    _eof = false;
+    // Two frames in a row at this file's rate, within 16 KB.
+    if (pos != _audioStart && !syncScan(16384, _rate, nullptr)) return false;
+    uint32_t first = _filePos - (_inLen - _inPos);
+    if (!_file.seekSet(first)) return false;
+    _filePos = first;
+    _eof = first >= _dataEnd;
+    g_sh.head = g_sh.tail = 0;
+    g_sh.eof = _eof;
+    g_sh.ended = false;
+    for (int i = 0; i < 4 && !_eof; i++) fillRing();
+    return true;
+}
+
 bool Mp3Player::load(const char* path) {
     close();
     _error[0] = '\0';
+    hashPath(path);
+    _totalMs = _bitrate = _rate = _tagBytes = _tagMs = _vbriTable = 0;
+    _vbr = _hasToc = false;
+    _vbrTag[0] = 0;
     if (!sdOpenPath(_file, path, O_RDONLY)) return fail("could not open file");
     uint32_t size = (uint32_t)_file.fileSize();
 
@@ -438,100 +730,50 @@ bool Mp3Player::load(const char* path) {
     if (!_dec) return fail("decoder init failed");
     g_c1.dec = _dec;
 
-    if (!findFirstFrame()) return fail(_error[0] ? _error : "not an MP3 file");
-
-    // Stream from the first audio frame on, through the ring.
-    uint32_t first = _filePos - (_inLen - _inPos);
-    if (!_file.seekSet(first)) return fail("seek failed");
-    _filePos = first;
-    _eof = first >= _dataEnd;
-    g_sh.head = g_sh.tail = 0;
-    g_sh.eof = _eof;
-    g_sh.ended = false;
-    for (int i = 0; i < 4 && !_eof; i++) fillRing();
+    if (!findFirstFrame()) return false;
+    if (!testDecode()) return fail("can't decode this file");
+    if (!startStream(_audioStart)) return fail("can't read this file");
 
     g_c1.step = (uint32_t)(((uint64_t)_rate << 16) / SAMPLE_RATE);
     g_c1.frac = 0x20000; // the first two advance() steps fill last and next
     g_c1.outPerFrame = (uint32_t)(((uint64_t)_samplesPerFrame * SAMPLE_RATE + _rate - 1) / _rate) + 2;
     Synth::wavStreamReset();
     _underrunBase = Synth::wavStreamUnderrunSamples();
-    _ringBase = Synth::wavStreamWritten();
+    restartClock(0);
     _state = STATE_PAUSED;
     MP3_DMB(); // release: everything above before core 1 may start
     g_sh.run = true;
     return true;
 }
 
-bool Mp3Player::findFirstFrame() {
-    // Look up to 64 KB in for two frames in a row.
-    uint32_t searched = 0;
-    while (searched < 65536) {
-        fillScan();
-        uint8_t* p = g_c1.ring + _inPos;
-        int avail = (int)(_inLen - _inPos);
-        if (avail < 4) return false;
-        int off = MP3FindSyncWord(p, avail);
-        if (off < 0) {
-            searched += avail - 3;
-            _inPos = _inLen - 3;
-            continue;
-        }
-        _inPos += off;
-        searched += off;
-        p += off;
-        avail -= off;
-        if (avail < 4) continue;
-        uint32_t rate, kbps;
-        uint8_t ver;
-        bool mono;
-        uint32_t len = frameBytes(p, rate, kbps, ver, mono);
-        uint32_t rate2, kbps2;
-        uint8_t ver2;
-        bool mono2;
-        if (len == 0 || (int)len + 4 > avail || frameBytes(p + len, rate2, kbps2, ver2, mono2) == 0 || rate2 != rate) {
-            _inPos++;
-            searched++;
-            continue;
-        }
-        _rate = rate;
-        _version = ver;
-        _channels = mono ? 1 : 2;
-        _samplesPerFrame = ver == 1 ? 1152 : 576;
-        _bitrate = kbps * 1000;
-
-        // A Xing/Info header sits after the side info, a VBRI 32 bytes after the header.
-        uint32_t side = ver == 1 ? (mono ? 17 : 32) : (mono ? 9 : 17);
-        const uint8_t* x = p + 4 + side;
-        const uint8_t* v = p + 4 + 32;
-        uint32_t frames = 0, bytes = 0;
-        _vbrTag[0] = 0;
-        if (!memcmp(x, "Xing", 4) || !memcmp(x, "Info", 4)) {
-            memcpy(_vbrTag, x, 4);
-            uint32_t flags = be32(x + 4);
-            const uint8_t* q = x + 8;
-            if (flags & 1) { frames = be32(q); q += 4; }
-            if (flags & 2) bytes = be32(q);
-        } else if (!memcmp(v, "VBRI", 4)) {
-            memcpy(_vbrTag, v, 4);
-            bytes = be32(v + 10);
-            frames = be32(v + 14);
-        }
-        _vbrTag[4] = 0;
-        uint32_t audioStart = _filePos - (_inLen - _inPos);
-        if (_vbrTag[0]) _inPos += len; // the header frame holds no audio
-        if (frames) {
-            _totalMs = (uint32_t)((uint64_t)frames * _samplesPerFrame * 1000 / _rate);
-            if (bytes && _totalMs) _bitrate = (uint32_t)((uint64_t)bytes * 8000 / _totalMs);
-        } else {
-            if (_vbrTag[0] && (int)(len * 2 + 4) <= avail) {
-                frameBytes(p + len, rate2, kbps2, ver2, mono2); // the first audio frame's bitrate
-                _bitrate = kbps2 * 1000;
-            }
-            _totalMs = _bitrate ? (uint32_t)((uint64_t)(_dataEnd - audioStart) * 8000 / _bitrate) : 0;
-        }
-        return true;
+void Mp3Player::seekTo(uint32_t targetMs) {
+    if (_state != STATE_PLAYING && _state != STATE_PAUSED && _state != STATE_DONE) return;
+    if (targetMs > _totalMs) targetMs = _totalMs;
+    bool wasPlaying = _state == STATE_PLAYING;
+    stopCore1();
+    Synth::wavStreamReset();
+    uint32_t pos = seekOffset(targetMs);
+    bool ok = targetMs < _totalMs && startStream(pos);
+    restartClock(targetMs);
+    if (!ok) {
+        _state = STATE_DONE; // core 1 stays out until the next seek or load
+        return;
     }
-    return false;
+    // A fresh decoder. Past the first frame, the frames before aren't
+    // there, so the first ones fail on the missing bit reservoir and give
+    // nothing, and the first that decodes is dropped, as its overlap with
+    // the frame before is missing.
+    _dec = MP3InitDecoder();
+    g_c1.dec = _dec;
+    g_c1.pcmFrames = g_c1.pcmPos = 0;
+    g_c1.frac = 0x20000;
+    g_c1.lastL = g_c1.lastR = g_c1.nextL = g_c1.nextR = 0;
+    g_c1.starving = false;
+    g_c1.skip = pos <= _audioStart ? 0 : 1;
+    _state = wasPlaying ? STATE_PLAYING : STATE_PAUSED;
+    Synth::wavStreamSetActive(wasPlaying);
+    MP3_DMB(); // release: everything above before core 1 may start
+    g_sh.run = true;
 }
 
 bool Mp3Player::ringDrained() const {
@@ -542,7 +784,10 @@ bool Mp3Player::ringDrained() const {
 void Mp3Player::update() {
     if (_state != STATE_PLAYING && _state != STATE_PAUSED) return;
     fillRing();
-    if (_state == STATE_PLAYING && g_sh.ended) {
+    if (_state != STATE_PLAYING) return;
+    uint32_t e = elapsedMs();
+    if (e > _totalMs) _totalMs = e; // the estimate was short
+    if (g_sh.ended) {
         MP3_DMB(); // acquire: ended read before the stream state
         if (ringDrained()) _state = STATE_DONE;
     }
@@ -561,7 +806,7 @@ void Mp3Player::pause() {
 }
 
 void Mp3Player::close() {
-    if (_dec) stopCore1();
+    stopCore1();
     if (_file) _file.close();
     if (_dec) MP3FreeDecoder((HMP3Decoder)_dec);
     _dec = nullptr;
@@ -574,7 +819,7 @@ uint32_t Mp3Player::elapsedMs() const {
     if (_state == STATE_DONE) return _totalMs;
     if (_state != STATE_PLAYING && _state != STATE_PAUSED) return 0;
     uint32_t played = Synth::wavStreamPlayed() - _ringBase;
-    return (uint32_t)((uint64_t)played * 1000u / SAMPLE_RATE);
+    return _startMs + (uint32_t)((uint64_t)played * 1000u / SAMPLE_RATE);
 }
 
 uint32_t Mp3Player::underrunSamples() const { return Synth::wavStreamUnderrunSamples() - _underrunBase; }
@@ -609,4 +854,8 @@ Mp3Player::Profile Mp3Player::profileTake() {
 }
 #endif
 
+// In RAM: loop1() asks every sample, MP3 or not.
+#ifdef ARDUINO_ARCH_RP2040
+__attribute__((section(".time_critical.mp3_core1Active")))
+#endif
 bool Mp3Player::core1Active() { return g_sh.run; }
