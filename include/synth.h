@@ -315,4 +315,44 @@ bool wavStreamTookUnderrun();
 // to see how many samples were actually dropped in a given window.
 uint32_t wavStreamUnderrunSamples();
 
+#ifdef TRACKER_PROFILE
+// Core 1 render cost since profileReset(), in CPU cycles.
+struct SynthProfile {
+    uint32_t peakSampleCycles, avgSampleCycles, peakBlockCycles, peakVoices;
+    uint32_t sheds, shedsTotal, peakUsedTotal;
+};
+void profileReset();
+void profileGet(SynthProfile& p);
+
+// Hang trace, kept in RAM a watchdog reset leaves alone. where1 is set by
+// core 1 (PW_* codes, | voice index while a voice renders), where0 by
+// core 0. vstate per voice: bit 0 active, bits 1-2 stage, bit 3 note
+// queued behind a steal, bit 4 held; vamp is amplitude >> 16.
+const uint32_t PROFILE_TRACE_MAGIC = 0x50524F46;
+enum : uint32_t {
+    PW_DRAIN = 0x10, PW_MESSAGE = 0x11, PW_NOTE_ON = 0x12, PW_STEAL = 0x13, PW_START_PENDING = 0x14,
+    PW_RENDER = 0x20, PW_VOICE = 0x100, PW_MIX = 0x21, PW_GOVERNOR = 0x22, PW_SHED = 0x23, PW_I2S = 0x24,
+    PW0_IDLE = 0x1000, PW0_FIND = 0x1001, PW0_LOAD = 0x1002, PW0_PLAY = 0x1003, PW0_UPDATE = 0x1004,
+    PW0_PRINT = 0x1005, PW0_STOP = 0x1006, PW0_PUSH_WAIT = 0x1007,
+};
+struct ProfileTrace {
+    uint32_t magic;
+    uint32_t armed;          // 1 while a .mid plays under the watchdog
+    volatile uint32_t where1, count1, lastMsg1, msgs1;
+    volatile uint32_t where0, lastMsg0, pushes0, pushWaitUs, ms0;
+    uint32_t snapAt;         // count1 at the voice snapshot below
+    uint8_t vstate[32];
+    int16_t vamp[32];
+    uint32_t msgHead, msgTail;
+    uint32_t faultMagic, faultCore, faultPc, faultLr, faultSp;
+};
+ProfileTrace& profileTrace();
+// Prints a trace (a saved copy after a reboot, or the live one).
+void profilePrintTrace(const ProfileTrace& t, const char* why);
+// Takes a voice snapshot now and prints the live trace.
+void profileDump(const char* why);
+// One line: core 1 progress, where both cores are, ring use, voices.
+void profileHeartbeat();
+#endif
+
 } // namespace Synth

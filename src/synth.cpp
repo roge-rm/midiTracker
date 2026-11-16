@@ -19,6 +19,20 @@ uint32_t g_hostGovernorSheds = 0;
 #include <hardware/clocks.h>
 #endif
 
+#if defined(TRACKER_PROFILE) && !defined(HOST_MIDI)
+#include <Arduino.h>
+#include <hardware/timer.h>
+// Profile build only: where each core is, in RAM that a watchdog reset
+// leaves alone, so a hang can be read back after the reboot (see
+// tracker_profile.cpp). where1/where0 are PW_* codes.
+__attribute__((section(".uninitialized_data.proftrace"))) Synth::ProfileTrace g_trace;
+#define PROF_WHERE1(n) (g_trace.where1 = (n))
+#define PROF_WHERE0(n) (g_trace.where0 = (n))
+#else
+#define PROF_WHERE1(n) ((void)0)
+#define PROF_WHERE0(n) ((void)0)
+#endif
+
 namespace {
 
 // Cross-core message format, one 32-bit word per event in the message
@@ -131,6 +145,26 @@ void drainMessages(int maxMessages);
 // samples at most (it drains up to 32 a sample).
 void pushMsg(uint32_t msg) {
     uint32_t head = g_msgHead;
+#if defined(TRACKER_PROFILE) && !defined(HOST_MIDI)
+    // Profile build: a wait of 200 ms means core 1 stopped draining, so
+    // say where it is, once per boot.
+    static bool told = false;
+    g_trace.lastMsg0 = msg;
+    g_trace.pushes0++;
+    if (head - g_msgTail >= MSG_RING_SIZE) {
+        uint32_t was = g_trace.where0, t0 = time_us_32();
+        g_trace.where0 = Synth::PW0_PUSH_WAIT;
+        while (head - g_msgTail >= MSG_RING_SIZE) {
+            uint32_t waited = time_us_32() - t0;
+            g_trace.pushWaitUs = waited;
+            if (!told && waited > 200000) {
+                told = true;
+                Synth::profileDump("pushMsg waited 200 ms for core 1");
+            }
+        }
+        g_trace.where0 = was;
+    }
+#endif
     while (head - g_msgTail >= MSG_RING_SIZE) {
 #ifdef HOST_MIDI
         drainMessages(MSG_RING_SIZE); // host: core 1 runs on this thread
@@ -1645,6 +1679,7 @@ const uint16_t STEAL_FADE_K = 8784;
 // old note's waveform and filter never jump. renderVoice() calls
 // startPending() when the fade ends.
 void startStealFade(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity) {
+    PROF_WHERE1(Synth::PW_STEAL);
     v.pendNote = note;
     v.pendVel = velocity;
     v.pendChan = channel;
@@ -1657,6 +1692,7 @@ void startStealFade(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity) {
 }
 
 void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
+    PROF_WHERE1(Synth::PW_NOTE_ON);
     if (channel == PERCUSSION_CHANNEL) {
         // Closed and pedal hi-hat choke the open hi-hat.
         if (note == 42 || note == 44) {
@@ -1722,6 +1758,7 @@ void handleNoteOff(uint8_t channel, uint8_t note) {
 // startStealFade()), from silence. Called from renderVoice(), so it stays
 // out of line; it only runs once per steal.
 __attribute__((noinline)) void startPending(Voice& v) {
+    PROF_WHERE1(Synth::PW_START_PENDING);
     uint8_t channel = v.pendChan & 0x0F;
     bool off = (v.pendChan & PEND_OFF) != 0;
     bool latched = (v.pendChan & PEND_SOST_LATCHED) != 0;
@@ -2333,6 +2370,7 @@ void __not_in_flash_func(renderSample)(int16_t& outLeft, int16_t& outRight) {
     int32_t mixL = 0, mixR = 0, sendSum = 0;
     for (int i = 0; i < NUM_VOICES; i++) {
         if (!g_voices[i].active) continue;
+        PROF_WHERE1(Synth::PW_VOICE | i);
         int32_t l, r, snd;
         renderVoice(g_voices[i], lfoValue, l, r, snd);
 #ifdef __thumb__
@@ -2346,6 +2384,7 @@ void __not_in_flash_func(renderSample)(int16_t& outLeft, int16_t& outRight) {
 #endif
     }
 
+    PROF_WHERE1(Synth::PW_MIX);
     // WAV and tracker frames keep their own path below.
     bool wavLive = g_wavActive;
     int32_t wavL = 0, wavR = 0;
@@ -2745,6 +2784,7 @@ bool Synth::wavStreamTookUnderrun() {
     return v;
 }
 
+
 uint32_t Synth::wavStreamUnderrunSamples() {
     return g_wavUnderrunSamples;
 }
@@ -2888,7 +2928,14 @@ __attribute__((noinline)) void handleMessage(uint32_t msg) {
 // Core 1: applies up to maxMessages waiting messages.
 void drainMessages(int maxMessages) {
     uint32_t msg;
-    while (maxMessages-- > 0 && popMsg(msg)) handleMessage(msg);
+    while (maxMessages-- > 0 && popMsg(msg)) {
+#if defined(TRACKER_PROFILE) && !defined(HOST_MIDI)
+        g_trace.where1 = Synth::PW_MESSAGE;
+        g_trace.lastMsg1 = msg;
+        g_trace.msgs1++;
+#endif
+        handleMessage(msg);
+    }
 }
 
 } // namespace
@@ -2907,6 +2954,13 @@ uint32_t g_governorCount = 0;
 bool g_governorHold = false;
 uint32_t g_governorSheds = 0;     // voices shed since boot, for debugging
 uint32_t g_governorPeakUsed = 0;  // busiest block since boot, in cycles
+
+#ifdef TRACKER_PROFILE
+// Profile build only: render cycles per sample on core 1, read by core 0.
+uint32_t g_profPeakSample = 0, g_profPeakBlock = 0, g_profPeakVoices = 0;
+uint64_t g_profSumCycles = 0;
+uint32_t g_profSamples = 0, g_profSheds0 = 0;
+#endif
 
 void setupGovernor() {
 #ifndef HOST_MIDI
@@ -2947,7 +3001,16 @@ ALWAYS_INLINE void __not_in_flash_func(governorTick)(uint32_t used) {
     g_governorUsed += used;
     if (++g_governorCount < (uint32_t)GOVERNOR_BLOCK) return;
     if (g_governorUsed > g_governorPeakUsed) g_governorPeakUsed = g_governorUsed;
+#ifdef TRACKER_PROFILE
+    if (g_governorUsed > g_profPeakBlock) g_profPeakBlock = g_governorUsed;
+    {
+        uint32_t n = 0;
+        for (int i = 0; i < NUM_VOICES; i++) n += g_voices[i].active;
+        if (n > g_profPeakVoices) g_profPeakVoices = n;
+    }
+#endif
     if (g_governorUsed > g_governorLimit && !g_governorHold) {
+        PROF_WHERE1(Synth::PW_SHED);
         governorShed();
         g_governorHold = true;
     } else {
@@ -2960,15 +3023,38 @@ ALWAYS_INLINE void __not_in_flash_func(governorTick)(uint32_t used) {
 void __not_in_flash_func(loop1)() {
     // A cap per sample keeps a long burst from holding up one sample; the
     // rest wait for the next sample.
+#if defined(TRACKER_PROFILE) && !defined(HOST_MIDI)
+    g_trace.count1++;
+    g_trace.where1 = Synth::PW_DRAIN;
+#endif
     drainMessages(32);
 #ifndef HOST_MIDI
+    PROF_WHERE1(Synth::PW_RENDER);
     uint32_t start = systick_hw->cvr; // render time only, see governorTick()
 #endif
 
     int16_t left, right;
     renderSample(left, right);
 #ifndef HOST_MIDI
-    governorTick((start - systick_hw->cvr) & 0x00FFFFFF);
+    uint32_t cyc = (start - systick_hw->cvr) & 0x00FFFFFF;
+#ifdef TRACKER_PROFILE
+    if (cyc > g_profPeakSample) g_profPeakSample = cyc;
+    g_profSumCycles += cyc;
+    g_profSamples++;
+    g_trace.where1 = Synth::PW_GOVERNOR;
+    // Voice snapshot every 1024 samples, for the trace after a hang.
+    if ((g_trace.count1 & 1023) == 0) {
+        for (int i = 0; i < NUM_VOICES && i < 32; i++) {
+            const Voice& v = g_voices[i];
+            g_trace.vstate[i] = (uint8_t)(v.active | ((v.stage & 3) << 1) | ((v.pendVel != 0) << 3) | (v.held << 4));
+            g_trace.vamp[i] = (int16_t)(v.amplitude >> 16);
+        }
+        g_trace.snapAt = g_trace.count1;
+        g_trace.msgHead = g_msgHead;
+        g_trace.msgTail = g_msgTail;
+    }
+#endif
+    governorTick(cyc);
 #else
     if (g_hostGovernorModel) {
         // About what the disassembly gives: 125 cycles a voice, 150 with
@@ -2982,5 +3068,123 @@ void __not_in_flash_func(loop1)() {
         governorTick(used);
     }
 #endif
+    PROF_WHERE1(Synth::PW_I2S);
     g_i2s.write16(left, right); // blocks until DMA buffer space is free, paces this loop
 }
+
+#ifdef TRACKER_PROFILE
+void Synth::profileReset() {
+    g_profPeakSample = g_profPeakBlock = g_profPeakVoices = 0;
+    g_profSumCycles = 0;
+    g_profSamples = 0;
+    g_profSheds0 = g_governorSheds;
+}
+void Synth::profileGet(SynthProfile& p) {
+    p.peakSampleCycles = g_profPeakSample;
+    p.avgSampleCycles = g_profSamples ? (uint32_t)(g_profSumCycles / g_profSamples) : 0;
+    p.peakBlockCycles = g_profPeakBlock;
+    p.peakVoices = g_profPeakVoices;
+    p.sheds = g_governorSheds - g_profSheds0;
+    p.shedsTotal = g_governorSheds;
+    p.peakUsedTotal = g_governorPeakUsed;
+}
+#endif
+
+#if defined(TRACKER_PROFILE) && !defined(HOST_MIDI)
+Synth::ProfileTrace& Synth::profileTrace() { return g_trace; }
+
+static const char* whereName(uint32_t w) {
+    if (w & Synth::PW_VOICE && w < 0x1000) return "renderVoice";
+    switch (w) {
+        case Synth::PW_DRAIN: return "loop1 drain";
+        case Synth::PW_MESSAGE: return "handleMessage";
+        case Synth::PW_NOTE_ON: return "handleNoteOn";
+        case Synth::PW_STEAL: return "startStealFade";
+        case Synth::PW_START_PENDING: return "startPending";
+        case Synth::PW_RENDER: return "renderSample";
+        case Synth::PW_MIX: return "renderSample mix/reverb";
+        case Synth::PW_GOVERNOR: return "governorTick";
+        case Synth::PW_SHED: return "governorShed";
+        case Synth::PW_I2S: return "i2s write16";
+        case Synth::PW0_IDLE: return "idle";
+        case Synth::PW0_FIND: return "findFile";
+        case Synth::PW0_LOAD: return "MidiPlayer load";
+        case Synth::PW0_PLAY: return "MidiPlayer play";
+        case Synth::PW0_UPDATE: return "MidiPlayer update";
+        case Synth::PW0_PRINT: return "profile print";
+        case Synth::PW0_STOP: return "MidiPlayer stop";
+        case Synth::PW0_PUSH_WAIT: return "pushMsg wait";
+        default: return "?";
+    }
+}
+
+void Synth::profilePrintTrace(const Synth::ProfileTrace& t, const char* why) {
+    Serial.printf("TRACE %s\n", why);
+    Serial.printf("TRACE core1 where 0x%lx (%s) voice %ld, loops %lu, msgs %lu, last msg 0x%08lx\n",
+                  (unsigned long)t.where1, whereName(t.where1),
+                  (t.where1 & PW_VOICE) && t.where1 < 0x1000 ? (long)(t.where1 & 0xFF) : -1L,
+                  (unsigned long)t.count1, (unsigned long)t.msgs1, (unsigned long)t.lastMsg1);
+    Serial.printf("TRACE core0 where 0x%lx (%s), pushes %lu, last msg 0x%08lx, push wait %lu us, at %lu ms\n",
+                  (unsigned long)t.where0, whereName(t.where0), (unsigned long)t.pushes0,
+                  (unsigned long)t.lastMsg0, (unsigned long)t.pushWaitUs, (unsigned long)t.ms0);
+    Serial.printf("TRACE ring head %lu tail %lu at loop %lu\n", (unsigned long)t.msgHead,
+                  (unsigned long)t.msgTail, (unsigned long)t.snapAt);
+    Serial.print("TRACE voices (active,stage,queued,held:amp)");
+    for (int i = 0; i < NUM_VOICES && i < 32; i++) {
+        uint8_t s = t.vstate[i];
+        Serial.printf(" %d:%d%d%d%d:%d", i, s & 1, (s >> 1) & 3, (s >> 3) & 1, (s >> 4) & 1, (int)t.vamp[i]);
+    }
+    Serial.println();
+    if (t.faultMagic == PROFILE_TRACE_MAGIC) {
+        Serial.printf("TRACE hard fault on core %lu: pc 0x%08lx lr 0x%08lx sp 0x%08lx\n", (unsigned long)t.faultCore,
+                      (unsigned long)t.faultPc, (unsigned long)t.faultLr, (unsigned long)t.faultSp);
+    }
+    Serial.flush();
+}
+
+void Synth::profileDump(const char* why) {
+    for (int i = 0; i < NUM_VOICES && i < 32; i++) {
+        const Voice& v = g_voices[i];
+        g_trace.vstate[i] = (uint8_t)(v.active | ((v.stage & 3) << 1) | ((v.pendVel != 0) << 3) | (v.held << 4));
+        g_trace.vamp[i] = (int16_t)(v.amplitude >> 16);
+    }
+    g_trace.snapAt = g_trace.count1;
+    g_trace.msgHead = g_msgHead;
+    g_trace.msgTail = g_msgTail;
+    profilePrintTrace(g_trace, why);
+}
+
+void Synth::profileHeartbeat() {
+    int n = 0;
+    for (int i = 0; i < NUM_VOICES; i++) n += g_voices[i].active;
+    Serial.printf("BEAT %lu ms: core1 loops %lu where 0x%lx (%s), core0 where 0x%lx (%s), ring %lu, voices %d, sheds %lu\n",
+                  (unsigned long)millis(), (unsigned long)g_trace.count1, (unsigned long)g_trace.where1,
+                  whereName(g_trace.where1), (unsigned long)g_trace.where0, whereName(g_trace.where0),
+                  (unsigned long)(g_msgHead - g_msgTail), n, (unsigned long)g_governorSheds);
+}
+
+// Profile build: a hard fault on either core records its pc, lr and sp in
+// the trace and spins; the watchdog in tracker_profile.cpp then reboots.
+extern "C" __attribute__((used)) void profileHardFault(uint32_t* frame) {
+    g_trace.faultCore = get_core_num();
+    g_trace.faultPc = frame[6];
+    g_trace.faultLr = frame[5];
+    g_trace.faultSp = (uint32_t)frame;
+    g_trace.faultMagic = Synth::PROFILE_TRACE_MAGIC;
+    for (;;) {}
+}
+
+extern "C" __attribute__((naked)) void isr_hardfault() {
+    asm volatile(
+        "movs r0, #4\n"
+        "mov r1, lr\n"
+        "tst r0, r1\n"
+        "beq 1f\n"
+        "mrs r0, psp\n"
+        "b 2f\n"
+        "1: mrs r0, msp\n"
+        "2: ldr r1, =profileHardFault\n"
+        "bx r1\n"
+        ".ltorg\n");
+}
+#endif
