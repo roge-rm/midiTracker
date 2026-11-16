@@ -313,8 +313,9 @@ const int CONVERT_MAX = 4;
 ConvertTarget convertTargetList[CONVERT_MAX];
 int convertTargetCount = 0;
 int convertCursor = 0;
-char convertSubtitle[MAX_FILENAME_LEN + 12] = {0};
 char convertName[MAX_FILENAME_LEN] = {0}; // the source's display name
+ConvertFormat convertFmt;      // from convertProbe(), for the rows' text
+bool convertFmtKnown = false;
 FileKind convertKind = FILE_WAV;
 bool pendingConvert = false; // the looper's free-tracks gate is up for an MP3 convert
 Converter* converter = nullptr;
@@ -1071,9 +1072,8 @@ void beginEntryMenu() {
         if (isFile) {
             char path[224];
             browser.buildFullPath(selectedIndex, path, sizeof(path));
-            ConvertFormat fmt;
-            bool probed = convertProbe(selected.kind, path, wavPlayer, fmt);
-            convertTargetCount = convertTargets(selected.kind, probed ? &fmt : nullptr, convertTargetList, CONVERT_MAX);
+            convertFmtKnown = convertProbe(selected.kind, path, wavPlayer, convertFmt);
+            convertTargetCount = convertTargets(selected.kind, convertFmtKnown ? &convertFmt : nullptr, convertTargetList, CONVERT_MAX);
         }
         if (convertTargetCount > 0) menuEntries[menuEntryCount++] = {MENU_CONVERT, "Convert"};
         menuEntries[menuEntryCount++] = {MENU_RENAME, "Rename"};
@@ -1774,11 +1774,26 @@ void beginConvertPick() {
     strncpy(convertName, e.name, sizeof(convertName) - 1);
     convertName[sizeof(convertName) - 1] = '\0';
     convertKind = e.kind;
-    snprintf(convertSubtitle, sizeof(convertSubtitle), "Convert %s", convertName);
     convertCursor = 0;
     appState = APP_CONVERT_PICK;
     needsRedraw = true;
 }
+
+// The target rows' titles and notes, into the caller's buffers.
+struct ConvertRows {
+    char title[CONVERT_MAX][24];
+    char note[CONVERT_MAX][48];
+    const char* titles[CONVERT_MAX];
+    const char* notes[CONVERT_MAX];
+    ConvertRows() {
+        for (int i = 0; i < convertTargetCount; i++) {
+            convertTargetText(convertTargetList[i], convertFmtKnown ? &convertFmt : nullptr, title[i], sizeof(title[i]),
+                              note[i], sizeof(note[i]));
+            titles[i] = title[i];
+            notes[i] = note[i];
+        }
+    }
+};
 
 ConvertSource* convertSourceFor(FileKind kind) {
     switch (kind) {
@@ -1845,18 +1860,19 @@ void startConvert() {
 }
 
 void handleConvertPickInput() {
-    const char* labels[CONVERT_MAX];
-    for (int i = 0; i < convertTargetCount; i++) labels[i] = convertTargetLabel(convertTargetList[i]);
     int prev = convertCursor;
     if (Input::justPressed(BTN_UP)) convertCursor = convertCursor > 0 ? convertCursor - 1 : convertTargetCount - 1;
     if (Input::justPressed(BTN_DOWN)) convertCursor = convertCursor < convertTargetCount - 1 ? convertCursor + 1 : 0;
-    if (convertCursor != prev) Ui::updateEntryMenuSelection(labels, convertTargetCount, prev, convertCursor);
+    if (convertCursor != prev) {
+        ConvertRows rows;
+        Ui::updateConvertTargetsCursor(rows.titles, rows.notes, convertTargetCount, prev, convertCursor);
+    }
     if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
         appState = APP_ENTRY_MENU;
         needsRedraw = true;
         return;
     }
-    if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) startConvert();
+    if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_RIGHT) || Input::justPressed(BTN_PLAY)) startConvert();
 }
 
 // Back to the browser from the convert screen, with the new file selected
@@ -2103,6 +2119,10 @@ void recoverTempTakes() {
     dir.close();
     for (int i = 0; i < count; i++) {
         char path[RECORDER_PATH_MAX + 8];
+        // A cut path would name another file, so one that doesn't fit is left alone.
+        const char* dirPath = browser.currentPath();
+        size_t sep = strcmp(dirPath, "/") == 0 ? 0 : 1; // buildPath() adds no second "/" at the root
+        if (strlen(dirPath) + sep + strlen(names[i]) >= sizeof(path)) continue;
         browser.buildPath(names[i], path, sizeof(path));
         // Half a conversion isn't worth keeping, the source is still there.
         if (isConvertTempName(names[i])) sdRemove(path);
@@ -2735,9 +2755,8 @@ bool update() {
             }
 
             case APP_CONVERT_PICK: {
-                const char* labels[CONVERT_MAX];
-                for (int i = 0; i < convertTargetCount; i++) labels[i] = convertTargetLabel(convertTargetList[i]);
-                Ui::drawEntryMenu(convertSubtitle, labels, convertTargetCount, convertCursor);
+                ConvertRows rows;
+                Ui::drawConvertTargets(convertName, rows.titles, rows.notes, convertTargetCount, convertCursor);
                 break;
             }
 

@@ -10,7 +10,10 @@
 // MPEG 1/2/2.5 layer III, mono or stereo, CBR or VBR. Layer I/II and free
 // format files are refused at load. A leading ID3v2 tag is skipped, a
 // Xing/Info or VBRI header frame gives the length and seek table and isn't
-// played, a trailing ID3v1 tag isn't read. Rates other than SAMPLE_RATE are
+// played, a trailing ID3v1 tag isn't read. A LAME tag in the Xing/Info
+// frame gives the encoder delay and padding, which are trimmed as ffmpeg
+// does (the delay plus 529 at the start, the padding at the end), so the
+// clock and length cover only the music; without one nothing is trimmed. Rates other than SAMPLE_RATE are
 // resampled linearly, as WavPlayer does.
 //
 // seekTo() finds the byte position from the Xing TOC or the VBRI table when
@@ -64,6 +67,10 @@ public:
     const char* vbrTag() const { return _vbrTag; } // "Xing", "Info", "VBRI" or "" when there's none
     uint32_t id3Bytes() const { return _id3Bytes; }
     uint32_t samplesPerFrame() const { return _samplesPerFrame; }
+    // From a LAME tag, in samples: false when there's none and nothing is trimmed.
+    bool isGapless() const { return _gapless; }
+    uint32_t encoderDelay() const { return _encDelay; }
+    uint32_t encoderPadding() const { return _encPad; }
 
     // Convert: loads as load() does but leaves core 1 and the WAV stream
     // alone. decodeNext() then decodes the next frame on the calling core
@@ -72,6 +79,10 @@ public:
     // end of the data. readFailed() tells a card error from the end. Close
     // with close(). Core 0 only, never while another Mp3Player is loaded.
     bool openOffline(const char* path);
+    // The rate and channels of the first frames, without the decoder or
+    // the arena: skips ID3v2 tags, then looks for three layer III frame
+    // headers in a row in the first 64 KB. Core 0, any time.
+    static bool probe(const char* path, uint32_t& rate, uint8_t& channels);
     int decodeNext(const int16_t*& pcm, uint8_t& channels);
     bool readFailed() const { return _readFailed; }
     // Bytes of audio data read so far and in all, for a progress bar.
@@ -119,6 +130,19 @@ private:
     // audio frame. The VBRI table stays on the card and is read at a seek.
     uint32_t _tagFrame = 0, _audioStart = 0, _tagBytes = 0;
     uint32_t _tagMs = 0; // the length the header gives, which the TOC is in proportion to
+    // Gapless playback, from the LAME tag: the encoder delay and padding,
+    // the Xing frame count and the delay as the clock's offset from the
+    // first frame. See setTrim().
+    bool _gapless = false;
+    uint32_t _encDelay = 0, _encPad = 0, _xingFrames = 0, _skipMs = 0;
+    // After a seek the end trim counts frames back from the end of the
+    // data: _endPos holds the file offsets of the last _endCount frames,
+    // read once at the first seek (_endScanned). _endCount is 0 when they
+    // couldn't be found or the file is cut short.
+    static const int END_FRAMES = 8;
+    uint32_t _endPos[END_FRAMES];
+    uint8_t _endCount = 0;
+    bool _endScanned = false;
     bool _hasToc = false;
     uint8_t _toc[100];
     uint32_t _vbriTable = 0; // file offset, 0 when there's none
@@ -157,6 +181,7 @@ private:
     uint32_t offsetMs(uint32_t pos);  // about the reverse of seekOffset()
     // Looks for frames in maxBytes from pos; found is the first one's offset.
     bool findSync(uint32_t pos, uint32_t maxBytes, uint32_t& found);
+    void scanEnd();        // fills _endPos, core 1 stopped
     bool startStream(uint32_t pos);   // input ring from the frame at pos, core 1 stopped
     void seekStep();       // one chunk of a pending seek
     void startAt(uint32_t pos, uint32_t ms); // ends a seek: plays from the frame at pos, the clock at ms
@@ -165,4 +190,7 @@ private:
     void stopCore1();      // waits until core 1 is out of core1Push()/core1Decode() and stays out
     void restartClock(uint32_t ms);
     bool ringDrained() const;
+    // Core 1's trim for a stream whose next frame starts at sample srcPos
+    // (from the first audio frame's start, the trimmed delay included).
+    void setTrim(uint32_t srcPos);
 };

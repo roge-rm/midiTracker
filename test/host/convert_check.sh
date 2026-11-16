@@ -4,7 +4,11 @@
 # each to its targets with convert_check, and compares the output with
 # ffmpeg's conversion of the same file: header (ours and ffprobe's view),
 # correlation per channel and length. Then cancel, card full and free
-# names. MP3s in mp3dir are converted too.
+# names. MP3s in mp3dir are converted too. Every output must line up with
+# ffmpeg's (lag 0) and have its length: MP3s through their LAME tags'
+# encoder delay and padding. Then the resampler's low-pass: a sweep above
+# 22.05 kHz in a 96 kHz file must come out near silent, and one below
+# 18 kHz must match ffmpeg's soxr.
 set -u
 BIN=$1
 DIR=$2
@@ -64,12 +68,15 @@ convert() {
         *clip*) min=0.8 ;; # ffmpeg mixes to mono before it clips, Helix clips each side first
     esac
     echo "$cmpl" | awk -v min="$min" '/^ch / { if ($4 < min) exit 1 }' || bad "$out: correlation under $min"
-    local diff
+    local diff lag
     diff=$(echo "$cmpl" | sed -n 's/.*(diff \(-\?[0-9]*\)).*/\1/p')
     diff=${diff#-}
-    local maxd=8
-    case "$src" in *.mp3) maxd=4000 ;; esac # ffmpeg drops the encoder delay and padding, Helix doesn't
-    [ "$diff" -le "$maxd" ] || bad "$out: length differs by $diff frames"
+    lag=$(echo "$cmpl" | sed -n 's/^lag \(-\?[0-9]*\) frames.*/\1/p')
+    [ "$diff" -le 1 ] || bad "$out: length differs by $diff frames"
+    case "$src" in
+        *clip*) ;; # a repeating signal, the lag search finds another period
+        *) [ "$lag" = 0 ] || bad "$out: lag $lag frames" ;;
+    esac
 }
 
 echo "== target lists and names"
@@ -89,9 +96,68 @@ for f in "$DIR"/m*.mp3 "$DIR"/x_*.mp3; do
     convert "$f" 2
 done
 
+echo "== a 44.1k mono MP3 lists WAV only"
+ff -f lavfi -i "aevalsrc='${SIG}':s=44100:d=2" -ac 1 -c:a libmp3lame -b:a 96k "$DIR/m44m.mp3"
+targets=$("$BIN" run "$DIR/m44m.mp3" list | sed -n 's/^targets://p')
+echo "  targets:$targets"
+[ "$targets" = " 0(WAV 16-bit)" ] || bad "m44m.mp3 targets:$targets"
+echo "junk" > "$DIR/junk.mp3"
+targets=$("$BIN" run "$DIR/junk.mp3" list | sed -n 's/^targets://p')
+[ -z "$targets" ] || bad "junk.mp3 targets:$targets"
+rm -f "$DIR/junk.mp3"
+
+echo "== no LAME tag: nothing trimmed"
+ff -f lavfi -i "aevalsrc='${SIG}':s=44100:d=2" -c:a libmp3lame -b:a 128k -write_xing 0 "$DIR/m44nox.mp3"
+log=$("$BIN" run "$DIR/m44nox.mp3" 0)
+out=$(echo "$log" | sed -n 's/^out \([^,]*\),.*/\1/p')
+frames=$(( ($(stat -c %s "$DIR/$out") - 44) / 4 ))
+echo "  $frames frames, a whole number of 1152-frame MP3 frames: $(( frames % 1152 == 0 ))"
+[ $((frames % 1152)) = 0 ] && [ "$frames" -gt 88200 ] || bad "m44nox.mp3 gave $frames frames"
+rm -f "$DIR/m44nox.mp3" "$DIR/$out"
+
+echo "== aliasing: a 22.5-47 kHz sweep in a 96 kHz file to 44.1k"
+ff -f lavfi -i "aevalsrc='0.5*sin(2*PI*(22500*t+12250*t*t/4))':s=96000:d=4" -c:a pcm_s16le "$DIR/a96_high.wav"
+log=$("$BIN" run "$DIR/a96_high.wav" 2)
+echo "$log" | grep -E "^(out|state)" | sed "s|^|  |"
+out=$(echo "$log" | sed -n 's/^out \([^,]*\),.*/\1/p')
+# Levels leave out 0.1 s at each end, where the sweep starting and stopping clicks.
+ours=$("$BIN" rms "$DIR/$out" 4410 | awk '{print $2}')
+ff -i "$DIR/a96_high.wav" -ar 44100 -ac 1 -c:a pcm_s16le "$DIR/a96_high.ff.wav"
+ff -i "$DIR/a96_high.wav" -af aresample=44100:resampler=soxr -ac 1 -c:a pcm_s16le "$DIR/a96_high.soxr.wav"
+ff -i "$DIR/a96_high.wav" -ac 1 -c:a pcm_s16le "$DIR/a96_high.in.wav"
+echo "  input $("$BIN" rms "$DIR/a96_high.in.wav" 9600 | awk '{print $2}') dBFS, ours $ours, ffmpeg $("$BIN" rms "$DIR/a96_high.ff.wav" 4410 | awk '{print $2}'), soxr $("$BIN" rms "$DIR/a96_high.soxr.wav" 4410 | awk '{print $2}')"
+awk -v v="$ours" 'BEGIN { exit !(v < -75) }' || bad "aliasing at $ours dBFS"
+rm -f "$DIR"/a96_high*
+
+echo "== pass band: a 20 Hz-18 kHz sweep in 96k and 48k files, against soxr"
+for r in 96000 48000; do
+    ff -f lavfi -i "aevalsrc='0.5*sin(2*PI*(20*t+17980*t*t/8))|0.5*sin(2*PI*(20*t+17980*t*t/8)+1)':s=$r:d=4" -c:a pcm_s24le "$DIR/p$r.wav"
+    log=$("$BIN" run "$DIR/p$r.wav" 1)
+    out=$(echo "$log" | sed -n 's/^out \([^,]*\),.*/\1/p')
+    ff -i "$DIR/p$r.wav" -af aresample=44100:resampler=soxr -f s16le "$DIR/p$r.ref.raw"
+    cmpl=$("$BIN" cmp "$DIR/$out" "$DIR/p$r.ref.raw" 44100 2)
+    echo "$cmpl" | sed "s|^|  $r: |"
+    echo "$cmpl" | awk '/^ch / { if ($4 < 0.999) exit 1 }' || bad "p$r.wav: pass band correlation"
+    echo "$cmpl" | grep -q "^lag 0 " || bad "p$r.wav: lag"
+    rm -f "$DIR/p$r"*
+done
+
 echo "== free names: a second m44.mp3 to WAV is m44-3.wav"
 log=$("$BIN" run "$DIR/m44.mp3" 0)
 echo "$log" | grep -q "^out m44-3.wav" || bad "free name: $(echo "$log" | grep '^out')"
+echo "== m44-4.wav taken mid-convert: m44-5.wav"
+log=$("$BIN" run "$DIR/m44.mp3" 0 -1 -1 2)
+echo "$log" | grep -E "^(out|took|final|files)" | sed "s|^|  |"
+echo "$log" | grep -q "^final m44-5.wav" || bad "taken mid-convert: $(echo "$log" | grep '^final')"
+echo "$log" | grep -q "^files ok" || bad "taken mid-convert files"
+echo "== path too long"
+long="$DIR/$(printf 'd%.0s' $(seq 1 200))"
+mkdir -p "$long"
+cp "$DIR/m44.mp3" "$long/m44.mp3"
+log=$("$BIN" run "$long/m44.mp3" 0)
+echo "$log" | grep "^begin" | sed "s|^|  |"
+echo "$log" | grep -q "^begin failed: Path too long" || bad "long path: $(echo "$log" | grep '^begin')"
+rm -rf "$long"
 echo "== w44_16.wav to mono is w44_16-2.wav (the source keeps its name)"
 ls "$DIR"/w44_16-2.wav >/dev/null || bad "w44_16-2.wav missing"
 

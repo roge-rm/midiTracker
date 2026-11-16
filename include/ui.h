@@ -181,6 +181,11 @@ void drawEntryMenu(const char* subtitle, const char* const* labels, int count, i
 // whenever the move also changes scrollOffset.
 void updateEntryMenuSelection(const char* const* labels, int count, int prevCursor, int newCursor, int scrollOffset = 0);
 
+// Convert's target list: the strip names the file, then a row per target
+// (up to 4) with its title and note, as the Settings page list draws them.
+void drawConvertTargets(const char* name, const char* const* titles, const char* const* notes, int count, int cursor);
+void updateConvertTargetsCursor(const char* const* titles, const char* const* notes, int count, int prevCursor, int newCursor);
+
 // Full redraw of the delete confirmation screen. `failed`, once set,
 // switches the screen from "Delete X?" to an error message.
 void drawConfirmDelete(const char* name, bool isDir, bool failed);

@@ -31,6 +31,8 @@ int main(int argc, char** argv) {
             p.mpegVersion() == 25 ? "2.5" : p.mpegVersion() == 2 ? "2" : "1", (unsigned long)p.sampleRate(), p.channels(),
             (unsigned long)p.bitrate(), p.isVbr() ? "VBR" : "CBR", p.vbrTag(), (unsigned long)p.id3Bytes(), (unsigned long)p.totalMs(),
             Mp3Player::decoderBytes(), Mp3Player::arenaBytes());
+    if (p.isGapless()) fprintf(stderr, "%s: LAME tag, encoder delay %lu, padding %lu\n", argv[1], (unsigned long)p.encoderDelay(), (unsigned long)p.encoderPadding());
+    else fprintf(stderr, "%s: no LAME tag, nothing trimmed\n", argv[1]);
     FILE* out = fopen(argv[2], "wb");
     if (!out) { perror(argv[2]); return 1; }
     long seekMs = argc > 4 ? atol(argv[3]) : -1, atMs = argc > 4 ? atol(argv[4]) : 0;

@@ -981,15 +981,36 @@ void recScreens() {
 // ---- convert --------------------------------------------------------------------
 
 void convertScreens() {
-    // The target list, as Ui::drawEntryMenu() draws it.
+    // The target list, as Ui::drawConvertTargets() draws it.
     g_tft.fillScreen(COLOR_BG);
     Status st;
-    st.text = "Convert Night Drive (2019 remaster).mp3";
+    st.icon = &ICON_WAVE;
+    st.iconColor = COLOR_WAV;
+    st.title = "CONVERT";
+    st.text = "Night Drive (2019 remaster) [live] & more.mp3";
+    char fitted[64];
+    fitText(FONT_TEXT, st.text, statusTextRoom(st), fitted, sizeof(fitted));
+    st.text = fitted;
     drawStatus(st);
-    const char* items[] = {"WAV 16-bit", "WAV 16-bit 44.1k mono"};
-    for (int i = 0; i < ROWS; i++) drawTextRow(LIST_TOP + i * LIST_ROW_H, i < 2 ? items[i] : nullptr, nullptr, 0, i == 0);
-    drawHintFooter("UP/DN move  ENTER select", nullptr);
+    clearModeList();
+    const char* titles[] = {"WAV 48k STEREO", "WAV 44.1k MONO"};
+    const char* notes[] = {"16-bit \x7f file is 48k stereo", "16-bit \x7f file is 48k stereo"};
+    for (int i = 0; i < 4; i++) {
+        if (i < 2) drawIconRow(i, ICON_WAVE, COLOR_WAV, titles[i], notes[i], i == 0);
+        else clearModeRow(i);
+    }
+    static const Key pickKeys[] = {{"UD", "move", TONE_TEXT}, {"NAV", "back", TONE_TEXT}, {"RIGHT/ENT", "convert", TONE_SELECT}};
+    drawKeyFooter(pickKeys, 3);
     save("convert-targets");
+    // A 44.1k WAV: the two it can still become.
+    clearModeList();
+    const char* titles2[] = {"WAV 44.1k STEREO", "WAV 44.1k MONO"};
+    const char* notes2[] = {"16-bit \x7f file is 96k stereo", "16-bit \x7f file is 96k stereo"};
+    for (int i = 0; i < 4; i++) {
+        if (i < 2) drawIconRow(i, ICON_WAVE, COLOR_WAV, titles2[i], notes2[i], i == 1);
+        else clearModeRow(i);
+    }
+    save("convert-targets-wav");
 
     using namespace UiRec;
     ConvInfo c;

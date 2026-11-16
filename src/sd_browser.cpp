@@ -1,5 +1,6 @@
 #include "sd_browser.h"
 #include "sd_card.h"
+#include "convert.h" // isConvertTempName
 #include <string.h>
 #include <strings.h> // strcasecmp
 #include <ctype.h>   // toupper
@@ -210,7 +211,7 @@ void SdBrowser::loadEntries() {
             if (file.getName(nameBuf, nameCap) == 0) nameBuf[0] = '\0';
             size_t nameLen = strlen(nameBuf);
             if (nameBuf[0] == '.' && nameLen > 5 && !file.isDir() &&
-                ((nameLen > 6 && strcmp(nameBuf + nameLen - 5, ".part") == 0) || strcmp(nameBuf + nameLen - 4, ".cvt") == 0))
+                ((nameLen > 6 && strcmp(nameBuf + nameLen - 5, ".part") == 0) || isConvertTempName(nameBuf)))
                 _sawTemp = true;
             if (classifyEntry(file, nameBuf, isDirEntry, kind)) {
                 total++;

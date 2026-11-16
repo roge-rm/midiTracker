@@ -6,6 +6,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdio.h>
+#include <new>
 
 namespace {
 
@@ -22,6 +23,79 @@ void put16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8)
 void put32(uint8_t* p, uint32_t v) { put16(p, (uint16_t)v); put16(p + 2, (uint16_t)(v >> 16)); }
 
 int16_t clamp16(int32_t v) { return v > 32767 ? 32767 : v < -32768 ? -32768 : (int16_t)v; }
+
+// The resampler's low-pass, see Converter: sinc(x) * Kaiser window, x in
+// zero crossings, KERNEL_L entries per zero crossing up to KERNEL_ZC, in
+// Q15, with zeros past the end for the interpolation.
+constexpr int KERNEL_ZC = 32;
+constexpr int KERNEL_L = 64;
+constexpr int KERNEL_N = KERNEL_ZC * KERNEL_L + 2;
+constexpr double KERNEL_BETA = 8.0; // about 80 dB down in the stop band
+constexpr double KERNEL_CUTOFF = 0.46; // of the lower rate, so the stop band starts just under half of it
+
+constexpr double PI_D = 3.14159265358979323846;
+
+// sin(PI * j / KERNEL_L) for j in 0..2L, for the table below.
+constexpr double sinPiFrac(int j) {
+    double x = PI_D * (j % (2 * KERNEL_L)) / KERNEL_L; // 0..2pi
+    double sign = 1;
+    if (x > PI_D) { x -= PI_D; sign = -1; }
+    if (x > PI_D / 2) x = PI_D - x;
+    double term = x, sum = x;
+    for (int n = 1; n < 12; n++) {
+        term *= -x * x / ((2 * n) * (2 * n + 1));
+        sum += term;
+    }
+    return sign * sum;
+}
+
+// Modified Bessel function of the first kind, order 0.
+constexpr double besselI0(double x) {
+    double term = 1, sum = 1;
+    for (int k = 1; k < 40; k++) {
+        term *= (x / 2) / k;
+        sum += term * term;
+    }
+    return sum;
+}
+
+constexpr double sqrtD(double v) {
+    if (v <= 0) return 0;
+    double r = v > 1 ? v : 1;
+    for (int i = 0; i < 40; i++) r = (r + v / r) / 2;
+    return r;
+}
+
+struct Kernel {
+    int16_t v[KERNEL_N];
+};
+
+constexpr Kernel makeKernel() {
+    Kernel k{};
+    double i0b = besselI0(KERNEL_BETA);
+    for (int i = 0; i < KERNEL_ZC * KERNEL_L; i++) {
+        double sinc = i == 0 ? 1.0 : sinPiFrac(i) / (PI_D * i / KERNEL_L);
+        double r = (double)i / (KERNEL_ZC * KERNEL_L);
+        double w = besselI0(KERNEL_BETA * sqrtD(1 - r * r)) / i0b;
+        double q = sinc * w * 32767;
+        k.v[i] = (int16_t)(q < 0 ? q - 0.5 : q + 0.5);
+    }
+    return k;
+}
+
+constexpr Kernel KERNEL = makeKernel();
+
+// "44.1k", "48k", "22.05k".
+void formatRate(uint32_t rate, char* out, size_t size) {
+    uint32_t whole = rate / 1000, part = rate % 1000;
+    if (!part) {
+        snprintf(out, size, "%luk", (unsigned long)whole);
+        return;
+    }
+    char frac[4] = {(char)('0' + part / 100), (char)('0' + part / 10 % 10), (char)('0' + part % 10), '\0'};
+    for (int i = 2; i > 0 && frac[i] == '0'; i--) frac[i] = '\0';
+    snprintf(out, size, "%lu.%sk", (unsigned long)whole, frac);
+}
 
 // Characters FAT won't take in a name become '_'.
 char safeChar(char c) {
@@ -42,6 +116,11 @@ const char* convertTargetLabel(ConvertTarget t) {
 
 bool convertProbe(FileKind kind, const char* path, WavPlayer& wav, ConvertFormat& fmt) {
     fmt = ConvertFormat();
+    if (kind == FILE_MP3) {
+        bool ok = Mp3Player::probe(path, fmt.rate, fmt.channels);
+        fmt.pcm16 = true; // what it decodes to
+        return ok;
+    }
     if (kind != FILE_WAV) return false;
     bool ok = wav.load(path);
     if (ok) {
@@ -60,8 +139,10 @@ int convertTargets(FileKind kind, const ConvertFormat* fmt, ConvertTarget* out, 
     };
     switch (kind) {
         case FILE_MP3:
+            if (!fmt || !fmt->rate) break; // not an MP3 the player can read
             add(CONVERT_WAV);
-            add(CONVERT_WAV_44K_MONO);
+            // A 44.1k mono MP3 to WAV is already that.
+            if (!(fmt->rate == OUT_RATE_44K && fmt->channels == 1)) add(CONVERT_WAV_44K_MONO);
             break;
         case FILE_WAV: {
             if (!fmt || !fmt->rate) break; // unreadable
@@ -76,9 +157,31 @@ int convertTargets(FileKind kind, const ConvertFormat* fmt, ConvertTarget* out, 
     return n;
 }
 
+void convertTargetText(ConvertTarget t, const ConvertFormat* fmt, char* title, size_t titleSize, char* note, size_t noteSize) {
+    bool known = fmt && fmt->rate;
+    char rate[12] = "";
+    if (known) formatRate(fmt->rate, rate, sizeof(rate));
+    switch (t) {
+        case CONVERT_WAV:
+            if (known) {
+                snprintf(title, titleSize, "WAV %s %s", rate, fmt->channels == 1 ? "MONO" : "STEREO");
+            } else {
+                snprintf(title, titleSize, "WAV 16-BIT");
+            }
+            break;
+        case CONVERT_WAV_44K_STEREO: snprintf(title, titleSize, "WAV 44.1k STEREO"); break;
+        case CONVERT_WAV_44K_MONO:   snprintf(title, titleSize, "WAV 44.1k MONO"); break;
+    }
+    if (known) {
+        snprintf(note, noteSize, "16-bit \x7f file is %s %s", rate, fmt->channels == 1 ? "mono" : "stereo");
+    } else {
+        snprintf(note, noteSize, "16-bit");
+    }
+}
+
 bool isConvertTempName(const char* leaf) {
     size_t len = strlen(leaf);
-    return len > 5 && leaf[0] == '.' && strcmp(leaf + len - 4, ".cvt") == 0;
+    return len > 9 && leaf[0] == '.' && strcmp(leaf + len - 8, ".wav.cvt") == 0;
 }
 
 // ---- sources ------------------------------------------------------------------
@@ -140,6 +243,11 @@ void Mp3ConvertSource::close() { _p.close(); }
 
 // ---- converter ------------------------------------------------------------------
 
+Converter::~Converter() {
+    if (_state == STATE_RUNNING) cancel();
+    delete[] _ring;
+}
+
 const char* Converter::outputName() const {
     const char* slash = strrchr(_outPath, '/');
     return slash ? slash + 1 : _outPath;
@@ -162,6 +270,8 @@ int Converter::progressPermille() const { return _state == STATE_DONE ? 1000 : _
 void Converter::closeSource() {
     if (_src) _src->close();
     _src = nullptr;
+    delete[] _ring;
+    _ring = nullptr;
 }
 
 void Converter::fail(const char* msg) {
@@ -189,31 +299,43 @@ void Converter::refuse(ConvertTarget target, const char* msg) {
     fail(msg);
 }
 
-bool Converter::pickNames(const char* srcPath, const char* displayName) {
+bool Converter::setStem(const char* srcPath, const char* displayName) {
     const char* slash = strrchr(srcPath, '/');
-    int dirLen = slash ? (int)(slash - srcPath) + 1 : 0;
-    char stem[41]; // short enough that the temp name stays under 64
+    _dirLen = slash ? (int)(slash - srcPath) + 1 : 0;
+    _outPath[0] = '\0';
+    if (_dirLen >= (int)sizeof(_outPath)) return false;
+    memcpy(_outPath, srcPath, (size_t)_dirLen); // the folder, for pickNames()
+    _outPath[_dirLen] = '\0';
+    // Short enough that the temp name stays under 64.
     const char* dot = strrchr(displayName, '.');
     size_t len = dot && dot != displayName ? (size_t)(dot - displayName) : strlen(displayName);
-    if (len >= sizeof(stem)) len = sizeof(stem) - 1;
-    for (size_t i = 0; i < len; i++) stem[i] = safeChar(displayName[i]);
-    while (len > 0 && (stem[len - 1] == ' ' || stem[len - 1] == '.')) len--;
-    stem[len] = '\0';
-    if (!len) strcpy(stem, "convert");
+    if (len >= sizeof(_stem)) len = sizeof(_stem) - 1;
+    for (size_t i = 0; i < len; i++) _stem[i] = safeChar(displayName[i]);
+    while (len > 0 && (_stem[len - 1] == ' ' || _stem[len - 1] == '.')) len--;
+    _stem[len] = '\0';
+    if (!len) strcpy(_stem, "convert");
+    return true;
+}
+
+const char* Converter::pickNames() {
+    char dir[sizeof(_outPath)];
+    memcpy(dir, _outPath, (size_t)_dirLen);
+    dir[_dirLen] = '\0';
     for (int n = 1; n <= 999; n++) {
         char suffix[8] = "";
         if (n > 1) snprintf(suffix, sizeof(suffix), "-%d", n);
-        int k = snprintf(_outPath, sizeof(_outPath), "%.*s%s%s.wav", dirLen, srcPath, stem, suffix);
-        if (k <= 0 || (size_t)k >= sizeof(_outPath)) return false;
-        if (sdExists(_outPath)) continue;
-        k = snprintf(_tmpPath, sizeof(_tmpPath), "%.*s.%s.cvt", dirLen, srcPath, _outPath + dirLen);
-        if (k <= 0 || (size_t)k >= sizeof(_tmpPath)) {
+        int k = snprintf(_outPath, sizeof(_outPath), "%s%s%s.wav", dir, _stem, suffix);
+        int t = snprintf(_tmpPath, sizeof(_tmpPath), "%s.%s%s.wav.cvt", dir, _stem, suffix);
+        if (k <= 0 || (size_t)k >= sizeof(_outPath) || t <= 0 || (size_t)t >= sizeof(_tmpPath)) {
             _tmpPath[0] = '\0';
-            return false;
+            memcpy(_outPath, dir, (size_t)_dirLen + 1);
+            return "Path too long";
         }
-        return true;
+        if (!sdExists(_outPath)) return nullptr;
     }
-    return false;
+    _tmpPath[0] = '\0';
+    memcpy(_outPath, dir, (size_t)_dirLen + 1);
+    return "No free name for the new file";
 }
 
 void Converter::writeHeader(uint8_t* h, uint32_t dataBytes) const {
@@ -242,9 +364,12 @@ bool Converter::begin(ConvertSource& src, const char* srcPath, const char* displ
     _bufLen = 0;
     _permille = 0;
     _src = nullptr;
+    delete[] _ring;
+    _ring = nullptr;
 
-    if (!pickNames(srcPath, displayName)) {
-        fail("No free name for the new file");
+    const char* nameErr = setStem(srcPath, displayName) ? pickNames() : "Path too long";
+    if (nameErr) {
+        fail(nameErr);
         return false;
     }
     if (!src.open(srcPath)) {
@@ -272,13 +397,35 @@ bool Converter::begin(ConvertSource& src, const char* srcPath, const char* displ
         return false;
     }
     _resample = srcRate != _outRate;
-    uint64_t step = ((uint64_t)srcRate << 32) / _outRate;
-    _stepInt = (uint32_t)(step >> 32);
-    _stepFrac = (uint32_t)step;
-    _frac = 0;
-    _need = 3; // x[-1], x0, x1, x2 from the first three frames
-    _taken = _pos0 = 0;
-    _primed = false;
+    if (_resample) {
+        // Rounded up, so the last output never lands past the source's end.
+        uint64_t step = (((uint64_t)srcRate << 32) + _outRate - 1) / _outRate;
+        _stepInt = (uint32_t)(step >> 32);
+        _stepFrac = (uint32_t)step;
+        // The low-pass in source frames: cut off at KERNEL_CUTOFF of the
+        // lower rate, so its zero crossings are 1 / (2 * fc) frames apart.
+        uint32_t lower = srcRate < _outRate ? srcRate : _outRate;
+        double fc = KERNEL_CUTOFF * lower / srcRate; // cycles per source frame
+        _kStep = (uint32_t)(2 * fc * KERNEL_L * 65536 + 0.5);
+        _gain = (uint32_t)(2 * fc * 65536 + 0.5);
+        _taps = (int)(KERNEL_ZC / (2 * fc)) + 2;
+        uint32_t r = 16;
+        while (r < (uint32_t)(2 * _taps + 2)) r <<= 1;
+        _ringMask = r - 1;
+        size_t n = (size_t)r * 2 * _outChannels;
+        _ring = new (std::nothrow) int16_t[n];
+        if (!_ring) {
+            _tmpPath[0] = '\0';
+            fail("Not enough RAM to convert");
+            return false;
+        }
+        memset(_ring, 0, n * sizeof(int16_t));
+        // The first output sits on source frame 0, with _taps silent frames before it.
+        _pad = (uint32_t)_taps;
+        _pos0 = _next = _pad;
+        _frac = 0;
+    }
+    _taken = 0;
 
     // A leftover temp of the same name is from an earlier run.
     if (sdExists(_tmpPath)) sdRemove(_tmpPath);
@@ -318,38 +465,72 @@ bool Converter::putFrame(int32_t l, int32_t r) {
     return true;
 }
 
-void Converter::shiftIn(int16_t l, int16_t r) {
-    if (!_primed) {
-        for (int i = 0; i < 4; i++) {
-            _hist[i][0] = l;
-            _hist[i][1] = r;
-        }
-        _primed = true;
-    } else {
-        memmove(_hist[0], _hist[1], sizeof(_hist[0]) * 3);
-        _hist[3][0] = l;
-        _hist[3][1] = r;
-    }
-}
-
 // One output frame at the current position, then the position moves on.
+// The low-pass is evaluated at each tap's distance d from the position:
+// left of it d = frac + m, right of it m - frac, in kernel table steps.
 bool Converter::emitOne() {
-    // Hermite through x[-1], x0, x1, x2 at t = _frac, with the
-    // coefficients doubled so they stay whole numbers. t is 16 bits.
-    int64_t t = _frac >> 16;
-    int32_t y[2];
-    for (int c = 0; c < 2; c++) {
-        int32_t xm = _hist[0][c], x0 = _hist[1][c], x1 = _hist[2][c], x2 = _hist[3][c];
-        int64_t v = (x2 - xm) + 3 * (x0 - x1);
-        v = ((v * t) >> 16) + (2 * xm - 5 * x0 + 4 * x1 - x2);
-        v = ((v * t) >> 16) + (x1 - xm);
-        v = ((v * t) >> 16) + 2 * x0;
-        y[c] = (int32_t)((v + 1) >> 1);
+    const int16_t* k = KERNEL.v;
+    const uint32_t end = (uint32_t)(KERNEL_ZC * KERNEL_L) << 16;
+    uint32_t fk = (uint32_t)(((uint64_t)(_frac >> 16) * _kStep) >> 16);
+    uint32_t slot = _pos0 & _ringMask, r = _ringMask + 1;
+    // Each Q15 tap times a sample is under 2^30; shifted down 4 the sums
+    // stay in 32 bits up to about a 400 kHz source, and the 4 bits lost are
+    // far under the output's last bit.
+    int32_t accL = 0, accR = 0;
+    if (_outChannels == 1) {
+        const int16_t* p = _ring + slot + r; // the copy, so it can go back r - 1 frames
+        for (uint32_t idx = fk; idx < end; idx += _kStep, p--) {
+            uint32_t i = idx >> 16;
+            int32_t c = k[i] + (((k[i + 1] - k[i]) * (int32_t)((idx >> 1) & 0x7FFF)) >> 15);
+            accL += (c * p[0]) >> 4;
+        }
+        p = _ring + slot + 1;
+        for (uint32_t idx = _kStep - fk; idx < end; idx += _kStep, p++) {
+            uint32_t i = idx >> 16;
+            int32_t c = k[i] + (((k[i + 1] - k[i]) * (int32_t)((idx >> 1) & 0x7FFF)) >> 15);
+            accL += (c * p[0]) >> 4;
+        }
+        accR = accL;
+    } else {
+        const int16_t* p = _ring + (slot + r) * 2;
+        for (uint32_t idx = fk; idx < end; idx += _kStep, p -= 2) {
+            uint32_t i = idx >> 16;
+            int32_t c = k[i] + (((k[i + 1] - k[i]) * (int32_t)((idx >> 1) & 0x7FFF)) >> 15);
+            accL += (c * p[0]) >> 4;
+            accR += (c * p[1]) >> 4;
+        }
+        p = _ring + (slot + 1) * 2;
+        for (uint32_t idx = _kStep - fk; idx < end; idx += _kStep, p += 2) {
+            uint32_t i = idx >> 16;
+            int32_t c = k[i] + (((k[i + 1] - k[i]) * (int32_t)((idx >> 1) & 0x7FFF)) >> 15);
+            accL += (c * p[0]) >> 4;
+            accR += (c * p[1]) >> 4;
+        }
     }
-    if (!putFrame(y[0], y[1])) return false;
+    // Q11 sums times the 16.16 gain.
+    int32_t yl = (int32_t)(((int64_t)accL * _gain + (1LL << 26)) >> 27);
+    int32_t yr = (int32_t)(((int64_t)accR * _gain + (1LL << 26)) >> 27);
+    if (!putFrame(yl, yr)) return false;
     uint64_t f = (uint64_t)_frac + _stepFrac;
     _frac = (uint32_t)f;
-    _need = _stepInt + (uint32_t)(f >> 32);
+    _pos0 += _stepInt + (uint32_t)(f >> 32);
+    return true;
+}
+
+bool Converter::pushIn(int16_t l, int16_t r) {
+    uint32_t slot = _next & _ringMask, rs = _ringMask + 1;
+    if (_outChannels == 1) {
+        int16_t m = (int16_t)(((int32_t)l + r) >> 1);
+        _ring[slot] = _ring[slot + rs] = m;
+    } else {
+        _ring[slot * 2] = _ring[(slot + rs) * 2] = l;
+        _ring[slot * 2 + 1] = _ring[(slot + rs) * 2 + 1] = r;
+    }
+    _next++;
+    // An output needs the frames up to _taps past its position.
+    while (_pos0 + (uint32_t)_taps < _next) {
+        if (!emitOne()) return false;
+    }
     return true;
 }
 
@@ -362,32 +543,31 @@ bool Converter::feed(const int16_t* in, int n) {
         return true;
     }
     for (int i = 0; i < n; i++) {
-        shiftIn(in[i * 2], in[i * 2 + 1]);
-        _taken++;
-        if (_taken > 3) _pos0++;
-        _need--;
-        while (_need == 0) {
+        if (!pushIn(in[i * 2], in[i * 2 + 1])) return false;
+    }
+    _taken += (uint32_t)n;
+    return true;
+}
+
+// Silence past the source's end, until every output whose position is
+// before the end is out.
+bool Converter::drainEnd() {
+    if (!_resample || _taken == 0) return true;
+    uint32_t endPos = _pad + _taken;
+    while (_pos0 < endPos) {
+        uint32_t slot = _next & _ringMask, rs = _ringMask + 1;
+        if (_outChannels == 1) {
+            _ring[slot] = _ring[slot + rs] = 0;
+        } else {
+            _ring[slot * 2] = _ring[slot * 2 + 1] = 0;
+            _ring[(slot + rs) * 2] = _ring[(slot + rs) * 2 + 1] = 0;
+        }
+        _next++;
+        while (_pos0 < endPos && _pos0 + (uint32_t)_taps < _next) {
             if (!emitOne()) return false;
         }
     }
     return true;
-}
-
-// Past the source's end x1 and x2 repeat the last frame, until the
-// position passes the last real frame.
-bool Converter::drainEnd() {
-    if (!_resample || _taken == 0) return true;
-    uint32_t shifts = _taken;
-    for (;;) {
-        while (_need > 0) {
-            shiftIn(_hist[3][0], _hist[3][1]);
-            shifts++;
-            if (shifts > 3) _pos0++;
-            _need--;
-        }
-        if (_pos0 >= _taken) return true;
-        if (!emitOne()) return false;
-    }
 }
 
 void Converter::step(uint32_t budgetUs) {
@@ -442,15 +622,15 @@ bool Converter::finish() {
     }
     _out.close();
     closeSource();
-    // The name was free at begin(); take the next one if it isn't now.
+    // The name was free at begin(); take the next free one from the same
+    // stem if it isn't now. The audio stays in the temp file begin() named.
     if (sdExists(_outPath)) {
-        char tmp[sizeof(_tmpPath)], from[sizeof(_outPath)];
+        char tmp[sizeof(_tmpPath)];
         strcpy(tmp, _tmpPath);
-        strcpy(from, _outPath);
-        bool named = pickNames(from, outputName());
-        strcpy(_tmpPath, tmp); // still where the audio is
-        if (!named) {
-            fail("No free name for the new file");
+        const char* err = pickNames();
+        strcpy(_tmpPath, tmp);
+        if (err) {
+            fail(err);
             return false;
         }
     }

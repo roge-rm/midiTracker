@@ -823,6 +823,31 @@ void updateEntryMenuSelection(const char* const* labels, int count, int prevCurs
     if (newCursor >= 0 && newCursor < count) drawMenuRow(labels[newCursor], newCursor, scrollOffset, true);
 }
 
+void drawConvertTargetRow(const char* const* titles, const char* const* notes, int count, int i, bool selected) {
+    if (i < 0 || i >= count || i >= 4) return;
+    Look::drawIconRow(i, Look::ICON_WAVE, COLOR_WAV, titles[i], notes[i], selected);
+}
+
+void drawConvertTargets(const char* name, const char* const* titles, const char* const* notes, int count, int cursor) {
+    statusBar("CONVERT", &Look::ICON_WAVE, COLOR_WAV, name);
+    Look::clearModeList();
+    for (int i = 0; i < 4; i++) {
+        if (i < count) drawConvertTargetRow(titles, notes, count, i, i == cursor);
+        else Look::clearModeRow(i);
+    }
+    static const Look::Key keys[] = {
+        {"UD", "move", Look::TONE_TEXT},
+        {"NAV", "back", Look::TONE_TEXT},
+        {"RIGHT/ENT", "convert", Look::TONE_SELECT},
+    };
+    Look::drawKeyFooter(keys, 3);
+}
+
+void updateConvertTargetsCursor(const char* const* titles, const char* const* notes, int count, int prevCursor, int newCursor) {
+    drawConvertTargetRow(titles, notes, count, prevCursor, false);
+    drawConvertTargetRow(titles, notes, count, newCursor, true);
+}
+
 void drawConfirmDelete(const char* name, bool isDir, bool failed) {
     Look::Card c;
     c.icon = &Look::ICON_WARNING;

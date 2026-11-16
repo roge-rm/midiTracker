@@ -1,8 +1,11 @@
-// convert_check run <src.mp3|src.wav> <target 0|1|2|list> [writeBudget] [cancelAfterSteps]
+// convert_check run <src.mp3|src.wav> <target 0|1|2|list> [writeBudget] [cancelAfterSteps] [takeAfterSteps]
 //   Runs Converter on the file the way the file player does (step() until
 //   it ends) and prints the state, message, new file name, steps and the
 //   longest step (list: just the targets). The new file goes next to the source. writeBudget caps
-//   the bytes the card takes (card full), cancelAfterSteps cancels.
+//   the bytes the card takes (card full, -1 for none), cancelAfterSteps cancels, takeAfterSteps
+//   makes a file of the new file's name meanwhile, so finish() has to pick another.
+// convert_check rms <file.wav> [skip]
+//   The RMS level of a 16-bit WAV's audio in dBFS, leaving out skip samples at each end.
 // convert_check cmp <ours.wav> <ref.raw> <rate> <channels>
 //   Checks ours's header (sizes match the file, format 16-bit PCM at rate
 //   and channels) and compares its audio with ref (s16le, same layout):
@@ -25,6 +28,7 @@ static int run(int argc, char** argv) {
     int target = atoi(argv[3]);
     long budget = argc > 4 ? atol(argv[4]) : -1;
     long cancelAfter = argc > 5 ? atol(argv[5]) : -1;
+    long takeAfter = argc > 6 ? atol(argv[6]) : -1;
     static WavPlayer wav;
     static Mp3Player mp3;
     WavConvertSource wavSrc(wav);
@@ -61,6 +65,13 @@ static int run(int argc, char** argv) {
             c.cancel();
             break;
         }
+        if (steps == takeAfter) {
+            std::string dir(src, slash ? (size_t)(slash - src + 1) : 0);
+            std::string taken = dir + c.outputName();
+            FILE* f = fopen(taken.c_str(), "wb");
+            if (f) fclose(f);
+            printf("took %s\n", c.outputName());
+        }
         uint32_t t0 = micros();
         c.step();
         uint32_t d = micros() - t0;
@@ -73,6 +84,7 @@ static int run(int argc, char** argv) {
     const char* states[] = {"IDLE", "RUNNING", "DONE", "FAILED", "CANCELLED"};
     printf("state %s, msg '%s', steps %ld, worst step %lu us, permille %d%s, elapsed %lu ms\n", states[c.state()], c.message(), steps,
            (unsigned long)worst, c.progressPermille(), permilleBack ? " (went back)" : "", (unsigned long)c.elapsedMs());
+    printf("final %s\n", c.outputName());
     // No temp file may be left, and the output exists only when done.
     std::string dir(src, slash ? (size_t)(slash - src + 1) : 0);
     std::string tmp = dir + "." + c.outputName() + ".cvt";
@@ -161,6 +173,8 @@ static int names(int argc, char** argv) {
     expect(!isConvertTempName("Song.wav.cvt"), "not hidden");
     expect(!isConvertTempName(".Song.wav.part"), "recorder temp");
     expect(!isConvertTempName(".cvt"), "bare");
+    expect(!isConvertTempName(".notes.cvt"), "someone else's .cvt");
+    expect(!isConvertTempName(".wav.cvt"), "no name");
     // Targets.
     ConvertFormat f;
     ConvertTarget t[4];
@@ -173,13 +187,47 @@ static int names(int argc, char** argv) {
     f.rate = 44100; f.channels = 2; f.pcm16 = false;
     expect(convertTargets(FILE_WAV, &f, t, 4) == 2, "44.1k 24-bit wav: both");
     expect(convertTargets(FILE_WAV, nullptr, t, 4) == 0, "unreadable wav: none");
-    expect(convertTargets(FILE_MP3, nullptr, t, 4) == 2, "mp3: two");
+    f.rate = 44100; f.channels = 1; f.pcm16 = true;
+    expect(convertTargets(FILE_MP3, &f, t, 4) == 1 && t[0] == CONVERT_WAV, "44.1k mono mp3: WAV only");
+    f.channels = 2;
+    expect(convertTargets(FILE_MP3, &f, t, 4) == 2, "44.1k stereo mp3: two");
+    f.rate = 48000; f.channels = 1;
+    expect(convertTargets(FILE_MP3, &f, t, 4) == 2, "48k mono mp3: two");
+    expect(convertTargets(FILE_MP3, nullptr, t, 4) == 0, "unreadable mp3: none");
     expect(convertTargets(FILE_MID, nullptr, t, 4) == 0, "mid: none yet");
+    char title[24], note[48];
+    f.rate = 22050; f.channels = 2;
+    convertTargetText(CONVERT_WAV, &f, title, sizeof(title), note, sizeof(note));
+    printf("row: '%s' '%s'\n", title, note);
+    expect(!strcmp(title, "WAV 22.05k STEREO"), "title");
+    f.rate = 11025;
+    convertTargetText(CONVERT_WAV_44K_MONO, &f, title, sizeof(title), note, sizeof(note));
+    printf("row: '%s' '%s'\n", title, note);
+    expect(!strcmp(note, "16-bit \x7f file is 11.025k stereo"), "note");
     printf("names %s\n", bad ? "FAILED" : "ok");
     return bad ? 1 : 0;
 }
 
+static int rms(int argc, char** argv) {
+    std::vector<uint8_t> raw;
+    readAll(argv[2], &raw);
+    if (raw.size() < 44) return 1;
+    size_t n = (raw.size() - 44) / 2;
+    const int16_t* v = (const int16_t*)(raw.data() + 44);
+    // Leaves out skip samples at each end, where a signal starting or stopping clicks.
+    size_t skip = argc > 3 ? (size_t)atol(argv[3]) : 0;
+    if (2 * skip >= n) return 1;
+    v += skip;
+    n -= 2 * skip;
+    double e = 0;
+    for (size_t i = 0; i < n; i++) e += (double)v[i] * v[i];
+    double r = n ? sqrt(e / n) / 32768 : 0;
+    printf("rms %.1f dBFS\n", r > 0 ? 20 * log10(r) : -200.0);
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc >= 3 && !strcmp(argv[1], "rms")) return rms(argc, argv);
     if (argc >= 4 && !strcmp(argv[1], "run")) return run(argc, argv);
     if (argc >= 6 && !strcmp(argv[1], "cmp")) return cmp(argc, argv);
     if (argc >= 2 && !strcmp(argv[1], "names")) return names(argc, argv);

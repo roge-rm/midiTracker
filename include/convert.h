@@ -32,14 +32,20 @@ struct ConvertFormat {
     bool pcm16 = false;
 };
 
-// Reads the format of a file of `kind` into fmt, when its targets depend on
-// it (WAV). False when the file can't be read or the kind needs nothing.
-// Uses wav for a WAV, which must be idle.
+// Reads the format of a file of `kind` into fmt: the WAV header (through
+// wav, which must be idle) or the first MP3 frame headers. False when the
+// file can't be read or the kind needs nothing.
 bool convertProbe(FileKind kind, const char* path, WavPlayer& wav, ConvertFormat& fmt);
 
-// The targets for a file of `kind`, fmt from convertProbe() or null.
-// Fills out (up to max) and returns how many.
+// The targets for a file of `kind`, fmt from convertProbe() or null when
+// that failed. Two targets that would make the same file aren't both
+// listed. Fills out (up to max) and returns how many.
 int convertTargets(FileKind kind, const ConvertFormat* fmt, ConvertTarget* out, int max);
+
+// The target list's row for t: title ("WAV 48K STEREO", Silkscreen at
+// double size, 19 characters at most) and note ("16-bit · file is 44.1k
+// mono"). fmt from convertProbe() or null.
+void convertTargetText(ConvertTarget t, const ConvertFormat* fmt, char* title, size_t titleSize, char* note, size_t noteSize);
 
 // Where the frames come from. read() is called from Converter::step() and
 // should do a bounded piece of work each call (a block or one MP3 frame).
@@ -99,16 +105,23 @@ private:
     uint8_t _pcmChannels = 2;
 };
 
-// Leftover temp output from a power cut: "/dir/.NAME.cvt". Deleted when the
-// folder is listed, see SdBrowser::sawTempFiles().
+// Leftover temp output from a power cut: ".NAME.wav.cvt", the leaf name.
+// Deleted when the folder is listed, see SdBrowser::sawTempFiles().
 bool isConvertTempName(const char* leaf);
 
 // One conversion. Output goes to a hidden temp file next to the source
-// (".NAME.cvt"), renamed to a free name at the end: Song.mp3 gives
+// (".NAME.wav.cvt"), renamed to a free name at the end: Song.mp3 gives
 // Song.wav, or Song-2.wav, Song-3.wav when taken. The source is only read.
 // On a failure or cancel the temp file is removed.
+//
+// When the rates differ the audio goes through a windowed-sinc low-pass
+// (Kaiser, 32 zero crossings each side, cut off at 0.46 of the lower rate)
+// evaluated at each output frame's source position, so downsampling
+// doesn't alias. Its cost grows with the source rate over the output's:
+// about 70 taps per output frame from 48 kHz to 44.1k, 150 from 96 kHz.
 class Converter {
 public:
+    ~Converter();
     enum State : uint8_t { STATE_IDLE, STATE_RUNNING, STATE_DONE, STATE_FAILED, STATE_CANCELLED };
 
     // How long step() works by default. A step can run over by one read()
@@ -161,27 +174,41 @@ private:
     uint8_t _buf[OUT_BYTES];
     size_t _bufLen = 0;
 
-    // Resampling, 4-point Hermite, used when the rates differ. _hist holds
-    // the source frames around the output position: x[-1], x0, x1, x2,
-    // stereo. The position is _pos0 (index of x0) plus _frac (32-bit
-    // fraction); _step is the source frames per output frame in 32.32.
+    // Resampling, see feed(). Source frames go into _ring (mono when the
+    // output is), each at slot (index & _ringMask) and again R slots on, so
+    // the taps around any position read in one piece. The output position
+    // is _pos0 (index of the frame at or before it) plus _frac (32-bit
+    // fraction); _stepInt/_stepFrac are source frames per output frame.
+    // Indices count _pad silent frames before the source's first.
     bool _resample = false;
-    int16_t _hist[4][2];
+    int16_t* _ring = nullptr;      // heap, 2 * R frames
+    uint32_t _ringMask = 0;
+    int _taps = 0;                 // most taps on each side of the position
+    uint32_t _kStep = 0;           // kernel table steps per source frame, 16.16
+    uint32_t _gain = 0;            // the low-pass's gain, 16.16
     uint32_t _stepInt = 0, _stepFrac = 0, _frac = 0;
-    uint32_t _need = 0;   // source frames to take before the next output
-    uint32_t _taken = 0;  // real source frames taken
-    uint32_t _pos0 = 0;   // source index of x0
-    bool _primed = false; // _hist holds the first frames
+    uint32_t _pos0 = 0;            // source index at or before the next output
+    uint32_t _next = 0;            // source index the next frame in goes to
+    uint32_t _pad = 0;
+    uint32_t _taken = 0;           // real source frames taken
+
+    // The output's leaf name: _stem, a "-N" suffix past 1, ".wav".
+    char _stem[41] = {0};
+    int _dirLen = 0;
 
     void fail(const char* msg);
     void closeSource();
-    bool pickNames(const char* srcPath, const char* displayName);
+    // Sets _stem and _dirLen from the source. False when the folder's path is too long.
+    bool setStem(const char* srcPath, const char* displayName);
+    // The first free name from _stem into _outPath and its temp into
+    // _tmpPath. Null, or the reason there isn't one.
+    const char* pickNames();
     void writeHeader(uint8_t* h, uint32_t dataBytes) const;
     bool putFrame(int32_t l, int32_t r); // to _buf, flushing when full
     bool flush();
     // Feeds n source frames; returns false on a write failure.
     bool feed(const int16_t* in, int n);
     bool drainEnd(); // the last outputs past the source's end
+    bool pushIn(int16_t l, int16_t r); // one frame into the ring, then the outputs it completes
     bool emitOne();
-    void shiftIn(int16_t l, int16_t r);
 };

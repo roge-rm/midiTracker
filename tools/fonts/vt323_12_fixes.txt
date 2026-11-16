@@ -1,5 +1,6 @@
 # Hand fixes for VT323 at 12 px, where three stems don't fit the
-# rasterised 4 px. "= CHAR XOFFSET YOFFSET", then the rows top down.
+# rasterised 4 px or hinting spoils a glyph. "= CHAR XOFFSET YOFFSET", then
+# the rows top down.
 = M 0 -7
 #...#
 ##.##
@@ -40,3 +41,68 @@
 #.#.#
 #.#.#
 .#.#.
+
+# Hinting drops the left column of ( and [ and scrambles $ % & @ ~.
+= ( 1 -8
+.#
+#.
+#.
+#.
+#.
+#.
+#.
+#.
+.#
+
+= [ 1 -8
+##
+#.
+#.
+#.
+#.
+#.
+#.
+#.
+##
+
+= $ 0 -8
+.#..
+.###
+##..
+##..
+.##.
+.#.#
+.#.#
+###.
+.#..
+
+= % 0 -7
+##...
+##..#
+...#.
+..#..
+.#...
+#..##
+...##
+
+= & 0 -7
+.#...
+#.#..
+#.#..
+.#...
+#.#.#
+#..#.
+.##.#
+
+= @ 0 -7
+.###.
+#...#
+#.###
+#.#.#
+#.###
+#....
+.###.
+
+= ~ 0 -5
+.#.#
+#.#.
