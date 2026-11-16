@@ -25,7 +25,7 @@
 // Runs entirely on the RP2040's second core (setup1()/loop1() in
 // synth.cpp) so audio rendering never competes with the UI/SD/USB work on
 // core 0; noteOn()/noteOff()/programChange()/allNotesOff() just push a
-// message across the inter-core FIFO and return immediately.
+// message into the core 0 -> core 1 ring and return immediately.
 namespace Synth {
 
 // Signals core 1 that it's safe to claim a PIO state machine for I2S. The
@@ -175,10 +175,10 @@ void setStereoSpread(uint8_t percent);
 // their own note-on, with no click or audible discontinuity. Both cores
 // share plain SRAM (see Synth::begin()'s g_readyForPioInit precedent), so
 // these setters write the shared preset tables directly from core 0; a
-// one-word "dirty" doorbell over the same inter-core FIFO used elsewhere
+// one-word "dirty" doorbell over the same message ring used elsewhere
 // in this file then tells core 1 to recompute that one record's derived
 // caches (filter alpha, vibrato/tremolo/PWM depth). Getters read the same
-// shared tables directly -- no FIFO round trip needed for a read.
+// shared tables directly -- no round trip needed for a read.
 
 enum SynthWaveform : uint8_t { SYNTH_WAVE_SINE, SYNTH_WAVE_TRIANGLE, SYNTH_WAVE_SAW, SYNTH_WAVE_SQUARE, SYNTH_WAVE_NOISE };
 
@@ -192,9 +192,9 @@ const uint8_t DRUM_PRESET_COUNT = 8;        // matches DrumType/DRUM_PRESETS in 
 struct InstrumentPresetParams {
     SynthWaveform waveform;
     uint16_t attackSamples;
-    uint16_t decaySamples;
+    uint16_t decaySamples;    // exponential, 40 dB down at this time
     uint8_t sustainPercent;   // 0-100
-    uint16_t releaseSamples;
+    uint16_t releaseSamples;  // exponential, 40 dB down at this time
     float cutoffHz;
     float vibratoDepthPercent;
     float tremoloDepthPercent;
@@ -243,7 +243,7 @@ uint8_t getChannelProgram(uint8_t channel);
 // the RP2040 doesn't have PIO/DMA resources to spare for a second I2S
 // output. Unlike noteOn()/etc, this is bulk continuous audio, not discrete
 // events, so it's fed through a small ring buffer rather than the
-// inter-core FIFO: WavPlayer (running on core 0, alongside SD/UI work)
+// note message ring: WavPlayer (running on core 0, alongside SD/UI work)
 // pushes already-converted 44.1kHz interleaved stereo frames in; loop1()
 // (core 1) pops one frame per sample and mixes it in, distinctly per
 // channel -- WavPlayer is responsible for all format conversion (bit

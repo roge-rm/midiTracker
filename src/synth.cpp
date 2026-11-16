@@ -8,10 +8,11 @@
 
 namespace {
 
-// Cross-core message format, one 32-bit FIFO word per event. The top
-// nibble tags the message type; PANIC_MSG/RESET_PROGRAMS_MSG (top nibble
-// 0xF) are reserved sentinels and can't collide with a real tag since
-// tags below only ever use 0/1.
+// Cross-core message format, one 32-bit word per event in the message
+// ring (see pushMsg()). The top nibble tags the message type, leaving 28
+// payload bits. 0xC-0xE are free for channel messages (CC, pitch bend,
+// aftertouch). PANIC_MSG/RESET_PROGRAMS_MSG (top nibble 0xF) are reserved
+// sentinels.
 const uint32_t MSG_TYPE_NOTE = 0x0u;
 const uint32_t MSG_TYPE_PROGRAM = 0x1u;
 const uint32_t MSG_TYPE_VOLUME = 0x2u;
@@ -82,9 +83,51 @@ inline uint32_t packStereoSpreadMsg(uint8_t percent) {
 // with no data cache to create a visibility problem.
 volatile bool g_readyForPioInit = false;
 
+// Core 0 -> core 1 message ring: single producer (core 0, pushMsg() from
+// the Synth:: methods) and single consumer (core 1, popMsg() in loop1()),
+// lock-free. head/tail are ever-increasing counts masked at index time,
+// head written only by core 0 and tail only by core 1. Ordering is the
+// same as the WAV ring below: the producer reads tail, dmb, writes the
+// slot, dmb, publishes head; the consumer reads head, dmb, reads the slot,
+// dmb, publishes tail. 128 deep so a big chord or a seek's catch-up burst
+// rarely makes core 0 wait. rp2040.fifo is left to the core (idleOtherCore()).
+const uint32_t MSG_RING_SIZE = 128; // power of two
+const uint32_t MSG_RING_MASK = MSG_RING_SIZE - 1;
+uint32_t g_msgRing[MSG_RING_SIZE];
+volatile uint32_t g_msgHead = 0; // core 0 only
+volatile uint32_t g_msgTail = 0; // core 1 only
+
+void drainMessages(int maxMessages);
+
+// Core 0 only. Waits while the ring is full, which takes core 1 a few
+// samples at most (it drains up to 32 a sample).
+void pushMsg(uint32_t msg) {
+    uint32_t head = g_msgHead;
+    while (head - g_msgTail >= MSG_RING_SIZE) {
+#ifdef HOST_MIDI
+        drainMessages(MSG_RING_SIZE); // host: core 1 runs on this thread
+#endif
+    }
+    __dmb(); // tail read before the freed slot is written
+    g_msgRing[head & MSG_RING_MASK] = msg;
+    __dmb(); // slot written before head covers it
+    g_msgHead = head + 1;
+}
+
+// Core 1 only.
+bool __not_in_flash_func(popMsg)(uint32_t& msg) {
+    uint32_t tail = g_msgTail;
+    if (g_msgHead == tail) return false;
+    __dmb(); // head read before the slot it covers
+    msg = g_msgRing[tail & MSG_RING_MASK];
+    __dmb(); // slot read before it is handed back
+    g_msgTail = tail + 1;
+    return true;
+}
+
 // ---- everything below this point runs on core 1 only (setup1()/loop1()
 // and whatever they call) -- core 0 only ever touches the pack*Msg()
-// helpers above and the FIFO pushes in Synth::noteOn() etc. ----
+// helpers and pushMsg() above, from Synth::noteOn() etc. ----
 
 const int SINE_TABLE_SIZE = 256;
 int16_t g_sineTable[SINE_TABLE_SIZE];
@@ -103,6 +146,11 @@ uint32_t g_presetVibratoDepthQ16[16];
 // amplitude (tremolo) or square-wave duty cycle (PWM) instead of pitch.
 uint32_t g_presetTremoloDepthQ16[16];
 uint32_t g_presetPwmDepthQ16[16];
+
+// Filled from PRESETS[i].decaySamples/releaseSamples (see envTimeToK()).
+// Decay 0 is stored as 0, which skips the decay stage.
+uint16_t g_presetDecayK[16];
+uint16_t g_presetReleaseK[16];
 
 // Shared vibrato/tremolo/PWM LFO: a single phase accumulator advanced once
 // per sample (in renderSample(), not per voice) and read by every melodic
@@ -178,7 +226,8 @@ int g_stereoSpreadPercent = 30;
 // number.
 const int NUM_MELODIC_VOICES = 24;
 const int NUM_DRUM_VOICES = 8;
-const uint16_t PANIC_RELEASE_SAMPLES = 100; // ~2ms, prompt but click-free
+// envTimeToK(100): 40 dB down in 100 samples (~2 ms), prompt but click-free.
+const uint16_t PANIC_RELEASE_K = 2950;
 const uint8_t PERCUSSION_CHANNEL = 9; // MIDI channel 10, 0-indexed
 
 // Per-voice headroom. With up to 32 voices now, a literal "all voices at
@@ -255,12 +304,17 @@ struct Voice {
     uint32_t phase = 0;    // 32-bit accumulator, one full cycle == 2^32
     uint32_t phaseInc = 0; // per-sample phase increment for this note's pitch
 
+    // Envelope levels are Q16 (level 0..~2880 << 16), so slow stages still
+    // move every sample. renderVoice() shifts once when it mixes.
     int32_t amplitude = 0; // current envelope level
-    int32_t envStep = 0;   // per-sample envelope delta for the active stage
+    int32_t envStep = 0;   // attack: linear per-sample delta
+    int32_t envFloor = 0;  // decay/release: distance left at which the stage ends (see envStageFloor())
     int32_t peakLevel = 0;    // end-of-attack level (velocity-scaled)
     int32_t sustainLevel = 0; // end-of-decay level; 0 for one-shot percussion
-    uint16_t decaySamples = 0;
-    uint16_t releaseSamples = 0;
+    // Exponential decay/release rates, Q16 fraction of the remaining
+    // distance per sample (see envTimeToK()). decayK 0 skips the decay stage.
+    uint16_t decayK = 0;
+    uint16_t releaseK = 0;
 
     // Percussion-only: extra phase-inc contribution that decays to 0, for
     // a kick/tom pitch-drop ("thump"). 0/0 for everything else.
@@ -305,11 +359,15 @@ struct Voice {
     int32_t pan = 128;
 };
 
-Voice g_melodicVoices[NUM_MELODIC_VOICES];
+// Both pools in one array so renderSample() renders them in one loop
+// (one inlined copy of renderVoice() in RAM instead of two).
+const int NUM_VOICES = NUM_MELODIC_VOICES + NUM_DRUM_VOICES;
+Voice g_voices[NUM_VOICES];
+Voice* const g_melodicVoices = g_voices;
+Voice* const g_drumVoices = g_voices + NUM_MELODIC_VOICES;
 // Bumped per note-on. Age is the unsigned difference from this, so
 // wraparound is harmless.
 uint32_t g_voiceStartCounter = 0;
-Voice g_drumVoices[NUM_DRUM_VOICES];
 I2S g_i2s(OUTPUT, AUDIO_BCLK, AUDIO_SDATA); // LRCLK is implicitly AUDIO_BCLK+1, see pins.h
 
 // GM program per channel (program / 8 = instrument-family index into
@@ -345,7 +403,7 @@ uint32_t volumePercentToGainQ16(uint8_t percent) {
 }
 
 // Master output gain, Q16 fixed point (0..65536, see volumePercentToGainQ16()
-// above). Written only from loop1() in response to a FIFO message (see
+// above). Written only from loop1() in response to a ring message (see
 // MSG_TYPE_VOLUME below) or setup1()'s initial default, so no cross-core
 // synchronization beyond volatile-free plain SRAM sharing is needed, same
 // as g_readyForPioInit above.
@@ -437,7 +495,7 @@ volatile uint32_t g_wavUnderrunSamples = 0;
 // Consumer-side pop, called once per sample from renderSample() while
 // g_wavActive. Returns false on empty (caller decides whether that means
 // "done" or "underrun" via g_wavEnded).
-bool popWavFrame(int16_t& outL, int16_t& outR) {
+bool __not_in_flash_func(popWavFrame)(int16_t& outL, int16_t& outR) {
     size_t tail = g_wavTail;
     if (g_wavHead == tail) return false;
     __dmb(); // acquire: head read before the frame data it covers
@@ -452,7 +510,7 @@ bool popWavFrame(int16_t& outL, int16_t& outR) {
 // Core 1, once per sample: drops every frame written before core 0's last
 // wavStreamReset(). Frames written since then are kept. Never moves tail
 // backwards, in case it already got past the reset point.
-ALWAYS_INLINE void wavStreamApplyReset() {
+ALWAYS_INLINE void __not_in_flash_func(wavStreamApplyReset)() {
     uint32_t seq = g_wavResetSeq;
     if (seq == g_wavResetSeen) return;
     __dmb(); // acquire: seq read before g_wavResetTo
@@ -462,7 +520,7 @@ ALWAYS_INLINE void wavStreamApplyReset() {
     g_wavResetSeen = seq;
 }
 
-int16_t nextNoise() {
+int16_t __not_in_flash_func(nextNoise)() {
     g_noiseState ^= g_noiseState << 13;
     g_noiseState ^= g_noiseState >> 17;
     g_noiseState ^= g_noiseState << 5;
@@ -475,7 +533,7 @@ int16_t nextNoise() {
 // pulseWidth is only meaningful for WAVE_SQUARE (the duty-cycle threshold,
 // 32768 == fixed 50% -- see Voice::pwmDepthQ16 for who modulates it and
 // why); every other waveform ignores it.
-ALWAYS_INLINE int16_t waveformSample(Waveform w, uint32_t phase, uint16_t pulseWidth) {
+ALWAYS_INLINE int16_t __not_in_flash_func(waveformSample)(Waveform w, uint32_t phase, uint16_t pulseWidth) {
     uint16_t p16 = (uint16_t)(phase >> 16);
     switch (w) {
         case WAVE_TRIANGLE:
@@ -517,22 +575,69 @@ uint32_t cutoffHzToAlphaQ14(float cutoffHz) {
 }
 
 uint32_t hzToPhaseInc(float hz) {
-    // Double intermediate: this only runs once per note-on (not per
-    // sample), so the extra precision is free, and 2^32 is large enough
-    // that float's ~7 significant digits would otherwise round visibly.
+    // Double intermediate: this only runs at startup and on a preset or
+    // LFO rate change, and float's ~7 digits would round visibly at 2^32.
     return (uint32_t)((double)hz * 4294967296.0 / SAMPLE_RATE);
 }
 
-uint32_t noteToPhaseInc(uint8_t note) {
-    float freqHz = 440.0f * powf(2.0f, (note - 69) / 12.0f);
-    return hzToPhaseInc(freqHz);
+// Phase increment per MIDI note at 44.1 kHz, round(440 * 2^((n-69)/12) * 2^32 / 44100).
+const uint32_t NOTE_PHASE_INC[128] = {
+    796254u, 843601u, 893765u, 946911u, 1003217u, 1062871u, 1126073u, 1193033u,
+    1263974u, 1339134u, 1418763u, 1503127u, 1592507u, 1687203u, 1787529u, 1893821u,
+    2006434u, 2125742u, 2252146u, 2386065u, 2527948u, 2678268u, 2837526u, 3006254u,
+    3185015u, 3374406u, 3575058u, 3787642u, 4012867u, 4251485u, 4504291u, 4772130u,
+    5055896u, 5356535u, 5675051u, 6012507u, 6370030u, 6748811u, 7150117u, 7575285u,
+    8025735u, 8502970u, 9008582u, 9544261u, 10111792u, 10713070u, 11350103u, 12025015u,
+    12740059u, 13497623u, 14300233u, 15150569u, 16051469u, 17005939u, 18017165u, 19088521u,
+    20223584u, 21426141u, 22700205u, 24050030u, 25480119u, 26995246u, 28600467u, 30301139u,
+    32102938u, 34011878u, 36034330u, 38177043u, 40447168u, 42852281u, 45400411u, 48100060u,
+    50960238u, 53990491u, 57200933u, 60602278u, 64205876u, 68023757u, 72068660u, 76354085u,
+    80894335u, 85704563u, 90800821u, 96200119u, 101920476u, 107980983u, 114401866u, 121204555u,
+    128411753u, 136047513u, 144137319u, 152708170u, 161788671u, 171409126u, 181601643u, 192400238u,
+    203840952u, 215961966u, 228803732u, 242409110u, 256823506u, 272095026u, 288274639u, 305416341u,
+    323577341u, 342818251u, 363203285u, 384800477u, 407681904u, 431923931u, 457607465u, 484818220u,
+    513647012u, 544190053u, 576549277u, 610832681u, 647154683u, 685636503u, 726406571u, 769600953u,
+    815363807u, 863847862u, 915214929u, 969636441u, 1027294024u, 1088380105u, 1153098554u, 1221665363u,
+};
+static_assert(SAMPLE_RATE == 44100, "NOTE_PHASE_INC is for 44.1 kHz");
+
+// Per-sample Q16 fraction for an exponential stage that falls 40 dB in
+// `samples` (the time the editor shows), about how long the old linear
+// ramp sounded. 0 samples is instant. Float, but
+// only runs on a preset change.
+uint16_t envTimeToK(uint32_t samples) {
+    if (samples <= 1) return 65535;
+    float k = -expm1f(-4.6052f / (float)samples); // ln(100) = 4.6052
+    int32_t q16 = (int32_t)(k * 65536.0f + 0.5f);
+    if (q16 < 1) q16 = 1;
+    if (q16 > 65535) q16 = 65535;
+    return (uint16_t)q16;
+}
+
+// One exponential envelope step: moves `dist` (Q16, >= 0) towards 0 by k.
+// Both forms keep the multiply in 32 bits (dist >> 12 <= ~46000, or
+// dist >> 4 < 65536, times k < 65536); the second keeps small distances
+// precise. The +1 makes sure a stage always finishes.
+ALWAYS_INLINE int32_t __not_in_flash_func(envExpStep)(int32_t dist, uint16_t k) {
+    uint32_t d = (uint32_t)dist;
+    uint32_t step = d >= (1u << 20) ? ((d >> 12) * k) >> 4 : ((d >> 4) * k) >> 12;
+    return dist - (int32_t)step - 1;
+}
+
+// Distance at which a decay or release ends: 60 dB below where it
+// started, and never below 4096 (level 1/16, about -90 dB of full scale),
+// so a quiet voice doesn't crawl down 1 per sample while silent.
+inline int32_t envStageFloor(int32_t startDist) {
+    int32_t f = startDist >> 10;
+    return f > 4096 ? f : 4096;
 }
 
 // One preset per GM instrument family (program / 8, 0-15) -- not one per
 // program, which would need 128 entries for barely more variety than
 // broad families already give at this fidelity level. Times are in
-// samples at 44.1kHz. decaySamples == 0 skips straight from attack to
-// sustain (organ-like, no decay stage).
+// samples at 44.1kHz: attack is linear, decay and release are exponential
+// and reach -40 dB at their time. decaySamples == 0 skips straight from
+// attack to sustain (organ-like, no decay stage).
 struct InstrumentPreset {
     Waveform waveform;
     uint16_t attackSamples;
@@ -621,6 +726,12 @@ InstrumentPreset PRESETS[16];
 enum DrumType { DRUM_KICK, DRUM_SNARE, DRUM_CLOSED_HAT, DRUM_OPEN_HAT, DRUM_TOM, DRUM_CYMBAL, DRUM_WOODBLOCK, DRUM_DEFAULT, DRUM_TYPE_COUNT };
 
 uint32_t g_drumFilterAlpha[DRUM_TYPE_COUNT];
+// Derived from DRUM_PRESETS by recomputeDrumPresetCache(), so a drum hit
+// needs no float math on core 1.
+uint16_t g_drumDecayK[DRUM_TYPE_COUNT];
+uint32_t g_drumPhaseInc[DRUM_TYPE_COUNT];
+int32_t g_drumPitchDrop[DRUM_TYPE_COUNT];
+int32_t g_drumPitchDropStep[DRUM_TYPE_COUNT];
 
 struct DrumPreset {
     Waveform waveform;
@@ -688,12 +799,26 @@ void recomputeInstrumentPresetCache(int family) {
     g_presetVibratoDepthQ16[family] = (uint32_t)(vib / 100.0f * 65536.0f + 0.5f);
     g_presetTremoloDepthQ16[family] = (uint32_t)(PRESETS[family].tremoloDepthPercent / 100.0f * 65536.0f + 0.5f);
     g_presetPwmDepthQ16[family] = (uint32_t)(PRESETS[family].pwmDepthPercent / 100.0f * 65536.0f + 0.5f);
+    g_presetDecayK[family] = PRESETS[family].decaySamples ? envTimeToK(PRESETS[family].decaySamples) : 0;
+    g_presetReleaseK[family] = envTimeToK(PRESETS[family].releaseSamples);
 }
 
 // Same as recomputeInstrumentPresetCache() above, for one drum type's
-// single derived cache value.
+// derived cache values.
 void recomputeDrumPresetCache(int drumType) {
-    g_drumFilterAlpha[drumType] = cutoffHzToAlphaQ14(DRUM_PRESETS[drumType].cutoffHz);
+    const DrumPreset& p = DRUM_PRESETS[drumType];
+    g_drumFilterAlpha[drumType] = cutoffHzToAlphaQ14(p.cutoffHz);
+    g_drumDecayK[drumType] = p.decaySamples ? envTimeToK(p.decaySamples) : 0;
+    g_drumPhaseInc[drumType] = (p.basePitchHz > 0.0f) ? hzToPhaseInc(p.basePitchHz) : 0;
+    // Drop time 0 means no drop, whatever the amount.
+    int32_t drop = 0, step = 0;
+    if (p.pitchDropStartHz > 0.0f && p.pitchDropSamples > 0) {
+        drop = (int32_t)hzToPhaseInc(p.pitchDropStartHz);
+        step = -(drop / (int32_t)p.pitchDropSamples);
+        if (step == 0) step = -1;
+    }
+    g_drumPitchDrop[drumType] = drop;
+    g_drumPitchDropStep[drumType] = step;
 }
 
 DrumType classifyDrum(uint8_t note) {
@@ -768,7 +893,7 @@ void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity
     v.startOrder = ++g_voiceStartCounter;
     v.waveform = preset.waveform;
     if (!wasActive) { v.phase = 0; v.filterState = 0; }
-    v.phaseInc = noteToPhaseInc(note);
+    v.phaseInc = NOTE_PHASE_INC[note & 0x7F];
     v.pitchDrop = 0;
     v.pitchDropStep = 0;
     v.filterAlpha = g_presetFilterAlpha[family];
@@ -815,16 +940,17 @@ void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity
     v.pan = 128 + (fullOffset * g_stereoSpreadPercent) / 100;
 
     int32_t peak = ((int32_t)VOICE_PEAK * velocity) / 127;
-    v.peakLevel = peak;
-    v.sustainLevel = (peak * preset.sustainPercent) / 100;
-    v.decaySamples = preset.decaySamples;
-    v.releaseSamples = preset.releaseSamples;
+    v.peakLevel = peak << 16;
+    v.sustainLevel = ((peak * preset.sustainPercent) / 100) << 16;
+    v.decayK = g_presetDecayK[family];
+    v.releaseK = g_presetReleaseK[family];
 
+    // Linear attack from wherever the voice is.
     v.stage = ENV_ATTACK;
     v.amplitude = startAmplitude;
     uint16_t atk = preset.attackSamples > 0 ? preset.attackSamples : 1;
-    v.envStep = (peak - startAmplitude) / atk;
-    if (v.envStep == 0) v.envStep = (peak >= startAmplitude) ? 1 : -1;
+    v.envStep = (v.peakLevel - startAmplitude) / atk;
+    if (v.envStep == 0) v.envStep = (v.peakLevel >= startAmplitude) ? 1 : -1;
 }
 
 void startPercussionVoice(Voice& v, uint8_t note, uint8_t velocity) {
@@ -842,16 +968,9 @@ void startPercussionVoice(Voice& v, uint8_t note, uint8_t velocity) {
     v.waveform = p.waveform;
     v.filterAlpha = g_drumFilterAlpha[drumType];
     v.pan = 128; // drums stay centered, matching how real kits are usually mixed
-    v.phaseInc = (p.basePitchHz > 0.0f) ? hzToPhaseInc(p.basePitchHz) : 0;
-
-    // Drop time 0 means no drop, whatever the amount.
-    v.pitchDrop = 0;
-    v.pitchDropStep = 0;
-    if (p.pitchDropStartHz > 0.0f && p.pitchDropSamples > 0) {
-        v.pitchDrop = (int32_t)hzToPhaseInc(p.pitchDropStartHz);
-        v.pitchDropStep = -(v.pitchDrop / (int32_t)p.pitchDropSamples);
-        if (v.pitchDropStep == 0) v.pitchDropStep = -1;
-    }
+    v.phaseInc = g_drumPhaseInc[drumType];
+    v.pitchDrop = g_drumPitchDrop[drumType];
+    v.pitchDropStep = g_drumPitchDropStep[drumType];
 
     // A modest prominence boost (x1.125, shift-friendly rather than a real
     // multiply): real drum mixes are usually pushed hot specifically so
@@ -888,10 +1007,10 @@ void startPercussionVoice(Voice& v, uint8_t note, uint8_t velocity) {
     if (drumType == DRUM_KICK || drumType == DRUM_TOM) {
         peak += peak >> 2;
     }
-    v.peakLevel = peak;
+    v.peakLevel = peak << 16;
     v.sustainLevel = 0; // one-shot: decays fully to silence, ignores note-off
-    v.decaySamples = p.decaySamples;
-    v.releaseSamples = 0; // unused -- see handleNoteOff()
+    v.decayK = g_drumDecayK[drumType];
+    v.releaseK = 0; // unused, see handleNoteOff(); releaseVoice() sets its own
 
     v.stage = ENV_ATTACK;
     v.amplitude = startAmplitude;
@@ -900,8 +1019,8 @@ void startPercussionVoice(Voice& v, uint8_t note, uint8_t velocity) {
     // exactly the kind of discontinuity that clicks, especially at high
     // velocity. ~10 samples (0.2ms) is imperceptible as a ramp. Can be a
     // downward ramp when a loud hit is retriggered softer.
-    v.envStep = (peak - startAmplitude) / 10;
-    if (v.envStep == 0) v.envStep = (peak >= startAmplitude) ? 1 : -1;
+    v.envStep = (v.peakLevel - startAmplitude) / 10;
+    if (v.envStep == 0) v.envStep = (v.peakLevel >= startAmplitude) ? 1 : -1;
 }
 
 // Voice to steal when a pool is full: the quietest voice already in
@@ -967,9 +1086,7 @@ void handleNoteOff(uint8_t channel, uint8_t note) {
         Voice& v = g_melodicVoices[i];
         if (v.active && v.note == note && v.channel == channel && v.stage != ENV_RELEASE) {
             v.stage = ENV_RELEASE;
-            uint16_t rel = v.releaseSamples > 0 ? v.releaseSamples : 1;
-            v.envStep = -(v.amplitude / rel);
-            if (v.envStep > -1) v.envStep = -1;
+            v.envFloor = envStageFloor(v.amplitude);
         }
     }
 }
@@ -977,8 +1094,8 @@ void handleNoteOff(uint8_t channel, uint8_t note) {
 void releaseVoice(Voice& v) {
     if (!v.active) return;
     v.stage = ENV_RELEASE;
-    v.envStep = -(v.amplitude / PANIC_RELEASE_SAMPLES);
-    if (v.envStep > -1) v.envStep = -1;
+    v.releaseK = PANIC_RELEASE_K;
+    v.envFloor = envStageFloor(v.amplitude);
 }
 
 void handlePanic() {
@@ -989,26 +1106,22 @@ void handlePanic() {
 // Renders one voice's current sample and advances its phase/envelope by
 // one sample. Returns its contribution to the mix (0 if inactive). Shared
 // by both voice pools so the envelope state machine only exists once.
-ALWAYS_INLINE void renderVoice(Voice& v, int16_t lfoValue, int32_t& outL, int32_t& outR) {
+ALWAYS_INLINE void __not_in_flash_func(renderVoice)(Voice& v, int16_t lfoValue, int32_t& outL, int32_t& outR) {
     if (!v.active) { outL = 0; outR = 0; return; }
 
-    // Signed accumulate: pitchDrop (percussion pitch-sweep) and the shared
-    // vibrato LFO both nudge phaseInc, one always down (pitchDrop, never
-    // negative itself) and the other bidirectionally. int64_t keeps this
-    // safe regardless of sign without needing to reason about where
-    // v.phaseInc (uint32_t, can be a large fraction of its range for high
-    // notes) sits relative to either adjustment.
-    int64_t phaseIncAdj = (int64_t)v.phaseInc;
-    if (v.pitchDrop > 0) phaseIncAdj += v.pitchDrop;
+    // pitchDrop (percussion pitch sweep, >= 0) and the shared vibrato LFO
+    // (either sign) nudge phaseInc. Plain uint32 adds: a negative nudge
+    // wraps to the right value since the sum itself stays in range.
+    uint32_t effectivePhaseInc = v.phaseInc;
+    if (v.pitchDrop > 0) effectivePhaseInc += (uint32_t)v.pitchDrop;
     if (v.vibratoRange != 0) {
         // lfoValue is g_sineTable's output, ~-32000..32000. vibratoRange
         // already lost 8 bits at note-start, so the remaining >>7 is split
         // into >>5 on lfoValue before the multiply and >>2 after, keeping
         // it a plain int32 multiply: at note 127 and the editor's 30% cap
         // vibratoRange is ~1.43e6, times |lfo>>5| <= 1000 is ~1.43e9.
-        phaseIncAdj += ((int32_t)v.vibratoRange * (lfoValue >> 5)) >> 2;
+        effectivePhaseInc += (uint32_t)(((int32_t)v.vibratoRange * (lfoValue >> 5)) >> 2);
     }
-    uint32_t effectivePhaseInc = (uint32_t)phaseIncAdj;
 
     // PWM: the same shared LFO nudges the square wave's duty cycle around
     // its fixed 50% (32768) center instead of pitch. Only WAVE_SQUARE
@@ -1036,7 +1149,9 @@ ALWAYS_INLINE void renderVoice(Voice& v, int16_t lfoValue, int32_t& outL, int32_
     int32_t diff = (int32_t)raw - v.filterState;
     v.filterState += (diff * (int32_t)v.filterAlpha) >> 14;
 
-    int32_t contribution = (v.filterState * v.amplitude) >> VOICE_PEAK_SHIFT;
+    // amplitude is Q16: >>13 here and >>14 after is the same >>(16 +
+    // VOICE_PEAK_SHIFT) as one shift, kept in int32 (32767 * 23040 max).
+    int32_t contribution = (v.filterState * (v.amplitude >> 13)) >> (VOICE_PEAK_SHIFT + 3);
     // Tremolo: same shared LFO again, this time as a gain wobble around
     // unity (65536 Q16) rather than a pitch or duty-cycle nudge. Applied
     // post-envelope so it modulates the note's own current loudness
@@ -1062,36 +1177,39 @@ ALWAYS_INLINE void renderVoice(Voice& v, int16_t lfoValue, int32_t& outL, int32_
         if (v.pitchDrop < 0) { v.pitchDrop = 0; v.pitchDropStep = 0; }
     }
 
-    v.amplitude += v.envStep;
     switch (v.stage) {
         case ENV_ATTACK:
+            v.amplitude += v.envStep;
             if ((v.envStep >= 0 && v.amplitude >= v.peakLevel) ||
                 (v.envStep < 0 && v.amplitude <= v.peakLevel)) {
                 v.amplitude = v.peakLevel;
-                if (v.decaySamples == 0) {
+                if (v.decayK == 0) {
                     v.amplitude = v.sustainLevel;
                     if (v.sustainLevel <= 0) { v.active = false; }
-                    else { v.stage = ENV_SUSTAIN; v.envStep = 0; }
+                    else { v.stage = ENV_SUSTAIN; }
                 } else {
                     v.stage = ENV_DECAY;
-                    int32_t diff = v.sustainLevel - v.peakLevel;
-                    v.envStep = diff / (int32_t)v.decaySamples;
-                    if (v.envStep == 0) v.envStep = (diff >= 0) ? 1 : -1;
+                    v.envFloor = envStageFloor(v.peakLevel - v.sustainLevel);
                 }
             }
             break;
-        case ENV_DECAY:
-            if ((v.envStep >= 0 && v.amplitude >= v.sustainLevel) ||
-                (v.envStep < 0 && v.amplitude <= v.sustainLevel)) {
+        case ENV_DECAY: {
+            // Exponential towards sustain, ends at envFloor short of it.
+            int32_t dist = envExpStep(v.amplitude - v.sustainLevel, v.decayK);
+            if (dist <= v.envFloor) {
                 v.amplitude = v.sustainLevel;
                 if (v.sustainLevel <= 0) { v.active = false; }
-                else { v.stage = ENV_SUSTAIN; v.envStep = 0; }
+                else { v.stage = ENV_SUSTAIN; }
+            } else {
+                v.amplitude = v.sustainLevel + dist;
             }
             break;
+        }
         case ENV_SUSTAIN:
-            break; // held, envStep == 0
+            break; // held
         case ENV_RELEASE:
-            if (v.amplitude <= 0) { v.amplitude = 0; v.active = false; }
+            v.amplitude = envExpStep(v.amplitude, v.releaseK);
+            if (v.amplitude <= v.envFloor) { v.amplitude = 0; v.active = false; }
             break;
     }
 }
@@ -1100,7 +1218,7 @@ ALWAYS_INLINE void renderVoice(Voice& v, int16_t lfoValue, int32_t& outL, int32_
 // voices summing near full scale) compresses gently instead of hard-
 // clipping, which is audible as harsh crackling/popping -- exactly what
 // too little headroom caused before. Below the knee, level is untouched.
-int32_t softLimit(int32_t mix) {
+int32_t __not_in_flash_func(softLimit)(int32_t mix) {
     int32_t sign = (mix < 0) ? -1 : 1;
     int32_t mag = mix * sign;
     if (mag > SOFT_KNEE_START) {
@@ -1170,7 +1288,7 @@ const int32_t REVERB_WET_MAX_Q16 = 14417;
 
 // Runtime state for the two Settings controls (see Synth::setReverbEnabled()/
 // setReverbMix() in synth.h) -- written only from loop1() in response to a
-// FIFO message, same convention as g_masterGainQ16/g_outputLevelShift.
+// ring message, same convention as g_masterGainQ16/g_outputLevelShift.
 // Reverb defaults on (this whole effect exists to be heard) at a mix
 // roughly matching what shipped before these became adjustable.
 bool g_reverbEnabled = true;
@@ -1178,7 +1296,7 @@ uint32_t g_reverbMixQ16 = 0; // set from the default percent in setup1()
 
 // Which reverb algorithm renderSample()'s reverb block runs, set from the
 // Settings "Reverb Type" control (see Synth::setReverbType()) -- same
-// write-only-from-loop1()-via-FIFO convention as g_reverbEnabled above.
+// write-only-from-loop1()-via-ring convention as g_reverbEnabled above.
 // All three share the same comb+allpass tank (reverbProcess() below);
 // Lush and Shimmer differ only in how they post-process its output (see
 // chorusProcess()/shimmerProcess()'s own header comments) rather than
@@ -1203,7 +1321,7 @@ uint32_t reverbMixPercentToQ16(uint8_t percent) {
 // comment). `input` (the raw mix sum, not clamped to int16 range) is only
 // ever added, never multiplied, so its larger magnitude doesn't risk
 // overflow here either.
-int32_t reverbComb(int16_t* buf, size_t& pos, int len, int32_t input, int32_t& dampState) {
+int32_t __not_in_flash_func(reverbComb)(int16_t* buf, size_t& pos, int len, int32_t input, int32_t& dampState) {
     int32_t delayed = buf[pos];
     dampState += ((delayed - dampState) * REVERB_DAMP_ALPHA_Q16) >> 16;
     int32_t fedBack = input + ((dampState * REVERB_COMB_FEEDBACK_Q16) >> 16);
@@ -1215,7 +1333,7 @@ int32_t reverbComb(int16_t* buf, size_t& pos, int len, int32_t input, int32_t& d
     return delayed;
 }
 
-int32_t reverbAllpass(int16_t* buf, size_t& pos, int len, int32_t input) {
+int32_t __not_in_flash_func(reverbAllpass)(int16_t* buf, size_t& pos, int len, int32_t input) {
     int32_t bufOut = buf[pos];
     int32_t output = bufOut - input;
     int32_t fedBack = input + ((bufOut * REVERB_ALLPASS_FEEDBACK_Q16) >> 16);
@@ -1230,7 +1348,7 @@ int32_t reverbAllpass(int16_t* buf, size_t& pos, int len, int32_t input) {
 // Runs the tank every sample (see this block's header comment on why),
 // returns the full-rate wet signal -- reverbProcess()'s caller is what
 // applies the decimate/bitcrush lo-fi treatment to what it reads out.
-int32_t reverbProcess(int32_t input) {
+int32_t __not_in_flash_func(reverbProcess)(int32_t input) {
     int32_t combSum = 0;
     combSum += reverbComb(g_reverbCombBuf0, g_reverbCombPos0, REVERB_COMB_LEN0, input, g_reverbDampState0);
     combSum += reverbComb(g_reverbCombBuf1, g_reverbCombPos1, REVERB_COMB_LEN1, input, g_reverbDampState1);
@@ -1273,7 +1391,7 @@ size_t g_reverbChorusPos = 0;
 const int32_t REVERB_CHORUS_BASE_Q8 = 300 << 8;  // ~6.8ms center delay
 const int32_t REVERB_CHORUS_DEPTH_Q8 = 100 << 8; // +-~2.3ms sweep
 
-int32_t chorusProcess(int32_t tankWet) {
+int32_t __not_in_flash_func(chorusProcess)(int32_t tankWet) {
     if (!g_reverbChorusBuf) return 0; // shouldn't happen -- see reverbTypeChanged()
 
     // Clamp before storing -- tankWet is the tank's raw output, whose
@@ -1347,7 +1465,7 @@ int32_t g_shimmerReadPosQ16[2] = {0, 0};
 int32_t g_shimmerGrainPos[2] = {0, SHIMMER_GRAIN_LEN / 2}; // half a grain apart, so their crossfades interleave
 int32_t g_shimmerFeedbackHeld = 0;
 
-int32_t shimmerReadTap(int tapIdx) {
+int32_t __not_in_flash_func(shimmerReadTap)(int tapIdx) {
     int32_t posQ16 = g_shimmerReadPosQ16[tapIdx];
     int32_t intPos = posQ16 >> 16;
     int32_t frac = posQ16 & 0xFFFF; // Q16 fraction
@@ -1372,7 +1490,7 @@ int32_t shimmerReadTap(int tapIdx) {
     return (interpolated * window) >> 8;
 }
 
-int32_t shimmerProcess(int32_t tankWet) {
+int32_t __not_in_flash_func(shimmerProcess)(int32_t tankWet) {
     if (!g_shimmerBuf) return 0; // shouldn't happen -- see reverbTypeChanged()
 
     int32_t clamped = tankWet;
@@ -1431,7 +1549,7 @@ void reverbTypeChanged(uint8_t newType) {
 // see startMelodicVoice()/startPercussionVoice()), and a WAV stream
 // (genuinely stereo -- see popWavFrame()) adds in on top of that; softLimit()/
 // the leveler/volume then apply per-channel.
-void renderSample(int16_t& outLeft, int16_t& outRight) {
+void __not_in_flash_func(renderSample)(int16_t& outLeft, int16_t& outRight) {
     // One shared LFO lookup for this whole sample -- see g_lfoPhase's
     // comment -- rather than each voice maintaining (and advancing) its
     // own phase. g_lfoEnabled false (Settings "LFO Rate" == Off) leaves
@@ -1447,14 +1565,9 @@ void renderSample(int16_t& outLeft, int16_t& outRight) {
     }
 
     int32_t mixL = 0, mixR = 0;
-    for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
+    for (int i = 0; i < NUM_VOICES; i++) {
         int32_t l, r;
-        renderVoice(g_melodicVoices[i], lfoValue, l, r);
-        mixL += l; mixR += r;
-    }
-    for (int i = 0; i < NUM_DRUM_VOICES; i++) {
-        int32_t l, r;
-        renderVoice(g_drumVoices[i], lfoValue, l, r);
+        renderVoice(g_voices[i], lfoValue, l, r);
         mixL += l; mixR += r;
     }
 
@@ -1539,15 +1652,18 @@ void renderSample(int16_t& outLeft, int16_t& outRight) {
     if (++g_levelerUpdateCounter >= LEVELER_UPDATE_PERIOD) {
         g_levelerUpdateCounter = 0;
         if (g_levelerEnvelope > LEVELER_TARGET) {
-            g_levelerGainQ16 = (uint32_t)(((int64_t)LEVELER_TARGET << 16) / g_levelerEnvelope);
+            g_levelerGainQ16 = ((uint32_t)LEVELER_TARGET << 16) / (uint32_t)g_levelerEnvelope; // 26000 << 16 fits uint32
         } else {
             g_levelerGainQ16 = 65536; // unity -- never boosts past this
         }
     }
-    // Unity (the usual case) skips the two 64-bit multiplies.
+    // Unity (the usual case) skips this. The gain (< 65536) is split into
+    // its high and low bytes so both multiplies stay in int32 for a mix up
+    // to ~8M.
     if (g_levelerGainQ16 != 65536) {
-        mixL = (int32_t)(((int64_t)mixL * g_levelerGainQ16) >> 16);
-        mixR = (int32_t)(((int64_t)mixR * g_levelerGainQ16) >> 16);
+        int32_t gHi = (int32_t)(g_levelerGainQ16 >> 8), gLo = (int32_t)(g_levelerGainQ16 & 0xFF);
+        mixL = ((mixL * gHi) >> 8) + ((mixL * gLo) >> 16);
+        mixR = ((mixR * gHi) >> 8) + ((mixR * gLo) >> 16);
     }
 
     int32_t limitedL = softLimit(mixL);
@@ -1565,9 +1681,7 @@ void renderSample(int16_t& outLeft, int16_t& outRight) {
     // comment for why this class of fix matters on a Cortex-M0+, which has
     // no hardware 32x32->64 multiply and would otherwise emulate this in
     // software every single sample, unconditionally, regardless of voice
-    // count). g_levelerGainQ16's own multiply just above is NOT the same
-    // case -- mixL/R there are the *pre-limiter* mix, not bounded this
-    // tightly, so it still needs the wider multiply.
+    // count).
     outLeft = (int16_t)(((limitedL * (int32_t)g_masterGainQ16) >> 16) >> g_outputLevelShift);
     outRight = (int16_t)(((limitedR * (int32_t)g_masterGainQ16) >> 16) >> g_outputLevelShift);
 }
@@ -1586,79 +1700,75 @@ void Synth::begin() {
 
 void Synth::noteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     if (velocity == 0) { noteOff(channel, note); return; }
-    // Blocking, not push_nb(): a big chord landing on the same tick across
-    // many tracks can generate more note-on messages than the hardware
-    // FIFO's 8-word depth in one burst, and a dropped push here means a
-    // silently missing note -- directly against "let them ring out". Core
-    // 1 drains this FIFO every single audio sample (~23us at 44.1kHz), so
-    // core 0 blocking here is a brief, bounded wait, not a real stall.
-    rp2040.fifo.push(packNoteMsg(channel, note, velocity));
+    // pushMsg() waits rather than drops when the ring is full, so a note is
+    // never lost.
+    pushMsg(packNoteMsg(channel, note, velocity));
 }
 
 void Synth::noteOff(uint8_t channel, uint8_t note) {
-    rp2040.fifo.push(packNoteMsg(channel, note, 0));
+    pushMsg(packNoteMsg(channel, note, 0));
 }
 
 void Synth::programChange(uint8_t channel, uint8_t program) {
-    // Written here immediately, not just via the FIFO message below --
+    // Written here immediately, not just via the ring message below --
     // Synth::getChannelProgram() reads g_channelProgram[] directly, and a
     // caller that reads it back on the very same tick (e.g. pariSynth's
     // manual EDIT+LEFT/RIGHT handler, which calls
     // Ui::updatePariSynthChannelCell() right after this) would otherwise
-    // often see the stale value -- core1 only applies the FIFO message
+    // often see the stale value -- core1 only applies the ring message
     // whenever it next drains its queue, not synchronously. Plain uint8_t
     // writes are already treated as safely atomic across cores in this
     // codebase (see synth.h's comment on the live-editable preset arrays);
     // core1's own write of the identical value when it later drains the
-    // FIFO is redundant but harmless.
+    // ring is redundant but harmless.
     g_channelProgram[channel] = program;
-    rp2040.fifo.push(packProgramMsg(channel, program));
+    pushMsg(packProgramMsg(channel, program));
 }
 
 void Synth::resetPrograms() {
-    rp2040.fifo.push(RESET_PROGRAMS_MSG);
+    pushMsg(RESET_PROGRAMS_MSG);
 }
 
 void Synth::allNotesOff() {
-    rp2040.fifo.push(PANIC_MSG);
+    pushMsg(PANIC_MSG);
 }
 
 void Synth::setVolume(uint8_t percent) {
     if (percent > 100) percent = 100;
-    rp2040.fifo.push(packVolumeMsg(percent));
+    pushMsg(packVolumeMsg(percent));
 }
 
 void Synth::setOutputLevel(uint8_t level) {
     if (level >= OUTPUT_LEVEL_COUNT) level = OUTPUT_LEVEL_HP_LOW;
-    rp2040.fifo.push(packOutputLevelMsg(level));
+    pushMsg(packOutputLevelMsg(level));
 }
 
 void Synth::setReverbEnabled(bool enabled) {
-    rp2040.fifo.push(packReverbEnabledMsg(enabled));
+    pushMsg(packReverbEnabledMsg(enabled));
 }
 
 void Synth::setReverbMix(uint8_t percent) {
     if (percent > 100) percent = 100;
-    rp2040.fifo.push(packReverbMixMsg(percent));
+    pushMsg(packReverbMixMsg(percent));
 }
 
 void Synth::setReverbType(uint8_t type) {
     if (type > 2) type = 0;
-    rp2040.fifo.push(packReverbTypeMsg(type));
+    pushMsg(packReverbTypeMsg(type));
 }
 
 void Synth::setLfoRateTenthsHz(uint16_t tenthsHz) {
-    rp2040.fifo.push(packLfoRateMsg(tenthsHz));
+    pushMsg(packLfoRateMsg(tenthsHz));
 }
 
 void Synth::setLfoVoices(uint8_t maxVoices) {
     if (maxVoices > NUM_MELODIC_VOICES) maxVoices = NUM_MELODIC_VOICES;
-    rp2040.fifo.push(packLfoVoicesMsg(maxVoices));
+    pushMsg(packLfoVoicesMsg(maxVoices));
 }
 
 void Synth::setStereoSpread(uint8_t percent) {
     if (percent > 100) percent = 100;
-    rp2040.fifo.push(packStereoSpreadMsg(percent));
+    pushMsg(packStereoSpreadMsg(percent));
 }
 
 // -- Instrument/drum preset editing (see synth.h's long comment) --------
@@ -1702,13 +1812,13 @@ void Synth::setInstrumentPreset(uint8_t family, const Synth::InstrumentPresetPar
     p.vibratoDepthPercent = in.vibratoDepthPercent;
     p.tremoloDepthPercent = in.tremoloDepthPercent;
     p.pwmDepthPercent = in.pwmDepthPercent;
-    rp2040.fifo.push(packPresetDirtyMsg(family));
+    pushMsg(packPresetDirtyMsg(family));
 }
 
 void Synth::resetInstrumentPresetToDefault(uint8_t family) {
     if (family >= 16) return;
     PRESETS[family] = DEFAULT_PRESETS[family];
-    rp2040.fifo.push(packPresetDirtyMsg(family));
+    pushMsg(packPresetDirtyMsg(family));
 }
 
 const char* Synth::drumPresetName(uint8_t drumType) {
@@ -1736,13 +1846,13 @@ void Synth::setDrumPreset(uint8_t drumType, const Synth::DrumPresetParams& in) {
     p.pitchDropStartHz = in.pitchDropStartHz;
     p.pitchDropSamples = in.pitchDropSamples;
     p.cutoffHz = in.cutoffHz;
-    rp2040.fifo.push(packDrumPresetDirtyMsg(drumType));
+    pushMsg(packDrumPresetDirtyMsg(drumType));
 }
 
 void Synth::resetDrumPresetToDefault(uint8_t drumType) {
     if (drumType >= DRUM_TYPE_COUNT) return;
     DRUM_PRESETS[drumType] = DEFAULT_DRUM_PRESETS[drumType];
-    rp2040.fifo.push(packDrumPresetDirtyMsg(drumType));
+    pushMsg(packDrumPresetDirtyMsg(drumType));
 }
 
 void Synth::resetAllPresetsToDefault() {
@@ -1845,95 +1955,103 @@ void setup1() {
     g_masterGainQ16 = volumePercentToGainQ16(80); // matches the previous default percent
     g_reverbMixQ16 = reverbMixPercentToQ16(70); // matches the level this effect first shipped at
 
-    // Larger than the library default (6 buffers x 64 words, ~9ms) to
-    // absorb brief core 1 stalls without an audible underrun/pop -- most
-    // notably, core 0 and core 1 share the same flash XIP bus, so core 0
-    // reading MIDI track data off the SD card during playback can briefly
-    // starve core 1's code fetches. Bumped from 8 buffers (~46ms) to 12
-    // (~70ms) after round-2 popping diagnostics on busy multi-track MIDI
-    // files showed availableForWrite() repeatedly dropping to ~19% of
-    // capacity during passages with heavy track-switching (more open
-    // tracks == more SD reads interleaved == more XIP contention) -- never
-    // a confirmed full drain in that data, but not much margin left
-    // either. Still plenty responsive for note timing; trading a bit more
-    // latency for resilience is the right call here.
-    g_i2s.setBuffers(12, 256);
+    // 8 x 256 words, ~46 ms. The per-sample render path (loop1(),
+    // renderSample() and what they call) runs from RAM. What's left in flash
+    // is the I2S library's write16() per sample, the leveler's divide every
+    // 256 samples and message handling (note-on etc.); the margin covers
+    // those stalling on core 0's flash and SD traffic.
+    g_i2s.setBuffers(8, 256);
     g_i2s.setBitsPerSample(16);
     g_i2s.begin(SAMPLE_RATE);
 }
 
-void loop1() {
-    uint32_t msg;
-    while (rp2040.fifo.pop_nb(&msg)) {
-        if (msg == PANIC_MSG) {
-            handlePanic();
-            continue;
-        }
-        if (msg == RESET_PROGRAMS_MSG) {
-            for (int i = 0; i < 16; i++) g_channelProgram[i] = 0;
-            continue;
-        }
-        uint32_t type = msg >> 28;
-        if (type == MSG_TYPE_VOLUME) {
-            g_masterGainQ16 = volumePercentToGainQ16((uint8_t)(msg & 0xFF));
-            continue;
-        }
-        if (type == MSG_TYPE_OUTPUT_LEVEL) {
-            uint8_t level = (uint8_t)(msg & 0xFF);
-            if (level < OUTPUT_LEVEL_COUNT) g_outputLevelShift = OUTPUT_LEVEL_SHIFT[level];
-            continue;
-        }
-        if (type == MSG_TYPE_REVERB_ENABLED) {
-            g_reverbEnabled = (msg & 0xFF) != 0;
-            continue;
-        }
-        if (type == MSG_TYPE_REVERB_MIX) {
-            g_reverbMixQ16 = reverbMixPercentToQ16((uint8_t)(msg & 0xFF));
-            continue;
-        }
-        if (type == MSG_TYPE_REVERB_TYPE) {
-            uint8_t t = (uint8_t)(msg & 0xFF);
-            if (t <= REVERB_TYPE_SHIMMER && t != g_reverbType) reverbTypeChanged(t);
-            continue;
-        }
-        if (type == MSG_TYPE_PRESET_DIRTY) {
-            uint8_t family = (uint8_t)(msg & 0xFF);
-            if (family < 16) recomputeInstrumentPresetCache(family);
-            continue;
-        }
-        if (type == MSG_TYPE_DRUM_PRESET_DIRTY) {
-            uint8_t drumType = (uint8_t)(msg & 0xFF);
-            if (drumType < DRUM_TYPE_COUNT) recomputeDrumPresetCache(drumType);
-            continue;
-        }
-        if (type == MSG_TYPE_LFO_RATE) {
-            uint16_t tenthsHz = (uint16_t)(msg & 0xFFFF);
-            if (tenthsHz == 0) {
-                g_lfoEnabled = false;
-            } else {
-                g_lfoEnabled = true;
-                g_lfoPhaseInc = hzToPhaseInc((float)tenthsHz / 10.0f);
-            }
-            continue;
-        }
-        if (type == MSG_TYPE_LFO_VOICES) {
-            g_maxModulatedVoices = (int)(uint8_t)(msg & 0xFF);
-            continue;
-        }
-        if (type == MSG_TYPE_STEREO_SPREAD) {
-            g_stereoSpreadPercent = (int)(uint8_t)(msg & 0xFF);
-            continue;
-        }
-        uint8_t channel = (msg >> 16) & 0x0F;
-        if (type == MSG_TYPE_PROGRAM) {
-            g_channelProgram[channel] = (uint8_t)(msg & 0xFF);
-            continue;
-        }
-        uint8_t note = msg & 0xFF;
-        uint8_t velocity = (msg >> 8) & 0xFF;
-        if (velocity > 0) handleNoteOn(channel, note, velocity);
-        else handleNoteOff(channel, note);
+namespace {
+
+// Core 1: applies one ring message. Stays in flash, it only runs when a
+// message arrives.
+__attribute__((noinline)) void handleMessage(uint32_t msg) {
+    if (msg == PANIC_MSG) {
+        handlePanic();
+        return;
     }
+    if (msg == RESET_PROGRAMS_MSG) {
+        for (int i = 0; i < 16; i++) g_channelProgram[i] = 0;
+        return;
+    }
+    uint32_t type = msg >> 28;
+    if (type == MSG_TYPE_VOLUME) {
+        g_masterGainQ16 = volumePercentToGainQ16((uint8_t)(msg & 0xFF));
+        return;
+    }
+    if (type == MSG_TYPE_OUTPUT_LEVEL) {
+        uint8_t level = (uint8_t)(msg & 0xFF);
+        if (level < OUTPUT_LEVEL_COUNT) g_outputLevelShift = OUTPUT_LEVEL_SHIFT[level];
+        return;
+    }
+    if (type == MSG_TYPE_REVERB_ENABLED) {
+        g_reverbEnabled = (msg & 0xFF) != 0;
+        return;
+    }
+    if (type == MSG_TYPE_REVERB_MIX) {
+        g_reverbMixQ16 = reverbMixPercentToQ16((uint8_t)(msg & 0xFF));
+        return;
+    }
+    if (type == MSG_TYPE_REVERB_TYPE) {
+        uint8_t t = (uint8_t)(msg & 0xFF);
+        if (t <= REVERB_TYPE_SHIMMER && t != g_reverbType) reverbTypeChanged(t);
+        return;
+    }
+    if (type == MSG_TYPE_PRESET_DIRTY) {
+        uint8_t family = (uint8_t)(msg & 0xFF);
+        if (family < 16) recomputeInstrumentPresetCache(family);
+        return;
+    }
+    if (type == MSG_TYPE_DRUM_PRESET_DIRTY) {
+        uint8_t drumType = (uint8_t)(msg & 0xFF);
+        if (drumType < DRUM_TYPE_COUNT) recomputeDrumPresetCache(drumType);
+        return;
+    }
+    if (type == MSG_TYPE_LFO_RATE) {
+        uint16_t tenthsHz = (uint16_t)(msg & 0xFFFF);
+        if (tenthsHz == 0) {
+            g_lfoEnabled = false;
+        } else {
+            g_lfoEnabled = true;
+            g_lfoPhaseInc = hzToPhaseInc((float)tenthsHz / 10.0f);
+        }
+        return;
+    }
+    if (type == MSG_TYPE_LFO_VOICES) {
+        g_maxModulatedVoices = (int)(uint8_t)(msg & 0xFF);
+        return;
+    }
+    if (type == MSG_TYPE_STEREO_SPREAD) {
+        g_stereoSpreadPercent = (int)(uint8_t)(msg & 0xFF);
+        return;
+    }
+    uint8_t channel = (msg >> 16) & 0x0F;
+    if (type == MSG_TYPE_PROGRAM) {
+        g_channelProgram[channel] = (uint8_t)(msg & 0xFF);
+        return;
+    }
+    uint8_t note = msg & 0xFF;
+    uint8_t velocity = (msg >> 8) & 0xFF;
+    if (velocity > 0) handleNoteOn(channel, note, velocity);
+    else handleNoteOff(channel, note);
+}
+
+// Core 1: applies up to maxMessages waiting messages.
+void drainMessages(int maxMessages) {
+    uint32_t msg;
+    while (maxMessages-- > 0 && popMsg(msg)) handleMessage(msg);
+}
+
+} // namespace
+
+void __not_in_flash_func(loop1)() {
+    // A cap per sample keeps a long burst from holding up one sample; the
+    // rest wait for the next sample.
+    drainMessages(32);
 
     int16_t left, right;
     renderSample(left, right);
