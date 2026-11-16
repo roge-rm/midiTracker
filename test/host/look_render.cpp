@@ -1,10 +1,11 @@
-// Host render of the M12 look: draws the stage 2 screens with the real
+// Host render of the M12 look: draws the stage 2 and 4 screens with the real
 // ui_look.cpp widgets into a framebuffer and writes PNGs, 1x and 2x.
 //   make -C test/host look OUT_DIR=~/debug/midiTracker/m12-2
 // The screens are put together here the way ui.cpp does it, with made-up
 // data, so the layout can be checked without the device.
 #include "ui_look.h"
 #include "ui_player.h"
+#include "ui_modes.h"
 #include "ui_tap.h"
 #include "synth.h"
 #include "midi_output.h"
@@ -271,14 +272,129 @@ void playerChrome() {
     drawHintFooter("EDIT+UD vol  PLAY tog", "NAV stop");
 }
 
-void looperChrome() {
+// ---- looper and pariSynth (stage 4) -------------------------------------------
+
+using namespace UiModes;
+
+// Made-up notes for a lane: a phrase that repeats every bar.
+void fakeDots(int track, uint32_t len, int bars, int perBar, int seed) {
+    laneDotsBegin(track, len);
+    for (int b = 0; b < bars; b++)
+        for (int k = 0; k < perBar; k++) {
+            uint32_t at = (uint32_t)((b * perBar + k) * (uint64_t)len / (bars * perBar));
+            at += (uint32_t)((k * 37 + seed) % 60);
+            laneDot(at, (uint8_t)(48 + (k * 7 + seed + b * 3) % 30));
+        }
+    laneDotsEnd();
+}
+
+LoopBpmRow g_lrow;
+LoopTrackView g_ltr[4];
+
+void looperSetup() {
+    g_lrow = LoopBpmRow();
+    g_lrow.bpm = 120;
+    g_lrow.sync = true;
+    g_lrow.metroOn = false;
+    g_lrow.countIn = true;
+    g_lrow.barMs = 2000;
+    for (auto& t : g_ltr) t = LoopTrackView();
+    g_ltr[0].channelIn = 16; g_ltr[0].channelOut = 2; g_ltr[0].state = LOOP_TRACK_RECORDING;
+    g_ltr[0].barLength = 4; g_ltr[0].lengthMs = 8000; g_ltr[0].recordActive = true;
+    g_ltr[1].channelIn = 4; g_ltr[1].channelOut = 16; g_ltr[1].state = LOOP_TRACK_PLAYING;
+    g_ltr[1].lengthMs = 7300; g_ltr[1].playActive = true;
+    g_ltr[2].channelIn = 9; g_ltr[2].channelOut = 9; g_ltr[2].state = LOOP_TRACK_MUTED;
+    g_ltr[2].barLength = 2; g_ltr[2].lengthMs = 4000;
+    g_ltr[3].channelIn = 16; g_ltr[3].channelOut = 3;
+    fakeDots(0, 8000, 4, 3, 3);
+    fakeDots(1, 7300, 4, 4, 11);
+    fakeDots(2, 4000, 2, 4, 5);
+    fakeDots(3, 0, 0, 0, 0);
+}
+
+// Moves the playheads from pos to pos2 in live steps, as the device would.
+void looperRun(int selected, uint16_t from, uint16_t to) {
+    for (int k = 0; k <= 8; k++) {
+        uint16_t p = (uint16_t)(from + (to - from) * k / 8);
+        g_ltr[0].pos = p;
+        g_ltr[1].pos = (uint16_t)(p * 3 / 4 + 9000);
+        g_hostMs += 40;
+        looperLive(g_ltr, selected);
+    }
+}
+
+void looperScreens() {
+    looperSetup();
     g_tft.fillScreen(COLOR_BG);
-    Status st;
-    st.icon = &ICON_LOOPER;
-    st.iconColor = COLOR_ACCENT;
-    st.title = "LOOPER";
-    drawStatus(st);
-    drawHintFooter("UD row/ALT out/in  PLAY pause  EDIT rec/bpm", "L back/R mute/EDIT bar  ENT menu  NAV stop");
+    statusLeds(true, true);
+    looperDraw(g_ltr, 0, g_lrow, true, 2);
+    looperBarBeat(3, 2);
+    looperRun(0, 20000, 38000);
+    save("looper");
+
+    // The BPM row with METRO focused, and a beat flash on the downbeat.
+    g_lrow.selected = true;
+    g_lrow.focus = 2;
+    g_lrow.metroOn = true;
+    looperSelection(g_ltr, 0, false, -1, true, g_lrow);
+    looperBeats(true, 0, 4);
+    looperBarBeat(4, 1);
+    looperBeatFlash(true, true);
+    looperRun(-1, 38000, 60000);
+    save("looper-bpm");
+
+    // EDIT held on METRO: the volume shows instead.
+    g_lrow.showMetroVolume = true;
+    g_lrow.metroVolume = 80;
+    looperBpm(g_lrow);
+    looperBeatFlash(false, false);
+    // A track wraps and T4 starts its first pass, 2 bars set.
+    g_ltr[3].state = LOOP_TRACK_RECORDING;
+    g_ltr[3].barLength = 2;
+    g_ltr[3].pos = 12000;
+    looperTrackRow(g_ltr[3], 3, false);
+    looperRun(-1, 60000, 9000);
+    save("looper-wrap");
+
+    g_tft.fillScreen(COLOR_BG);
+    looperCountIn(3);
+    save("looper-countin");
+}
+
+const char* const FAMILY[16] = {"Piano", "Chrom.Percus.", "Organ", "Guitar", "Bass", "Strings", "Ensemble", "Brass",
+                                "Reed", "Pipe", "SynthLead", "SynthPad", "SynthFX", "Ethnic", "Percussive", "SoundFX"};
+const uint8_t PARI_FAMILY[16] = {0, 4, 3, 5, 2, 7, 8, 9, 6, 16, 10, 11, 1, 13, 14, 15};
+
+void synthScreen(bool volume) {
+    static HostSnap::MidiFrame f;
+    memset(&f, 0, sizeof(f));
+    // A chord on 1, bass on 2, a pad on 12, drums on 10.
+    const struct { int ch, note, vel; } held[] = {{0, 60, 100}, {0, 64, 90}, {0, 67, 96}, {1, 36, 120},
+                                                 {11, 72, 70}, {11, 76, 64}, {9, 36, 127}, {9, 42, 90}};
+    UiTap::g_midi = UiTap::Midi();
+    g_midiFrame = &f;
+    SynthCell cells[16];
+    for (int ch = 0; ch < 16; ch++) {
+        cells[ch].family = PARI_FAMILY[ch];
+        cells[ch].name = ch == 9 ? "Drums" : FAMILY[PARI_FAMILY[ch]];
+    }
+    g_tft.fillScreen(COLOR_BG);
+    statusLeds(true, false);
+    synthDraw(cells, 2, 0);
+    for (auto& h : held) {
+        f.noteMask[h.note] |= (uint16_t)(1u << h.ch);
+        f.noteVel[h.note] = (uint8_t)h.vel;
+        UiTap::midiNoteOn((uint8_t)h.ch, (uint8_t)h.note, (uint8_t)h.vel);
+    }
+    uint16_t mask = MidiOutput::activeChannelMask();
+    for (int ch = 0; ch < 16; ch++)
+        if ((mask >> ch) & 1) synthCell(ch, cells[ch], ch == 2, true);
+    for (int k = 0; k < 3; k++) {
+        g_hostMs += 40;
+        synthLive();
+    }
+    if (volume) synthVolume(75);
+    g_midiFrame = nullptr;
 }
 
 void fontSheet() {
@@ -467,8 +583,11 @@ int main(int argc, char** argv) {
     save("settings");
     playerChrome();
     save("tracker-chrome");
-    looperChrome();
-    save("looper-chrome");
+    looperScreens();
+    synthScreen(false);
+    save("parisynth");
+    synthScreen(true);
+    save("parisynth-vol");
     fontSheet();
     save("fonts");
     return 0;

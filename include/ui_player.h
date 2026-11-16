@@ -73,4 +73,12 @@ bool liveSettled();
 // The volume readout on whichever player screen is up.
 void setVolume(int volume);
 
+// The .mid screen's keybed somewhere else (pariSynth): y and h take in its
+// two rule lines. keybedDraw() puts it up with the notes down now, and
+// keybedUpdate() repaints only the keys that changed since. Drawing a
+// keybed leaves the player screen, so the *Live() calls stop until the next
+// draw*().
+void keybedDraw(int y, int h);
+void keybedUpdate();
+
 } // namespace UiPlayer

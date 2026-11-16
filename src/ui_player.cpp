@@ -52,7 +52,8 @@ const int CH_SEGS = 8;
 const int CH_LABEL_Y = CH_METER_Y + CH_SEGS * SEG_STEP + 2;
 const int KEYS_Y = 142;
 const int KEYS_H = 50;
-const int BLACK_H = 30;
+// Where the keybed is now: the .mid screen's, or pariSynth's (keybedDraw()).
+int g_keysY = KEYS_Y, g_keysH = KEYS_H, g_blackH = 30;
 const int WHITE_W = 6;
 const int KEYS_X = (SCREEN_W - 52 * WHITE_W) / 2;
 const int PIANO_LO = 21, PIANO_HI = 108;
@@ -505,16 +506,16 @@ uint16_t keyColor(int note, uint8_t state) {
 
 void paintWhite(TFT_eSPI& g, int note) {
     int x = KEYS_X + whiteIndex(note) * WHITE_W;
-    g.fillRect(x, KEYS_Y, WHITE_W - 1, KEYS_H, keyColor(note, g_midi.key[note - PIANO_LO]));
+    g.fillRect(x, g_keysY, WHITE_W - 1, g_keysH, keyColor(note, g_midi.key[note - PIANO_LO]));
 }
 void paintBlack(TFT_eSPI& g, int note) {
     int x = KEYS_X + (whiteIndex(note) + 1) * WHITE_W - 3;
-    g.fillRect(x, KEYS_Y, 4, BLACK_H, keyColor(note, g_midi.key[note - PIANO_LO]));
+    g.fillRect(x, g_keysY, 4, g_blackH, keyColor(note, g_midi.key[note - PIANO_LO]));
 }
 
 void paintKeys(TFT_eSPI& g) {
-    g.drawFastHLine(0, KEYS_Y - 2, SCREEN_W, COLOR_RULE);
-    g.drawFastHLine(0, KEYS_Y - 1, SCREEN_W, COLOR_RULE);
+    g.drawFastHLine(0, g_keysY - 2, SCREEN_W, COLOR_RULE);
+    g.drawFastHLine(0, g_keysY - 1, SCREEN_W, COLOR_RULE);
     for (int n = PIANO_LO; n <= PIANO_HI; n++) if (!isBlack(n)) paintWhite(g, n);
     for (int n = PIANO_LO; n <= PIANO_HI; n++) if (isBlack(n)) paintBlack(g, n);
 }
@@ -892,6 +893,9 @@ void drawMidi(const MidiInfo& m) {
     g_midi.audioOn = m.audioOn;
     g_midi.format = m.format;
     g_midi.tracks = m.tracks;
+    g_keysY = KEYS_Y;
+    g_keysH = KEYS_H;
+    g_blackH = 30;
     uint16_t mask = MidiOutput::activeChannelMask();
     for (int ch = 0; ch < 16; ch++) g_midi.active[ch] = (mask >> ch) & 1;
     for (int n = PIANO_LO; n <= PIANO_HI; n++) g_midi.key[n - PIANO_LO] = keyState(n);
@@ -936,6 +940,17 @@ void midiLive(const MidiInfo& m) {
         updateKeys();
     }
 }
+
+void keybedDraw(int y, int h) {
+    g_screen = SCREEN_NONE;
+    g_keysY = y + 2;
+    g_keysH = h - 2;
+    g_blackH = g_keysH * 3 / 5;
+    for (int n = PIANO_LO; n <= PIANO_HI; n++) g_midi.key[n - PIANO_LO] = keyState(n);
+    band(0, y, SCREEN_W, h, COLOR_BG, [&](TFT_eSPI& g) { paintKeys(g); });
+}
+
+void keybedUpdate() { updateKeys(); }
 
 void midiOutput(const char* out, bool audioOn) {
     if (g_screen != SCREEN_MIDI) return;

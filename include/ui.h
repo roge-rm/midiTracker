@@ -8,6 +8,7 @@
 #include "midi_recorder.h"
 #include "sysex_recorder.h"
 #include "sysex_player.h"
+#include "ui_modes.h"
 
 namespace Ui {
 
@@ -77,76 +78,29 @@ void updatePlayerState(MidiPlayer::State state, bool stopped);
 void updatePlayerOutputTarget(MidiOutTarget target);
 void updatePlayerAudioState(bool audioOn);
 
-// -- pariSynth live play screen -------------------------------------------
-// A 16-channel grid (2 columns x 8 rows, channel numbers 1-16) showing
-// each channel's resolved instrument (via Synth::getChannelProgram()/
-// instrumentFamilyName() -- pulled directly, the same "reach into the
-// lower-level module for my own data" precedent drawNoteStrip() already
-// sets for MidiOutput, rather than being handed a snapshot struct),
-// channel 10 always shown as "Drums" regardless of its program. The
-// shared note-activity strip (see drawNoteStrip()/updatePlayerLive())
-// sits below the grid, fed by MidiOutput::noteActivityIn() -- PariSynthMode
-// calls that instead of MidiOutput::sendNoteOn/sendNoteOff for its live
-// incoming notes, see that function's own comment for why.
-//
-// `activeMask` (bit N = channel N) tints that channel's number a
-// different color while at least one note is currently held on it --
-// derived from MidiOutput::isChannelActive()/activeChannelMask(), which
-// both PariSynthMode's own live incoming MIDI and FilePlayerMode's file
-// playback feed (see midi_output.h's comment on isChannelActive()), so a
-// caller just passes through whichever it's got. Same "caller owns the
-// state, this just draws it" split `selected` already uses.
+// -- pariSynth live play screen (ui_modes.cpp) ----------------------------
+// 16 channel cells, 2 columns of 8: number, family icon, instrument and a
+// meter, over a keybed. `activeMask` has a bit per channel with notes
+// down, which lights that cell's number and icon. Both PariSynthMode and
+// FilePlayerMode's ALT+EDIT overlay show it; the footer shows
+// PariSynthGrid's keys.
+void drawPariSynthPlay(int selectedChannel, uint16_t activeMask = 0);
 
-// Full redraw: the whole 16-channel grid plus the note strip.
-// `selectedChannel` (0-15) is highlighted. `footerLine1`/`footerLine2`
-// default to the input handling PariSynthGrid actually implements (see
-// pari_synth_grid.h) -- RIGHT/LEFT column jump, EDIT-tap to edit,
-// EDIT+LEFT/RIGHT manual family reassignment, EDIT+UP/DOWN volume, ENTER
-// for the bank menu, PLAY for the picker -- identical from both places
-// this screen is reachable (PariSynthMode's own play screen and
-// FilePlayerMode's APP_SYNTH_EDIT overlay), since both drive the same
-// PariSynthGrid and neither overrides these defaults. Keeping the string
-// literals only here, not duplicated at each call site, is what makes it
-// impossible for the footer to silently drift out of sync with itself
-// again the way it once did.
-void drawPariSynthPlay(int selectedChannel, uint16_t activeMask = 0,
-                        const char* footerLine1 = "UD channel/R col  EDIT+LR/UD inst/vol",
-                        const char* footerLine2 = "EDIT edit  ENTER bank  PLAY pick");
-
-// Cheap partial redraw of just the note-activity strip, meant to be called
-// at a low fixed rate (same convention as updatePlayerLive()). Does not
-// touch the channel grid.
+// Cell meters and the keybed, at their own 40 ms rate. Call every loop.
 void updatePariSynthPlayLive();
 
-// Bit per channel: the active state each grid cell was last drawn with.
+// Bit per channel: the active state each cell was last drawn with.
 uint16_t pariSynthDrawnActiveMask();
 
-// Cheap partial redraw of one channel's grid cell, e.g. after a Program
-// Change or a manual instrument assignment changes what it resolves to, or
-// a Note On/Off changes whether it should be glowing (see activeMask's
-// comment above). `selected` is whether that channel is also the current
-// cursor position (picks the cell's highlight background). Does not touch
-// any other cell, the header, or the strip.
+// One cell, after a program change or a held-note change.
 void updatePariSynthChannelCell(int channel, bool selected, bool active);
 
-// Cheap partial redraw for moving the channel cursor: repaints only the
-// previously and newly selected cells instead of the whole grid.
-// `prevActive`/`newActive` are each channel's own current glow state (see
-// activeMask's comment above) -- moving the cursor doesn't change either.
+// Moves the cursor: repaints the two cells.
 void updatePariSynthSelection(int prevChannel, int newChannel, bool prevActive, bool newActive);
 
-// Brief "Vol NN%" overlay, shown while EDIT+UP/DOWN adjusts the shared
-// synth volume (see PariSynthGrid::update()) -- drawn directly over
-// channel 9's grid cell (index 8 -- row 0 of the right column, the
-// top-right corner, right under the header row), since this screen has no
-// spare header-adjacent row the way drawPlayer()'s stat rows do. This
-// function doesn't know how to erase itself: once its own fade timer
-// elapses, the caller (PariSynthGrid) restores the cell underneath with a
-// plain updatePariSynthChannelCell(8, ...) call instead -- the same rect,
-// so it cleanly covers this overlay. A host must also call this again
-// immediately after any full
-// drawPariSynthPlay() redraw while the overlay is still showing, since
-// that redraw repaints every cell including this one.
+// VOL over channel 9's cell while EDIT+UP/DOWN changes the volume. The
+// caller takes it away with updatePariSynthChannelCell(8, ...), and puts it
+// back after a full drawPariSynthPlay() while it should still show.
 void updatePariSynthVolumeOverlay(int volume);
 
 // The WAV player screen (ui_player.cpp): time and length, a waveform that
@@ -304,135 +258,74 @@ void drawMessage(const char* line1, const char* line2 = nullptr);
 // How many browser rows fit on screen -- used by main.cpp to page/scroll.
 int visibleRows();
 
-// Looper mode: one track's display state for the always-visible 4-track
-// screen. A plain snapshot struct (like MidiPlayer/MidiRecorder feed the
-// player/recording screens) rather than exposing LooperMode's internal
-// track representation to ui.cpp.
-enum LoopTrackState { LOOP_TRACK_EMPTY, LOOP_TRACK_ARMED, LOOP_TRACK_RECORDING, LOOP_TRACK_PLAYING, LOOP_TRACK_MUTED, LOOP_TRACK_STOPPED, LOOP_TRACK_PAUSED };
+// -- Looper screen (ui_modes.cpp) -----------------------------------------
+// The BPM block (big BPM, time signature, METRO, COUNT, SYNC, bar and
+// beat) over 4 track rows (state chip, route, bar length, a lane with bar
+// ticks, event dots and a playhead, and the length).
+using UiModes::LoopTrackState;
+using UiModes::LoopTrackView;
+using UiModes::LOOP_TRACK_EMPTY;
+using UiModes::LOOP_TRACK_ARMED;
+using UiModes::LOOP_TRACK_RECORDING;
+using UiModes::LOOP_TRACK_PLAYING;
+using UiModes::LOOP_TRACK_MUTED;
+using UiModes::LOOP_TRACK_STOPPED;
+using UiModes::LOOP_TRACK_PAUSED;
 
-struct LoopTrackView {
-    uint8_t channelIn = 0;   // 0-15 (displayed as 1-16), or 16 for OMNI -- record-input filter
-    uint8_t channelOut = 0;  // 0-15 (displayed as 1-16), or 16 for "as recorded" (no remap) -- playback output channel
-    LoopTrackState state = LOOP_TRACK_EMPTY;
-    int barLength = 0;       // 0 = Freeform, else the number of bars this track's length is quantized to
-    uint32_t lengthMs = 0;   // 0 if empty, armed, or still on an open-ended first recording pass
-    float positionFrac = 0;  // 0.0-1.0 position within the loop, for the progress bar; meaningless if lengthMs==0
-    // Two separate indicators, not one: a track mid-overdub is
-    // simultaneously capturing new events (recordActive) and playing back
-    // its existing content (playActive), so one "active" flag couldn't
-    // represent both at once.
-    bool recordActive = false; // true briefly whenever this track actually captures an incoming MIDI event
-    bool playActive = false;   // true briefly whenever this track actually sends an event out during playback
-    bool bufferFull = false;   // this track's event buffer is full; further recorded events are being dropped
-};
-
-// Full redraw of the looper's main screen: all 4 tracks' state, plus a
-// 5th BPM row (see updateLooperBpm()) -- `onBpmRow` says whether the
-// cursor is on that row rather than `selectedTrack`. BPM/Time Signature/
-// Sync/Metronome/Count In are shared, global settings (not per-track),
-// which is why they live here as one shared row instead of being
-// duplicated per track. `metronomeOn`/`countInEnabled` are shown as
-// Metro/Count In between the time signature and Sync text on that same
-// row (their own text color is the on/off indicator). `showMetronomeVolume`/
-// `showCountInBars` briefly replace Metro's/Count In's own label with
-// `metronomeVolumePercent`/`countInBars` while EDIT is held with that
-// field focused (see LooperMode's handleMetronomeVolumeAdjust()/
-// handleCountInBarsAdjust()) -- meaningless (and always false) unless
-// focusIndex is 2 or 3 respectively and onBpmRow is true. `focusIndex`
-// says which of the row's five fields ALT+UP/DOWN/LEFT/RIGHT (or EDIT,
-// for BPM value/Time Sig) currently targets -- 0 = BPM value, 1 = Time
-// Sig, 2 = Metro, 3 = Count In, 4 = Sync (see LooperMode's
-// handleBpmRowFocus()) -- meaningless unless onBpmRow is also true.
-// `showBeatIndicator` gates the header's beat-indicator row's visibility
-// on its own (EDIT-tap toggle while BPM value has focus, see LooperMode's
-// handleBpmRowEditToggle()) -- independent of `metronomeOn`, since the
-// squares are still useful as a static time-signature reference even with
-// the metronome's own click off. `metronomeCurrentBeat` (0-based, 0 =
-// downbeat, or -1 for "nothing lit") drives which square is highlighted --
-// meaningless (ignored) whenever `showBeatIndicator` is false.
+// Full redraw. `onBpmRow` puts the cursor on the BPM block instead of
+// `selectedTrack`; `focusIndex` is the focused field there (0 BPM, 1 time
+// sig, 2 Metro, 3 Count In, 4 Sync). `showMetronomeVolume`/
+// `showCountInBars` show the volume or bars in place of METRO/COUNT while
+// EDIT is held. `showBeatIndicator` shows the beat squares in the status
+// strip, `metronomeCurrentBeat` (0-based, -1 none) lights one.
 void drawLooper(const LoopTrackView tracks[4], int selectedTrack, bool onBpmRow, bool syncMode, float bpm,
                  int timeSigNum, int timeSigDen, bool metronomeOn, int metronomeVolumePercent,
                  bool showMetronomeVolume, bool countInEnabled, int countInBars, bool showCountInBars,
                  int focusIndex, bool showBeatIndicator, int metronomeCurrentBeat);
 
-// Cheap partial redraw of just the 4 tracks' progress bars and MIDI
-// activity indicators, meant to be called at a low fixed rate to animate
-// them without redrawing the rest of the screen (track labels/state/
-// cursor don't change here). `selectedTrack` is needed so the activity
-// dot's "off" color matches that row's current background.
+// Playheads, fills, event dots and activity lights, only what moved. Call
+// at the 40 ms frame rate, which the looper keeps. `selectedTrack` is -1 on
+// the BPM row.
 void updateLooperPositions(const LoopTrackView tracks[4], int selectedTrack);
 
-// Cheap partial redraw for moving the looper's row cursor: repaints only
-// the previously and newly selected rows instead of the whole screen.
-// Covers both track rows and the BPM row -- prevOnBpm/newOnBpm say
-// whether that endpoint is the BPM row rather than a track index.
+// Moves the cursor between track rows and the BPM row.
 void updateLooperSelection(const LoopTrackView tracks[4], int prevSelected, bool prevOnBpm,
                             int newSelected, bool newOnBpm, bool syncMode, float bpm,
                             int timeSigNum, int timeSigDen, bool metronomeOn, int metronomeVolumePercent,
                             bool showMetronomeVolume, bool countInEnabled, int countInBars,
                             bool showCountInBars, int focusIndex);
 
-// Cheap partial redraw of trackIdx's whole row (label text, progress bar,
-// activity dots) -- e.g. after a button press changes that track's state,
-// without touching any other row, the BPM row, header, or footer.
+// Track trackIdx's whole row, after its state changes.
 void updateLooperTrackRow(const LoopTrackView tracks[4], int trackIdx, bool selected);
 
-// Cheap partial redraw of just the selected track's channel field (shown
-// as "In/Out", e.g. "OMNI/REC"), e.g. after ALT+UP/DOWN (out) or
-// ALT+LEFT/RIGHT (in) changes it. Does not touch the rest of that row or
-// any other row.
+// The selected track's route, after ALT+UP/DOWN/LEFT/RIGHT.
 void updateLooperChannel(const LoopTrackView tracks[4], int selectedTrack);
 
-// Cheap partial redraw of just the selected track's bar-length field, e.g.
-// after EDIT+LEFT/RIGHT changes it. Does not touch the rest of that row or
-// any other row.
+// The selected track's bar length, after EDIT+LEFT/RIGHT.
 void updateLooperBarLength(const LoopTrackView tracks[4], int selectedTrack);
 
-// Cheap partial redraw of just trackIdx's length field, e.g. after a BPM
-// change rescales a bar-quantized track. Unlike the channel/bar-length
-// updates above, this isn't limited to the selected track -- a BPM change
-// can rescale several tracks at once -- so `selected` is passed explicitly.
+// Track trackIdx's length, after a BPM change rescales it.
 void updateLooperLength(const LoopTrackView tracks[4], int trackIdx, bool selected);
 
-// Cheap partial redraw of just the BPM row -- e.g. after ALT+UP/DOWN/
-// LEFT/RIGHT (or EDIT) adjusts whichever of BPM/Time Sig/Metro/Count
-// In/Sync has focus (see drawLooper()'s comment on `focusIndex`/
-// `showMetronomeVolume`/`showCountInBars`). `selected` false means the
-// row isn't actually highlighted right now (focusIndex is meaningless
-// then); callers pass it false for symmetry, never true off the BPM row.
-// Does not touch any track row.
+// The BPM block, after one of its fields changes. `selected` is whether
+// the cursor is on it.
 void updateLooperBpm(float bpm, int timeSigNum, int timeSigDen, bool syncMode, bool metronomeOn,
                       int metronomeVolumePercent, bool showMetronomeVolume, bool countInEnabled,
                       int countInBars, bool showCountInBars, int focusIndex, bool selected);
 
-// Cheap partial redraw of just the BPM row's outline -- a brief flash on
-// each metronome beat (see LooperMode's updateBpmRowBeatFlash()), meant to
-// be visible without close attention but not disruptive if you're already
-// looking right at it. `active` true draws the flash border (orange for
-// the downbeat, `downbeat` true, yellow otherwise -- meaningless when
-// `active` is false); false erases it back to the row's own background.
-// `selected` picks which background to erase into, same convention
-// updateLooperBpm() itself uses.
+// The beat flash round the BPM block: the downbeat colour on beat 1, the
+// pulse colour on the others; `active` false takes it away.
 void updateLooperBpmRowBeatFlash(bool active, bool downbeat, bool selected);
 
-// Full redraw of the looper's count-in overlay, shown in place of the
-// normal 4-track view while counting in before recording starts (see
-// LooperMode's maybeStartCountIn()). `beatsRemaining` counts down to 1
-// (e.g. 4, 3, 2, 1), not up -- recording starts right after 1.
-void drawLooperCountIn(int beatsRemaining);
+// Bar and beat in the BPM block, 1-based; bar 0 shows dashes.
+void updateLooperBarBeat(int bar, int beat);
 
-// Cheap partial redraw of just the beat number/caption, called once per
-// beat during the count-in. Does not touch the header/footer.
+// The count-in screen, in place of the tracks, counting down to 1.
+void drawLooperCountIn(int beatsRemaining);
 void updateLooperCountInBeat(int beatsRemaining);
 
-// Cheap partial redraw of just the header's metronome beat-indicator row --
-// a square per beat of the current time signature, between "MIDI Looper"
-// and "midiTracker". `visible` false hides the whole row -- gated on its
-// own showBeatIndicator toggle, not directly on Metro being on (see
-// LooperMode's updateMetronomeBeatIndicator()), so the row can still show
-// as a static time-signature reference with the metronome's click off.
-// `currentBeat` is 0-based (0 = downbeat) or -1 for "nothing lit" (Metro
-// not actually running); meaningless unless `visible`.
+// The beat squares in the status strip, one per beat of the time
+// signature. `currentBeat` is 0-based or -1 for none.
 void updateLooperBeatIndicator(bool visible, int currentBeat, int timeSigNum);
 
 // Full redraw of the Settings screen: a scrollable list of labeled

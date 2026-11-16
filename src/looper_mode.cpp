@@ -13,6 +13,7 @@
 #include "midi_output.h"
 #include "input.h"
 #include "ui.h"
+#include "ui_strip.h"
 #include "config.h"
 #include "synth.h"
 #include "settings_mode.h"
@@ -169,6 +170,7 @@ struct LoopTrack {
 
     LoopEvent events[MAX_EVENTS_PER_TRACK];
     int eventCount = 0;
+    uint16_t eventEdits = 0; // bumped on every change to events[], for the lane dots
     bool bufferFull = false; // events[] hit MAX_EVENTS_PER_TRACK and further events are being silently dropped
 };
 
@@ -263,6 +265,7 @@ uint32_t masterClockAnchorMs = 0;
 uint32_t masterClockBeatsSinceAnchor = 0;
 float masterClockAnchorBeatMs = 0.0f;
 uint32_t masterClockLastDueMs = 0; // what updateMasterClock() last set masterClockNextDueMs to
+int masterClockBar = 0; // bars since the clock started, 1-based; 0 until its first beat
 int metronomeVolumePercent = 80; // scales METRONOME_VELOCITY(_DOWNBEAT) below -- see SettingsMode::metronomeVolume()
 const uint8_t METRONOME_CHANNEL = 9;   // GM percussion (MIDI channel 10) -- see PERCUSSION_CHANNEL in synth.cpp
 const uint8_t METRONOME_NOTE = 76;     // GM Hi Wood Block -- a resonant "knock" (synth.cpp's classifyDrum()), trying this in place of the previous Closed Hi-Hat tick
@@ -290,6 +293,7 @@ const uint8_t METRONOME_VELOCITY_DOWNBEAT = (uint8_t)(METRONOME_VELOCITY * 1.40f
 // unfreezing actually left off.
 void restartMasterClockFromStart(uint32_t now) {
     masterClockBeatInBar = 0;
+    masterClockBar = 0;
     masterClockNextDueMs = now;
 }
 
@@ -575,17 +579,19 @@ uint32_t snapToBarBoundary(uint32_t now, uint32_t origin, uint32_t barMs) {
 // established loop yet to show a position within -- but a bar-quantized
 // track (barLength > 0) does have a known target duration even before
 // that first pass commits, so show progress toward *that* instead of
-// leaving the bar empty until the auto-commit lands.
-float positionFrac(const LoopTrack& t) {
-    if (t.state == TRACK_STOPPED) return 0.0f;
+// leaving the bar empty until the auto-commit lands. 0-65535 for 0 to
+// the end of the loop.
+uint16_t positionQ16(const LoopTrack& t) {
+    if (t.state == TRACK_STOPPED) return 0;
     if (t.lengthMs == 0) {
-        if (t.state != TRACK_RECORDING || t.barLength == 0) return 0.0f;
+        if (t.state != TRACK_RECORDING || t.barLength == 0) return 0;
         uint32_t target = barsToMs(t.barLength);
-        if (target == 0) return 0.0f;
-        float frac = (float)(millis() - t.recordStartMs) / (float)target;
-        return frac > 1.0f ? 1.0f : frac;
+        if (target == 0) return 0;
+        uint32_t elapsed = millis() - t.recordStartMs;
+        if (elapsed >= target) return 65535;
+        return (uint16_t)(((uint64_t)elapsed << 16) / target);
     }
-    return (float)(elapsedRunMs(t) % t.lengthMs) / (float)t.lengthMs;
+    return (uint16_t)(((uint64_t)(elapsedRunMs(t) % t.lengthMs) << 16) / t.lengthMs);
 }
 
 // Recomputes prevPos/playCursor from the current position -- used both
@@ -601,6 +607,7 @@ void clampEventOffsets(LoopTrack& t) {
     if (t.baseLengthMs == 0) return;
     uint32_t last = t.baseLengthMs - 1;
     for (int i = t.eventCount - 1; i >= 0 && t.events[i].offsetMs() > last; i--) t.events[i].setOffsetMs(last);
+    t.eventEdits++;
 }
 
 // Current position in the loop, in the track's offset scale
@@ -867,6 +874,7 @@ void updateMasterClock() {
         // back to idle remembering to clean up after itself.
         masterClockNextDueMs = 0;
         masterClockBeatInBar = 0;
+        masterClockBar = 0;
         return;
     }
 
@@ -891,6 +899,7 @@ void updateMasterClock() {
         Synth::noteOn(METRONOME_CHANNEL, METRONOME_NOTE, velocity);
     }
 
+    if (masterClockBar == 0 || masterClockBeatInBar == 0) masterClockBar++;
     masterClockBeatInBar = (masterClockBeatInBar + 1) % timeSigNum;
     if (beatMs != masterClockAnchorBeatMs || masterClockNextDueMs != masterClockLastDueMs) {
         masterClockAnchorMs = masterClockNextDueMs;
@@ -957,6 +966,7 @@ void maybeStartCountIn() {
     // down, not whatever click happened to already be mid-cycle).
     masterClockNextDueMs = countInStartMs;
     masterClockBeatInBar = 0;
+    masterClockBar = 0;
 
     needsRedraw = true; // switches the main-screen redraw into count-in mode -- see update()
 }
@@ -1004,6 +1014,7 @@ void updateCountIn() {
 
     if (elapsed >= totalMs) {
         countInActive = false;
+        masterClockBar = 0; // the take counts from bar 1
         startArmedTracksTogether();
         needsRedraw = true;
         return;
@@ -1133,6 +1144,7 @@ void insertEvent(LoopTrack& t, uint32_t offset, uint8_t status, uint8_t data1, u
     for (int j = t.eventCount; j > idx; j--) t.events[j] = t.events[j - 1];
     t.events[idx].set(offset, status, data1, data2);
     t.eventCount++;
+    t.eventEdits++;
 
     // Inserting at/before the playback cursor shifts every event from
     // idx onward one slot to the right -- without this, the cursor would
@@ -1354,6 +1366,7 @@ void toggleRecordOnSelected() {
             t.lengthMs = 0;
             t.baseLengthMs = 0;
             t.eventCount = 0;
+            t.eventEdits++;
             t.state = TRACK_ARMED;
             break;
 
@@ -1363,7 +1376,7 @@ void toggleRecordOnSelected() {
             // to STOPPED (content untouched, still frozen) if this was
             // arming an existing stopped track for overdub instead (see
             // the TRACK_STOPPED case below) -- lengthMs > 0 is what tells
-            // the two apart, same convention recordEvent()/positionFrac()
+            // the two apart, same convention recordEvent()/positionQ16()
             // already use for "still on the open first pass" vs. not.
             t.state = (t.lengthMs > 0) ? TRACK_STOPPED : TRACK_EMPTY;
             break;
@@ -1856,6 +1869,7 @@ void resetTrack(LoopTrack& t) {
     t.prevPos = 0;
     t.playCursor = 0;
     t.eventCount = 0;
+    t.eventEdits++;
     t.bufferFull = false;
 }
 
@@ -2383,6 +2397,8 @@ bool loadTrackFromFile(LoopTrack& t, const char* path) {
     const uint32_t usPerQuarter = 500000; // must match saveTrackToFile()'s synthetic tempo
 
     t.eventCount = 0;
+
+    t.eventEdits++;
     t.bufferFull = false;
     t.lengthMs = 0;
 
@@ -2397,6 +2413,7 @@ bool loadTrackFromFile(LoopTrack& t, const char* path) {
             t.bufferFull = true; // past the longest loop, left out
         } else if (t.eventCount < MAX_EVENTS_PER_TRACK) {
             t.events[t.eventCount++].set(ms, r.pendingStatus, r.pendingData1, r.pendingData2);
+            t.eventEdits++;
         } else {
             t.bufferFull = true;
         }
@@ -2521,6 +2538,7 @@ bool importMidiEvents(LoopTrack& t, const char* path) {
                 t.bufferFull = true; // past the longest loop, left out
             } else if (t.eventCount < MAX_EVENTS_PER_TRACK) {
                 LoopEvent& e = t.events[t.eventCount++];
+                t.eventEdits++;
                 e.set((uint32_t)ms, r.pendingStatus, r.pendingData1, r.pendingData2);
             } else {
                 t.bufferFull = true;
@@ -2965,7 +2983,7 @@ void rescaleBarQuantizedTracks() {
 
     // Only the affected tracks' displayed length actually changed --
     // their progress bars self-correct on the next ~100ms position tick
-    // (positionFrac() reads lengthMs fresh every time), so this only
+    // (positionQ16() reads lengthMs fresh every time), so this only
     // needs to touch the length text.
     Ui::LoopTrackView views[4];
     buildTrackViews(views);
@@ -4177,7 +4195,7 @@ void buildTrackViews(Ui::LoopTrackView out[4]) {
         out[i].channelOut = t.channelOut;
         out[i].barLength = t.barLength;
         out[i].lengthMs = t.lengthMs;
-        out[i].positionFrac = positionFrac(t);
+        out[i].pos = positionQ16(t);
         out[i].recordActive = t.lastRecordActivityMs != 0 && (now - t.lastRecordActivityMs) < ACTIVITY_FLASH_MS;
         out[i].playActive = t.lastPlaybackActivityMs != 0 && (now - t.lastPlaybackActivityMs) < ACTIVITY_FLASH_MS;
         out[i].bufferFull = t.bufferFull;
@@ -4233,6 +4251,100 @@ const char* const FREE_GATE_LABELS[] = { "Save & Continue", "Discard & Continue"
 const int FREE_GATE_COUNT = 3;
 int freeGateCursor = 0;
 bool freeGateErrorShown = false; // a save-failed message is up; the menu comes back once flashUntilMs passes
+
+
+// Draw pump (see Ui::setDrawPump()): keeps the loops and the metronome
+// going while a strip goes out. Only set around the main screen's draws at
+// the end of update(), where nothing is half changed.
+void pumpLooper() {
+    updatePlayback();
+    updateMasterClock();
+}
+
+// BAR and BEAT in the BPM block, both from the master clock. Bars count
+// from when it started, wrapping at the longest running loop when that's a
+// whole number of bars. barBeatShown = -1 forces a redraw.
+int barBeatShown = -1;
+
+void updateBarBeatReadout() {
+    int beat = masterClockCurrentBeat();
+    int bar = beat < 0 ? 0 : masterClockBar;
+    if (bar > 0) {
+        uint32_t barMs = barsToMs(1);
+        uint32_t longest = 0;
+        for (int i = 0; i < NUM_TRACKS; i++) {
+            const LoopTrack& t = tracks[i];
+            bool running = t.state == TRACK_PLAYING || t.state == TRACK_RECORDING || t.state == TRACK_MUTED;
+            if (running && t.lengthMs > longest) longest = t.lengthMs;
+        }
+        if (barMs > 0 && longest >= barMs) {
+            // Within 2 ms of whole bars, as barsToMs() rounds.
+            uint32_t bars = (longest + barMs / 2) / barMs;
+            int32_t off = (int32_t)(longest - bars * barMs);
+            if (off >= -2 && off <= 2) bar = (int)((bar - 1) % bars) + 1;
+        }
+        bar = (bar - 1) % 999 + 1;
+    }
+    int key = bar * 16 + beat + 1;
+    if (key == barBeatShown) return;
+    barBeatShown = key;
+    Ui::updateLooperBarBeat(bar, bar > 0 ? beat + 1 : 0);
+}
+
+// Rebuilds a lane's event dots when its events change: note-ons placed
+// across the loop, or across the bar-quantized target on a first pass. One
+// lane at a time, DOT_BUDGET events per loop pass so a pass stays well
+// under 100 us. An edit during the walk doesn't restart it, so steady
+// overdubbing can't starve it; the lane is keyed as it was at the start,
+// so the next check builds it again.
+const int DOT_BUDGET = 48;
+int dotTrack = -1;    // lane being built, -1 none
+int dotCursor = 0;    // next event to place
+uint32_t dotBuildKey = 0;
+uint32_t dotShownKey[NUM_TRACKS] = {1, 1, 1, 1}; // never a real key, so the first check builds
+
+uint32_t laneLength(const LoopTrack& t) {
+    if (t.baseLengthMs > 0) return t.baseLengthMs;
+    if (t.state == TRACK_RECORDING && t.barLength > 0) return barsToMs(t.barLength);
+    return 0;
+}
+
+uint32_t laneKey(const LoopTrack& t) {
+    // Low bit clear so it never matches the starting value.
+    return ((laneLength(t) * 2654435761u) ^ ((uint32_t)t.eventEdits << 8)) & ~1u;
+}
+
+void refreshLaneDots() {
+    static uint32_t lastMs = 0;
+    if (dotTrack < 0) {
+        uint32_t now = millis();
+        if (now - lastMs < 200) return;
+        lastMs = now;
+        for (int i = 0; i < NUM_TRACKS; i++) {
+            uint32_t key = laneKey(tracks[i]);
+            if (key == dotShownKey[i]) continue;
+            dotTrack = i;
+            dotCursor = 0;
+            dotBuildKey = key;
+            UiModes::laneDotsBegin(i, laneLength(tracks[i]));
+            break;
+        }
+        if (dotTrack < 0) return;
+    }
+    const LoopTrack& t = tracks[dotTrack];
+    if (laneLength(t) > 0) {
+        int end = dotCursor + DOT_BUDGET;
+        if (end > t.eventCount) end = t.eventCount;
+        for (; dotCursor < end; dotCursor++) {
+            const LoopEvent& e = t.events[dotCursor];
+            if ((e.status() & 0xF0) == 0x90 && e.data2() > 0) UiModes::laneDot(e.offsetMs(), e.data1());
+        }
+        if (dotCursor < t.eventCount) return;
+    }
+    UiModes::laneDotsEnd();
+    dotShownKey[dotTrack] = dotBuildKey;
+    dotTrack = -1;
+}
 
 } // namespace
 
@@ -4407,10 +4519,20 @@ bool update() {
 
     updateMetronomeBeatIndicator(); // every tick, cheap comparison -- see its own comment
     updateBpmRowBeatFlash(); // every tick, same reasoning -- see its own comment
+    if (needsRedraw) barBeatShown = -1;
+    updateBarBeatReadout();
+    refreshLaneDots();
+
+    // The lanes move at 25 fps; between frames there's nothing to build.
+    static uint32_t lastViewMs = 0;
+    uint32_t nowMs = millis();
+    if (!needsRedraw && nowMs - lastViewMs < 40) return false;
+    lastViewMs = nowMs;
 
     Ui::LoopTrackView views[4];
     buildTrackViews(views);
 
+    Ui::setDrawPump(pumpLooper);
     if (needsRedraw) {
         needsRedraw = false;
         // -1 ("nothing lit") when the row is hidden, not just whenever
@@ -4423,18 +4545,11 @@ bool update() {
                        metronomeOn, metronomeVolumePercent, false, countInEnabled, countInBars, false,
                        (int)bpmRowFocus, showBeatIndicator, currentBeat);
     } else {
-        static uint32_t lastPosTick = 0;
-        uint32_t now = millis();
-        if (now - lastPosTick >= 100) {
-            lastPosTick = now;
-            // -1 when the BPM row is selected, so no track row is
-            // (incorrectly) treated as highlighted for the activity dots'
-            // "off" background color -- drawLooper()/updateLooperSelection()
-            // already cleared that track's real highlight when the cursor
-            // moved off it.
-            Ui::updateLooperPositions(views, onBpmRow ? -1 : selectedTrack);
-        }
+        // -1 when the BPM row is selected, so no track row is treated as
+        // highlighted. The 40 ms gate above sets the frame rate.
+        Ui::updateLooperPositions(views, onBpmRow ? -1 : selectedTrack);
     }
+    Ui::setDrawPump(nullptr);
 
     return false;
 }

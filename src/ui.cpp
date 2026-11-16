@@ -7,6 +7,7 @@
 #include "ui_strip.h"
 #include "ui_look.h"
 #include "ui_player.h"
+#include "ui_modes.h"
 #include <ctype.h>
 #include <TFT_eSPI.h>
 #include <hardware/clocks.h>
@@ -112,37 +113,6 @@ const int ROW_HEIGHT = 18;
 const int HEADER_HEIGHT = Look::HEADER_H;
 const int FOOTER_HEIGHT = Look::FOOTER_H;
 
-const int STRIP_HEIGHT      = 74; // note strip height on the pariSynth screen, before it's cut to fit
-const int STRIP_MIN_BAR_HEIGHT = 4; // floor so even the softest note stays visible
-
-// Note-activity strip range: standard 88-key piano (A0..C8). Notes
-// outside this range (rare outside percussion channels) just don't show.
-const int PIANO_LO = 21;
-const int PIANO_HI = 108;
-
-// pariSynth play screen layout: a 16-channel grid, 2 columns (channels
-// 1-8 left, 9-16 right) x 8 rows, above the shared note-activity strip
-// (see PIANO_LO/PIANO_HI/STRIP_HEIGHT above -- reused as-is, same widget
-// drawPlayer() uses). Channel numbers form an aligned "spine" down the
-// middle of the screen (right-aligned for the left column, left-aligned
-// for the right column, via TR_DATUM/TL_DATUM rather than a measured
-// offset), with instrument names radiating outward from there -- right-
-// aligned on the left column, left-aligned on the right -- so a name
-// grows toward its own screen edge as it gets longer instead of crowding
-// its neighbor column, and the numbers stay put regardless of name length.
-// PARISYNTH_NUM_SLOT_W is a fixed reservation (not measured against any
-// specific string) sized for the widest number this screen ever shows,
-// "16".
-const int PARISYNTH_GRID_Y = HEADER_HEIGHT + 6;
-const int PARISYNTH_ROWS = 8;
-const int PARISYNTH_ROW_SPLIT_X = 160; // left/right cell-background boundary -- screen center (tft.width()/2)
-const int PARISYNTH_NUM_SLOT_W = 20;
-const int PARISYNTH_NUM_LEFT_X = PARISYNTH_ROW_SPLIT_X - 8;  // right edge of left-column numbers (TR_DATUM)
-const int PARISYNTH_NUM_RIGHT_X = PARISYNTH_ROW_SPLIT_X + 8; // left edge of right-column numbers (TL_DATUM)
-const int PARISYNTH_NAME_LEFT_X = PARISYNTH_NUM_LEFT_X - PARISYNTH_NUM_SLOT_W;   // right edge of left-column names (TR_DATUM)
-const int PARISYNTH_NAME_RIGHT_X = PARISYNTH_NUM_RIGHT_X + PARISYNTH_NUM_SLOT_W; // left edge of right-column names (TL_DATUM)
-const int PARISYNTH_GRID_BOTTOM = PARISYNTH_GRID_Y + PARISYNTH_ROWS * ROW_HEIGHT;
-const int PARISYNTH_STRIP_Y = PARISYNTH_GRID_BOTTOM + 8;
 
 // Recording screen layout, same fixed-offset approach as the player
 // screen above so updateRecordingLive() can repaint just the elapsed/
@@ -236,63 +206,6 @@ void drawScrollbar(int count, int scrollOffset, int rows, int trackY) {
     Look::drawScrollbar(trackY, rows, count, scrollOffset);
 }
 
-// Redraws the full note-activity strip at `y`, `height` tall (default
-// STRIP_HEIGHT, drawPlayer()'s own budgeted size -- pariSynth's screen
-// passes a smaller value that actually fits its own layout, see
-// parisynthStripHeight()): one column per piano key, bar height scaled to
-// that note's velocity (max velocity = full height, floored at
-// STRIP_MIN_BAR_HEIGHT so soft notes stay visible), anchored to the
-// bottom like a keybed/VU meter. Percussion-channel notes (see
-// MidiOutput::isNotePercussion()) get a warm red/orange palette instead of
-// the melodic green/yellow one, so drum hits read as visually distinct
-// from melodic notes at a glance rather than just being more activity in
-// the same color. Each column remembers what it last painted (tier and
-// bar height) and is only repainted when that changes; `full` forgets
-// that, for the screens' full redraws (entry, theme change, cleared area).
-uint16_t g_stripKey[PIANO_HI - PIANO_LO + 1];
-
-void drawNoteStrip(int y, int height = STRIP_HEIGHT, bool full = false) {
-    // A meter: skipped while the slice is spent or the ring is low. The
-    // column cache catches up on the next pass that runs.
-    if (!full && !sliceAllows(DRAW_METER)) return;
-    SliceTimer timer;
-    int span = PIANO_HI - PIANO_LO + 1;
-    int colWidth = tft.width() / span;
-    if (colWidth < 1) colWidth = 1;
-    int barWidth = colWidth > 1 ? colWidth - 1 : 1;
-    if (full) {
-        for (int i = 0; i < span; i++) g_stripKey[i] = 0xFFFF;
-    }
-
-    for (int note = PIANO_LO; note <= PIANO_HI; note++) {
-        int x = (note - PIANO_LO) * colWidth;
-        int barHeight = 0;
-        uint8_t tier = 0;
-        uint16_t color = COLOR_BG;
-        if (MidiOutput::isNoteActive((uint8_t)note)) {
-            uint8_t vel = MidiOutput::noteVelocity((uint8_t)note);
-            barHeight = STRIP_MIN_BAR_HEIGHT + ((height - STRIP_MIN_BAR_HEIGHT) * vel) / 127;
-            uint8_t level = (vel >= 100) ? 3 : (vel >= 64) ? 2 : 1;
-            bool perc = MidiOutput::isNotePercussion((uint8_t)note);
-            tier = perc ? level + 3 : level;
-            if (perc) {
-                color = (level == 3) ? COLOR_PERC_HIGH : (level == 2) ? COLOR_PERC_MID : COLOR_PERC_LOW;
-            } else {
-                color = (level == 3) ? COLOR_NOTE_HIGH : (level == 2) ? COLOR_NOTE_MID : COLOR_NOTE_LOW;
-            }
-        }
-        uint16_t key = (uint16_t)((tier << 8) | (barHeight & 0xFF));
-        if (key == g_stripKey[note - PIANO_LO]) continue;
-        g_stripKey[note - PIANO_LO] = key;
-        if (barHeight < height) {
-            tft.fillRect(x, y, barWidth, height - barHeight, COLOR_BG);
-        }
-        if (barHeight > 0) {
-            tft.fillRect(x, y + height - barHeight, barWidth, barHeight, color);
-        }
-    }
-}
-
 // Clears a w x h box at x, y to bg and draws `text` in font 2 at tx along
 // from x, top aligned, through the strip canvas. A box taller than one strip
 // at that width goes out in bands, the text clipped to each.
@@ -311,51 +224,6 @@ void stripText(int x, int y, int w, int h, const char* text, int tx, uint16_t fg
     }
 }
 
-
-// Header beat-indicator row (see drawLooperBeatIndicator()) -- BEATS_MAX
-// matches TIME_SIG_PRESETS' widest numerator, 7 (7/8), in looper_mode.cpp;
-// used to size a fixed clear region wide enough for the largest possible
-// row so shrinking from a wider time signature (or turning Metro off)
-// never leaves a stray square from the previous draw.
-const int BEAT_INDICATOR_MAX_BEATS = 7;
-const int BEAT_INDICATOR_SIZE = 8;
-const int BEAT_INDICATOR_GAP = 6;
-const int BEAT_INDICATOR_MAX_WIDTH =
-    BEAT_INDICATOR_MAX_BEATS * BEAT_INDICATOR_SIZE + (BEAT_INDICATOR_MAX_BEATS - 1) * BEAT_INDICATOR_GAP; // 92
-
-// Header beat-indicator row: one small square per beat of the current time
-// signature, centred in the status strip. The whole row is hidden (region
-// just blanked back to the strip background) whenever `visible` is false -- gated on its own
-// showBeatIndicator toggle, independent of Metro's own on/off (see
-// LooperMode's updateMetronomeBeatIndicator()). Three visual states per
-// square: the current beat is lit solid bright (COLOR_PULSE, same "active"
-// color as drawActivityDot()); the downbeat (index 0) gets a solid-outline
-// resting look even when it isn't current, so the bar's start stays
-// visible at a glance; every other beat is a plain dim (COLOR_DIM) filled
-// square. Always clears a fixed BEAT_INDICATOR_MAX_WIDTH-wide region
-// first regardless of the actual (possibly narrower) row about to be drawn,
-// so shrinking timeSigNum (or Metro turning off) can't leave a stray square
-// behind from a wider previous draw.
-void drawLooperBeatIndicator(bool visible, int currentBeat, int timeSigNum) {
-    int clearX = tft.width() / 2 - BEAT_INDICATOR_MAX_WIDTH / 2;
-    tft.fillRect(clearX, 0, BEAT_INDICATOR_MAX_WIDTH, Look::STATUS_H, COLOR_SURFACE);
-    if (!visible || timeSigNum < 1) return;
-
-    int rowWidth = timeSigNum * BEAT_INDICATOR_SIZE + (timeSigNum - 1) * BEAT_INDICATOR_GAP;
-    int x = tft.width() / 2 - rowWidth / 2;
-    int y = (Look::STATUS_H - BEAT_INDICATOR_SIZE) / 2;
-
-    for (int i = 0; i < timeSigNum; i++) {
-        if (i == currentBeat) {
-            tft.fillRect(x, y, BEAT_INDICATOR_SIZE, BEAT_INDICATOR_SIZE, COLOR_PULSE);
-        } else if (i == 0) {
-            tft.drawRect(x, y, BEAT_INDICATOR_SIZE, BEAT_INDICATOR_SIZE, COLOR_TEXT);
-        } else {
-            tft.fillRect(x, y, BEAT_INDICATOR_SIZE, BEAT_INDICATOR_SIZE, COLOR_DIM);
-        }
-        x += BEAT_INDICATOR_SIZE + BEAT_INDICATOR_GAP;
-    }
-}
 
 void formatDuration(uint32_t ms, char* out, size_t outSize) {
     uint32_t totalSec = ms / 1000;
@@ -524,83 +392,6 @@ void drawSysExProgress(const SysExPlayer& player, bool full) {
                   color, color != g_sysexColor);
     g_sysexFill = fillW;
     g_sysexColor = color;
-}
-
-// Splits one pariSynth channel cell's text into its two independently-
-// positioned parts (see PARISYNTH_ROW_SPLIT_X's comment) -- `numBuf` gets
-// the 1-based channel number (matching every other on-screen channel
-// display in this app, e.g. LoopTrackView's own "In/Out" fields), `nameBuf`
-// the resolved instrument name. Channel 10 (index 9) always names "Drums"
-// regardless of its program, same GM convention Synth uses.
-void parisynthChannelParts(int channel, char* numBuf, size_t numBufSize, char* nameBuf, size_t nameBufSize) {
-    snprintf(numBuf, numBufSize, "%d", channel + 1);
-    if (channel == 9) {
-        snprintf(nameBuf, nameBufSize, "Drums");
-        return;
-    }
-    uint8_t program = Synth::getChannelProgram((uint8_t)channel);
-    uint8_t family = (program >> 3) & 0x0F;
-    snprintf(nameBuf, nameBufSize, "%s", Synth::instrumentFamilyName(family));
-}
-
-// Redraws exactly one cell -- shared by the full-grid draw and the two
-// cheap partial-update entry points below. Left column (channels 0-7):
-// name and number both right-aligned (TR_DATUM), number closer to center
-// -- reads "Instrument Name  1". Right column (8-15): both left-aligned
-// (TL_DATUM), mirrored -- reads "9  Instrument Name". See
-// PARISYNTH_ROW_SPLIT_X's comment for why the numbers don't need their
-// own width measured to stay clear of the names. `active` (see
-// drawPariSynthPlay()'s activeMask comment) swaps the number from
-// COLOR_ACCENT to COLOR_NOTE_HIGH -- the same color the note strip already
-// uses for a hard-hit note just below this grid, rather than inventing a
-// new color meaning -- while at least one note is currently held on that
-// channel.
-uint16_t g_cellActiveDrawn = 0;
-
-void drawParisynthCell(int channel, bool selected, bool active) {
-    if (active) g_cellActiveDrawn |= (uint16_t)(1u << channel);
-    else g_cellActiveDrawn &= (uint16_t)~(1u << channel);
-    int col = channel / PARISYNTH_ROWS;
-    int row = channel % PARISYNTH_ROWS;
-    int y = PARISYNTH_GRID_Y + row * ROW_HEIGHT;
-    uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
-    uint16_t numColor = active ? COLOR_NOTE_HIGH : COLOR_ACCENT;
-
-    char numBuf[4], nameBuf[20];
-    parisynthChannelParts(channel, numBuf, sizeof(numBuf), nameBuf, sizeof(nameBuf));
-
-    if (col == 0) {
-        tft.fillRect(0, y, PARISYNTH_ROW_SPLIT_X, ROW_HEIGHT, bg);
-        tft.setTextDatum(TR_DATUM);
-        tft.setTextColor(COLOR_TEXT, bg);
-        tft.drawString(nameBuf, PARISYNTH_NAME_LEFT_X, y + 2);
-        tft.setTextColor(numColor, bg);
-        tft.drawString(numBuf, PARISYNTH_NUM_LEFT_X, y + 2);
-    } else {
-        tft.fillRect(PARISYNTH_ROW_SPLIT_X, y, tft.width() - PARISYNTH_ROW_SPLIT_X, ROW_HEIGHT, bg);
-        tft.setTextDatum(TL_DATUM);
-        tft.setTextColor(numColor, bg);
-        tft.drawString(numBuf, PARISYNTH_NUM_RIGHT_X, y + 2);
-        tft.setTextColor(COLOR_TEXT, bg);
-        tft.drawString(nameBuf, PARISYNTH_NAME_RIGHT_X, y + 2);
-    }
-    tft.setTextDatum(TL_DATUM);
-}
-
-// How tall the note strip can actually be on this screen without reaching
-// into the footer's row -- the 16-channel grid above it (144px) leaves far
-// less headroom than drawPlayer()'s own stat rows do, so STRIP_HEIGHT (74,
-// budgeted for that other screen) doesn't fit here. Using it unclipped
-// used to make drawNoteStrip() paint note-activity bars straight over the
-// footer text on every live tick (updatePariSynthPlayLive() only redraws
-// the strip, not the footer) -- clamping to what's actually free keeps the
-// strip's own fillRect calls from ever touching footer pixels in the
-// first place, so there's nothing left to redraw over.
-int parisynthStripHeight() {
-    int available = tft.height() - FOOTER_HEIGHT - PARISYNTH_STRIP_Y;
-    if (available > STRIP_HEIGHT) available = STRIP_HEIGHT;
-    if (available < STRIP_MIN_BAR_HEIGHT) available = STRIP_MIN_BAR_HEIGHT;
-    return available;
 }
 
 // Shared keypad footer from up to two hint lines, see Look::drawHintFooter().
@@ -868,72 +659,41 @@ void updatePlayerLive(const MidiPlayer& player) {
     UiPlayer::midiLive(midiInfo(nullptr, player));
 }
 
-// -- pariSynth play screen -----------------------------------------------
+// -- pariSynth play screen (ui_modes.cpp) --------------------------------
 
-void drawPariSynthPlay(int selectedChannel, uint16_t activeMask, const char* footerLine1, const char* footerLine2) {
-    statusBar("PARISYNTH", &Look::ICON_PARISYNTH, COLOR_MIDI);
-
-    // Full-width clear for the whole grid area. drawParisynthCell() itself
-    // covers every row's full width now (its two halves meet exactly at
-    // PARISYNTH_ROW_SPLIT_X), but the small header-to-first-row gap above
-    // row 0 isn't part of any cell's own fillRect -- clear that here too
-    // rather than relying on whatever the previous screen last drew at
-    // those Y coordinates, same reasoning as the note-strip's right-edge
-    // remainder below.
-    tft.fillRect(0, HEADER_HEIGHT, tft.width(), PARISYNTH_GRID_BOTTOM - HEADER_HEIGHT, COLOR_BG);
-    for (int ch = 0; ch < 16; ch++) {
-        drawParisynthCell(ch, ch == selectedChannel, (activeMask & (1u << ch)) != 0);
+static UiModes::SynthCell pariCell(int channel) {
+    UiModes::SynthCell c;
+    if (channel == 9) {
+        c.name = "Drums";
+        c.family = 16;
+        return c;
     }
-
-    // Cleared as one full-width span down to the footer -- covers the gap
-    // above the strip *and* the strip's own right-edge remainder (320px
-    // doesn't divide evenly by its 88 note-columns, see drawNoteStrip()'s
-    // comment), same reasoning drawPlayer() documents for its own
-    // contentBottom-to-footer clear. Splitting this into two conditional
-    // gap-fills around drawNoteStrip() (the old version here) missed that
-    // remainder whenever the strip's bottom landed exactly on the footer,
-    // which it always does now that parisynthStripHeight() sizes it to fit
-    // -- leaving whatever the editor screen last painted there stuck on
-    // screen after returning from it.
-    int fy = tft.height() - FOOTER_HEIGHT;
-    if (fy > PARISYNTH_GRID_BOTTOM) {
-        tft.fillRect(0, PARISYNTH_GRID_BOTTOM, tft.width(), fy - PARISYNTH_GRID_BOTTOM, COLOR_BG);
-    }
-    drawNoteStrip(PARISYNTH_STRIP_Y, parisynthStripHeight(), true);
-
-    drawFooter(footerLine1, footerLine2);
+    uint8_t family = (Synth::getChannelProgram((uint8_t)channel) >> 3) & 0x0F;
+    c.name = Synth::instrumentFamilyName(family);
+    c.family = family;
+    return c;
 }
 
-uint16_t pariSynthDrawnActiveMask() { return g_cellActiveDrawn; }
-
-void updatePariSynthPlayLive() {
-    drawNoteStrip(PARISYNTH_STRIP_Y, parisynthStripHeight());
+void drawPariSynthPlay(int selectedChannel, uint16_t activeMask) {
+    UiModes::SynthCell cells[16];
+    for (int ch = 0; ch < 16; ch++) cells[ch] = pariCell(ch);
+    UiModes::synthDraw(cells, selectedChannel, activeMask);
 }
+
+uint16_t pariSynthDrawnActiveMask() { return UiModes::synthDrawnActiveMask(); }
+
+void updatePariSynthPlayLive() { UiModes::synthLive(); }
 
 void updatePariSynthChannelCell(int channel, bool selected, bool active) {
-    drawParisynthCell(channel, selected, active);
+    UiModes::synthCell(channel, pariCell(channel), selected, active);
 }
 
 void updatePariSynthSelection(int prevChannel, int newChannel, bool prevActive, bool newActive) {
-    drawParisynthCell(prevChannel, false, prevActive);
-    drawParisynthCell(newChannel, true, newActive);
+    updatePariSynthChannelCell(prevChannel, false, prevActive);
+    updatePariSynthChannelCell(newChannel, true, newActive);
 }
 
-// Same rect channel 9's own cell occupies (index 8, row 0 of the right
-// column -- top-right, right under the header row) -- see PariSynthGrid's
-// own comment on why an overlay here rather than new permanent screen
-// space. COLOR_HILITE_BG/COLOR_TEXT, the same highlight-chip look the
-// selected cell already uses elsewhere on this screen, so it reads as
-// this app's own visual language rather than a new one.
-void updatePariSynthVolumeOverlay(int volume) {
-    tft.fillRect(PARISYNTH_ROW_SPLIT_X, PARISYNTH_GRID_Y, tft.width() - PARISYNTH_ROW_SPLIT_X, ROW_HEIGHT, COLOR_HILITE_BG);
-    tft.setTextColor(COLOR_TEXT, COLOR_HILITE_BG);
-    tft.setTextDatum(TR_DATUM);
-    char buf[16];
-    snprintf(buf, sizeof(buf), "Vol %d%%", volume);
-    tft.drawString(buf, tft.width() - 4, PARISYNTH_GRID_Y + 2);
-    tft.setTextDatum(TL_DATUM);
-}
+void updatePariSynthVolumeOverlay(int volume) { UiModes::synthVolume(volume); }
 
 // -- WAV and tracker player screens (ui_player.cpp) ----------------------
 
@@ -1475,601 +1235,96 @@ void updateSysExPlayerLive(const SysExPlayer& player) {
     drawSysExProgress(player, false);
 }
 
-// Looper screen layout: header, then 4 fixed-height track rows (label
-// line + a thin progress bar), then a status line, then footer. The label
-// line uses fixed x columns (track number / channel / state) rather than
-// one concatenated string, so the channel field can be redrawn on its own
-// (see drawLooperTrackChannel()) without needing to know how wide the
-// surrounding text renders in this proportional font.
-const int LOOPER_ROW_HEIGHT = 40;
-const int LOOPER_FIRST_ROW_Y = HEADER_HEIGHT + 4;
-const int LOOPER_BAR_HEIGHT = 6;
-const int LOOPER_BAR_Y_OFFSET = 22; // bar sits below the label line within a row
-const int LOOPER_STATUS_Y = LOOPER_FIRST_ROW_Y + 4 * LOOPER_ROW_HEIGHT + 2;
-const int LOOPER_TRACK_COL_X = 8;
-const int LOOPER_CHANNEL_COL_X = 28;   // wide enough for "T4" plus a gap
-// Both in and out channel show together on one line now (e.g. "OMNI/REC"),
-// same slot the single old "Ch16"/"OMNI" field used to occupy -- see
-// looperChannelText(). Given a deliberately wide gap on both sides (78px,
-// vs. the 56px the single old "Ch16"/"OMNI" field used to get) at the
-// user's explicit request, since it reads as the row's most important
-// field. That leaves STATE/BARLEN/the activity dots noticeably tighter
-// than their old margins. STATE's worst case is "PLAYING!"/"STOPPED!"
-// (7-char label + the buffer-full "!" marker, see the stateBuf snprintf
-// below -- NOT "RECORD!", which is shorter now that the RECORDING label
-// was shortened to RECORD). BARLEN's worst case is the "128BAR" preset --
-// confirmed too tight on real hardware (its trailing "R" ran into the
-// activity dots), so its column now borrows from the wide stretch of
-// unused space to the right of the dots (row content only reaches ~x244
-// of the 320px screen width) rather than the tight STATE/BARLEN boundary.
-const int LOOPER_STATE_COL_X = 110;    // wide enough for "OMNI/REC" plus a deliberately generous gap
-const int LOOPER_BARLEN_COL_X = 182;   // wide enough for "PLAYING!"/"STOPPED!" (longest state + overflow marker) plus a gap
-const int LOOPER_ACTIVITY_X = 246;     // wide enough for "128BAR" (longest bar-length value) plus a real safety margin -- was 226, too tight (see above), confirmed on real hardware
-// Two radius-4 circles need their centers >= 9px apart just to stop
-// sharing a pixel column (4+4), and a full 10px to leave one genuinely
-// clear column between them -- 8px (tried first) put center+radius of
-// the record dot and center-radius of the play dot on the very same
-// column, which read as the two dots overlapping.
-const int LOOPER_ACTIVITY_SPACING = 10; // gap between the record and play activity dots -- tightened from 14 to help the dots + BARLEN fit ahead of the fixed-position length field
+// -- Looper screen (ui_modes.cpp) -----------------------------------------
 
-// RECORDING covers two different situations that read very differently to
-// the person playing: a fresh, still open-ended first pass (t.lengthMs==0,
-// see LoopTrackView's own comment and looper_mode.cpp's recordStartMs) vs.
-// capturing more on top of a track that already has committed content
-// (t.lengthMs>0) -- the latter is an overdub, not a first recording, so it
-// gets its own label rather than both reading as plain "RECORD".
-const char* loopStateLabel(const LoopTrackView& t) {
-    switch (t.state) {
-        case LOOP_TRACK_ARMED:     return "ARMED";
-        case LOOP_TRACK_RECORDING: return t.lengthMs > 0 ? "OVERDUB" : "RECORD";
-        case LOOP_TRACK_PLAYING:   return "PLAYING";
-        case LOOP_TRACK_MUTED:     return "MUTED";
-        case LOOP_TRACK_STOPPED:   return "STOPPED";
-        case LOOP_TRACK_PAUSED:    return "PAUSED";
-        default:                   return "EMPTY";
-    }
+static UiModes::LoopBpmRow looperRow(float bpm, int timeSigNum, int timeSigDen, bool syncMode, bool metronomeOn,
+                              int metronomeVolumePercent, bool showMetronomeVolume, bool countInEnabled,
+                              int countInBars, bool showCountInBars, int focusIndex, bool selected) {
+    UiModes::LoopBpmRow r;
+    r.bpm = (int)(bpm + 0.5f);
+    r.sigNum = timeSigNum;
+    r.sigDen = timeSigDen;
+    r.sync = syncMode;
+    r.metroOn = metronomeOn;
+    r.metroVolume = metronomeVolumePercent;
+    r.showMetroVolume = showMetronomeVolume;
+    r.countIn = countInEnabled;
+    r.countInBars = countInBars;
+    r.showCountInBars = showCountInBars;
+    r.focus = focusIndex;
+    r.selected = selected;
+    // One bar in ms, as LooperMode's barsToMs(1).
+    float beatMs = bpm > 0.0f ? 60000.0f / bpm * (4.0f / (timeSigDen > 0 ? timeSigDen : 4)) : 500.0f;
+    r.barMs = (uint32_t)(timeSigNum * beatMs);
+    return r;
 }
 
-uint16_t loopStateColor(LoopTrackState s) {
-    switch (s) {
-        case LOOP_TRACK_ARMED:     return COLOR_TRACK_ARMED;
-        case LOOP_TRACK_RECORDING: return COLOR_TRACK_RECORDING;
-        case LOOP_TRACK_PLAYING:   return COLOR_TRACK_PLAYING;
-        case LOOP_TRACK_MUTED:     return COLOR_DIM;
-        case LOOP_TRACK_STOPPED:   return COLOR_TRACK_STOPPED;
-        case LOOP_TRACK_PAUSED:    return COLOR_TRACK_PAUSED;
-        default:                   return COLOR_DIM;
-    }
-}
-
-// "In/Out", e.g. "OMNI/REC", "OMNI/03", "05/REC", "05/03" -- shared by
-// drawLooperTrackLabel() (full row) and drawLooperTrackChannel()
-// (channel-only partial update).
-void looperChannelText(char* buf, size_t bufSize, const LoopTrackView& t) {
-    char inBuf[6];
-    if (t.channelIn >= 16) snprintf(inBuf, sizeof(inBuf), "OMNI");
-    else snprintf(inBuf, sizeof(inBuf), "%02d", t.channelIn + 1);
-
-    char outBuf[6];
-    if (t.channelOut >= 16) snprintf(outBuf, sizeof(outBuf), "REC");
-    else snprintf(outBuf, sizeof(outBuf), "%02d", t.channelOut + 1);
-
-    snprintf(buf, bufSize, "%s/%s", inBuf, outBuf);
-}
-
-// "FREE" or "NBAR" (e.g. "1BAR", "128BAR") -- shared by drawLooperTrackLabel()
-// (full row) and drawLooperTrackBarLength() (bar-length-only partial update).
-void looperBarLenText(char* buf, size_t bufSize, const LoopTrackView& t) {
-    if (t.barLength == 0) snprintf(buf, bufSize, "FREE");
-    else snprintf(buf, bufSize, "%dBAR", t.barLength);
-}
-
-// Redraws just the length field of track idx's row (e.g. after a BPM
-// change rescales a bar-quantized track's effective length) -- clears a
-// fixed-width box at the row's right edge, same approach as
-// drawLooperTrackChannel()/drawLooperTrackBarLength(), rather than
-// needing to know how wide the value renders.
-void drawLooperTrackLength(const LoopTrackView& t, int idx, bool selected) {
-    int y = LOOPER_FIRST_ROW_Y + idx * LOOPER_ROW_HEIGHT;
-    uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
-    // Trimmed from 72 -- still comfortable room for "NNN.Ns", and gives the
-    // play-activity dot (right edge at LOOPER_ACTIVITY_X + LOOPER_ACTIVITY_
-    // SPACING + 4, i.e. 260 at the real-hardware-confirmed 246 -- see that
-    // constant's own comment) a clear 4px gap before this box's start,
-    // instead of the two overlapping by a few px.
-    int boxX = tft.width() - 56;
-    tft.fillRect(boxX, y, tft.width() - boxX, ROW_HEIGHT, bg);
-
-    if (t.lengthMs == 0) return;
-    char lenBuf[16];
-    snprintf(lenBuf, sizeof(lenBuf), "%lu.%01lus", (unsigned long)(t.lengthMs / 1000),
-             (unsigned long)((t.lengthMs / 100) % 10));
-    tft.setTextColor(loopStateColor(t.state), bg);
-    tft.setTextDatum(TR_DATUM);
-    tft.drawString(lenBuf, tft.width() - 8, y + 2);
-    tft.setTextDatum(TL_DATUM);
-}
-
-// Draws one track's label line (row background, "T1 / OMNI/03 / PLAYING"
-// in their fixed columns, selection highlight) -- everything in the row
-// except the progress bar and activity dot, which updateLooperPositions()
-// owns separately so they can be refreshed on their own at a faster tick
-// without re-drawing this text.
-// What each track's activity dots last showed: bit 0 record lit, bit 1
-// play lit, bit 2 selected row background. -1 forces a repaint.
-int8_t g_looperActivityKey[4] = {-1, -1, -1, -1};
-
-void drawLooperTrackLabel(const LoopTrackView& t, int idx, bool selected) {
-    int y = LOOPER_FIRST_ROW_Y + idx * LOOPER_ROW_HEIGHT;
-    uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
-    tft.fillRect(0, y, tft.width(), LOOPER_ROW_HEIGHT - 4, bg);
-    g_looperActivityKey[idx] = -1; // the fill above covers the dots
-    // The trailing 4px between this row and the next is a deliberate gap
-    // (breathing room, and where a selected row's highlight visibly ends
-    // before the next row starts) -- always background regardless of
-    // `selected`, and cleared here explicitly (not left to a caller's
-    // fillScreen()) so this row is fully self-contained for both the full
-    // screen redraw and a standalone partial update.
-    tft.fillRect(0, y + LOOPER_ROW_HEIGHT - 4, tft.width(), 4, COLOR_BG);
-
-    tft.setTextColor(loopStateColor(t.state), bg);
-    tft.setTextDatum(TL_DATUM);
-
-    char trackBuf[4];
-    snprintf(trackBuf, sizeof(trackBuf), "T%d", idx + 1);
-    tft.drawString(trackBuf, LOOPER_TRACK_COL_X, y + 2);
-
-    char chBuf[10];
-    looperChannelText(chBuf, sizeof(chBuf), t);
-    tft.drawString(chBuf, LOOPER_CHANNEL_COL_X, y + 2);
-
-    // "!" appended when the event buffer filled up and further events are
-    // being silently dropped -- surfaced rather than left invisible.
-    char stateBuf[12];
-    snprintf(stateBuf, sizeof(stateBuf), t.bufferFull ? "%s!" : "%s", loopStateLabel(t));
-    tft.drawString(stateBuf, LOOPER_STATE_COL_X, y + 2);
-
-    char barBuf[10];
-    looperBarLenText(barBuf, sizeof(barBuf), t);
-    tft.drawString(barBuf, LOOPER_BARLEN_COL_X, y + 2);
-
-    drawLooperTrackLength(t, idx, selected);
-}
-
-// Redraws just the channel field of track idx's row (e.g. after ALT+UP/
-// DOWN or ALT+LEFT/RIGHT changes it) -- clears a fixed-width box at
-// LOOPER_CHANNEL_COL_X, comfortably wide enough for any "OMNI/REC"-style
-// value, rather than the whole row. Safe to call on its own since the
-// channel column never overlaps the track number or state text next to it.
-void drawLooperTrackChannel(const LoopTrackView& t, int idx, bool selected) {
-    int y = LOOPER_FIRST_ROW_Y + idx * LOOPER_ROW_HEIGHT;
-    uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
-    tft.fillRect(LOOPER_CHANNEL_COL_X, y, LOOPER_STATE_COL_X - LOOPER_CHANNEL_COL_X - 4, ROW_HEIGHT, bg);
-
-    char chBuf[10];
-    looperChannelText(chBuf, sizeof(chBuf), t);
-    tft.setTextColor(loopStateColor(t.state), bg);
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString(chBuf, LOOPER_CHANNEL_COL_X, y + 2);
-}
-
-// Redraws just the bar-length field of track idx's row (e.g. after EDIT+
-// LEFT/RIGHT changes it, see handleBarLengthAdjust()) -- same approach as
-// drawLooperTrackChannel(): a fixed-width box at LOOPER_BARLEN_COL_X, wide
-// enough for any "FREE"/"NBAR" value (see LOOPER_ACTIVITY_X's own comment
-// for the real-hardware fix behind that width) so it never collides with
-// the state text or activity dots on either side.
-void drawLooperTrackBarLength(const LoopTrackView& t, int idx, bool selected) {
-    int y = LOOPER_FIRST_ROW_Y + idx * LOOPER_ROW_HEIGHT;
-    uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
-    tft.fillRect(LOOPER_BARLEN_COL_X, y, LOOPER_ACTIVITY_X - LOOPER_BARLEN_COL_X - 4, ROW_HEIGHT, bg);
-
-    char barBuf[10];
-    looperBarLenText(barBuf, sizeof(barBuf), t);
-    tft.setTextColor(loopStateColor(t.state), bg);
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString(barBuf, LOOPER_BARLEN_COL_X, y + 2);
-}
-
-// Draws just track idx's progress bar at its fixed position within the
-// row -- a dim background track the full row width, filled proportionally
-// to positionFrac. Always safe to call standalone (e.g. every ~100ms)
-// since it never touches the label line above it.
-int16_t g_looperBarFill[4] = {-1, -1, -1, -1};
-uint16_t g_looperBarColor[4] = {0, 0, 0, 0};
-
-void drawLooperTrackBar(const LoopTrackView& t, int idx, bool force) {
-    int y = LOOPER_FIRST_ROW_Y + idx * LOOPER_ROW_HEIGHT + LOOPER_BAR_Y_OFFSET;
-    int barW = tft.width() - 16;
-    // No lengthMs==0 guard here: positionFrac() already reports 0 for
-    // every state where there's genuinely nothing to show (empty, armed,
-    // freeform recording with no target yet). But a bar-quantized track's
-    // open-ended first pass also has lengthMs==0 right up until it
-    // auto-commits, and positionFrac() *does* compute real progress
-    // toward its target length in that case -- bailing out here on
-    // lengthMs alone would silently discard it.
-    int fillW = (int)(barW * t.positionFrac);
-    uint16_t color = loopStateColor(t.state);
-    if (force) g_looperBarFill[idx] = -1;
-    if (fillW == g_looperBarFill[idx] && (fillW == 0 || color == g_looperBarColor[idx])) return;
-    // Only a moving bar can wait for a later tick; a paused or stopped
-    // one draws straight away so it never stays stale.
-    bool moving = t.state == LOOP_TRACK_PLAYING || t.state == LOOP_TRACK_RECORDING;
-    if (!force && moving && g_looperBarFill[idx] >= 0 && !sliceAllows(DRAW_METER)) return;
-    SliceTimer timer;
-    paintBarDelta(8, y, LOOPER_BAR_HEIGHT, barW, fillW, g_looperBarFill[idx], color,
-                  color != g_looperBarColor[idx]);
-    g_looperBarFill[idx] = (int16_t)fillW;
-    g_looperBarColor[idx] = color;
-}
-
-void resetLooperBarCache() {
-    for (int i = 0; i < 4; i++) {
-        g_looperBarFill[i] = -1;
-        g_looperActivityKey[i] = -1;
-    }
-}
-
-// Draws (or clears) track idx's two MIDI-activity dots -- record (red)
-// and play (green), each lit briefly whenever the track actually
-// captures/sends an event, matching the same colors as the RECORDING/
-// PLAYING state text. Separate dots because a track mid-overdub does
-// both at once (see LoopTrackView::recordActive/playActive) and one
-// shared indicator couldn't show that. `selected` must match whatever
-// drawLooperTrackLabel() last used for this row, so the "off" color
-// matches the row's background.
-void drawLooperTrackActivity(const LoopTrackView& t, int idx, bool selected) {
-    int y = LOOPER_FIRST_ROW_Y + idx * LOOPER_ROW_HEIGHT;
-    uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
-    int8_t key = (int8_t)((t.recordActive ? 1 : 0) | (t.playActive ? 2 : 0) | (selected ? 4 : 0));
-    if (key == g_looperActivityKey[idx]) return;
-    g_looperActivityKey[idx] = key;
-    tft.fillCircle(LOOPER_ACTIVITY_X, y + 8, 4, t.recordActive ? COLOR_TRACK_RECORDING : bg);
-    tft.fillCircle(LOOPER_ACTIVITY_X + LOOPER_ACTIVITY_SPACING, y + 8, 4, t.playActive ? COLOR_TRACK_PLAYING : bg);
-}
-
-// The BPM row: a 5th, single-line item below the 4 track rows, selectable
-// by the same row cursor (see LooperMode's onBpmRow) so BPM/Time
-// Signature/Sync/Metronome/Count In -- shared, global settings, not
-// per-track ones -- live directly in the main list instead of a separate
-// menu screen. Highlighted the same way a selected track row is.
-//
-// Metro and Count In sit between the time signature and Sync -- their own
-// text color is the on/off indicator (dim = off, full-bright = on, same
-// convention dim-vs-bright text uses everywhere else in this app); Sync
-// (right-aligned) uses the same coloring rather than swapping its label
-// text to "Independent" when off -- a fixed "Sync" label dim vs. bright
-// reads at a glance the same way every other on/off field on this row
-// already does, without needing the row to make room for a second, longer
-// word. Whichever of the five fields currently has focus
-// (RIGHT/LEFT step through BPM -> Time Sig -> Metro -> Count In -> Sync
-// and back -- see LooperMode's handleBpmRowFocus()) is shown inverted
-// instead: a small filled box in the field's own on/off color with the
-// row's own background color as the text, so it's unambiguous which one
-// ALT+UP/DOWN (Metro/Count In/Sync) or EDIT+UP/DOWN/LEFT/RIGHT (BPM
-// value/Time Sig) currently targets, without needing a third color whose
-// contrast against dim/bright text can't be verified without hardware in
-// hand. BPM value and Time Sig (focusIndex 0/1) get the same
-// inverted-box treatment in COLOR_TEXT (neither has an on/off state of
-// its own to color by) -- besides matching the other three fields, it's
-// what makes landing on the BPM row from a track row above/below read as
-// "now editing something" rather than just "row selected", since without
-// it the row-level highlight alone looks identical to a plain selected
-// track row.
-//
-// BPM value/Time Sig/Metro/Count In are laid out left-to-right from a
-// running x cursor (each draw call below returns its own rendered width)
-// rather than fixed pixel columns -- the row is always redrawn as a whole
-// on any change (never just one field in place), so there's no benefit to
-// fixed columns, and it means the layout self-adjusts if a field's text
-// ever changes length (e.g. BPM gaining/losing a digit) instead of
-// needing hand-tuned constants re-verified on hardware. Sync stays
-// right-aligned, independent of that run.
-const char* LOOPER_METRONOME_LABEL = "Metro";
-const char* LOOPER_COUNTIN_LABEL = "Count";
-const int LOOPER_FIELD_GAP = 10;
-
-// x range of the focused field's box on the BPM row (empty when none), so
-// the beat flash can leave its edges alone.
-int g_bpmFocusX0 = 0;
-int g_bpmFocusX1 = 0;
-
-// A "value" field (not on/off) at x: BPM's own numeric readout, or the
-// time signature -- always shown in COLOR_TEXT (there's no dim/off state
-// for either), same inverted-box focus treatment as the on/off fields
-// below. Returns the field's rendered width (text + padding) so the
-// caller can lay out the next field immediately after it.
-int drawLooperBpmValueField(int x, const char* text, bool focused, uint16_t rowBg) {
-    uint16_t fg = focused ? rowBg : COLOR_TEXT;
-    uint16_t fieldBg = focused ? COLOR_TEXT : rowBg;
-    int w = tft.textWidth(text) + 6;
-    if (focused) {
-        tft.fillRect(x - 3, LOOPER_STATUS_Y, w, ROW_HEIGHT, fieldBg);
-        g_bpmFocusX0 = x - 3;
-        g_bpmFocusX1 = x - 3 + w;
-    }
-    tft.setTextColor(fg, fieldBg);
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString(text, x, LOOPER_STATUS_Y);
-    return w;
-}
-
-// Shared by the Metro and Count In fields (both left-aligned, on/off
-// style) -- see drawLooperBpmRow()'s comment for the inversion scheme.
-// Returns the field's rendered width, same reason as
-// drawLooperBpmValueField()'s.
-int drawLooperBpmField(int x, const char* label, bool on, bool focused, uint16_t rowBg) {
-    uint16_t color = on ? COLOR_TEXT : COLOR_DIM;
-    uint16_t fg = focused ? rowBg : color;
-    uint16_t fieldBg = focused ? color : rowBg;
-    int w = tft.textWidth(label) + 6;
-    if (focused) {
-        tft.fillRect(x - 3, LOOPER_STATUS_Y, w, ROW_HEIGHT, fieldBg);
-        g_bpmFocusX0 = x - 3;
-        g_bpmFocusX1 = x - 3 + w;
-    }
-    tft.setTextColor(fg, fieldBg);
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString(label, x, LOOPER_STATUS_Y);
-    return w;
-}
-
-// focusIndex: 0 = BPM value, 1 = Time Sig, 2 = Metro, 3 = Count In,
-// 4 = Sync -- see drawLooper()'s doc comment. Meaningless unless
-// `selected` is also true. `showMetronomeVolume`/`showCountInBars` swap
-// Metro's/Count In's own label for `metronomeVolumePercent`/`countInBars`
-// while EDIT is held with that field focused, so adjusting it
-// (handleMetronomeVolumeAdjust()/handleCountInBarsAdjust()) shows what's
-// actually changing instead of the field just sitting there unreadably
-// static under a value the user can't see -- meaningless unless
-// focusIndex is 2 or 3 respectively (that field already has to have
-// focus for this to make sense).
-void drawLooperBpmRow(float bpm, int timeSigNum, int timeSigDen, bool syncMode, bool metronomeOn,
-                       int metronomeVolumePercent, bool showMetronomeVolume, bool countInEnabled,
-                       int countInBars, bool showCountInBars, int focusIndex, bool selected) {
-    uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
-    tft.fillRect(0, LOOPER_STATUS_Y, tft.width(), ROW_HEIGHT, bg);
-    g_bpmFocusX0 = g_bpmFocusX1 = 0;
-
-    int x = 8;
-    char bpmBuf[16];
-    snprintf(bpmBuf, sizeof(bpmBuf), "BPM: %d", (int)(bpm + 0.5f));
-    x += drawLooperBpmValueField(x, bpmBuf, selected && focusIndex == 0, bg) + LOOPER_FIELD_GAP;
-
-    char sigBuf[8];
-    snprintf(sigBuf, sizeof(sigBuf), "%d/%d", timeSigNum, timeSigDen);
-    x += drawLooperBpmValueField(x, sigBuf, selected && focusIndex == 1, bg) + LOOPER_FIELD_GAP;
-
-    char metroVolBuf[8];
-    const char* metroLabel = LOOPER_METRONOME_LABEL;
-    if (showMetronomeVolume) {
-        snprintf(metroVolBuf, sizeof(metroVolBuf), "%d%%", metronomeVolumePercent);
-        metroLabel = metroVolBuf;
-    }
-    x += drawLooperBpmField(x, metroLabel, metronomeOn, selected && focusIndex == 2, bg) + LOOPER_FIELD_GAP;
-
-    char countInBarsBuf[8];
-    const char* countInLabel = LOOPER_COUNTIN_LABEL;
-    if (showCountInBars) {
-        snprintf(countInBarsBuf, sizeof(countInBarsBuf), "%d bar%s", countInBars, countInBars == 1 ? "" : "s");
-        countInLabel = countInBarsBuf;
-    }
-    drawLooperBpmField(x, countInLabel, countInEnabled, selected && focusIndex == 3, bg);
-
-    const char* syncLabel = "Sync";
-    uint16_t syncColor = syncMode ? COLOR_TEXT : COLOR_DIM;
-    bool syncFocused = selected && focusIndex == 4;
-    uint16_t syncFg = syncFocused ? bg : syncColor;
-    uint16_t syncBg = syncFocused ? syncColor : bg;
-    if (syncFocused) {
-        int w = tft.textWidth(syncLabel) + 6;
-        tft.fillRect(tft.width() - 8 - w, LOOPER_STATUS_Y, w, ROW_HEIGHT, syncBg);
-        g_bpmFocusX0 = tft.width() - 8 - w;
-        g_bpmFocusX1 = tft.width() - 8;
-    }
-    tft.setTextColor(syncFg, syncBg);
-    tft.setTextDatum(TR_DATUM);
-    tft.drawString(syncLabel, tft.width() - 8, LOOPER_STATUS_Y);
-    tft.setTextDatum(TL_DATUM);
-}
-
-void drawLooper(const LoopTrackView tracksArg[4], int selectedTrack, bool onBpmRow, bool syncMode, float bpm,
+void drawLooper(const LoopTrackView tracks[4], int selectedTrack, bool onBpmRow, bool syncMode, float bpm,
                  int timeSigNum, int timeSigDen, bool metronomeOn, int metronomeVolumePercent,
                  bool showMetronomeVolume, bool countInEnabled, int countInBars, bool showCountInBars,
                  int focusIndex, bool showBeatIndicator, int metronomeCurrentBeat) {
-    statusBar("LOOPER", &Look::ICON_LOOPER, COLOR_ACCENT);
-    drawLooperBeatIndicator(showBeatIndicator, metronomeCurrentBeat, timeSigNum);
-
-    // Small gaps nothing else here covers -- above the first track row,
-    // between the last track row and the BPM row, and between the BPM
-    // row and the footer -- cleared explicitly rather than relying on a
-    // blanket fillScreen() (removed: it caused a visible full-screen
-    // black flash on every redraw, same fix as drawBrowser()'s). Each
-    // row's own internal trailing gap is drawLooperTrackLabel()'s job.
-    tft.fillRect(0, HEADER_HEIGHT, tft.width(), LOOPER_FIRST_ROW_Y - HEADER_HEIGHT, COLOR_BG);
-    tft.fillRect(0, LOOPER_FIRST_ROW_Y + 4 * LOOPER_ROW_HEIGHT, tft.width(),
-                 LOOPER_STATUS_Y - (LOOPER_FIRST_ROW_Y + 4 * LOOPER_ROW_HEIGHT), COLOR_BG);
-    tft.fillRect(0, LOOPER_STATUS_Y + ROW_HEIGHT, tft.width(),
-                 (tft.height() - FOOTER_HEIGHT) - (LOOPER_STATUS_Y + ROW_HEIGHT), COLOR_BG);
-
-    for (int i = 0; i < 4; i++) {
-        bool selected = !onBpmRow && (i == selectedTrack);
-        drawLooperTrackLabel(tracksArg[i], i, selected);
-        drawLooperTrackBar(tracksArg[i], i, true);
-        drawLooperTrackActivity(tracksArg[i], i, selected);
-    }
-    drawLooperBpmRow(bpm, timeSigNum, timeSigDen, syncMode, metronomeOn, metronomeVolumePercent,
-                      showMetronomeVolume, countInEnabled, countInBars, showCountInBars, focusIndex, onBpmRow);
-
-    // These two lines have to fit the footer's key boxes -- with
-    // 10 distinct button/modifier meanings to cover, that budget is tight
-    // enough that grouping matters. Grouped by MODIFIER BUTTON here
-    // (everything ALT does together, everything EDIT-as-a-tap/BPM-row-hold
-    // does together) rather than by which physical D-pad axis it uses --
-    // "ALT out/in" reads as one coherent idea (ALT affects channel
-    // routing, both directions) instead of splitting across two lines, and
-    // it's what keeps both lines within the proven-safe length (a past
-    // version that split ALT's two meanings across lines pushed line 2 to
-    // 49 characters and overflowed). EDIT+LEFT/
-    // RIGHT (bar length, handleBarLengthAdjust()) stays on line 2 instead
-    // of joining EDIT's other meanings on line 1 -- adding it there would
-    // overflow line 1 the same way. EDIT+UP/DOWN has no meaning on a track
-    // row (see handleRecordInput()'s comment), so line 1's EDIT hint only
-    // covers record (tap) and BPM/Time Sig (held, BPM row only --
-    // handleBpmValueAdjust()/handleTimeSigAdjust()). PLAY/RIGHT's
-    // track-row meanings (Pause, Mute) are each a single word since both
-    // are toggles -- pressing the same button again does the opposite,
-    // not a separate action. "L"/"R" (rather than spelled-out LEFT/RIGHT)
-    // is line 2's own concession to fitting several hints on one row, same
-    // idea as "UD" above.
-    //
-    // drawLooperBpmRow() (just above) ends by setting its own "Sync" label
-    // color, which depends on focus/selection state -- drawFooter() resets
-    // color/datum unconditionally rather than trusting whatever that left
-    // behind, which is what fixed this footer showing up in the wrong
-    // color depending on BPM-row focus.
-    drawFooter("UD row/ALT out/in  PLAY pause  EDIT rec/bpm", "L back/R mute/EDIT bar  ENT menu  NAV stop");
+    UiModes::LoopBpmRow r = looperRow(bpm, timeSigNum, timeSigDen, syncMode, metronomeOn, metronomeVolumePercent,
+                                      showMetronomeVolume, countInEnabled, countInBars, showCountInBars,
+                                      focusIndex, onBpmRow);
+    UiModes::looperDraw(tracks, selectedTrack, r, showBeatIndicator, metronomeCurrentBeat);
 }
 
-void updateLooperPositions(const LoopTrackView tracksArg[4], int selectedTrack) {
-    for (int i = 0; i < 4; i++) {
-        drawLooperTrackBar(tracksArg[i], i, false);
-        drawLooperTrackActivity(tracksArg[i], i, i == selectedTrack);
-    }
+void updateLooperPositions(const LoopTrackView tracks[4], int selectedTrack) {
+    UiModes::looperLive(tracks, selectedTrack);
 }
 
-// Cheap partial redraw of just the selected track's channel field (see
-// drawLooperTrackChannel()), e.g. after ALT+UP/DOWN or ALT+LEFT/RIGHT
-// changes it. Channel changes only ever apply to the currently selected
-// track, so this is always the highlighted row.
-void updateLooperChannel(const LoopTrackView tracksArg[4], int selectedTrack) {
-    drawLooperTrackChannel(tracksArg[selectedTrack], selectedTrack, true);
+void updateLooperSelection(const LoopTrackView tracks[4], int prevSelected, bool prevOnBpm,
+                            int newSelected, bool newOnBpm, bool syncMode, float bpm,
+                            int timeSigNum, int timeSigDen, bool metronomeOn, int metronomeVolumePercent,
+                            bool showMetronomeVolume, bool countInEnabled, int countInBars,
+                            bool showCountInBars, int focusIndex) {
+    UiModes::LoopBpmRow r = looperRow(bpm, timeSigNum, timeSigDen, syncMode, metronomeOn, metronomeVolumePercent,
+                                      showMetronomeVolume, countInEnabled, countInBars, showCountInBars,
+                                      focusIndex, newOnBpm);
+    UiModes::looperSelection(tracks, prevSelected, prevOnBpm, newSelected, newOnBpm, r);
 }
 
-void updateLooperBarLength(const LoopTrackView tracksArg[4], int selectedTrack) {
-    drawLooperTrackBarLength(tracksArg[selectedTrack], selectedTrack, true);
+void updateLooperTrackRow(const LoopTrackView tracks[4], int trackIdx, bool selected) {
+    if (trackIdx < 0 || trackIdx > 3) return;
+    UiModes::looperTrackRow(tracks[trackIdx], trackIdx, selected);
 }
 
-// Cheap partial redraw of just track trackIdx's length field -- e.g. after
-// a BPM change rescales it. Unlike the other per-field update functions,
-// this can be called for any track, not just the selected one (a BPM
-// change can rescale several bar-quantized tracks at once), hence the
-// explicit `selected` rather than always assuming true.
-void updateLooperLength(const LoopTrackView tracksArg[4], int trackIdx, bool selected) {
-    drawLooperTrackLength(tracksArg[trackIdx], trackIdx, selected);
+void updateLooperChannel(const LoopTrackView tracks[4], int selectedTrack) {
+    if (selectedTrack < 0 || selectedTrack > 3) return;
+    UiModes::looperTrackInfo(tracks[selectedTrack], selectedTrack, true);
+}
+
+void updateLooperBarLength(const LoopTrackView tracks[4], int selectedTrack) {
+    if (selectedTrack < 0 || selectedTrack > 3) return;
+    UiModes::looperTrackRow(tracks[selectedTrack], selectedTrack, true);
+}
+
+void updateLooperLength(const LoopTrackView tracks[4], int trackIdx, bool selected) {
+    if (trackIdx < 0 || trackIdx > 3) return;
+    UiModes::looperTrackLength(tracks[trackIdx], trackIdx, selected);
 }
 
 void updateLooperBpm(float bpm, int timeSigNum, int timeSigDen, bool syncMode, bool metronomeOn,
                       int metronomeVolumePercent, bool showMetronomeVolume, bool countInEnabled,
                       int countInBars, bool showCountInBars, int focusIndex, bool selected) {
-    drawLooperBpmRow(bpm, timeSigNum, timeSigDen, syncMode, metronomeOn, metronomeVolumePercent,
-                      showMetronomeVolume, countInEnabled, countInBars, showCountInBars, focusIndex, selected);
+    UiModes::looperBpm(looperRow(bpm, timeSigNum, timeSigDen, syncMode, metronomeOn, metronomeVolumePercent,
+                                 showMetronomeVolume, countInEnabled, countInBars, showCountInBars,
+                                 focusIndex, selected));
 }
 
-// Cheap partial redraw of just the BPM row's outline -- a brief accent-
-// colored border flashed on each metronome beat (see LooperMode's
-// updateBpmRowBeatFlash()), a bigger-than-the-header-squares but still
-// non-disruptive "glanceable from a distance" beat cue. Just a stroke
-// (tft.drawRect(), not fillRect()) so it never touches the row's own text
-// underneath -- `active` true draws it, in the same COLOR_PULSE the
-// header's current-beat square uses (see drawLooperBeatIndicator()) for an
-// ordinary beat, or COLOR_DOWNBEAT for the downbeat (`downbeat` true) so
-// bar boundaries stand out from the beats in between, same idea as the
-// metronome's own louder downbeat click. `active` false erases it back to
-// the row's own background (`selected` picks which, same convention
-// drawLooperBpmRow() itself uses) -- `downbeat` is meaningless then.
 void updateLooperBpmRowBeatFlash(bool active, bool downbeat, bool selected) {
-    uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_BG;
-    uint16_t color = active ? (downbeat ? COLOR_DOWNBEAT : COLOR_PULSE) : bg;
-    int w = tft.width();
-    int y0 = LOOPER_STATUS_Y, y1 = LOOPER_STATUS_Y + ROW_HEIGHT - 1;
-    tft.drawFastVLine(0, y0, ROW_HEIGHT, color);
-    tft.drawFastVLine(w - 1, y0, ROW_HEIGHT, color);
-    // Top and bottom edges skip the focused field's box.
-    int x0 = g_bpmFocusX0, x1 = g_bpmFocusX1;
-    if (x1 <= x0) {
-        tft.drawFastHLine(1, y0, w - 2, color);
-        tft.drawFastHLine(1, y1, w - 2, color);
-        return;
-    }
-    if (x0 > 1) {
-        tft.drawFastHLine(1, y0, x0 - 1, color);
-        tft.drawFastHLine(1, y1, x0 - 1, color);
-    }
-    if (x1 < w - 1) {
-        tft.drawFastHLine(x1, y0, w - 1 - x1, color);
-        tft.drawFastHLine(x1, y1, w - 1 - x1, color);
-    }
+    (void)selected;
+    UiModes::looperBeatFlash(active, downbeat);
 }
 
-// -- count-in overlay -----------------------------------------------------
+void updateLooperBarBeat(int bar, int beat) { UiModes::looperBarBeat(bar, beat); }
 
-// Redraws just the big countdown number + caption, both cleared and
-// redrawn together every call -- cheap enough (one big glyph, one short
-// string) at the once-per-beat rate this is actually called, so there's
-// no need to diff which part changed the way updateStatValue() does for
-// the constantly-polled player screen.
-void drawLooperCountInBeat(int beatsRemaining) {
-    int cx = tft.width() / 2;
-    int cy = tft.height() / 2;
+void drawLooperCountIn(int beatsRemaining) { UiModes::looperCountIn(beatsRemaining); }
 
-    tft.fillRect(cx - 60, cy - 30, 120, 76, COLOR_BG);
-
-    char numBuf[8];
-    snprintf(numBuf, sizeof(numBuf), "%d", beatsRemaining);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(COLOR_ACCENT, COLOR_BG);
-    tft.setTextFont(4);
-    tft.drawString(numBuf, cx, cy);
-
-    tft.setTextFont(2);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.drawString("beats remaining", cx, cy + 38);
-
-    tft.setTextDatum(TL_DATUM);
-}
-
-void drawLooperCountIn(int beatsRemaining) {
-    resetLooperBarCache();
-    statusBar("LOOPER", &Look::ICON_LOOPER, COLOR_ACCENT);
-
-    int cx = tft.width() / 2;
-    int cy = tft.height() / 2;
-    int fy = tft.height() - FOOTER_HEIGHT;
-
-    // Everything else on this screen is either the header, the footer, or
-    // drawLooperCountInBeat()'s own small centered box (cy-30 to cy+46,
-    // matching its own fillRect below) -- clear the otherwise-empty space
-    // above and below that box explicitly rather than relying on a
-    // blanket fillScreen() (removed: it caused a visible full-screen
-    // black flash on every redraw, same fix as
-    // drawBrowser()'s/drawLooper()'s).
-    int boxTop = cy - 30;
-    int boxBottom = cy + 46;
-    if (boxTop > HEADER_HEIGHT) {
-        tft.fillRect(0, HEADER_HEIGHT, tft.width(), boxTop - HEADER_HEIGHT, COLOR_BG);
-    }
-    if (fy > boxBottom) {
-        tft.fillRect(0, boxBottom, tft.width(), fy - boxBottom, COLOR_BG);
-    }
-
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.setTextFont(2);
-    tft.drawString("Count In", cx, cy - 45);
-    tft.setTextDatum(TL_DATUM);
-
-    drawLooperCountInBeat(beatsRemaining);
-
-    drawFooter("Recording starts after the count-in");
-}
-
-void updateLooperCountInBeat(int beatsRemaining) {
-    drawLooperCountInBeat(beatsRemaining);
-}
+void updateLooperCountInBeat(int beatsRemaining) { UiModes::looperCountInBeat(beatsRemaining); }
 
 void updateLooperBeatIndicator(bool visible, int currentBeat, int timeSigNum) {
-    drawLooperBeatIndicator(visible, currentBeat, timeSigNum);
+    UiModes::looperBeats(visible, currentBeat, timeSigNum);
 }
 
 // -- Settings screen --------------------------------------------------------
@@ -2279,46 +1534,9 @@ void themeLoadEnd(bool ok) {
     }
 }
 
-// Cheap partial redraw for moving the looper's row cursor: repaints only
-// the previously and newly selected rows instead of the whole screen.
-// Covers all 5 rows (4 tracks + BPM), since the cursor can land on any of
-// them -- prevOnBpm/newOnBpm say whether that endpoint is the BPM row
-// rather than prevSelected/newSelected being a track index. Track rows
-// redraw label *and* bar together -- the label's background fill spans
-// the bar's y-range too, so drawing the label alone would wipe the bar
-// without redrawing it.
-// Cheap partial redraw of trackIdx's whole row (label text + bar +
-// activity dots) -- e.g. after its state changes from a button press,
-// without touching any other row, the BPM row, header, or footer.
-void updateLooperTrackRow(const LoopTrackView tracksArg[4], int trackIdx, bool selected) {
-    drawLooperTrackLabel(tracksArg[trackIdx], trackIdx, selected);
-    drawLooperTrackBar(tracksArg[trackIdx], trackIdx, true);
-    drawLooperTrackActivity(tracksArg[trackIdx], trackIdx, selected);
-}
-
-void updateLooperSelection(const LoopTrackView tracksArg[4], int prevSelected, bool prevOnBpm,
-                            int newSelected, bool newOnBpm, bool syncMode, float bpm,
-                            int timeSigNum, int timeSigDen, bool metronomeOn, int metronomeVolumePercent,
-                            bool showMetronomeVolume, bool countInEnabled, int countInBars,
-                            bool showCountInBars, int focusIndex) {
-    if (prevOnBpm) {
-        drawLooperBpmRow(bpm, timeSigNum, timeSigDen, syncMode, metronomeOn, metronomeVolumePercent,
-                          showMetronomeVolume, countInEnabled, countInBars, showCountInBars, focusIndex, false);
-    } else if (prevSelected >= 0 && prevSelected < 4) {
-        updateLooperTrackRow(tracksArg, prevSelected, false);
-    }
-    if (newOnBpm) {
-        drawLooperBpmRow(bpm, timeSigNum, timeSigDen, syncMode, metronomeOn, metronomeVolumePercent,
-                          showMetronomeVolume, countInEnabled, countInBars, showCountInBars, focusIndex, true);
-    } else if (newSelected >= 0 && newSelected < 4) {
-        updateLooperTrackRow(tracksArg, newSelected, true);
-    }
-}
-
 // A card over the current screen. line2 in key form ("ENTER confirm  NAV
 // cancel") becomes buttons, anything else a dim second line.
 void drawMessage(const char* line1, const char* line2) {
-    resetLooperBarCache();
     Look::Card c;
     c.line1 = line1;
     char buf[96];

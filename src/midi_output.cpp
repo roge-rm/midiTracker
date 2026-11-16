@@ -371,6 +371,7 @@ void noteActivityIn(uint8_t channel, uint8_t note, uint8_t velocity) {
     if (velocity > 0) {
         g_noteChannelMask[note] |= (uint16_t)(1u << channel);
         g_noteVelocity[note] = velocity;
+        UiTap::midiNoteOn(channel, note, velocity);
     } else {
         g_noteChannelMask[note] &= (uint16_t)~(1u << channel);
     }

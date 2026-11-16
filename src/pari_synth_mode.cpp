@@ -216,15 +216,8 @@ bool update() {
         }
     }
 
-    // Live note-strip refresh -- same fixed low-rate poll convention
-    // FilePlayerMode's updatePlayerLive() uses, so incoming notes visibly
-    // light up the strip without a full-screen redraw every tick.
-    static uint32_t lastLiveMs = 0;
-    uint32_t now = millis();
-    if (now - lastLiveMs >= 50) {
-        lastLiveMs = now;
-        Ui::updatePariSynthPlayLive();
-    }
+    // Cell meters and the keybed; the screen keeps its own 40 ms rate.
+    Ui::updatePariSynthPlayLive();
 
     return false;
 }
