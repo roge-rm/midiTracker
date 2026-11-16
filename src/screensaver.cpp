@@ -178,6 +178,7 @@ void draw(const UiSaver::Info& in, void (*pump)()) {
     if (info.src == UiSaver::SRC_LOOPER || info.src == UiSaver::SRC_MIDI_IN) info.elapsedMs = now - g_srcSinceMs;
     info.battery = Battery::percentage();
     info.charging = Battery::isCharging();
+    info.low = Battery::isLow();
 
     bool playing = info.src != UiSaver::SRC_NONE;
     bool dark = g_style == STYLE_BLACK || now - g_dimAtMs >= (playing ? DARK_PLAYING_MS : DARK_IDLE_MS);

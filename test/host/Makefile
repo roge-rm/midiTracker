@@ -11,6 +11,7 @@
 #   make -C test/host players OUT_DIR=dir   the player screens, drawn from host renders of real songs
 #   make -C test/host wav            build build/host/render_wav (WavPlayer over the host ring)
 #   make -C test/host rec-check      MidiRecorder, SysExRecorder and SysExPlayer on an in-memory card
+#   make -C test/host battery-check  the battery gauge on made-up voltage sequences
 ROOT   := $(abspath ../..)
 OUT    := $(ROOT)/build/host
 CXX    ?= g++
@@ -22,7 +23,7 @@ PLAYER_SRC := $(wildcard $(ROOT)/src/tracker_base.cpp) $(ROOT)/src/ui_tap.cpp $(
 HARNESS_SRC := $(CURDIR)/render.cpp $(CURDIR)/host_stubs.cpp
 SECONDS ?= 60
 
-.PHONY: all baseline check clean midi midi-baseline midi-check look players wav rec-check
+.PHONY: all baseline check clean midi midi-baseline midi-check look players wav rec-check battery-check
 all: $(OUT)/render $(OUT)/gen $(OUT)/corr
 
 $(OUT)/corr: $(CURDIR)/corr.cpp
@@ -70,6 +71,14 @@ $(OUT)/rec_check: $(REC_SRC) $(wildcard $(CURDIR)/stub-rec/*.h $(CURDIR)/stub-re
 
 rec-check: $(OUT)/rec_check
 	$(OUT)/rec_check
+
+# Battery gauge check: battery_gauge.cpp on made-up voltage sequences.
+$(OUT)/battery_check: $(ROOT)/src/battery_gauge.cpp $(CURDIR)/battery_check.cpp $(ROOT)/include/battery_gauge.h
+	@mkdir -p $(OUT)
+	$(CXX) -std=gnu++17 -O1 -g -Wall -Wextra -I$(ROOT)/include -o $@ $(ROOT)/src/battery_gauge.cpp $(CURDIR)/battery_check.cpp
+
+battery-check: $(OUT)/battery_check
+	$(OUT)/battery_check
 
 # MIDI target: the real synth.cpp and midi_file.cpp with a stub MidiOutput and I2S.
 MIDI_SRC := $(ROOT)/src/synth.cpp $(ROOT)/src/midi_file.cpp $(ROOT)/src/ui_tap.cpp $(CURDIR)/midi_stubs.cpp $(CURDIR)/render_midi.cpp $(CURDIR)/host_stubs.cpp

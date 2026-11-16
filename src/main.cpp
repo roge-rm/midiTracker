@@ -256,8 +256,8 @@ void loop() {
         Ui::transitionDraw([] { Ui::drawModeSelect(MODE_LABELS, MODE_COUNT, modeCursor); });
     }
 
-    // Battery gauge, bottom-right corner. Battery::update() re-samples the
-    // ADC every ~5 s; the gauge redraws only when what it shows changes.
+    // Battery gauge, bottom-right corner. Battery::update() reads the
+    // ADC every 25 ms; the gauge redraws only when what it shows changes.
     // Screens draw it with their footer, so a screen change brings it back.
     Battery::update();
     Ui::updateBatteryMeter();

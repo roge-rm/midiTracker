@@ -22,6 +22,7 @@ struct Info {
     int channels = 0;    // tracker channels
     int battery = 0;     // percent
     bool charging = false;
+    bool low = false;    // battery low, with hysteresis
 };
 
 // The tracker and WAV sources have audio in the WAV ring; the others are

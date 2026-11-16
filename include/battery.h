@@ -1,24 +1,25 @@
 #pragma once
 #include <Arduino.h>
 
-// Reads the onboard LiPo battery voltage divider via ADC (see pins.h's
-// BATTERY_VOLTAGE_PIN) and derives a percentage + charging estimate.
-// This board reuses picoTracker's own hardware (same GPIO for the
-// battery sense line), so the math here is ported directly from
-// picoTracker's own firmware (picoTrackerSystem::GetBatteryState() in
-// xiphonics/picoTracker) rather than re-derived from scratch.
+// Reads the LiPo voltage on BATTERY_VOLTAGE_PIN (see pins.h) through the
+// board's 2:1 divider and gives a steady percent, charging and low flag.
+// The maths lives in battery_gauge.h.
+//
+// Charging means on USB power below about 4.15 V; above that it shows full.
+// USB power is a mounted USB host, so a charger with no data lines doesn't
+// show. Build with -D BATTERY_VBUS_PIN=N to take it from a VBUS sense pin
+// (high = USB power) instead.
+// -D BATTERY_DIAG prints a line ending in "BATT" over USB serial each second.
 namespace Battery {
 
 void begin();
 
-// Call every loop() iteration; internally throttles the actual ADC
-// sample (and the percentage/charging recompute) to once per ~5s --
-// battery voltage doesn't move meaningfully faster than that, and this
-// avoids paying analogRead()'s brief blocking cost any more often than
-// the display would even show a difference.
+// Call every loop() iteration. Takes one ADC read (a few us) every 25 ms
+// and feeds the gauge the average of each 20.
 void update();
 
-uint8_t percentage(); // 0-100, clamped
+uint8_t percentage(); // 0-100
 bool isCharging();
+bool isLow();         // at 15% or less, clears above 18%
 
 } // namespace Battery

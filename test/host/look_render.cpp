@@ -192,7 +192,7 @@ void browserScreen() {
 void modeScreen(bool ledIn, bool ledOut) {
     g_tft.fillScreen(COLOR_BG);
     statusLeds(ledIn, ledOut);
-    statusBattery(90, true);
+    statusBattery(90, true, false);
     Status st;
     st.title = "MIDITRACKER";
     st.titleColor = COLOR_ACCENT;
@@ -288,7 +288,7 @@ void messageScreen() {
 void playerChrome() {
     g_tft.fillScreen(COLOR_BG);
     statusLeds(false, true);
-    statusBattery(55, false);
+    statusBattery(55, false, false);
     Status st;
     st.icon = &ICON_TRACKER;
     st.iconColor = COLOR_ACCENT;
@@ -767,6 +767,7 @@ int saverScreens(const std::string& dir) {
     info.battery = 70;
     saverRun(UiSaver::VIEW_IDLE, info, 20000, "saver-idle", false);
     info.battery = 12;
+    info.low = true;
     saverRun(UiSaver::VIEW_IDLE, info, 4000, "saver-idle-low", false);
     return 0;
 }
@@ -833,7 +834,7 @@ int main(int argc, char** argv) {
     g_outDir = argc > 1 ? argv[1] : ".";
     crcInit();
     setScreen(&g_tft);
-    statusBattery(70, false);
+    statusBattery(70, false, false);
     if (argc > 3 && strcmp(argv[2], "--players") == 0) return playerScreens(argv[3]);
     if (argc > 2 && strcmp(argv[2], "--boot-frames") == 0) return bootFrames();
 

@@ -146,7 +146,7 @@ const int IDLE_H = 10 + 8 + 9;
 void paintIdle(TFT_eSPI& g, int x, int y, const Info& info) {
     drawText(g, FONT_LABEL, TITLE, x, y, COLOR_TEXT, IDLE_TITLE_SCALE);
     int by = y + 18;
-    uint16_t fill = info.charging ? COLOR_WAV : info.battery <= 15 ? COLOR_ERROR : COLOR_TEXT;
+    uint16_t fill = info.charging ? COLOR_WAV : info.low ? COLOR_ERROR : COLOR_TEXT;
     int pct = info.battery < 0 ? 0 : info.battery > 100 ? 100 : info.battery;
     int fw = (8 * pct + 50) / 100;
     if (pct > 0 && fw == 0) fw = 1;
@@ -155,7 +155,7 @@ void paintIdle(TFT_eSPI& g, int x, int y, const Info& info) {
     if (fw) g.fillRect(x + 2, by + 2, fw, 5, fill);
     char t[8];
     snprintf(t, sizeof(t), "%d%%", pct);
-    drawText(g, FONT_TEXT, t, x + 18, by + 1, info.battery <= 15 && !info.charging ? COLOR_ERROR : COLOR_DIM);
+    drawText(g, FONT_TEXT, t, x + 18, by + 1, info.low && !info.charging ? COLOR_ERROR : COLOR_DIM);
 }
 
 // ---- Now playing ----------------------------------------------------------

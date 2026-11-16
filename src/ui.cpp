@@ -1640,7 +1640,7 @@ void drawMessage(const char* line1, const char* line2) {
 // The battery and MIDI LEDs live in the status strip. Every screen draws
 // the strip, so this only redraws them.
 void drawBatteryMeter() {
-    Look::statusBattery(Battery::percentage(), Battery::isCharging());
+    Look::statusBattery(Battery::percentage(), Battery::isCharging(), Battery::isLow());
 }
 
 // The LEDs light on any MIDI in or out and hold for LED_HOLD_MS, so a single
@@ -1659,7 +1659,7 @@ void updateBatteryMeter() {
         stepAt = now;
         Look::statusLeds(inAt && now - inAt < LED_HOLD_MS, outAt && now - outAt < LED_HOLD_MS);
     }
-    Look::statusBattery(Battery::percentage(), Battery::isCharging());
+    Look::statusBattery(Battery::percentage(), Battery::isCharging(), Battery::isLow());
 }
 
 } // namespace Ui

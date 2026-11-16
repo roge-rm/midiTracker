@@ -164,7 +164,7 @@ int statusTextRoom(const Status& st);
 // Set the LEDs and battery. Each redraws only its own few pixels, and only
 // when what it shows changes, so they're cheap to call every loop.
 void statusLeds(bool in, bool out);
-void statusBattery(int percent, bool charging);
+void statusBattery(int percent, bool charging, bool low);
 
 // Forgets the strip, for screens without one (boot animation).
 void hideStatus();

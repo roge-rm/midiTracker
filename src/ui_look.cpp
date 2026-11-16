@@ -256,6 +256,7 @@ bool g_ledOn[2] = {false, false};
 int g_battX = 0;
 int g_battPct = -1;
 bool g_battCharging = false;
+bool g_battLow = false;
 uint32_t g_battKey = 0xFFFFFFFF;
 
 const int PAD = 6;
@@ -287,21 +288,21 @@ uint16_t toneColor(Tone t) {
     }
 }
 
-uint32_t batteryKey(int pct, bool charging, int& fillW, uint16_t& fill) {
+uint32_t batteryKey(int pct, bool charging, bool low, int& fillW, uint16_t& fill) {
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
     fillW = (8 * pct + 50) / 100;
     if (pct > 0 && fillW == 0) fillW = 1;
     fill = COLOR_TEXT;
     if (charging) fill = COLOR_WAV;
-    else if (pct <= 15) fill = COLOR_ERROR;
+    else if (low) fill = COLOR_ERROR;
     return ((uint32_t)fill << 8) | (uint32_t)fillW;
 }
 
 void drawBattery(TFT_eSPI& g, int x, int y) {
     int fillW;
     uint16_t fill;
-    g_battKey = batteryKey(g_battPct, g_battCharging, fillW, fill);
+    g_battKey = batteryKey(g_battPct, g_battCharging, g_battLow, fillW, fill);
     g.drawRect(x, y, 12, BATT_H, COLOR_TEXT);
     g.fillRect(x + 12, y + 2, 2, 3, COLOR_TEXT);
     if (fillW > 0) g.fillRect(x + 2, y + 2, fillW, BATT_H - 4, fill);
@@ -572,12 +573,13 @@ void statusLeds(bool in, bool out) {
     }
 }
 
-void statusBattery(int percent, bool charging) {
+void statusBattery(int percent, bool charging, bool low) {
     g_battPct = percent;
     g_battCharging = charging;
+    g_battLow = low;
     int fillW;
     uint16_t fill;
-    if (batteryKey(percent, charging, fillW, fill) == g_battKey) return;
+    if (batteryKey(percent, charging, low, fillW, fill) == g_battKey) return;
     if (!g_statusShown) return;
     TFT_eSPI& g = screen();
     g.fillRect(g_battX, BATT_Y, BATT_W, BATT_H, COLOR_SURFACE);
