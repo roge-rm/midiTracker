@@ -8,12 +8,69 @@
 
 namespace {
 
-// Arena layout: decoder state, then the read buffer, then one decoded frame.
-// The read buffer keeps at least MIN_AVAIL bytes ahead while data is left,
-// more than the largest layer III frame (1441 bytes, 320 kbps at 32 kHz).
-const uint32_t IN_SIZE = 4608;
-const uint32_t MIN_AVAIL = 1600;
+// Arena layout: decoder state, then the input ring and its mirror, then one
+// decoded frame.
+//
+// The input ring is a single-producer (core 0, fillRing()), single-consumer
+// (core 1, decodeOne()) byte ring. head and tail are byte counts that only
+// go up: head is written by core 0 only, tail by core 1 only. The first
+// MIRROR bytes are copied again after the ring's end, so core 1 can hand
+// the decoder any MIRROR bytes from tail in one piece. MIRROR is more than
+// the largest layer III frame (1441 bytes, 320 kbps at 32 kHz).
+// - core 0: reads tail, dmb, writes the bytes (and the mirror), dmb, head;
+// - core 1: reads eof, dmb, head, dmb, reads the bytes, dmb, then tail.
+// load() scans for the first frame in the ring's bytes as a plain linear
+// buffer of SCAN_SIZE, before core 1 is let in.
+const uint32_t RING = 8192; // power of two
+const uint32_t MIRROR = 2048;
+const uint32_t MIN_AVAIL = 1600; // core 1 decodes only with this much in one piece, until eof
+const uint32_t READ_MIN = 2048;  // core 0 reads only when this much is free
+const uint32_t SCAN_SIZE = 4608;
 const uint32_t PCM_SAMPLES = 1152 * 2;
+static_assert(SCAN_SIZE <= RING + MIRROR, "scan buffer is the ring's bytes");
+
+#ifdef ARDUINO_ARCH_RP2040
+#define MP3_DMB() __dmb()
+#else
+#define MP3_DMB() __atomic_thread_fence(__ATOMIC_SEQ_CST)
+#endif
+
+// Between the cores.
+struct Shared {
+    volatile uint32_t head = 0, tail = 0; // input ring, see above
+    volatile bool eof = false;            // core 0: no input will come after head
+    volatile bool run = false;            // core 0: core 1 may decode
+    volatile bool inService = false;      // core 1: inside core1Push()/core1Decode()
+    volatile bool ended = false;          // core 1: data ran out, wavStreamEnd() called
+};
+Shared g_sh;
+
+// Core 1's decoder state. Core 0 sets it up in load() before it sets
+// g_sh.run, and doesn't touch it again until stopCore1() returns.
+struct Core1 {
+    void* dec;
+    uint8_t* ring;
+    int16_t* pcm;
+    uint32_t pcmFrames, pcmPos, outPerFrame;
+    uint8_t pcmChannels;
+    // Linear resampler, as WavPlayer's.
+    uint32_t step, frac;
+    int16_t lastL, lastR, nextL, nextR;
+    bool starving;
+};
+Core1 g_c1;
+
+#ifdef TRACKER_PROFILE
+// Written by core 1 only, they only go up. Core 0 asks for a new worst by
+// bumping g_worstReq, core 1 clears g_worstUs when it sees that.
+volatile uint32_t g_frames = 0, g_decodeUs = 0, g_errors = 0, g_starved = 0, g_worstUs = 0;
+volatile uint32_t g_worstReq = 0, g_worstAck = 0;
+Mp3Player::Profile g_reads; // core 0 only
+uint32_t g_frames0 = 0, g_decodeUs0 = 0, g_errors0 = 0, g_starved0 = 0;
+#define PROF1(x) x
+#else
+#define PROF1(x)
+#endif
 
 size_t poolBytes() { return ((size_t)MP3PoolBytes() + 15) & ~(size_t)15; }
 
@@ -39,11 +96,212 @@ uint32_t frameBytes(const uint8_t* h, uint32_t& rate, uint32_t& kbps, uint8_t& v
 
 } // namespace
 
-size_t Mp3Player::decoderBytes() { return (size_t)MP3PoolBytes(); }
-size_t Mp3Player::arenaBytes() { return poolBytes() + IN_SIZE + PCM_SAMPLES * sizeof(int16_t); }
 
-uint8_t* Mp3Player::inBuf() const { return _in; }
-int16_t* Mp3Player::pcmBuf() const { return _pcm; }
+// ---- core 1 only, while g_sh.run is set ----
+
+namespace {
+
+enum DecodeResult { DECODED, NEED_INPUT, SOURCE_END };
+
+bool takeSrc(int16_t& l, int16_t& r) {
+    if (g_c1.pcmPos >= g_c1.pcmFrames) return false;
+    const int16_t* s = g_c1.pcm;
+    uint32_t i = g_c1.pcmPos++;
+    if (g_c1.pcmChannels == 2) {
+        l = s[i * 2];
+        r = s[i * 2 + 1];
+    } else {
+        l = r = s[i];
+    }
+    return true;
+}
+
+// Moves the resampler on to the source frame its position needs. false
+// when the decoded frame runs out first, with nothing taken.
+bool advance() {
+    while (g_c1.frac >= 0x10000) {
+        int16_t l, r;
+        if (!takeSrc(l, r)) return false;
+        g_c1.frac -= 0x10000;
+        g_c1.lastL = g_c1.nextL;
+        g_c1.lastR = g_c1.nextR;
+        g_c1.nextL = l;
+        g_c1.nextR = r;
+    }
+    return true;
+}
+
+// Resamples what's left of the decoded frame into the WAV stream, as far as
+// it has room. true when the decoded frame is used up.
+bool pushFrames() {
+    const size_t BATCH = 32;
+    int16_t out[BATCH * 2];
+    for (;;) {
+        if (!advance()) return true;
+        size_t n = Synth::wavStreamFree();
+        if (n == 0) return false;
+        if (n > BATCH) n = BATCH;
+        size_t k = 0;
+        while (k < n) {
+            int32_t diffL = (int32_t)g_c1.nextL - (int32_t)g_c1.lastL;
+            int32_t diffR = (int32_t)g_c1.nextR - (int32_t)g_c1.lastR;
+            int32_t frac15 = (int32_t)((g_c1.frac & 0xFFFF) >> 1);
+            out[k * 2] = (int16_t)(g_c1.lastL + ((diffL * frac15) >> 15));
+            out[k * 2 + 1] = (int16_t)(g_c1.lastR + ((diffR * frac15) >> 15));
+            k++;
+            g_c1.frac += g_c1.step;
+            if (!advance()) break;
+        }
+        Synth::wavStreamWrite(out, k);
+    }
+}
+
+// The input ring as core 1 sees it: bytes ready, and how many of those
+// start at p in one piece.
+struct Window {
+    uint32_t tail, avail, len;
+    bool eof;
+    uint8_t* p;
+};
+
+Window window() {
+    Window w;
+    w.eof = g_sh.eof;
+    MP3_DMB(); // acquire: eof read before head, so eof covers every byte below head
+    uint32_t head = g_sh.head;
+    MP3_DMB(); // acquire: head read before the bytes it covers
+    w.tail = g_sh.tail;
+    w.avail = head - w.tail;
+    uint32_t pos = w.tail & (RING - 1);
+    w.len = RING + MIRROR - pos;
+    if (w.len > w.avail) w.len = w.avail;
+    w.p = g_c1.ring + pos;
+    return w;
+}
+
+void consume(uint32_t tail, uint32_t n) {
+    MP3_DMB(); // release: bytes read before core 0 may reuse them
+    g_sh.tail = tail + n;
+}
+
+// True when decodeOne() won't come back with NEED_INPUT straight away.
+bool inputReady() {
+    Window w = window();
+    return w.eof || w.len >= MIN_AVAIL;
+}
+
+// One frame into g_c1.pcm.
+DecodeResult decodeOne() {
+    g_c1.pcmFrames = g_c1.pcmPos = 0;
+    int tries = 0;
+    while (tries < 16) {
+        Window w = window();
+        if (!w.eof && w.len < MIN_AVAIL) return NEED_INPUT;
+        if (w.avail < 4) return SOURCE_END;
+        int off = MP3FindSyncWord(w.p, (int)w.len);
+        if (off < 0) {
+            consume(w.tail, w.len - 3);
+            if (w.eof && w.len == w.avail) return SOURCE_END;
+            tries++;
+            continue;
+        }
+        if (off > 0) {
+            consume(w.tail, (uint32_t)off); // then look again from the sync word
+            continue;
+        }
+        tries++;
+        unsigned char* ip = w.p;
+        int left = (int)w.len;
+        PROF1(uint32_t t0 = micros());
+        int err = MP3Decode((HMP3Decoder)g_c1.dec, &ip, &left, g_c1.pcm, 0);
+#ifdef TRACKER_PROFILE
+        uint32_t d = micros() - t0;
+        if (g_worstReq != g_worstAck) {
+            g_worstUs = 0;
+            g_worstAck = g_worstReq;
+        }
+        g_decodeUs = g_decodeUs + d;
+        if (d > g_worstUs) g_worstUs = d;
+        g_frames = g_frames + 1;
+#endif
+        if (err == ERR_MP3_INVALID_FRAMEHEADER || err == ERR_MP3_INDATA_UNDERFLOW) {
+            // Not a real frame here, or the last one is cut short.
+            if (err == ERR_MP3_INDATA_UNDERFLOW && w.eof) return SOURCE_END;
+            consume(w.tail, 1);
+            PROF1(g_errors = g_errors + 1);
+            continue;
+        }
+        consume(w.tail, w.len - (uint32_t)left);
+        if (err == ERR_MP3_MAINDATA_UNDERFLOW) return DECODED; // bit reservoir not filled yet, no audio
+        if (err) {
+            PROF1(g_errors = g_errors + 1);
+            return DECODED;
+        }
+        MP3FrameInfo fi;
+        MP3GetLastFrameInfo((HMP3Decoder)g_c1.dec, &fi);
+        g_c1.pcmChannels = (uint8_t)fi.nChans;
+        g_c1.pcmFrames = fi.nChans ? (uint32_t)fi.outputSamps / (uint32_t)fi.nChans : 0;
+        return DECODED;
+    }
+    return DECODED;
+}
+
+// Entry and exit for core1Push()/core1Decode(). Core 1 sets inService, then
+// checks run; core 0 clears run, then waits for inService to clear (see
+// stopCore1()). The barriers between each store and the load after it mean
+// at least one of them sees the other's store.
+bool enter() {
+    if (!g_sh.run) return false;
+    g_sh.inService = true;
+    MP3_DMB();
+    if (g_sh.run) return true;
+    g_sh.inService = false;
+    return false;
+}
+
+void leave() {
+    MP3_DMB(); // release: ring, stream and state written before core 0 may take them over
+    g_sh.inService = false;
+}
+
+} // namespace
+
+bool Mp3Player::core1Push() {
+    if (!enter()) return false;
+    bool want = false;
+    if (!g_sh.ended && pushFrames()) {
+        // A new frame only when all of its output fits in the stream.
+        if (Synth::wavStreamFree() >= g_c1.outPerFrame) {
+            want = inputReady();
+#ifdef TRACKER_PROFILE
+            if (!want && !g_c1.starving) g_starved = g_starved + 1;
+#endif
+            g_c1.starving = !want;
+        }
+    }
+    leave();
+    return want;
+}
+
+void Mp3Player::core1Decode() {
+    if (!enter()) return;
+    if (!g_sh.ended) {
+        DecodeResult r = decodeOne();
+        if (r == SOURCE_END) {
+            Synth::wavStreamEnd();
+            MP3_DMB(); // release: the stream's end flag before ours
+            g_sh.ended = true;
+        } else if (r == DECODED) {
+            pushFrames();
+        }
+    }
+    leave();
+}
+
+// ---- core 0 ----
+
+size_t Mp3Player::decoderBytes() { return (size_t)MP3PoolBytes(); }
+size_t Mp3Player::arenaBytes() { return poolBytes() + RING + MIRROR + PCM_SAMPLES * sizeof(int16_t); }
 
 bool Mp3Player::fail(const char* msg) {
     strncpy(_error, msg, sizeof(_error) - 1);
@@ -53,30 +311,20 @@ bool Mp3Player::fail(const char* msg) {
     return false;
 }
 
-bool Mp3Player::fillInput() {
+bool Mp3Player::fillScan() {
     uint32_t have = _inLen - _inPos;
     if (have >= MIN_AVAIL) return true;
     if (_eof) return false;
-    uint8_t* buf = inBuf();
+    uint8_t* buf = g_c1.ring;
     memmove(buf, buf + _inPos, have);
     _inPos = 0;
     _inLen = have;
-    uint32_t len = IN_SIZE - have;
+    uint32_t len = SCAN_SIZE - have;
     uint32_t end = (_filePos + len) & ~511u;
     if (end > _filePos) len = end - _filePos; // end on a sector boundary
     if (len > _dataEnd - _filePos) len = _dataEnd - _filePos;
     int got = 0;
-    if (len > 0) {
-#ifdef TRACKER_PROFILE
-        uint32_t t0 = micros();
-#endif
-        got = _file.read(buf + have, len);
-#ifdef TRACKER_PROFILE
-        profile.readUs += micros() - t0;
-        profile.reads++;
-        profile.readBytes += got > 0 ? (uint32_t)got : 0;
-#endif
-    }
+    if (len > 0) got = _file.read(buf + have, len);
     if (got <= 0) {
         _eof = true;
         return false;
@@ -85,6 +333,57 @@ bool Mp3Player::fillInput() {
     _inLen += (uint32_t)got;
     if (_filePos >= _dataEnd) _eof = true;
     return _inLen - _inPos >= MIN_AVAIL;
+}
+
+void Mp3Player::fillRing() {
+    if (_eof) return;
+    uint32_t head = g_sh.head;
+    uint32_t free = RING - (head - g_sh.tail);
+    MP3_DMB(); // acquire: tail read before writing into the bytes it freed
+    if (free < READ_MIN) return;
+    uint32_t pos = head & (RING - 1);
+    uint32_t len = RING - pos;
+    if (len > free) len = free;
+    uint32_t end = (_filePos + len) & ~511u;
+    if (end > _filePos) len = end - _filePos; // end on a sector boundary
+    if (len > _dataEnd - _filePos) len = _dataEnd - _filePos;
+    uint8_t* buf = g_c1.ring;
+    int got = 0;
+    if (len > 0) {
+#ifdef TRACKER_PROFILE
+        uint32_t t0 = micros();
+#endif
+        got = _file.read(buf + pos, len);
+#ifdef TRACKER_PROFILE
+        g_reads.readUs += micros() - t0;
+        g_reads.reads++;
+        g_reads.readBytes += got > 0 ? (uint32_t)got : 0;
+#endif
+    }
+    if (got > 0) {
+        if (pos < MIRROR) {
+            uint32_t m = MIRROR - pos;
+            if (m > (uint32_t)got) m = (uint32_t)got;
+            memcpy(buf + RING + pos, buf + pos, m);
+        }
+        MP3_DMB(); // release: bytes written before head covers them
+        g_sh.head = head + (uint32_t)got;
+        _filePos += (uint32_t)got;
+    }
+    if (got <= 0 || _filePos >= _dataEnd) {
+        _eof = true;
+        MP3_DMB(); // release: the last head before eof
+        g_sh.eof = true;
+    }
+}
+
+void Mp3Player::stopCore1() {
+    g_sh.run = false;
+    MP3_DMB(); // run cleared before inService is read, see enter()
+    while (g_sh.inService) {
+        // at most one decode, about 26 ms
+    }
+    MP3_DMB(); // acquire: core 1's writes before it left
 }
 
 bool Mp3Player::load(const char* path) {
@@ -117,22 +416,34 @@ bool Mp3Player::load(const char* path) {
 
     if (arenaBytes() > SharedRamArena::SIZE) return fail("decoder doesn't fit");
     MP3SetPool(SharedRamArena::data(), (int)poolBytes());
-    _in = (uint8_t*)SharedRamArena::data() + poolBytes();
-    _pcm = (int16_t*)(_in + IN_SIZE);
+    g_c1 = Core1{};
+    g_c1.ring = (uint8_t*)SharedRamArena::data() + poolBytes();
+    g_c1.pcm = (int16_t*)(g_c1.ring + RING + MIRROR);
     _dec = MP3InitDecoder();
     if (!_dec) return fail("decoder init failed");
+    g_c1.dec = _dec;
 
     if (!findFirstFrame()) return fail(_error[0] ? _error : "not an MP3 file");
 
-    _pcmFrames = _pcmPos = 0;
-    _sourceEnded = false;
-    _resampleStep = (uint32_t)(((uint64_t)_rate << 16) / SAMPLE_RATE);
-    _resampleFrac = 0x20000; // the first two advance() steps fill _last and _next
-    _lastL = _lastR = _nextL = _nextR = 0;
+    // Stream from the first audio frame on, through the ring.
+    uint32_t first = _filePos - (_inLen - _inPos);
+    if (!_file.seekSet(first)) return fail("seek failed");
+    _filePos = first;
+    _eof = first >= _dataEnd;
+    g_sh.head = g_sh.tail = 0;
+    g_sh.eof = _eof;
+    g_sh.ended = false;
+    for (int i = 0; i < 4 && !_eof; i++) fillRing();
+
+    g_c1.step = (uint32_t)(((uint64_t)_rate << 16) / SAMPLE_RATE);
+    g_c1.frac = 0x20000; // the first two advance() steps fill last and next
+    g_c1.outPerFrame = (uint32_t)(((uint64_t)_samplesPerFrame * SAMPLE_RATE + _rate - 1) / _rate) + 2;
     Synth::wavStreamReset();
     _underrunBase = Synth::wavStreamUnderrunSamples();
     _ringBase = Synth::wavStreamWritten();
     _state = STATE_PAUSED;
+    MP3_DMB(); // release: everything above before core 1 may start
+    g_sh.run = true;
     return true;
 }
 
@@ -140,8 +451,8 @@ bool Mp3Player::findFirstFrame() {
     // Look up to 64 KB in for two frames in a row.
     uint32_t searched = 0;
     while (searched < 65536) {
-        fillInput();
-        uint8_t* p = inBuf() + _inPos;
+        fillScan();
+        uint8_t* p = g_c1.ring + _inPos;
         int avail = (int)(_inLen - _inPos);
         if (avail < 4) return false;
         int off = MP3FindSyncWord(p, avail);
@@ -208,126 +519,6 @@ bool Mp3Player::findFirstFrame() {
     return false;
 }
 
-bool Mp3Player::decodeFrame() {
-    _pcmFrames = _pcmPos = 0;
-    for (int tries = 0; tries < 16; tries++) {
-        fillInput();
-        uint8_t* p = inBuf() + _inPos;
-        int avail = (int)(_inLen - _inPos);
-        if (avail < 4) return false;
-        int off = MP3FindSyncWord(p, avail);
-        if (off < 0) {
-            _inPos = _inLen - 3;
-            if (_eof) return false;
-            continue;
-        }
-        _inPos += off;
-        p += off;
-        avail -= off;
-        unsigned char* ip = p;
-        int left = avail;
-#ifdef TRACKER_PROFILE
-        uint32_t t0 = micros();
-#endif
-        int err = MP3Decode((HMP3Decoder)_dec, &ip, &left, pcmBuf(), 0);
-#ifdef TRACKER_PROFILE
-        uint32_t d = micros() - t0;
-        profile.decodeUs += d;
-        if (d > profile.decodeWorstUs) profile.decodeWorstUs = d;
-        profile.frames++;
-#endif
-        if (err == ERR_MP3_INVALID_FRAMEHEADER || err == ERR_MP3_INDATA_UNDERFLOW) {
-            // Not a real frame here, or the last one is cut short.
-            if (err == ERR_MP3_INDATA_UNDERFLOW && _eof) return false;
-            _inPos++;
-#ifdef TRACKER_PROFILE
-            profile.errors++;
-#endif
-            continue;
-        }
-        _inPos += (uint32_t)(avail - left);
-        if (err == ERR_MP3_MAINDATA_UNDERFLOW) return true; // bit reservoir not filled yet, no audio
-        if (err) {
-#ifdef TRACKER_PROFILE
-            profile.errors++;
-#endif
-            return true;
-        }
-        MP3FrameInfo fi;
-        MP3GetLastFrameInfo((HMP3Decoder)_dec, &fi);
-        _pcmChannels = (uint8_t)fi.nChans;
-        _pcmFrames = fi.nChans ? (uint32_t)fi.outputSamps / (uint32_t)fi.nChans : 0;
-        return true;
-    }
-    return true;
-}
-
-bool Mp3Player::takeSrc(int16_t& l, int16_t& r) {
-    if (_pcmPos >= _pcmFrames) return false;
-    const int16_t* s = pcmBuf();
-    if (_pcmChannels == 2) {
-        l = s[_pcmPos * 2];
-        r = s[_pcmPos * 2 + 1];
-    } else {
-        l = r = s[_pcmPos];
-    }
-    _pcmPos++;
-    return true;
-}
-
-void Mp3Player::refill() {
-    const size_t MAX_FRAMES_PER_TICK = 2048;
-    const size_t BATCH = 32;
-    int16_t out[BATCH * 2];
-    size_t budget = MAX_FRAMES_PER_TICK;
-    bool decoded = false;
-
-    // Moves the resampler on to the source frame its position needs. false
-    // when the decoded frame runs out first, with nothing taken.
-    auto advance = [&]() {
-        while (_resampleFrac >= 0x10000) {
-            int16_t l, r;
-            if (!takeSrc(l, r)) return false;
-            _resampleFrac -= 0x10000;
-            _lastL = _nextL;
-            _lastR = _nextR;
-            _nextL = l;
-            _nextR = r;
-        }
-        return true;
-    };
-
-    while (budget > 0 && !_sourceEnded) {
-        if (!advance()) {
-            // At most one frame decoded per update(), and only when the ring has room.
-            if (decoded || Synth::wavStreamFree() == 0) break;
-            decoded = true;
-            if (!decodeFrame()) {
-                Synth::wavStreamEnd();
-                _sourceEnded = true;
-            }
-            continue;
-        }
-        size_t n = Synth::wavStreamFree();
-        if (n > BATCH) n = BATCH;
-        if (n > budget) n = budget;
-        if (n == 0) break;
-        size_t k = 0;
-        while (k < n) {
-            int32_t diffL = (int32_t)_nextL - (int32_t)_lastL;
-            int32_t diffR = (int32_t)_nextR - (int32_t)_lastR;
-            int32_t frac15 = (int32_t)((_resampleFrac & 0xFFFF) >> 1);
-            out[k * 2] = (int16_t)(_lastL + ((diffL * frac15) >> 15));
-            out[k * 2 + 1] = (int16_t)(_lastR + ((diffR * frac15) >> 15));
-            k++;
-            _resampleFrac += _resampleStep;
-            if (!advance()) break;
-        }
-        Synth::wavStreamWrite(out, k);
-        budget -= k;
-    }
-}
-
 bool Mp3Player::ringDrained() const {
     if (!Synth::wavStreamIsActive() && Synth::wavStreamIsEnded()) return true;
     return (int32_t)(Synth::wavStreamPlayed() - Synth::wavStreamWritten()) >= 0;
@@ -335,8 +526,11 @@ bool Mp3Player::ringDrained() const {
 
 void Mp3Player::update() {
     if (_state != STATE_PLAYING && _state != STATE_PAUSED) return;
-    refill();
-    if (_state == STATE_PLAYING && _sourceEnded && ringDrained()) _state = STATE_DONE;
+    fillRing();
+    if (_state == STATE_PLAYING && g_sh.ended) {
+        MP3_DMB(); // acquire: ended read before the stream state
+        if (ringDrained()) _state = STATE_DONE;
+    }
 }
 
 void Mp3Player::play() {
@@ -352,9 +546,11 @@ void Mp3Player::pause() {
 }
 
 void Mp3Player::close() {
+    if (_dec) stopCore1();
     if (_file) _file.close();
     if (_dec) MP3FreeDecoder((HMP3Decoder)_dec);
     _dec = nullptr;
+    g_c1.dec = nullptr;
     Synth::wavStreamReset();
     _state = STATE_IDLE;
 }
@@ -369,5 +565,20 @@ uint32_t Mp3Player::elapsedMs() const {
 uint32_t Mp3Player::underrunSamples() const { return Synth::wavStreamUnderrunSamples() - _underrunBase; }
 
 #ifdef TRACKER_PROFILE
-Mp3Player::Profile Mp3Player::profile;
+Mp3Player::Profile Mp3Player::profileTake() {
+    Profile p = g_reads;
+    g_reads = {};
+    uint32_t frames = g_frames, us = g_decodeUs, errors = g_errors, starved = g_starved;
+    p.frames = frames - g_frames0;
+    p.decodeUs = us - g_decodeUs0;
+    p.errors = errors - g_errors0;
+    p.starved = starved - g_starved0;
+    p.decodeWorstUs = g_worstUs;
+    g_frames0 = frames;
+    g_decodeUs0 = us;
+    g_errors0 = errors;
+    g_starved0 = starved;
+    g_worstReq = g_worstReq + 1;
+    return p;
+}
 #endif

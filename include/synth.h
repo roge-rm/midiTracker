@@ -338,6 +338,10 @@ struct SynthProfile {
 };
 void profileReset();
 void profileGet(SynthProfile& p);
+// Cycles core 1 has spent waiting in the I2S write since boot (it wraps,
+// so diff two readings less than ~21 s apart at 200 MHz). Everything else
+// on core 1 counts as busy.
+uint32_t profileCore1IdleCycles();
 
 // Hang trace, kept in RAM a watchdog reset leaves alone. where1 is set by
 // core 1 (PW_* codes, | voice index while a voice renders), where0 by

@@ -16,8 +16,9 @@
 // PROFILE_WAV_DIR (e.g. "/wav") instead profiles up to 16 .wav files found
 // in that folder, each preceded by a line with its format.
 // PROFILE_MP3_DIR (e.g. "/mp3") plays up to 16 .mp3 files in that folder
-// through Mp3Player, each preceded by a format line, printing core 0 load,
-// decode time per frame, card reads and underruns.
+// through Mp3Player, each preceded by a format line, printing core 0 and
+// core 1 load, decode time per frame on core 1, card reads and underruns.
+// It needs MP3_PLAYER, which decodes on core 1 (see loop1()).
 // With -D PROFILE_SAVER the trackers play with the screensaver's Pattern
 // rain drawing, and each report adds the share of real time it took.
 #ifdef TRACKER_PROFILE
@@ -37,6 +38,7 @@
 #include "midi_output.h"
 #include "pins.h" // SAMPLE_RATE
 #include <hardware/watchdog.h>
+#include <hardware/clocks.h>
 #ifdef PROFILE_SAVER
 #include "ui_saver.h"
 #include "ui_strip.h"
@@ -477,8 +479,9 @@ void profileWavDir() {
 }
 
 // Plays an .mp3 like a file player would (update() every loop) and prints
-// core 0 load, decode time per frame, card reads and underruns per 5 s and
-// for the run.
+// per 5 s and for the run: core 0 load (time in update()), core 1 load
+// (time outside its I2S write wait, synth render included), decode time per
+// frame on core 1, input ring starved count, card reads and underruns.
 void profileMp3Path(const char* path, const char* want) {
     static Mp3Player p;
     if (!p.load(path)) {
@@ -498,23 +501,32 @@ void profileMp3Path(const char* path, const char* want) {
     while (millis() - start < 1000 && p.state() == Mp3Player::STATE_PLAYING) p.update();
     uint32_t u0 = p.underrunSamples(), e0 = p.elapsedMs();
     uint32_t busyUs = 0, worstUs = 0, winWorst = 0, winBusy = 0, winU0 = u0;
+    uint32_t cyclesPerUs = clock_get_hz(clk_sys) / 1000000u;
+    uint64_t idleCycles = 0;
+    uint32_t idle0 = Synth::profileCore1IdleCycles();
     uint32_t t0 = micros(), win = millis(), winT0 = t0;
     Mp3Player::Profile total = {};
-    Mp3Player::profile = {};
-    auto print = [&](const char* tag, uint32_t busy, uint32_t us, uint32_t worst, const Mp3Player::Profile& r, uint32_t underruns) {
+    Mp3Player::profileTake();
+    auto print = [&](const char* tag, uint32_t busy, uint32_t us, uint64_t idle, uint32_t worst, const Mp3Player::Profile& r,
+                     uint32_t underruns) {
         int load = us ? (int)(1000.0f * (float)busy / (float)us) : 0;
+        float idleUs = (float)idle / (float)cyclesPerUs;
+        int load1 = us ? (int)(1000.0f * (1.0f - idleUs / (float)us)) : 0;
+        if (load1 < 0) load1 = 0;
         uint32_t avg = r.frames ? r.decodeUs / r.frames : 0;
         int avgPct = frameUs ? (int)(1000u * avg / frameUs) : 0;
         int worstPct = frameUs ? (int)(1000u * r.decodeWorstUs / frameUs) : 0;
-        Serial.printf("PROFILE %s %s: core0 load %d.%d%%, worst update %lu us, decode %lu frames avg %lu us (%d.%d%%) worst %lu us (%d.%d%%), "
-                      "errors %lu, reads %lu (%lu KB, %lu ms), underrun samples %lu\n",
-                      tag, want, load / 10, load % 10, (unsigned long)worst, (unsigned long)r.frames, (unsigned long)avg, avgPct / 10,
-                      avgPct % 10, (unsigned long)r.decodeWorstUs, worstPct / 10, worstPct % 10, (unsigned long)r.errors,
-                      (unsigned long)r.reads, (unsigned long)(r.readBytes / 1024), (unsigned long)(r.readUs / 1000), (unsigned long)underruns);
+        Serial.printf("PROFILE %s %s: core0 load %d.%d%%, worst update %lu us, core1 load %d.%d%%, "
+                      "core1 decode %lu frames avg %lu us (%d.%d%%) worst %lu us (%d.%d%%), errors %lu, input starved %lu, "
+                      "reads %lu (%lu KB, %lu ms), underrun samples %lu\n",
+                      tag, want, load / 10, load % 10, (unsigned long)worst, load1 / 10, load1 % 10, (unsigned long)r.frames,
+                      (unsigned long)avg, avgPct / 10, avgPct % 10, (unsigned long)r.decodeWorstUs, worstPct / 10, worstPct % 10,
+                      (unsigned long)r.errors, (unsigned long)r.starved, (unsigned long)r.reads, (unsigned long)(r.readBytes / 1024),
+                      (unsigned long)(r.readUs / 1000), (unsigned long)underruns);
     };
     auto add = [](Mp3Player::Profile& t, const Mp3Player::Profile& c) {
         t.reads += c.reads; t.readBytes += c.readBytes; t.readUs += c.readUs;
-        t.frames += c.frames; t.decodeUs += c.decodeUs; t.errors += c.errors;
+        t.frames += c.frames; t.decodeUs += c.decodeUs; t.errors += c.errors; t.starved += c.starved;
         if (c.decodeWorstUs > t.decodeWorstUs) t.decodeWorstUs = c.decodeWorstUs;
     };
     while (millis() - start < 1000u + PROFILE_SECONDS * 1000u && p.state() == Mp3Player::STATE_PLAYING) {
@@ -526,11 +538,13 @@ void profileMp3Path(const char* path, const char* want) {
         if (d > worstUs) worstUs = d;
         if (d > winWorst) winWorst = d;
         if (millis() - win >= 5000) {
-            Mp3Player::Profile& c = Mp3Player::profile;
+            Mp3Player::Profile c = Mp3Player::profileTake();
+            uint32_t idle = Synth::profileCore1IdleCycles();
             uint32_t now = micros();
-            print("5s", winBusy, now - winT0, winWorst, c, p.underrunSamples() - winU0);
+            print("5s", winBusy, now - winT0, idle - idle0, winWorst, c, p.underrunSamples() - winU0);
+            idleCycles += idle - idle0;
+            idle0 = idle;
             add(total, c);
-            c = {};
             winBusy = 0;
             winWorst = 0;
             winT0 = now;
@@ -538,9 +552,11 @@ void profileMp3Path(const char* path, const char* want) {
             win = millis();
         }
     }
-    add(total, Mp3Player::profile);
+    uint32_t idle = Synth::profileCore1IdleCycles();
+    idleCycles += idle - idle0;
+    add(total, Mp3Player::profileTake());
     uint32_t us = micros() - t0;
-    print("RESULT", busyUs, us, worstUs, total, p.underrunSamples() - u0);
+    print("RESULT", busyUs, us, idleCycles, worstUs, total, p.underrunSamples() - u0);
     Serial.printf("PROFILE RESULT %s: elapsed moved %lu ms in %lu ms\n", want, (unsigned long)(p.elapsedMs() - e0), (unsigned long)(us / 1000));
     p.stop();
     printStacks("after the mp3");

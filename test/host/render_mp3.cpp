@@ -1,6 +1,7 @@
 // render_mp3 <file.mp3> <out.raw>
 // Drives Mp3Player the way the profile does (load, play, update() every
-// loop) and writes the stereo int16 frames the WAV ring got at 44.1 kHz.
+// loop), with core 1's core1Push()/core1Decode() run after each update(),
+// and writes the stereo int16 frames the WAV ring got at 44.1 kHz.
 // Prints the format, the read() calls and, built with MP3_COUNT_OPS, the
 // 32x32->64 multiplies per decoded frame.
 #include <Arduino.h>
@@ -34,6 +35,7 @@ int main(int argc, char** argv) {
     unsigned long reads0 = FsFile::readCalls;
     while (p.state() == Mp3Player::STATE_PLAYING && idle < 4) {
         p.update();
+        if (Mp3Player::core1Push()) Mp3Player::core1Decode();
         loops++;
         size_t have = HostRing::framesCaptured();
         idle = have > written ? 0 : idle + 1;

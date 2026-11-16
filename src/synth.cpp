@@ -22,6 +22,9 @@ uint32_t g_hostGovernorSheds = 0;
 #if defined(TRACKER_PROFILE) && !defined(HOST_MIDI)
 #include <Arduino.h>
 #include <hardware/timer.h>
+#ifdef MP3_PLAYER
+#include "mp3_file.h"
+#endif
 // Profile build only: where each core is, in RAM that a watchdog reset
 // leaves alone, so a hang can be read back after the reboot (see
 // tracker_profile.cpp). where1/where0 are PW_* codes.
@@ -2991,6 +2994,9 @@ uint32_t g_governorPeakUsed = 0;  // busiest block since boot, in cycles
 uint32_t g_profPeakSample = 0, g_profPeakBlock = 0, g_profPeakVoices = 0;
 uint64_t g_profSumCycles = 0;
 uint32_t g_profSamples = 0, g_profSheds0 = 0;
+// Cycles core 1 spent inside g_i2s.write16(), which blocks while the I2S
+// buffers are full; it wraps, read with Synth::profileCore1IdleCycles().
+volatile uint32_t g_profIdleCycles = 0;
 #endif
 
 void setupGovernor() {
@@ -3099,8 +3105,20 @@ void __not_in_flash_func(loop1)() {
         governorTick(used);
     }
 #endif
+#ifdef MP3_PLAYER
+    // MP3 decoding runs here, between samples. A frame takes up to about
+    // 26 ms, so it only starts with at most one 256-frame I2S buffer free,
+    // which leaves 35-46 ms queued. Render time and the governor don't see it.
+    if (Mp3Player::core1Push() && g_i2s.availableForWrite() <= 256 * 4) Mp3Player::core1Decode();
+#endif
     PROF_WHERE1(Synth::PW_I2S);
+#if defined(TRACKER_PROFILE) && !defined(HOST_MIDI)
+    uint32_t idleStart = systick_hw->cvr;
+#endif
     g_i2s.write16(left, right); // blocks until DMA buffer space is free, paces this loop
+#if defined(TRACKER_PROFILE) && !defined(HOST_MIDI)
+    g_profIdleCycles = g_profIdleCycles + ((idleStart - systick_hw->cvr) & 0x00FFFFFF);
+#endif
 }
 
 #ifdef TRACKER_PROFILE
@@ -3119,6 +3137,9 @@ void Synth::profileGet(SynthProfile& p) {
     p.shedsTotal = g_governorSheds;
     p.peakUsedTotal = g_governorPeakUsed;
 }
+#ifndef HOST_MIDI
+uint32_t Synth::profileCore1IdleCycles() { return g_profIdleCycles; }
+#endif
 #endif
 
 #if defined(TRACKER_PROFILE) && !defined(HOST_MIDI)

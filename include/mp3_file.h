@@ -12,10 +12,17 @@
 // a trailing ID3v1 tag isn't read. Rates other than SAMPLE_RATE are
 // resampled linearly, as WavPlayer does.
 //
-// Uses the start of SharedRamArena::data() for the decoder state, the card
-// read buffer and one decoded frame (see arenaBytes()), so nothing else may
-// hold the arena while an MP3 is loaded. Core 0 only: load() and update()
-// read the card, and update() decodes at most one frame per call.
+// Uses the start of SharedRamArena::data() for the decoder state, the
+// compressed input ring and one decoded frame (see arenaBytes()), so nothing
+// else may hold the arena while an MP3 is loaded. Only one Mp3Player may be
+// loaded at a time, and nothing else may feed the WAV stream meanwhile.
+//
+// Two cores: core 0 calls load(), update(), play(), pause() and close(),
+// and is the only one that reads the card. update() tops up the input ring.
+// Core 1 calls core1Push() and core1Decode() from loop1(): they decode
+// from the input ring into the WAV stream, so core 1 is the WAV stream's
+// producer while an MP3 is loaded. close() waits for core 1 to leave them
+// before it frees the decoder.
 class Mp3Player {
 public:
     enum State { STATE_IDLE, STATE_PLAYING, STATE_PAUSED, STATE_DONE, STATE_ERROR };
@@ -41,14 +48,24 @@ public:
     uint32_t samplesPerFrame() const { return _samplesPerFrame; }
     uint32_t underrunSamples() const;
 
-    // Arena bytes used: decoder state, read buffer, one decoded frame.
+    // Arena bytes used: decoder state, input ring, one decoded frame.
     static size_t decoderBytes();
     static size_t arenaBytes();
 
+    // Core 1, between samples. core1Push() resamples decoded audio into the
+    // WAV stream and returns true when the next frame is due and its input
+    // is in the ring. core1Decode() then decodes that frame, which takes up
+    // to about 26 ms on the device, so call it only when the I2S buffers
+    // hold more than that. Both return at once when no MP3 is loaded.
+    static bool core1Push();
+    static void core1Decode();
+
 #ifdef TRACKER_PROFILE
-    // Card reads and decode time since the profile run last cleared it.
-    struct Profile { uint32_t reads, readBytes, readUs, frames, decodeUs, decodeWorstUs, errors; };
-    static Profile profile;
+    // Card reads (core 0) and decoding (core 1) since the last call.
+    // starved counts the times core 1 had room for a frame but the input
+    // ring didn't hold one yet.
+    struct Profile { uint32_t reads, readBytes, readUs, frames, decodeUs, decodeWorstUs, errors, starved; };
+    static Profile profileTake();
 #endif
 
 private:
@@ -56,37 +73,23 @@ private:
     State _state = STATE_IDLE;
     char _error[64] = {0};
     void* _dec = nullptr; // HMP3Decoder
-    uint8_t* _in = nullptr;   // read buffer and decoded frame, in the arena
-    int16_t* _pcm = nullptr;
 
     uint32_t _rate = 0, _bitrate = 0, _samplesPerFrame = 0, _id3Bytes = 0, _totalMs = 0;
     uint8_t _channels = 0, _version = 0;
     char _vbrTag[5] = {0};
 
-    // Read buffer (in the arena): bytes [_inPos, _inLen) are unread.
+    // load()'s linear scan buffer (the start of the input ring's bytes):
+    // bytes [_inPos, _inLen) are unread.
     uint32_t _inPos = 0, _inLen = 0;
     uint32_t _filePos = 0, _dataEnd = 0;
     bool _eof = false;
 
-    // Decoded frame (in the arena), _pcmFrames stereo or mono frames, _pcmPos next.
-    uint32_t _pcmFrames = 0, _pcmPos = 0;
-    uint8_t _pcmChannels = 0;
-    bool _sourceEnded = false;
-
-    // Linear resampler, as WavPlayer's.
-    uint32_t _resampleStep = 0, _resampleFrac = 0;
-    int16_t _lastL = 0, _lastR = 0, _nextL = 0, _nextR = 0;
-    bool _haveLast = false, _needNext = true;
-
     uint32_t _ringBase = 0, _underrunBase = 0;
 
     bool fail(const char* msg);
-    uint8_t* inBuf() const;
-    int16_t* pcmBuf() const;
-    bool fillInput();     // tops the read buffer up to a whole frame or more; false at the end of data
+    bool fillScan();       // load() only: tops the scan buffer up; false at the end of data
     bool findFirstFrame(); // skips to the first frame, reads its format and any Xing/Info/VBRI header
-    bool decodeFrame();   // one frame into pcmBuf(); false when the data has run out
-    bool takeSrc(int16_t& l, int16_t& r);
-    void refill();
+    void fillRing();       // one card read into the input ring when it has room
+    void stopCore1();      // waits until core 1 is out of core1Push()/core1Decode() and stays out
     bool ringDrained() const;
 };
