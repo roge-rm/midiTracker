@@ -7,6 +7,7 @@
 #   make -C test/host midi-check     render into build/host/midi-current/ and compare with the baseline
 #   fluid_compare.sh                 compare the midi renders with fluidsynth's
 #   openmpt_compare.sh <list> <outdir> [secs]   correlate .it renders with openmpt123 (uses build/host/corr)
+#   make -C test/host look OUT_DIR=dir   render the M12 screens to PNGs in dir (default build/host/look)
 ROOT   := $(abspath ../..)
 OUT    := $(ROOT)/build/host
 CXX    ?= g++
@@ -18,7 +19,7 @@ PLAYER_SRC := $(wildcard $(ROOT)/src/tracker_base.cpp) $(ROOT)/src/mod_file.cpp 
 HARNESS_SRC := $(CURDIR)/render.cpp $(CURDIR)/host_stubs.cpp
 SECONDS ?= 60
 
-.PHONY: all baseline check clean midi midi-baseline midi-check
+.PHONY: all baseline check clean midi midi-baseline midi-check look
 all: $(OUT)/render $(OUT)/gen $(OUT)/corr
 
 $(OUT)/corr: $(CURDIR)/corr.cpp
@@ -75,3 +76,15 @@ midi-baseline: midi $(MIDI_DIR)/.copied
 midi-check: midi $(MIDI_DIR)/.copied
 	SECONDS=$(SECONDS) $(CURDIR)/render_midi_all.sh $(OUT)/render_midi $(MIDI_DIR) $(OUT)/midi-current
 	EXT=wav $(CURDIR)/compare.sh $(OUT)/midi-baseline $(OUT)/midi-current
+
+# M12 look: the real ui_look.cpp drawn into a framebuffer, written as PNGs.
+LOOK_SRC := $(ROOT)/src/ui_look.cpp $(CURDIR)/look_render.cpp
+OUT_DIR ?= $(OUT)/look
+
+$(OUT)/look_render: $(LOOK_SRC) $(wildcard $(CURDIR)/stub-look/*.h) $(ROOT)/include/ui_look.h $(ROOT)/include/ui_strip.h $(wildcard $(ROOT)/include/fonts/*.h)
+	@mkdir -p $(OUT)
+	$(CXX) -std=gnu++17 -O2 -g -Wall -Wextra -Wno-unused-parameter -I$(CURDIR)/stub-look -I$(ROOT)/include -o $@ $(LOOK_SRC)
+
+look: $(OUT)/look_render
+	@mkdir -p $(OUT_DIR)
+	$(OUT)/look_render $(OUT_DIR)

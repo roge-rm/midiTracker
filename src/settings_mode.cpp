@@ -1268,6 +1268,7 @@ namespace SettingsMode
             if (!file.open(path, O_RDONLY) && !file.open(tmpPath, O_RDONLY))
                 return false;
 
+            Ui::themeLoadBegin();
             char line[48];
             int lineLen = 0;
             int c;
@@ -1303,6 +1304,7 @@ namespace SettingsMode
                 }
             }
             file.close();
+            Ui::themeLoadEnd(any);
             return any;
         }
 

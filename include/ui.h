@@ -42,6 +42,10 @@ void drawBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffset);
 // and newly selected rows instead of the whole screen.
 void updateBrowserSelection(const SdBrowser& browser, int prevIndex, int newIndex, int scrollOffset);
 
+// Redraws the browser's status strip, for when the MIDI output target it
+// shows changes.
+void updateBrowserHeader(const SdBrowser& browser);
+
 // Full redraw of LooperMode's restricted "Load Selected Loop" browser --
 // same header/row/scrollbar layout as drawBrowser(), just its own footer
 // hint text (tap ENTER to select, hold to delete, no EDIT menu/ALT output
@@ -501,6 +505,11 @@ const char* themeColorLabel(int index); // short row label, e.g. "Background", "
 void getThemeColorRGB(int index, uint8_t& r, uint8_t& g, uint8_t& b);
 void setThemeColorRGB(int index, uint8_t r, uint8_t g, uint8_t b);
 void resetThemeColorsToDefault(); // every color back to its hardcoded shipped value
+// Around loading a .thm: Begin resets to the defaults. End with ok fills
+// entries the file didn't have from the ones an older theme used for those
+// parts; without ok it puts back the colours from before Begin.
+void themeLoadBegin();
+void themeLoadEnd(bool ok);
 
 // Full redraw of the Theme editor: one row per themeColorCount() color
 // (label, R/G/B fields, a small solid swatch previewing the result),
@@ -521,12 +530,10 @@ void updateThemeRow(int index, int channelCursor, bool selected, int scrollOffse
 // drawThemePage() instead whenever the move also changes scrollOffset.
 void updateThemeSelection(int prevCursor, int newCursor, int channelCursor, int scrollOffset);
 
-// Small vertical battery gauge, bottom-right corner, drawn over whatever
-// screen is currently up. See Battery (battery.h) for the underlying
-// percentage/charging read -- this just paints the current cached value.
-// drawBatteryMeter() always draws (screens call it with their footer);
-// updateBatteryMeter() draws only when the shown fill or colour changed,
-// and main.cpp calls it every loop.
+// The battery and the MIDI in/out LEDs in the status strip, which every
+// screen draws. Both only redraw their own pixels when what they show
+// changes. main.cpp calls updateBatteryMeter() every loop; it also lights
+// the LEDs on MIDI activity. drawBatteryMeter() refreshes just the battery.
 void drawBatteryMeter();
 void updateBatteryMeter();
 

@@ -1043,9 +1043,8 @@ bool handleBrowseInput() {
     // elsewhere in this app.
     if (Input::justReleased(BTN_ALT)) {
         if (!altUsedAsModifier) {
-            // The browse screen never displays outputTarget -- nothing to
-            // redraw here, unlike the player-screen call site below.
             cycleOutputTarget();
+            Ui::updateBrowserHeader(browser);
         }
         altUsedAsModifier = false;
     }

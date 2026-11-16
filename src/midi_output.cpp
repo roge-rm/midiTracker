@@ -37,6 +37,14 @@ MidiThruMode g_thruMode = MIDI_THRU_OFF;
 
 inline bool hwEnabled()  { return g_target & MIDI_OUT_HARDWARE; }
 inline bool usbEnabled() { return g_target & MIDI_OUT_USB; }
+
+// Messages in and out on DIN or USB, for the status strip LEDs. Core 0 only.
+uint32_t g_inActivity = 0;
+uint32_t g_outActivity = 0;
+
+// hwEnabled() and usbEnabled() for a send, counting it for the LED.
+inline bool hwOut()  { bool on = hwEnabled(); g_outActivity += on; return on; }
+inline bool usbOut() { bool on = usbEnabled(); g_outActivity += on; return on; }
 inline bool audioOutEnabled() { return g_audioOutput; }
 
 // Which outgoing transport(s) a message arriving on `fromHw` should be
@@ -80,6 +88,7 @@ void sendChannelVoiceTo(Interface& iface, uint8_t status, uint8_t data1, uint8_t
 void routeThruChannelVoice(bool fromHw, uint8_t status, uint8_t data1, uint8_t data2) {
     bool toHw, toUsb;
     thruDestinations(fromHw, toHw, toUsb);
+    g_outActivity += toHw || toUsb;
     if (toHw)  sendChannelVoiceTo(MIDIHW, status, data1, data2);
     if (toUsb) sendChannelVoiceTo(MIDIUSB, status, data1, data2);
 }
@@ -96,6 +105,7 @@ void routeThruSysEx(bool fromHw, const uint8_t* data, size_t len) {
     if (len < 2) return; // empty
     bool toHw, toUsb;
     thruDestinations(fromHw, toHw, toUsb);
+    g_outActivity += toHw || toUsb;
     if (toHw)  MIDIHW.sendSysEx((unsigned)len, data, true);
     if (toUsb) MIDIUSB.sendSysEx((unsigned)len, data, true);
 }
@@ -131,6 +141,8 @@ MidiOutput::RealtimeHandler g_realtimeHandler = nullptr;
 template <typename Interface>
 void pumpOne(Interface& iface, bool fromHw) {
     if (!iface.read()) return;
+    midi::MidiType t = iface.getType();
+    if (t != midi::Clock && t != midi::ActiveSensing) g_inActivity++;
     bool thruActive = g_thruMode != MIDI_THRU_OFF;
     if (!g_inputHandler && !g_sysExHandler && !g_realtimeHandler && !thruActive) return;
 
@@ -233,48 +245,48 @@ void sendNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
         }
     }
     if (audioOutEnabled()) Synth::noteOn(channel, note, velocity);
-    if (hwEnabled())  MIDIHW.sendNoteOn(note, velocity, channel + 1);
-    if (usbEnabled()) MIDIUSB.sendNoteOn(note, velocity, channel + 1);
+    if (hwOut())  MIDIHW.sendNoteOn(note, velocity, channel + 1);
+    if (usbOut()) MIDIUSB.sendNoteOn(note, velocity, channel + 1);
 }
 
 void sendNoteOff(uint8_t channel, uint8_t note, uint8_t velocity) {
     if (note < 128) g_noteChannelMask[note] &= (uint16_t)~(1u << channel);
     if (audioOutEnabled()) Synth::noteOff(channel, note);
-    if (hwEnabled())  MIDIHW.sendNoteOff(note, velocity, channel + 1);
-    if (usbEnabled()) MIDIUSB.sendNoteOff(note, velocity, channel + 1);
+    if (hwOut())  MIDIHW.sendNoteOff(note, velocity, channel + 1);
+    if (usbOut()) MIDIUSB.sendNoteOff(note, velocity, channel + 1);
 }
 
 void sendControlChange(uint8_t channel, uint8_t controller, uint8_t value) {
     // Controllers always reach the synth so its channel state stays current
     // while audio is off; only notes are gated.
     Synth::controlChange(channel, controller, value);
-    if (hwEnabled())  MIDIHW.sendControlChange(controller, value, channel + 1);
-    if (usbEnabled()) MIDIUSB.sendControlChange(controller, value, channel + 1);
+    if (hwOut())  MIDIHW.sendControlChange(controller, value, channel + 1);
+    if (usbOut()) MIDIUSB.sendControlChange(controller, value, channel + 1);
 }
 
 void sendProgramChange(uint8_t channel, uint8_t program) {
     // Selects which instrument-family preset the synth uses for
     // subsequent notes on this channel (see Synth::programChange()).
     if (audioOutEnabled()) Synth::programChange(channel, program);
-    if (hwEnabled())  MIDIHW.sendProgramChange(program, channel + 1);
-    if (usbEnabled()) MIDIUSB.sendProgramChange(program, channel + 1);
+    if (hwOut())  MIDIHW.sendProgramChange(program, channel + 1);
+    if (usbOut()) MIDIUSB.sendProgramChange(program, channel + 1);
 }
 
 void sendPitchBend(uint8_t channel, int16_t bend) {
     Synth::pitchBend(channel, bend); // ungated, see sendControlChange()
-    if (hwEnabled())  MIDIHW.sendPitchBend(bend, channel + 1);
-    if (usbEnabled()) MIDIUSB.sendPitchBend(bend, channel + 1);
+    if (hwOut())  MIDIHW.sendPitchBend(bend, channel + 1);
+    if (usbOut()) MIDIUSB.sendPitchBend(bend, channel + 1);
 }
 
 void sendAfterTouch(uint8_t channel, uint8_t pressure) {
     Synth::channelPressure(channel, pressure); // ungated, see sendControlChange()
-    if (hwEnabled())  MIDIHW.sendAfterTouch(pressure, channel + 1);
-    if (usbEnabled()) MIDIUSB.sendAfterTouch(pressure, channel + 1);
+    if (hwOut())  MIDIHW.sendAfterTouch(pressure, channel + 1);
+    if (usbOut()) MIDIUSB.sendAfterTouch(pressure, channel + 1);
 }
 
 void sendPolyAfterTouch(uint8_t channel, uint8_t note, uint8_t pressure) {
-    if (hwEnabled())  MIDIHW.sendAfterTouch(note, pressure, channel + 1);
-    if (usbEnabled()) MIDIUSB.sendAfterTouch(note, pressure, channel + 1);
+    if (hwOut())  MIDIHW.sendAfterTouch(note, pressure, channel + 1);
+    if (usbOut()) MIDIUSB.sendAfterTouch(note, pressure, channel + 1);
 }
 
 void sendRaw(uint8_t status, uint8_t data1, uint8_t data2, uint8_t len) {
@@ -308,8 +320,8 @@ void sendSysExRaw(const uint8_t* data, size_t len) {
     if (len < 2) return; // smaller than a bare F0 F7 -- not a real message
     // `true` = data already includes the F0/F7 boundaries -- see this
     // function's header comment.
-    if (hwEnabled())  MIDIHW.sendSysEx((unsigned)len, data, true);
-    if (usbEnabled()) MIDIUSB.sendSysEx((unsigned)len, data, true);
+    if (hwOut())  MIDIHW.sendSysEx((unsigned)len, data, true);
+    if (usbOut()) MIDIUSB.sendSysEx((unsigned)len, data, true);
 }
 
 uint8_t* sysExScratch() { return g_sysExScratch; }
@@ -361,6 +373,9 @@ void noteActivityIn(uint8_t channel, uint8_t note, uint8_t velocity) {
         g_noteChannelMask[note] &= (uint16_t)~(1u << channel);
     }
 }
+
+uint32_t inActivity() { return g_inActivity; }
+uint32_t outActivity() { return g_outActivity; }
 
 void setInputHandler(InputHandler handler) { g_inputHandler = handler; }
 void setSysExHandler(SysExHandler handler) { g_sysExHandler = handler; }

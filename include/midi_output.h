@@ -149,6 +149,11 @@ uint16_t activeChannelMask();
 // off, same convention used everywhere else in this file.
 void noteActivityIn(uint8_t channel, uint8_t note, uint8_t velocity);
 
+// Count up on each message received or sent on DIN or USB (clock and
+// active sensing in aren't counted). The status strip LEDs watch them.
+uint32_t inActivity();
+uint32_t outActivity();
+
 // Called for every incoming channel-voice message read from either
 // transport (merged into one stream), e.g. to feed a MidiRecorder.
 // `len` is 1 for Program Change/Channel Pressure, 2 otherwise.

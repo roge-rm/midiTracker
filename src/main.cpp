@@ -24,7 +24,8 @@ namespace {
 
 enum TopMode { MODE_SELECT, MODE_FILE_PLAYER, MODE_LOOPER, MODE_PARI_SYNTH, MODE_SETTINGS };
 
-const char* MODE_LABELS[] = { "Play / Record Files", "MIDI Looper", "pariSynth", "Settings" };
+// Mode tiles, a 2x2 grid in this order.
+const char* MODE_LABELS[] = { "FILES", "LOOPER", "PARISYNTH", "SETTINGS" };
 const int MODE_COUNT = 4;
 
 // Parallel to MODE_LABELS -- modeCursor (a position in that list) maps to
@@ -63,31 +64,29 @@ void enterMode(TopMode mode) {
     }
 }
 
+void moveModeCursor(int to) {
+    if (to < 0 || to >= MODE_COUNT || to == modeCursor) return;
+    int prev = modeCursor;
+    modeCursor = to;
+    Ui::updateModeSelectCursor(MODE_LABELS, MODE_COUNT, prev, modeCursor);
+}
+
+// The arrows move around the 2x2 grid. ENTER or PLAY opens, and so does
+// RIGHT pressed on the right column. Opening waits for the release so the
+// new mode doesn't see it.
+bool rightOpens = false;
+
 void handleModeSelectInput() {
-    if (Input::justPressed(BTN_UP)) {
-        if (modeCursor > 0) {
-            int prev = modeCursor;
-            modeCursor--;
-            Ui::updateModeSelectCursor(MODE_LABELS, MODE_COUNT, prev, modeCursor);
-        }
+    if (Input::justPressed(BTN_UP) && modeCursor >= 2) moveModeCursor(modeCursor - 2);
+    if (Input::justPressed(BTN_DOWN)) moveModeCursor(modeCursor + 2);
+    if (Input::justPressed(BTN_LEFT) && modeCursor % 2 == 1) moveModeCursor(modeCursor - 1);
+    if (Input::justPressed(BTN_RIGHT)) {
+        rightOpens = modeCursor % 2 == 1;
+        if (!rightOpens) moveModeCursor(modeCursor + 1);
     }
-    if (Input::justPressed(BTN_DOWN)) {
-        if (modeCursor < MODE_COUNT - 1) {
-            int prev = modeCursor;
-            modeCursor++;
-            Ui::updateModeSelectCursor(MODE_LABELS, MODE_COUNT, prev, modeCursor);
-        }
-    }
-    // Reacts on release, not press: the new mode's update() doesn't run
-    // until the next tick, so if this fired on press, that same physical
-    // press's *release* would still be pending and land as a fresh edge
-    // inside whichever mode just became active -- e.g. LooperMode reads
-    // an ENTER release as "tap to open the menu", so pressing ENTER here
-    // used to open the looper straight into its menu screen. Triggering
-    // on release instead consumes both edges of the gesture before the
-    // new mode ever sees an update() tick.
-    if (Input::justReleased(BTN_ENTER) || Input::justReleased(BTN_PLAY) ||
-        Input::justReleased(BTN_RIGHT)) {
+    bool rightRelease = Input::justReleased(BTN_RIGHT) && rightOpens;
+    if (Input::justReleased(BTN_RIGHT)) rightOpens = false;
+    if (Input::justReleased(BTN_ENTER) || Input::justReleased(BTN_PLAY) || rightRelease) {
         enterMode(MODE_ORDER[modeCursor]);
     }
 }
