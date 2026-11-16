@@ -53,6 +53,14 @@ bool rowsBefore(uint32_t played, Row* out, int n, int& got) {
     return true;
 }
 
+int rowIndexAt(uint32_t played) { return newestAt(g_tracker.rows, ROW_RING, g_tracker.rowCount, played); }
+
+bool rowByIndex(uint32_t i, Row& out) {
+    if (i >= g_tracker.rowCount || g_tracker.rowCount - i > (uint32_t)ROW_RING) return false;
+    out = g_tracker.rows[i % ROW_RING];
+    return true;
+}
+
 bool levelsAt(uint32_t played, Levels& out) {
     int i = newestAt(g_tracker.levels, LEVEL_RING, g_tracker.levelCount, played);
     if (i < 0) return false;

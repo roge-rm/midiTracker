@@ -49,4 +49,11 @@ int metronomeVolume();       // percent, 0-100 -- scales the metronome click's v
 bool clockSourceSlave();      // false = Internal (preset BPM), true = Slave (follow incoming MIDI clock)
 bool midiTransportEnabled();  // react to incoming Start/Stop/Continue
 
+int displayBrightness();      // percent, the backlight when the screen is awake
+
+// Screensaver: not in USB Drive. redrawScreen() draws the whole screen
+// again on the next update().
+bool screensaverAllowed();
+void redrawScreen();
+
 } // namespace SettingsMode

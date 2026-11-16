@@ -226,4 +226,8 @@ bool update() {
     return false;
 }
 
+bool screensaverAllowed() { return screen == SCREEN_PLAY; }
+
+void redrawScreen() { needsRedraw = true; }
+
 } // namespace PariSynthMode

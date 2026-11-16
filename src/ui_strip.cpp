@@ -50,6 +50,17 @@ bool g_inPump = false;
 // The draw clip, x0 y0 inclusive, x1 y1 exclusive.
 int g_clipX0 = 0, g_clipY0 = 0, g_clipX1 = 320, g_clipY1 = 240;
 
+bool g_held = false, g_bypass = false;
+bool blocked() { return g_held && !g_bypass; }
+
+// Puts the tft viewport on the clip, or off screen while held.
+void applyViewport() {
+    if (blocked()) g_tft->setViewport(0, 0, 0, 0, false);
+    else if (g_clipX0 == 0 && g_clipY0 == 0 && g_clipX1 == g_tft->width() && g_clipY1 == g_tft->height())
+        g_tft->resetViewport();
+    else g_tft->setViewport(g_clipX0, g_clipY0, g_clipX1 - g_clipX0, g_clipY1 - g_clipY0, false);
+}
+
 uint32_t g_sliceSpentUs = 0;
 bool g_forceMeters = false;
 
@@ -88,6 +99,7 @@ TFT_eSprite& stripBegin(int x, int y, int w, int h, uint16_t bg) {
 void stripSend() {
     if (!g_open) return;
     g_open = false;
+    if (blocked()) return;
     uint32_t t0 = micros();
     if (!g_dma) {
         g_canvas->pushSprite(g_x, g_y);
@@ -136,7 +148,7 @@ void setDrawClip(int x, int y, int w, int h) {
     g_clipX1 = x + w;
     g_clipY1 = y + h;
     // The tft viewport clips direct draws and the strip's DMA push.
-    g_tft->setViewport(x, y, w, h, false);
+    applyViewport();
 }
 
 void clearDrawClip() {
@@ -144,10 +156,23 @@ void clearDrawClip() {
     g_clipY0 = 0;
     g_clipX1 = g_tft->width();
     g_clipY1 = g_tft->height();
-    g_tft->resetViewport();
+    applyViewport();
+}
+
+void setScreenHeld(bool held) {
+    g_held = held;
+    applyViewport();
+}
+
+bool screenHeld() { return g_held; }
+
+void holdBypass(bool on) {
+    g_bypass = on;
+    applyViewport();
 }
 
 bool clipRect(int& x, int& y, int& w, int& h) {
+    if (blocked()) return false;
     int x1 = x + w, y1 = y + h;
     if (x < g_clipX0) x = g_clipX0;
     if (y < g_clipY0) y = g_clipY0;
@@ -171,8 +196,12 @@ bool ringLow() {
     return buffered < cap / 4;
 }
 
+bool sliceLeft() { return g_sliceSpentUs < UI_SLICE_US; }
+
 bool sliceAllows(DrawKind kind) {
-    if (kind == DRAW_ESSENTIAL || g_forceMeters) return true;
+    if (kind == DRAW_ESSENTIAL) return true;
+    if (blocked()) return false;
+    if (g_forceMeters) return true;
     if (ringLow()) return false;
     return g_sliceSpentUs < UI_SLICE_US;
 }

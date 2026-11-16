@@ -81,4 +81,12 @@ void setVolume(int volume);
 void keybedDraw(int y, int h);
 void keybedUpdate();
 
+// A tracker note as the lanes show it: "C#4", "===", or dots for none.
+// out holds 4 bytes.
+void formatNote(uint8_t note, char* out);
+
+// The next frames to play from the WAV ring, stereo, into a buffer shared
+// with the player screens. Returns the frame count.
+int peek(const int16_t*& frames);
+
 } // namespace UiPlayer

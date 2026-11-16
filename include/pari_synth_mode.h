@@ -34,4 +34,9 @@ void enter(); // called every time the top-level mode switches into MODE_PARI_SY
 // the top-level mode-select screen when that happens.
 bool update();
 
+// Screensaver: not while the synth editor is open. redrawScreen() draws the
+// whole screen again on the next update().
+bool screensaverAllowed();
+void redrawScreen();
+
 } // namespace PariSynthMode

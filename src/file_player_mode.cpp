@@ -2461,6 +2461,72 @@ bool update() {
     return false;
 }
 
+// ---- screensaver -----------------------------------------------------------
+
+bool screensaverAllowed() {
+    // Not while a recorder or capture is armed or running, whatever screen
+    // is over it.
+    if (recorder.state() == MidiRecorder::STATE_ARMED || recorder.state() == MidiRecorder::STATE_RECORDING ||
+        sysexRecorder.state() == SysExRecorder::STATE_ARMED ||
+        sysexRecorder.state() == SysExRecorder::STATE_RECORDING)
+        return false;
+    switch (appState) {
+        case APP_SYNTH_EDIT:                   return synthEditShowingGrid;
+        case APP_RECORDING:
+        case APP_CONFIRM_CANCEL_RECORDING:
+        case APP_CAPTURING_SYSEX:
+        case APP_CONFIRM_CANCEL_SYSEX_CAPTURE:
+        case APP_FREE_LOOPER_RAM:              return false;
+        default:                               return true;
+    }
+}
+
+namespace {
+const TrackerPlayer* activeTracker() {
+    switch (appState) {
+        case APP_PLAY_MOD: return modPlayer;
+        case APP_PLAY_S3M: return s3mPlayer;
+        case APP_PLAY_XM:  return xmPlayer;
+        case APP_PLAY_IT:  return itPlayer;
+        default:           return nullptr;
+    }
+}
+} // namespace
+
+void screensaverInfo(UiSaver::Info& info, void (*&pump)()) {
+    info = UiSaver::Info();
+    pump = nullptr;
+    info.name = nowPlayingName;
+    if (const TrackerPlayer* t = activeTracker()) {
+        if (t->state() != TrackerPlayer::STATE_PLAYING) return;
+        info.src = UiSaver::SRC_TRACKER;
+        info.elapsedMs = t->elapsedMs();
+        info.channels = t->channelCount();
+        if (t->songLength() > 0) info.progress = t->patternOrderPosition() * 1000 / t->songLength();
+    } else if (appState == APP_PLAY || appState == APP_SYNTH_EDIT) {
+        if (!player || player->state() != MidiPlayer::STATE_PLAYING) return;
+        info.src = UiSaver::SRC_MIDI_FILE;
+        info.elapsedMs = player->elapsedMs();
+    } else if (appState == APP_PLAY_WAV) {
+        if (wavPlayer.state() != WavPlayer::STATE_PLAYING) return;
+        info.src = UiSaver::SRC_WAV;
+        info.elapsedMs = wavPlayer.elapsedMs();
+        uint32_t total = wavPlayer.totalMs();
+        if (total) info.progress = (int)((uint64_t)info.elapsedMs * 1000 / total);
+    } else if (appState == APP_PLAY_SYSEX) {
+        if (sysexPlayer.state() != SysExPlayer::STATE_SENDING) return;
+        info.src = UiSaver::SRC_SYSEX;
+        info.elapsedMs = sysexPlayer.elapsedMs();
+        if (sysexPlayer.totalBytes())
+            info.progress = (int)((uint64_t)sysexPlayer.bytesSent() * 1000 / sysexPlayer.totalBytes());
+    } else {
+        return;
+    }
+    pump = pumpPlayer;
+}
+
+void redrawScreen() { needsRedraw = true; }
+
 bool hasPendingLooperImport() { return pendingLooperImport; }
 
 void consumeLooperImport(char* pathOut, size_t pathOutSize, int& trackIndexOut) {

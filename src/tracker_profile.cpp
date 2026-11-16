@@ -11,6 +11,8 @@
 // The card searches and each .mid run under a 5 s watchdog, kicked while
 // core 1 keeps looping, with a heartbeat line every second. After a watchdog reset the hang trace
 // (see Synth::ProfileTrace) prints every 2 s and nothing else runs.
+// With -D PROFILE_SAVER the trackers play with the screensaver's Pattern
+// rain drawing, and each report adds the share of real time it took.
 #ifdef TRACKER_PROFILE
 #include <Arduino.h>
 #include <new>
@@ -26,6 +28,10 @@
 #include "midi_output.h"
 #include "pins.h" // SAMPLE_RATE
 #include <hardware/watchdog.h>
+#ifdef PROFILE_SAVER
+#include "ui_saver.h"
+#include "ui_strip.h"
+#endif
 #include <hardware/regs/addressmap.h>
 
 #ifndef PROFILE_FILES
@@ -40,6 +46,20 @@
 #endif
 #ifndef PROFILE_SECONDS
 #define PROFILE_SECONDS 30
+#endif
+
+#ifdef PROFILE_SAVER
+namespace {
+// The player's update() as the draw pump, timed so it can be taken out of
+// the saver's share.
+TrackerPlayer* g_saverPlayer = nullptr;
+uint32_t g_saverPumpUs = 0, g_saverUs = 0;
+void saverPump() {
+    uint32_t t = micros();
+    g_saverPlayer->update();
+    g_saverPumpUs += micros() - t;
+}
+} // namespace
 #endif
 
 namespace {
@@ -367,15 +387,42 @@ void trackerProfileRun() {
             // The first second (ring pre-fill, first reads) is left out.
             uint32_t start = millis();
             while (millis() - start < 1000 && p->state() == TrackerPlayer::STATE_PLAYING) p->update();
+#ifdef PROFILE_SAVER
+            UiSaver::Info si;
+            si.src = UiSaver::SRC_TRACKER;
+            si.channels = p->channelCount();
+            g_saverPlayer = p;
+            UiSaver::start(UiSaver::VIEW_RAIN, si);
+            uint32_t saverAt = millis();
+            bool saverPending = true;
+            g_saverUs = 0;
+#endif
             TrackerPlayer::profile = {};
             uint32_t u0 = Synth::wavStreamUnderrunSamples();
             TrackerPlayer::Profile total = {};
             uint32_t win = millis();
             while (millis() - start < 1000u + PROFILE_SECONDS * 1000u && p->state() == TrackerPlayer::STATE_PLAYING) {
                 p->update();
+#ifdef PROFILE_SAVER
+                Ui::sliceBeginLoop();
+                uint32_t now = millis();
+                bool due = now - saverAt >= UiSaver::frameMs(UiSaver::VIEW_RAIN);
+                if (due || (saverPending && !Ui::ringLow())) {
+                    if (due) saverAt = now;
+                    uint32_t t0 = micros(), p0 = g_saverPumpUs;
+                    Ui::setDrawPump(saverPump);
+                    saverPending = UiSaver::frame(si);
+                    Ui::setDrawPump(nullptr);
+                    g_saverUs += micros() - t0 - (g_saverPumpUs - p0);
+                }
+#endif
                 if (millis() - win >= 5000) {
                     TrackerPlayer::Profile& c = TrackerPlayer::profile;
                     report("5s", want, c, Synth::wavStreamUnderrunSamples() - u0);
+#ifdef PROFILE_SAVER
+                    Serial.printf("PROFILE saver %lu us in %lu ms\n", (unsigned long)g_saverUs, (unsigned long)(millis() - win));
+                    g_saverUs = 0;
+#endif
                     addProfile(total, c);
                     c = {};
                     win = millis();

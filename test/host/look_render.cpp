@@ -7,6 +7,7 @@
 #include "ui_player.h"
 #include "ui_modes.h"
 #include "ui_tap.h"
+#include "ui_saver.h"
 #include "synth.h"
 #include "midi_output.h"
 #include "host_snap.h"
@@ -36,6 +37,8 @@ TFT_eSprite& stripBegin(int x, int y, int w, int h, uint16_t bg) {
 }
 void stripSend() {}
 bool sliceAllows(DrawKind) { return true; }
+bool sliceLeft() { return true; }
+bool ringLow() { return false; }
 void sliceCharge(uint32_t) {}
 bool clipRect(int&, int&, int&, int&) { return true; }
 int drawPass() { return 0; }
@@ -225,12 +228,14 @@ void settingsScreen() {
     st.text = "MIDI/System";
     drawStatus(st);
     drawIcon(g_tft, ICON_KNOBS, 6, (STATUS_H - 12) / 2, COLOR_TEXT);
-    const char* labels[] = {"MIDI Out", "MIDI Thru", "Clock", "Brightness", "Theme", "USB Drive", "Count In Bars", "Version"};
-    const char* values[] = {"HW + USB", "Off", "Internal", "80%", "default", "", "1", "0.6.0"};
+    const char* labels[] = {"Clock Source", "MIDI Transport", "MIDI Thru", "Brightness", "Transitions",
+                            "Screensaver", "Screensaver Style", "Theme", "USB Drive", "USB Bootloader"};
+    const char* values[] = {"Internal", "Off", "Off", "80%", "Wipe", "5 min", "Auto", "ENTER to edit",
+                            "ENTER to start", "Hold ENTER"};
     int y0 = HEADER_H + 4;
     for (int i = 0; i < ROWS; i++)
-        drawTextRow(y0 + i * LIST_ROW_H, i < 8 ? labels[i] : nullptr, i < 8 ? values[i] : nullptr, 180, i == 3);
-    drawScrollbar(y0, ROWS, 8, 0);
+        drawTextRow(y0 + i * LIST_ROW_H, labels[i], values[i], 180, i == 5);
+    drawScrollbar(y0, ROWS, 10, 0);
     drawHintFooter("UD move  LR page", "EDIT+LR change");
 }
 
@@ -541,6 +546,116 @@ void stateScreens(const std::string& dir) {
     save("tracker-error");
 }
 
+
+// ---- screensaver views from the same snapshots -------------------------------
+
+// Runs a view for ms, a frame at its rate, then saves it.
+void saverRun(UiSaver::View v, UiSaver::Info& info, uint32_t ms, const char* name, bool ringMoves) {
+    g_tft.fillScreen(rgb(0xFF00FF)); // anything start() doesn't clear shows up
+    UiSaver::start(v, info);
+    uint32_t step = UiSaver::frameMs(v);
+    for (uint32_t t = 0; t < ms; t += step) {
+        g_hostMs += step;
+        if (ringMoves) g_played += RATE * step / 1000;
+        info.elapsedMs += step;
+        UiSaver::frame(info);
+    }
+    save(name);
+}
+
+bool loadTracker(const std::string& dir, const char* base, HostSnap::Tracker& s) {
+    std::vector<uint8_t> buf;
+    if (!readFile(dir + "/" + base + ".snap", buf) || buf.size() < sizeof(HostSnap::Tracker)) return false;
+    memcpy(&s, buf.data(), sizeof(s));
+    if (!readFile(dir + "/" + base + ".raw", g_raw)) return false;
+    UiTap::g_tracker = s.tap;
+    return true;
+}
+
+int saverScreens(const std::string& dir) {
+    struct { const char* base; const char* name; } trackers[] = {
+        {"mod", "AXELF.MOD"},
+        {"xm", "Kenetic & Seenix - Our Little Fantasy.xm"},
+        {"it", "Katie Cadet - Lucky Star.it"},
+    };
+    HostSnap::Tracker s;
+    for (auto& tr : trackers) {
+        if (!loadTracker(dir, tr.base, s)) return 1;
+        UiSaver::Info info;
+        info.src = UiSaver::SRC_TRACKER;
+        info.name = tr.name;
+        info.channels = s.channels;
+        info.battery = 70;
+        // Starts at the oldest row kept and plays up to the snapshot, so the
+        // bar has stepped down and wrapped.
+        const UiTap::Tracker& tk = UiTap::g_tracker;
+        uint32_t oldest = tk.rowCount > (uint32_t)UiTap::ROW_RING ? tk.rowCount - UiTap::ROW_RING : 0;
+        g_played = tk.rows[oldest % UiTap::ROW_RING].at;
+        uint32_t ms = (uint32_t)((uint64_t)(s.written - g_played) * 1000 / RATE);
+        info.elapsedMs = (uint32_t)((uint64_t)g_played * 1000 / RATE);
+        saverRun(UiSaver::VIEW_RAIN, info, ms, (std::string("saver-rain-") + tr.base).c_str(), true);
+    }
+
+    // Now playing and Meters on the XM.
+    if (!loadTracker(dir, "xm", s)) return 1;
+    UiSaver::Info info;
+    info.src = UiSaver::SRC_TRACKER;
+    info.name = "Kenetic & Seenix - Our Little Fantasy.xm";
+    info.channels = s.channels;
+    info.progress = s.songLength ? s.order * 1000 / s.songLength : -1;
+    info.battery = 70;
+    g_played = s.written - RATE * 2;
+    info.elapsedMs = (uint32_t)((uint64_t)g_played * 1000 / RATE);
+    saverRun(UiSaver::VIEW_NOW_PLAYING, info, 1500, "saver-nowplaying-xm", true);
+    g_played = s.written - RATE * 2;
+    saverRun(UiSaver::VIEW_METERS, info, 1500, "saver-meters-xm", true);
+
+    // Now playing on a WAV (Auto's choice for one), 60% in.
+    if (!readFile(dir + "/s3m.raw", g_raw)) return 1;
+    info = UiSaver::Info();
+    info.src = UiSaver::SRC_WAV;
+    info.name = "the reflex render.wav";
+    uint32_t total = (uint32_t)((uint64_t)(g_raw.size() / 2) * 1000 / RATE);
+    info.elapsedMs = total * 6 / 10;
+    info.progress = 600;
+    info.battery = 70;
+    g_played = (uint32_t)((uint64_t)info.elapsedMs * RATE / 1000);
+    saverRun(UiSaver::VIEW_NOW_PLAYING, info, 1000, "saver-nowplaying-wav", true);
+
+    // .mid: rain and Meters from the note-ons, 8 frames 40 ms apart, each
+    // one a rain line.
+    std::vector<uint8_t> buf;
+    if (!readFile(dir + "/mid.snap", buf) || buf.size() < sizeof(HostSnap::Midi)) return 1;
+    static HostSnap::Midi m;
+    memcpy(&m, buf.data(), sizeof(m));
+    info = UiSaver::Info();
+    info.src = UiSaver::SRC_MIDI_FILE;
+    info.name = "busy_schedule.mid";
+    info.battery = 70;
+    UiSaver::View views[] = {UiSaver::VIEW_RAIN, UiSaver::VIEW_METERS};
+    const char* names[] = {"saver-rain-mid", "saver-meters-mid"};
+    for (int v = 0; v < 2; v++) {
+        UiTap::g_midi = UiTap::Midi();
+        g_tft.fillScreen(rgb(0xFF00FF));
+        UiSaver::start(views[v], info);
+        for (int i = 0; i < HostSnap::Midi::FRAMES; i++) {
+            UiTap::g_midi = m.frames[i].tap;
+            info.elapsedMs = m.frames[i].elapsedMs;
+            g_hostMs += 250;
+            UiSaver::frame(info);
+        }
+        save(names[v]);
+    }
+
+    // The idle card, and with the battery low.
+    info = UiSaver::Info();
+    info.battery = 70;
+    saverRun(UiSaver::VIEW_IDLE, info, 20000, "saver-idle", false);
+    info.battery = 12;
+    saverRun(UiSaver::VIEW_IDLE, info, 4000, "saver-idle-low", false);
+    return 0;
+}
+
 int playerScreens(const std::string& dir) {
     struct { const char* base; const char* name; } trackers[] = {
         {"mod", "AXELF.MOD"},
@@ -557,7 +672,7 @@ int playerScreens(const std::string& dir) {
     if (!wavScreen(dir, "s3m", "the reflex render.wav")) return 1;
     save("wav");
     stateScreens(dir);
-    return 0;
+    return saverScreens(dir);
 }
 } // namespace
 

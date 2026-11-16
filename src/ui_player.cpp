@@ -1058,4 +1058,11 @@ void setVolume(int volume) {
     else if (g_screen == SCREEN_WAV && g_state != PS_ERROR) drawWavSide();
 }
 
+void formatNote(uint8_t note, char* out) { noteText(note, out); }
+
+int peek(const int16_t*& frames) {
+    frames = g_peek;
+    return (int)Synth::wavStreamPeek(g_peek, PEEK_FRAMES);
+}
+
 } // namespace UiPlayer

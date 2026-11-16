@@ -9,6 +9,7 @@
 #include "input.h"
 #include "ui.h"
 #include "ui_transition.h"
+#include "screensaver.h"
 #include "sd_card.h"
 #include "midi_output.h"
 #include "shared_ram_arena.h"
@@ -46,6 +47,8 @@ namespace SettingsMode
             SETTING_MIDI_THRU,
             SETTING_BRIGHTNESS,
             SETTING_TRANSITIONS,
+            SETTING_SCREENSAVER,
+            SETTING_SCREENSAVER_STYLE,
             SETTING_REBOOT_BOOTLOADER,
             SETTING_THEME_EDITOR, // ENTER opens the Theme editor (see beginThemeEditor()) -- not adjusted with EDIT+LEFT/RIGHT like every other row here
             SETTING_USB_DRIVE,    // ENTER starts USB Drive mode (see usb_drive_mode.h)
@@ -74,10 +77,10 @@ namespace SettingsMode
         const SettingIndex PAGE_AUDIO_ITEMS[] = {SETTING_OUTPUT_LEVEL, SETTING_DEFAULT_VOLUME, SETTING_REVERB, SETTING_REVERB_MIX, SETTING_REVERB_TYPE, SETTING_SYNTH_AUDIO, SETTING_LFO_RATE, SETTING_LFO_VOICES, SETTING_STEREO_SPREAD};
         const SettingIndex PAGE_LOOPER_ITEMS[] = {SETTING_BPM, SETTING_TIME_SIGNATURE, SETTING_BAR_LENGTH, SETTING_SYNC};
         const SettingIndex PAGE_METRONOME_ITEMS[] = {SETTING_METRONOME, SETTING_METRONOME_VOLUME, SETTING_COUNT_IN, SETTING_COUNT_IN_BARS};
-        const SettingIndex PAGE_MIDI_SYSTEM_ITEMS[] = {SETTING_CLOCK_SOURCE, SETTING_MIDI_TRANSPORT, SETTING_MIDI_THRU, SETTING_BRIGHTNESS, SETTING_TRANSITIONS, SETTING_THEME_EDITOR, SETTING_USB_DRIVE, SETTING_REBOOT_BOOTLOADER};
+        const SettingIndex PAGE_MIDI_SYSTEM_ITEMS[] = {SETTING_CLOCK_SOURCE, SETTING_MIDI_TRANSPORT, SETTING_MIDI_THRU, SETTING_BRIGHTNESS, SETTING_TRANSITIONS, SETTING_SCREENSAVER, SETTING_SCREENSAVER_STYLE, SETTING_THEME_EDITOR, SETTING_USB_DRIVE, SETTING_REBOOT_BOOTLOADER};
 
         const SettingIndex *PAGE_ITEMS[PAGE_COUNT] = {PAGE_AUDIO_ITEMS, PAGE_LOOPER_ITEMS, PAGE_METRONOME_ITEMS, PAGE_MIDI_SYSTEM_ITEMS};
-        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {9, 4, 4, 8};
+        const int PAGE_ITEM_COUNTS[PAGE_COUNT] = {9, 4, 4, 10};
 
         int currentPage = 0;
 
@@ -210,6 +213,19 @@ namespace SettingsMode
         int g_displayBrightness = 100; // percent -- see Ui::setBacklightBrightness()
         int g_transitions = Ui::TRANSITION_WIPE; // a Ui::TransitionStyle
         const char *const TRANSITION_LABELS[] = {"Off", "Wipe", "Slide"};
+        const int SAVER_MINUTES[] = {0, 1, 2, 5, 10};
+        const int SAVER_MINUTES_COUNT = 5;
+        int g_screensaverMin = 5; // one of SAVER_MINUTES, 0 = off
+        int g_screensaverStyle = Screensaver::STYLE_AUTO;
+        const char *const SAVER_STYLE_LABELS[] = {"Auto", "Now playing", "Meters", "Black"};
+
+        int saverMinutesIndex(int minutes)
+        {
+            for (int i = 0; i < SAVER_MINUTES_COUNT; i++)
+                if (SAVER_MINUTES[i] == minutes)
+                    return i;
+            return 3; // 5 min
+        }
         // Empty = the hardcoded default palette (Ui's own THEME_COLORS defaults,
         // never touched unless a theme's explicitly loaded). Set whenever a
         // theme is saved or loaded (see finishThemeSaveName()/
@@ -332,6 +348,10 @@ namespace SettingsMode
                 return "Brightness";
             case SETTING_TRANSITIONS:
                 return "Transitions";
+            case SETTING_SCREENSAVER:
+                return "Screensaver";
+            case SETTING_SCREENSAVER_STYLE:
+                return "Screensaver Style";
             case SETTING_USB_DRIVE:
                 return "USB Drive";
             case SETTING_REBOOT_BOOTLOADER:
@@ -427,6 +447,15 @@ namespace SettingsMode
                 break;
             case SETTING_TRANSITIONS:
                 snprintf(out, outSize, "%s", TRANSITION_LABELS[g_transitions]);
+                break;
+            case SETTING_SCREENSAVER:
+                if (g_screensaverMin == 0)
+                    snprintf(out, outSize, "Off");
+                else
+                    snprintf(out, outSize, "%d min", g_screensaverMin);
+                break;
+            case SETTING_SCREENSAVER_STYLE:
+                snprintf(out, outSize, "%s", SAVER_STYLE_LABELS[g_screensaverStyle]);
                 break;
             case SETTING_REBOOT_BOOTLOADER:
                 // Not a stored value -- see handleBootloaderHold() for the
@@ -620,6 +649,25 @@ namespace SettingsMode
                     g_transitions = Ui::TRANSITION_SLIDE;
                 Ui::setTransitionStyle((Ui::TransitionStyle)g_transitions);
                 break;
+            case SETTING_SCREENSAVER:
+            {
+                int i = saverMinutesIndex(g_screensaverMin) + direction;
+                if (i < 0)
+                    i = 0;
+                if (i >= SAVER_MINUTES_COUNT)
+                    i = SAVER_MINUTES_COUNT - 1;
+                g_screensaverMin = SAVER_MINUTES[i];
+                Screensaver::setTimeoutMinutes(g_screensaverMin);
+                break;
+            }
+            case SETTING_SCREENSAVER_STYLE:
+                g_screensaverStyle += direction;
+                if (g_screensaverStyle < Screensaver::STYLE_AUTO)
+                    g_screensaverStyle = Screensaver::STYLE_AUTO;
+                if (g_screensaverStyle > Screensaver::STYLE_BLACK)
+                    g_screensaverStyle = Screensaver::STYLE_BLACK;
+                Screensaver::setStyle((Screensaver::Style)g_screensaverStyle);
+                break;
             }
         }
 
@@ -721,6 +769,10 @@ namespace SettingsMode
             n = snprintf(line, sizeof(line), "brightness=%d\n", g_displayBrightness);
             file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "transitions=%d\n", g_transitions);
+            file.write((const uint8_t *)line, n);
+            n = snprintf(line, sizeof(line), "screensaver=%d\n", g_screensaverMin);
+            file.write((const uint8_t *)line, n);
+            n = snprintf(line, sizeof(line), "screensaverStyle=%d\n", g_screensaverStyle);
             file.write((const uint8_t *)line, n);
             n = snprintf(line, sizeof(line), "activeTheme=%s\n", g_activeThemeName);
             file.write((const uint8_t *)line, n);
@@ -897,6 +949,18 @@ namespace SettingsMode
                 g_transitions = atoi(line + 12);
                 if (g_transitions < Ui::TRANSITION_OFF || g_transitions > Ui::TRANSITION_SLIDE)
                     g_transitions = Ui::TRANSITION_WIPE;
+                return;
+            }
+            if (strncmp(line, "screensaver=", 12) == 0)
+            {
+                g_screensaverMin = SAVER_MINUTES[saverMinutesIndex(atoi(line + 12))];
+                return;
+            }
+            if (strncmp(line, "screensaverStyle=", 17) == 0)
+            {
+                g_screensaverStyle = atoi(line + 17);
+                if (g_screensaverStyle < Screensaver::STYLE_AUTO || g_screensaverStyle > Screensaver::STYLE_BLACK)
+                    g_screensaverStyle = Screensaver::STYLE_AUTO;
                 return;
             }
             if (strncmp(line, "activeTheme=", 12) == 0)
@@ -1811,6 +1875,8 @@ namespace SettingsMode
         // brings it to the saved value.
         Ui::setBacklightBrightness(g_displayBrightness);
         Ui::setTransitionStyle((Ui::TransitionStyle)g_transitions);
+        Screensaver::setTimeoutMinutes(g_screensaverMin);
+        Screensaver::setStyle((Screensaver::Style)g_screensaverStyle);
         // And again for whichever theme was last active (empty = the
         // hardcoded default palette Ui's own THEME_COLORS already start
         // at, so there's nothing to do then) -- a silent no-op if the file
@@ -1915,5 +1981,9 @@ namespace SettingsMode
     int metronomeVolume() { return g_metronomeVolume; }
     bool clockSourceSlave() { return g_clockSourceSlave; }
     bool midiTransportEnabled() { return g_midiTransportEnabled; }
+    int displayBrightness() { return g_displayBrightness; }
+
+    bool screensaverAllowed() { return !inUsbDrive; }
+    void redrawScreen() { needsRedraw = true; }
 
 } // namespace SettingsMode

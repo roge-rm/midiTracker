@@ -52,6 +52,14 @@ void clearDrawClip();
 // Cuts x, y, w, h down to the clip. False when nothing is left.
 bool clipRect(int& x, int& y, int& w, int& h);
 
+// Screen hold, for the screensaver. While held, strips aren't sent, direct
+// tft draws and bands draw nothing and meters wait, so the modes keep
+// running without touching the screen. holdBypass() lets the screensaver
+// draw through a hold.
+void setScreenHeld(bool held);
+bool screenHeld();
+void holdBypass(bool on);
+
 // 0 for an ordinary draw and a transition's first step, then 1, 2... for
 // its later steps, which draw the same screen again. Widgets that take a
 // snapshot when drawn keep the first step's.
@@ -74,6 +82,9 @@ const uint32_t UI_SLICE_US = 4000;
 
 void sliceBeginLoop();
 bool sliceAllows(DrawKind kind);
+
+// Time left in this loop's slice, whatever the ring is doing.
+bool sliceLeft();
 void sliceCharge(uint32_t us);
 
 // While on, meters always draw. For the one catch-up draw when playback

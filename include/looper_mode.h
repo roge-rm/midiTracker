@@ -87,4 +87,12 @@ enum FreeTracksResult {
 // need to run alongside update()'s own playback/metronome ticking.
 FreeTracksResult updateFreeTracksForFilePlayer();
 
+// Screensaver: whether it may start on the screen up now (not while a
+// track records or is armed), whether a loop plays, the draw pump for its
+// frames, and a full redraw of the screen for when it wakes.
+bool screensaverAllowed();
+bool screensaverPlaying();
+void (*screensaverPump())();
+void redrawScreen();
+
 } // namespace LooperMode

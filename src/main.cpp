@@ -15,6 +15,7 @@
 #include "settings_mode.h"
 #include "synth_editor.h"
 #include "usb_drive_mode.h"
+#include "screensaver.h"
 
 // Top-level boot screen: the user picks one of a small number of
 // self-contained modes, each of which owns its own screens/input/state
@@ -100,6 +101,41 @@ void handleModeSelectInput() {
     }
 }
 
+// Screensaver: whether the screen up now may go away, and drawing it again
+// when it wakes.
+bool screensaverAllowed() {
+    switch (topMode) {
+        case MODE_FILE_PLAYER: return FilePlayerMode::screensaverAllowed();
+        case MODE_LOOPER:      return LooperMode::screensaverAllowed();
+        case MODE_PARI_SYNTH:  return PariSynthMode::screensaverAllowed();
+        case MODE_SETTINGS:    return SettingsMode::screensaverAllowed();
+        default:               return true;
+    }
+}
+
+void redrawScreen() {
+    switch (topMode) {
+        case MODE_FILE_PLAYER: FilePlayerMode::redrawScreen(); break;
+        case MODE_LOOPER:      LooperMode::redrawScreen(); break;
+        case MODE_PARI_SYNTH:  PariSynthMode::redrawScreen(); break;
+        case MODE_SETTINGS:    SettingsMode::redrawScreen(); break;
+        case MODE_SELECT:      needsRedraw = true; break;
+    }
+}
+
+void drawScreensaver() {
+    UiSaver::Info info;
+    void (*pump)() = nullptr;
+    if (topMode == MODE_FILE_PLAYER) {
+        FilePlayerMode::screensaverInfo(info, pump);
+    } else if (topMode == MODE_LOOPER && LooperMode::screensaverPlaying()) {
+        info.src = UiSaver::SRC_LOOPER;
+        info.name = "Looper";
+        pump = LooperMode::screensaverPump();
+    }
+    Screensaver::draw(info, pump);
+}
+
 } // namespace
 
 void setup() {
@@ -166,6 +202,7 @@ void setup() {
 void loop() {
     Ui::sliceBeginLoop();
     Input::update();
+    if (Screensaver::update(screensaverAllowed())) redrawScreen();
     MidiOutput::update();
 
     switch (topMode) {
@@ -217,4 +254,6 @@ void loop() {
     // update leaves the transition unused; drop it.
     if (!armedThisLoop) Ui::transitionCancel();
     armedThisLoop = false;
+
+    drawScreensaver();
 }

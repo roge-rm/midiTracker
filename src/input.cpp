@@ -14,6 +14,13 @@ bool lastRawState[BTN_COUNT];    // raw reading from the previous update()
 uint32_t lastChangeMs[BTN_COUNT];
 bool edgePressed[BTN_COUNT];
 bool edgeReleased[BTN_COUNT];
+bool muted = false;
+
+bool allUp() {
+    for (int i = 0; i < BTN_COUNT; i++)
+        if (stableState[i]) return false;
+    return true;
+}
 
 inline bool readRawPressed(uint8_t pin) {
     return digitalRead(pin) == LOW; // active-low, internal pull-up
@@ -36,6 +43,8 @@ void begin() {
 
 void update() {
     uint32_t now = millis();
+    // Checked before reading, so the release that ends the mute stays hidden.
+    if (muted && allUp()) muted = false;
     for (int i = 0; i < BTN_COUNT; i++) {
         edgePressed[i] = false;
         edgeReleased[i] = false;
@@ -54,9 +63,13 @@ void update() {
     }
 }
 
-bool isDown(ButtonId id) { return stableState[id]; }
-bool justPressed(ButtonId id) { return edgePressed[id]; }
-bool justReleased(ButtonId id) { return edgeReleased[id]; }
+bool isDown(ButtonId id) { return !muted && stableState[id]; }
+bool justPressed(ButtonId id) { return !muted && edgePressed[id]; }
+bool justReleased(ButtonId id) { return !muted && edgeReleased[id]; }
+
+bool anyDown() { return !allUp(); }
+
+void muteUntilReleased() { muted = true; }
 
 bool anyNewPress() {
     for (int i = 0; i < BTN_COUNT; i++)

@@ -29,4 +29,12 @@ bool justReleased(ButtonId id); // true for exactly one update() after release
 // only, so the press is still picked up by the next update(). For long
 // draws that stop early on a key.
 bool anyNewPress();
+
+// Any button down, mute or not.
+bool anyDown();
+
+// Hides every button (isDown, justPressed and justReleased read as up)
+// until all of them have been let go, for a press that only wakes the
+// screen.
+void muteUntilReleased();
 } // namespace Input

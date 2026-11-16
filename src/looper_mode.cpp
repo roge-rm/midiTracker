@@ -4567,6 +4567,47 @@ bool update() {
     return false;
 }
 
+// ---- screensaver -----------------------------------------------------------
+
+bool screensaverAllowed() {
+    if (!tracks || countInActive) return false;
+    for (int i = 0; i < NUM_TRACKS; i++)
+        if (tracks[i].state == TRACK_RECORDING || tracks[i].state == TRACK_ARMED) return false;
+    // Only screens it can draw again on waking.
+    switch (screen) {
+        case SCREEN_MAIN:
+        case SCREEN_MENU:
+        case SCREEN_SAVE_MENU:
+        case SCREEN_LOAD_MENU:
+        case SCREEN_LOAD_LOOP_BROWSE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool screensaverPlaying() {
+    if (!tracks) return false;
+    for (int i = 0; i < NUM_TRACKS; i++)
+        if (tracks[i].state == TRACK_PLAYING) return true;
+    return false;
+}
+
+void (*screensaverPump())() { return pumpLooper; }
+
+void redrawScreen() {
+    switch (screen) {
+        case SCREEN_MAIN:      needsRedraw = true; break;
+        case SCREEN_MENU:      Ui::drawEntryMenu("Loops", menuLabels, MENU_COUNT, menuCursor); break;
+        case SCREEN_SAVE_MENU: Ui::drawEntryMenu("Save", saveMenuLabels, SAVE_MENU_COUNT, saveMenuCursor); break;
+        case SCREEN_LOAD_MENU: Ui::drawEntryMenu("Load", loadMenuLabels, LOAD_MENU_COUNT, loadMenuCursor); break;
+        case SCREEN_LOAD_LOOP_BROWSE:
+            Ui::drawLoopBrowser(loopBrowser, loopBrowseSelectedIndex, loopBrowseScrollOffset);
+            break;
+        default: break;
+    }
+}
+
 void requestImport(const char* path, int trackIndex) {
     if (trackIndex < 0 || trackIndex >= NUM_TRACKS) return;
     strncpy(pendingImportPath, path, sizeof(pendingImportPath) - 1);

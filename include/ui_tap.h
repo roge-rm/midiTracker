@@ -82,6 +82,11 @@ bool rowAt(uint32_t played, Row& out);
 bool rowsBefore(uint32_t played, Row* out, int n, int& got); // newest last
 bool levelsAt(uint32_t played, Levels& out);
 
+// The same by count: the newest row at or before played (-1 for none), and
+// row i, false once it has been overwritten or not yet made.
+int rowIndexAt(uint32_t played);
+bool rowByIndex(uint32_t i, Row& out);
+
 // MIDI, from MidiOutput::sendNoteOn() on core 0.
 struct Midi {
     uint8_t hits[16]; // note-ons per channel, wraps

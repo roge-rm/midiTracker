@@ -145,7 +145,7 @@ void transitionNext(TransitionDir dir) {
 void transitionDraw(void (*draw)(void*), void* ctx) {
     bool armed = g_armed && millis() - g_armedMs < ARM_MS;
     g_armed = false;
-    if (!armed || g_running || g_style == TRANSITION_OFF || ringLow()) {
+    if (!armed || g_running || g_style == TRANSITION_OFF || ringLow() || screenHeld()) {
         draw(ctx);
         return;
     }

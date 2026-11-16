@@ -1,5 +1,6 @@
 #pragma once
 #include <stddef.h>
+#include "ui_saver.h"
 
 // Owns the "play/record MIDI files" workflow: the SD card file browser,
 // file playback (MidiPlayer), and MIDI recording to a new file
@@ -56,5 +57,12 @@ void freeBrowserBuffers();
 // Drops the browser's list and goes back to the root folder; enter()
 // rescans. Called after the computer has had the card (USB Drive mode).
 void resetBrowser();
+
+// Screensaver: whether it may start on the screen up now, what's playing
+// (src SRC_NONE when nothing is) with the draw pump for it, and a full
+// redraw of the screen for when it wakes.
+bool screensaverAllowed();
+void screensaverInfo(UiSaver::Info& info, void (*&pump)());
+void redrawScreen();
 
 } // namespace FilePlayerMode
