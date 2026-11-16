@@ -37,6 +37,8 @@ const uint32_t MIN_AVAIL = 1600; // core 1 decodes only with this much in one pi
 const uint32_t READ_MIN = 2048;  // core 0 reads only when this much is free
 const uint32_t SCAN_SIZE = 4608;
 const uint32_t PCM_SAMPLES = 1152 * 2;
+const uint32_t SEEK_CHUNK = 16384;      // a seek searches this much per update(), a few ms of card reads
+const uint32_t SEEK_AHEAD = 256 * 1024; // then back towards the first frame
 static_assert(SCAN_SIZE <= RING + MIRROR, "scan buffer is the ring's bytes");
 
 #ifdef ARDUINO_ARCH_RP2040
@@ -52,6 +54,7 @@ struct Shared {
     volatile bool run = false;            // core 0: core 1 may decode
     volatile bool inService = false;      // core 1: inside core1Push()/core1Decode()
     volatile bool ended = false;          // core 1: data ran out, wavStreamEnd() called
+    volatile uint32_t lostMs = 0;         // core 1: length of the frames decoded without output since the last load or seek
 };
 Shared g_sh;
 
@@ -68,6 +71,7 @@ struct Core1 {
     int16_t lastL, lastR, nextL, nextR;
     bool starving;
     uint8_t skip; // decoded frames still to drop, see Mp3Player::seekTo()
+    uint32_t lostFrames, frameMs1000, rate; // for g_sh.lostMs: samples per frame * 1000, and the file's rate
 };
 Core1 g_c1;
 
@@ -293,10 +297,18 @@ DecodeResult decodeOne() {
             consume(w.tail, 1);
             continue;
         }
-        consume(w.tail, w.len - (uint32_t)left);
-        if (err) return DECODED; // no audio: bit reservoir not filled yet, or a bad frame
-        if (g_c1.skip) {
-            g_c1.skip--;
+        uint32_t used = w.len - (uint32_t)left;
+        consume(w.tail, used);
+        if (err || g_c1.skip) {
+            // No audio: bit reservoir not filled yet, a bad frame, or one to drop.
+            // Only reservoir misses and dropped frames held audio; a false sync
+            // in junk didn't, so it doesn't move the clock.
+            bool lost = !err || err == ERR_MP3_MAINDATA_UNDERFLOW;
+            if (!err) g_c1.skip--;
+            if (used && lost) {
+                g_c1.lostFrames++;
+                g_sh.lostMs = (uint32_t)((uint64_t)g_c1.lostFrames * g_c1.frameMs1000 / g_c1.rate);
+            }
             return DECODED;
         }
         MP3FrameInfo fi;
@@ -461,6 +473,7 @@ void Mp3Player::stopCore1() {
 void Mp3Player::restartClock(uint32_t ms) {
     _startMs = ms;
     _ringBase = Synth::wavStreamWritten();
+    _growLost = ~0u; // update() works out _growAt again
 }
 
 bool Mp3Player::syncScan(uint32_t maxBytes, uint32_t want, Mp3OtherFrames* other) {
@@ -670,18 +683,41 @@ uint32_t Mp3Player::seekOffset(uint32_t ms) {
     return _audioStart + (uint32_t)((uint64_t)(_dataEnd - _audioStart) * ms / _totalMs);
 }
 
-bool Mp3Player::startStream(uint32_t pos) {
-    if (pos < _audioStart) pos = _audioStart;
+uint32_t Mp3Player::offsetMs(uint32_t pos) {
+    if (pos <= _audioStart || !_totalMs) return 0;
+    uint32_t ms;
+    if (_hasToc && _tagMs) {
+        uint32_t bytes = _tagBytes ? _tagBytes : _dataEnd - _tagFrame;
+        uint32_t x = bytes ? (uint32_t)((uint64_t)(pos - _tagFrame) * 256000 / bytes) : 0; // 256000ths of the stream
+        uint32_t i = 0;
+        while (i < 99 && (uint32_t)_toc[i + 1] * 1000 <= x) i++;
+        uint32_t a = _toc[i], b = i < 99 ? _toc[i + 1] : 256;
+        uint32_t frac = b > a && x > a * 1000 ? (x - a * 1000) / (b - a) : 0;
+        if (frac > 999) frac = 999;
+        ms = (uint32_t)((uint64_t)(i * 1000 + frac) * _tagMs / 100000);
+    } else {
+        // VBRI too: its table stays on the card, and this only places a seek that missed.
+        ms = (uint32_t)((uint64_t)(pos - _audioStart) * _totalMs / (_dataEnd - _audioStart));
+    }
+    return ms < _totalMs ? ms : _totalMs - 1;
+}
+
+bool Mp3Player::findSync(uint32_t pos, uint32_t maxBytes, uint32_t& found) {
     if (pos >= _dataEnd || !_file.seekSet(pos)) return false;
     _filePos = pos;
     _inPos = _inLen = 0;
     _eof = false;
-    // Two frames in a row at this file's rate, within 16 KB.
-    if (pos != _audioStart && !syncScan(16384, _rate, nullptr)) return false;
-    uint32_t first = _filePos - (_inLen - _inPos);
-    if (!_file.seekSet(first)) return false;
+    // Two frames in a row at this file's rate.
+    if (!syncScan(maxBytes, _rate, nullptr)) return false;
+    found = _filePos - (_inLen - _inPos);
+    return true;
+}
+
+bool Mp3Player::startStream(uint32_t first) {
+    if (first >= _dataEnd || !_file.seekSet(first)) return false;
     _filePos = first;
-    _eof = first >= _dataEnd;
+    _inPos = _inLen = 0;
+    _eof = false;
     g_sh.head = g_sh.tail = 0;
     g_sh.eof = _eof;
     g_sh.ended = false;
@@ -734,6 +770,9 @@ bool Mp3Player::load(const char* path) {
     if (!testDecode()) return fail("can't decode this file");
     if (!startStream(_audioStart)) return fail("can't read this file");
 
+    g_c1.frameMs1000 = _samplesPerFrame * 1000;
+    g_c1.rate = _rate;
+    g_sh.lostMs = 0;
     g_c1.step = (uint32_t)(((uint64_t)_rate << 16) / SAMPLE_RATE);
     g_c1.frac = 0x20000; // the first two advance() steps fill last and next
     g_c1.outPerFrame = (uint32_t)(((uint64_t)_samplesPerFrame * SAMPLE_RATE + _rate - 1) / _rate) + 2;
@@ -752,17 +791,62 @@ void Mp3Player::seekTo(uint32_t targetMs) {
     bool wasPlaying = _state == STATE_PLAYING;
     stopCore1();
     Synth::wavStreamReset();
-    uint32_t pos = seekOffset(targetMs);
-    bool ok = targetMs < _totalMs && startStream(pos);
+    _seekPending = false;
     restartClock(targetMs);
-    if (!ok) {
+    if (targetMs >= _totalMs) {
         _state = STATE_DONE; // core 1 stays out until the next seek or load
+        return;
+    }
+    _state = wasPlaying ? STATE_PLAYING : STATE_PAUSED;
+    uint32_t pos = seekOffset(targetMs);
+    if (pos <= _audioStart) {
+        startAt(_audioStart, 0);
+        return;
+    }
+    _seekOrigin = _seekNext = pos;
+    _seekBack = 0;
+    _seekPending = true;
+    seekStep();
+}
+
+void Mp3Player::seekStep() {
+    uint32_t found;
+    if (!_seekBack) {
+        if (findSync(_seekNext, SEEK_CHUNK, found)) {
+            // Bytes that aren't frames take no time, so the clock stays at the target.
+            startAt(found, _startMs);
+            return;
+        }
+        _seekNext += SEEK_CHUNK;
+        if (_seekNext >= _dataEnd || _seekNext - _seekOrigin >= SEEK_AHEAD) _seekBack = 1;
+        return;
+    }
+    // Back from the seek point, the nearest frames first. The first frame
+    // is always there.
+    uint32_t back = _seekBack * SEEK_CHUNK;
+    if (_seekOrigin <= _audioStart + back) {
+        startAt(_audioStart, 0);
+        return;
+    }
+    uint32_t from = _seekOrigin - back;
+    if (findSync(from, SEEK_CHUNK, found) && found < _seekOrigin) {
+        startAt(found, offsetMs(found));
+        return;
+    }
+    _seekBack++;
+}
+
+void Mp3Player::startAt(uint32_t pos, uint32_t ms) {
+    _seekPending = false;
+    restartClock(ms);
+    if (!startStream(pos)) {
+        _state = STATE_DONE; // the card failed; core 1 stays out
         return;
     }
     // A fresh decoder. Past the first frame, the frames before aren't
     // there, so the first ones fail on the missing bit reservoir and give
     // nothing, and the first that decodes is dropped, as its overlap with
-    // the frame before is missing.
+    // the frame before is missing. g_sh.lostMs counts them for the clock.
     _dec = MP3InitDecoder();
     g_c1.dec = _dec;
     g_c1.pcmFrames = g_c1.pcmPos = 0;
@@ -770,8 +854,9 @@ void Mp3Player::seekTo(uint32_t targetMs) {
     g_c1.lastL = g_c1.lastR = g_c1.nextL = g_c1.nextR = 0;
     g_c1.starving = false;
     g_c1.skip = pos <= _audioStart ? 0 : 1;
-    _state = wasPlaying ? STATE_PLAYING : STATE_PAUSED;
-    Synth::wavStreamSetActive(wasPlaying);
+    g_c1.lostFrames = 0;
+    g_sh.lostMs = 0;
+    Synth::wavStreamSetActive(_state == STATE_PLAYING);
     MP3_DMB(); // release: everything above before core 1 may start
     g_sh.run = true;
 }
@@ -781,12 +866,28 @@ bool Mp3Player::ringDrained() const {
     return (int32_t)(Synth::wavStreamPlayed() - Synth::wavStreamWritten()) >= 0;
 }
 
+void Mp3Player::growTotal(uint32_t played, uint32_t lost) {
+    uint32_t e = _startMs + lost + played / SAMPLE_RATE * 1000 + played % SAMPLE_RATE * 1000 / SAMPLE_RATE;
+    if (e > _totalMs) _totalMs = e; // the estimate was short
+    // The clock passes _totalMs once played * 1000 / SAMPLE_RATE > left.
+    uint32_t left = _totalMs - _startMs - lost;
+    uint64_t at = (((uint64_t)left + 1) * SAMPLE_RATE + 999) / 1000;
+    _growAt = at > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)at; // past 27 h, played can't reach it
+    _growLost = lost;
+}
+
 void Mp3Player::update() {
     if (_state != STATE_PLAYING && _state != STATE_PAUSED) return;
+    if (_seekPending) {
+        seekStep();
+        return;
+    }
     fillRing();
     if (_state != STATE_PLAYING) return;
-    uint32_t e = elapsedMs();
-    if (e > _totalMs) _totalMs = e; // the estimate was short
+    // elapsedMs() > _totalMs, without its divides on every call.
+    uint32_t played = Synth::wavStreamPlayed() - _ringBase;
+    uint32_t lost = g_sh.lostMs;
+    if (played >= _growAt || lost != _growLost) growTotal(played, lost);
     if (g_sh.ended) {
         MP3_DMB(); // acquire: ended read before the stream state
         if (ringDrained()) _state = STATE_DONE;
@@ -796,7 +897,7 @@ void Mp3Player::update() {
 void Mp3Player::play() {
     if (_state != STATE_PAUSED) return;
     _state = STATE_PLAYING;
-    Synth::wavStreamSetActive(true);
+    if (!_seekPending) Synth::wavStreamSetActive(true); // else when the seek finds its frame
 }
 
 void Mp3Player::pause() {
@@ -807,6 +908,7 @@ void Mp3Player::pause() {
 
 void Mp3Player::close() {
     stopCore1();
+    _seekPending = false;
     if (_file) _file.close();
     if (_dec) MP3FreeDecoder((HMP3Decoder)_dec);
     _dec = nullptr;
@@ -818,8 +920,10 @@ void Mp3Player::close() {
 uint32_t Mp3Player::elapsedMs() const {
     if (_state == STATE_DONE) return _totalMs;
     if (_state != STATE_PLAYING && _state != STATE_PAUSED) return 0;
+    if (_seekPending) return _startMs;
     uint32_t played = Synth::wavStreamPlayed() - _ringBase;
-    return _startMs + (uint32_t)((uint64_t)played * 1000u / SAMPLE_RATE);
+    // played * 1000 / SAMPLE_RATE in 32 bits
+    return _startMs + g_sh.lostMs + played / SAMPLE_RATE * 1000 + played % SAMPLE_RATE * 1000 / SAMPLE_RATE;
 }
 
 uint32_t Mp3Player::underrunSamples() const { return Synth::wavStreamUnderrunSamples() - _underrunBase; }

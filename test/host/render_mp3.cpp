@@ -3,7 +3,8 @@
 // loop), with core 1's core1Push()/core1Decode() run after each update(),
 // and writes the stereo int16 frames the WAV ring got at 44.1 kHz. With
 // seekMs and atMs it seeks to seekMs once atMs has been written, and the
-// output starts again from there.
+// output starts again from there, and the clock at the first frame after
+// the seek is printed.
 // Prints the format, the read() calls and, built with MP3_COUNT_OPS, the
 // 32x32->64 multiplies per decoded frame.
 #include <Arduino.h>
@@ -37,12 +38,20 @@ int main(int argc, char** argv) {
     size_t written = 0, idle = 0;
     unsigned long loops = 0;
     unsigned long reads0 = FsFile::readCalls;
-    while (p.state() == Mp3Player::STATE_PLAYING && idle < 16) {
+    bool seeked = false;
+    unsigned long seekLoop = 0;
+    // A seek that misses can take a few dozen updates to find a frame.
+    while (p.state() == Mp3Player::STATE_PLAYING && idle < 1024) {
         p.update();
         if (Mp3Player::core1Push()) Mp3Player::core1Decode();
         loops++;
         size_t have = HostRing::framesCaptured();
         idle = have > written ? 0 : idle + 1;
+        if (seeked && have > written) {
+            fprintf(stderr, "%s: first audio after the seek at elapsed %lu ms, %lu updates later\n", argv[1], (unsigned long)p.elapsedMs(),
+                    loops - seekLoop);
+            seeked = false;
+        }
         fwrite(HostRing::data() + written * 2, sizeof(int16_t), (have - written) * 2, out);
         written = have;
         HostRing::drain();
@@ -53,6 +62,8 @@ int main(int argc, char** argv) {
             fflush(out);
             if (ftruncate(fileno(out), 0) == 0) rewind(out); // the output starts at the seek
             seekMs = -1;
+            seeked = true;
+            seekLoop = loops;
         }
     }
     p.update();

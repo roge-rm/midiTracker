@@ -17,6 +17,12 @@
 // WAV playback never touch that gate), so its lifetime isn't guaranteed
 // disjoint from tracks[]'s the way the others' is.
 //
+// Mp3Player uses it too, from load() until close(): the start of the arena
+// holds the Helix decoder's state, the compressed input ring and one decoded
+// frame (Mp3Player::arenaBytes(), about 40 KB), and core 1 reads and writes
+// it while an MP3 plays. FilePlayerMode opens an MP3 only once tracks[] is
+// down and no tracker player holds the arena.
+//
 // Backing all four with the same static bytes instead of separate heap
 // allocations means claiming any one of them is never subject to heap
 // fragmentation: there's no allocator search involved at all, just

@@ -4,9 +4,10 @@ Taken from https://github.com/pschatzmann/arduino-libhelix, commit
 f6e55a307c7577c5e3dfe1bf424a61075235fa08, src/libhelix-mp3 (the Helix
 sources only, not the C++ wrapper).
 
-Changes here:
+Changes here, all made 2026-11-16 (each changed file says so at the top):
 - buffers.c rewritten: the decoder state comes from one block given with
   MP3SetPool() (declared in mp3dec.h), no heap.
+- mp3dec.h: declares MP3SetPool() and MP3PoolBytes().
 - assembly.h: Cortex-M0+ (or MP3_MULHS_C) builds the 32x32 multiply's high
   word from 16-bit products, in inline asm on the M0+; MP3_COUNT_OPS counts
   the long multiplies.

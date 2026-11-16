@@ -1,5 +1,7 @@
-/* midiTracker: changed. With MP3_POLY_SPLIT the polyphase filter gets
- * SubbandInfo.polyK instead of polyCoef. */
+/* Changed for midiTracker, from arduino-libhelix's copy:
+ * 2026-11-16: with MP3_POLY_SPLIT the polyphase filter gets
+ *   SubbandInfo.polyK instead of polyCoef.
+ * See VENDORED.txt. */
 /* ***** BEGIN LICENSE BLOCK ***** 
  * Version: RCSL 1.0/RPSL 1.0 
  *  

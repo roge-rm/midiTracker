@@ -15,9 +15,11 @@
 //
 // seekTo() finds the byte position from the Xing TOC or the VBRI table when
 // there's one, else in proportion to the length, then looks for two or
-// three frame headers in a row. The decoder starts fresh there, so the
-// frames whose bit reservoir is missing give no audio, and the first frame
-// that decodes is dropped too.
+// three frame headers in a row, 16 KB at a time, up to 256 KB ahead, then
+// back from there towards the first frame. The first 16 KB is searched in
+// seekTo(), the rest one piece per update(). The decoder starts fresh there,
+// so the frames whose bit reservoir is missing give no audio, and the first
+// frame that decodes is dropped too; the clock counts those frames.
 //
 // Uses the start of SharedRamArena::data() for the decoder state, the
 // compressed input ring and one decoded frame (see arenaBytes()), so nothing
@@ -114,9 +116,19 @@ private:
     uint32_t _filePos = 0, _dataEnd = 0;
     bool _eof = false;
 
-    // elapsedMs() is _startMs plus the frames played since the ring held
-    // _ringBase frames written (the last load or seek).
+    // elapsedMs() is _startMs, plus the frames core 1 decoded without
+    // output since then (g_sh.lostMs), plus the frames played since the ring
+    // held _ringBase frames written (the last load or seek).
     uint32_t _startMs = 0, _ringBase = 0, _underrunBase = 0;
+    // update() grows _totalMs once the ring has played _growAt frames since
+    // _ringBase, worked out for a lost time of _growLost ms.
+    uint32_t _growAt = 0, _growLost = 0;
+
+    // A seek still looking for frames, one SEEK_CHUNK per update(): forward
+    // from _seekOrigin while _seekBack is 0, then back from it in steps.
+    // Core 1 stays out meanwhile.
+    bool _seekPending = false;
+    uint32_t _seekOrigin = 0, _seekNext = 0, _seekBack = 0;
 
     bool fail(const char* msg);
     bool fillScan();       // tops the scan buffer up; false at the end of data
@@ -127,7 +139,13 @@ private:
     bool findFirstFrame(); // skips to the first frame, reads its format and any Xing/Info/VBRI header
     bool testDecode();     // load() only: decodes the first few frames on core 0
     uint32_t seekOffset(uint32_t ms); // file offset to look for a frame from
-    bool startStream(uint32_t pos);   // input ring from pos, core 1 stopped; false when no frame is found
+    uint32_t offsetMs(uint32_t pos);  // about the reverse of seekOffset()
+    // Looks for frames in maxBytes from pos; found is the first one's offset.
+    bool findSync(uint32_t pos, uint32_t maxBytes, uint32_t& found);
+    bool startStream(uint32_t pos);   // input ring from the frame at pos, core 1 stopped
+    void seekStep();       // one chunk of a pending seek
+    void startAt(uint32_t pos, uint32_t ms); // ends a seek: plays from the frame at pos, the clock at ms
+    void growTotal(uint32_t played, uint32_t lost);
     void fillRing();       // one card read into the input ring when it has room
     void stopCore1();      // waits until core 1 is out of core1Push()/core1Decode() and stays out
     void restartClock(uint32_t ms);

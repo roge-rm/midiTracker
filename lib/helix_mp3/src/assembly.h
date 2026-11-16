@@ -1,4 +1,9 @@
-/* midiTracker: changed, see VENDORED.txt (the M0+ multiply below). */
+/* Changed for midiTracker, from arduino-libhelix's copy:
+ * 2026-11-16: MP3_COUNT_OPS counts the long multiplies, and on the
+ *   Cortex-M0+ (or with MP3_MULHS_C) MULSHIFT32 and MADD64 build the
+ *   multiply's high word from 16-bit products.
+ * 2026-11-16: that high word in inline asm on the M0+.
+ * See VENDORED.txt. */
 /* ***** BEGIN LICENSE BLOCK ***** 
  * Version: RCSL 1.0/RPSL 1.0 
  *  

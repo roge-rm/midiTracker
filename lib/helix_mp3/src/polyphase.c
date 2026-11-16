@@ -1,6 +1,9 @@
-/* midiTracker: changed. With MP3_POLY_SPLIT (Cortex-M0+) PolyphaseMono()
- * and PolyphaseStereo() use xmp3_PolyDot() and the table from
- * xmp3_PolyInitTable() instead of 64-bit sums, see the end of this file. */
+/* Changed for midiTracker, from arduino-libhelix's copy:
+ * 2026-11-16: with MP3_POLY_SPLIT (Cortex-M0+) PolyphaseMono() and
+ *   PolyphaseStereo() use xmp3_PolyDot() and the table from
+ *   xmp3_PolyInitTable() instead of 64-bit sums, see the end of this file.
+ * 2026-11-16: xmp3_PolyDot()'s asm keeps the section it was in.
+ * See VENDORED.txt. */
 /* ***** BEGIN LICENSE BLOCK ***** 
  * Version: RCSL 1.0/RPSL 1.0 
  *  

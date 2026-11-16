@@ -1,3 +1,9 @@
+/* Changed for midiTracker, from arduino-libhelix's copy:
+ * 2026-11-16: rewritten, the decoder's state comes from one block given
+ *   with MP3SetPool(), no heap.
+ * 2026-11-16: with MP3_POLY_SPLIT, MP3InitDecoder() builds the polyphase
+ *   table in that block.
+ * See VENDORED.txt. */
 /* midiTracker replacement for Helix's buffers.c: the decoder's state is
  * carved from one caller-owned block (MP3SetPool()) instead of the heap.
  * MP3FreeDecoder() only forgets it, the caller owns the memory.

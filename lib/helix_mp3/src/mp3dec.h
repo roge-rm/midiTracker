@@ -1,3 +1,6 @@
+/* Changed for midiTracker, from arduino-libhelix's copy:
+ * 2026-11-16: declares MP3SetPool() and MP3PoolBytes() (see buffers.c).
+ * See VENDORED.txt. */
 /* ***** BEGIN LICENSE BLOCK ***** 
  * Version: RCSL 1.0/RPSL 1.0 
  *  

@@ -1,4 +1,7 @@
-/* midiTracker: changed, see VENDORED.txt (MP3_POLY_SPLIT below). */
+/* Changed for midiTracker, from arduino-libhelix's copy:
+ * 2026-11-16: MP3_POLY_SPLIT (on by default on the Cortex-M0+) adds the
+ *   polyphase table to SubbandInfo and declares xmp3_PolyInitTable().
+ * See VENDORED.txt. */
 /* ***** BEGIN LICENSE BLOCK ***** 
  * Version: RCSL 1.0/RPSL 1.0 
  *  
