@@ -176,6 +176,7 @@ void SdBrowser::loadEntries() {
 
     _maxRec = 0;
     _maxDump = 0;
+    _sawTemp = false;
 
     FsFile dir;
     sdOpenPath(dir, _path, O_RDONLY);
@@ -199,6 +200,9 @@ void SdBrowser::loadEntries() {
             bool isDirEntry;
             uint8_t kind;
             if (file.getName(nameBuf, nameCap) == 0) nameBuf[0] = '\0';
+            size_t nameLen = strlen(nameBuf);
+            if (nameBuf[0] == '.' && nameLen > 6 && strcmp(nameBuf + nameLen - 5, ".part") == 0 && !file.isDir())
+                _sawTemp = true;
             if (classifyEntry(file, nameBuf, isDirEntry, kind)) {
                 total++;
                 if (!isDirEntry) {

@@ -788,8 +788,9 @@ const char* currentNameSuffix() {
 // (only filesystem errors at this point -- the collision case is handled
 // before this is ever called) stay on the editor screen with
 // `nameEntryError` set rather than navigating away, so the user can just
-// change the name and retry.
-void performNameEntryAction(const char* trimmed) {
+// change the name and retry. `replace`: the user confirmed overwriting an
+// existing recording or dump, which the recorder replaces only on save.
+void performNameEntryAction(const char* trimmed, bool replace = false) {
     if (namePurpose == NAME_NEW_RECORDING) {
         char filename[NAME_ENTRY_MAX_LEN + 5];
         snprintf(filename, sizeof(filename), "%s.mid", trimmed);
@@ -799,7 +800,7 @@ void performNameEntryAction(const char* trimmed) {
         strncpy(nowRecordingName, trimmed, sizeof(nowRecordingName) - 1);
         nowRecordingName[sizeof(nowRecordingName) - 1] = '\0';
 
-        recorder.arm(path); // failure (e.g. the collision we already cleared reappearing from a race) surfaces via recorder.state() on the recording screen
+        recorder.arm(path, replace); // failure (e.g. the collision we already cleared reappearing from a race) surfaces via recorder.state() on the recording screen
         midiLogCount = 0; // clear any previous take's log before this one starts receiving
         appState = APP_RECORDING;
         needsRedraw = true;
@@ -815,7 +816,7 @@ void performNameEntryAction(const char* trimmed) {
         strncpy(nowCapturingSysExName, trimmed, sizeof(nowCapturingSysExName) - 1);
         nowCapturingSysExName[sizeof(nowCapturingSysExName) - 1] = '\0';
 
-        sysexRecorder.arm(path); // failure surfaces via sysexRecorder.state() on the capture screen
+        sysexRecorder.arm(path, replace); // failure surfaces via sysexRecorder.state() on the capture screen
         midiLogCount = 0; // clear any previous take's log before this one starts receiving
         appState = APP_CAPTURING_SYSEX;
         needsRedraw = true;
@@ -942,7 +943,9 @@ void finishNameEntry() {
 }
 
 // ENTER removes whatever's at pendingOverwritePath and then proceeds with
-// the original action, same as if there'd been no collision at all; NAV
+// the original action, same as if there'd been no collision at all. A new
+// recording or dump leaves the old file in place instead, the recorder
+// replaces it when the take is saved. NAV
 // goes back to APP_NAME_ENTRY (not all the way to APP_BROWSE) so a
 // change-my-mind cancel lands back on editing the name, same place every
 // other name-entry error already leaves you.
@@ -953,6 +956,11 @@ void handleConfirmOverwriteInput() {
         return;
     }
     if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
+        if (!pendingOverwriteIsDir &&
+            (namePurpose == NAME_NEW_RECORDING || namePurpose == NAME_NEW_SYSEX_CAPTURE)) {
+            performNameEntryAction(pendingName, true);
+            return;
+        }
         bool ok = pendingOverwriteIsDir ? sdRmdir(pendingOverwritePath) : sdRemove(pendingOverwritePath);
         if (!ok) {
             strncpy(nameEntryError, "overwrite failed", sizeof(nameEntryError) - 1);
@@ -1832,18 +1840,62 @@ void handleFreeLooperRamGateInput() {
     }
 }
 
+// Recovers recorder temp files (".NAME.part") left in the browser's
+// folder by a power cut or a failed save, see recorderRecoverTemp(). Runs
+// from APP_BROWSE when the listing saw one, never while a recorder is
+// writing one.
+void recoverTempTakes() {
+    browser.clearSawTempFiles();
+    if (recorder.state() == MidiRecorder::STATE_ARMED || recorder.state() == MidiRecorder::STATE_RECORDING ||
+        sysexRecorder.state() == SysExRecorder::STATE_ARMED ||
+        sysexRecorder.state() == SysExRecorder::STATE_RECORDING)
+        return;
+    const int MAX_TEMPS = 8;
+    char names[MAX_TEMPS][NAME_ENTRY_MAX_LEN + 12];
+    int count = 0;
+    FsFile dir;
+    if (!sdOpenPath(dir, browser.currentPath(), O_RDONLY) || !dir.isDir()) return;
+    FsFile file;
+    char name[64];
+    while (count < MAX_TEMPS && file.openNext(&dir, O_RDONLY)) {
+        size_t len = file.getName(name, sizeof(name));
+        if (len > 6 && len < sizeof(names[0]) && name[0] == '.' && strcmp(name + len - 5, ".part") == 0 && !file.isDir())
+            strcpy(names[count++], name);
+        file.close();
+    }
+    dir.close();
+    for (int i = 0; i < count; i++) {
+        char path[RECORDER_PATH_MAX + 8];
+        browser.buildPath(names[i], path, sizeof(path));
+        recorderRecoverTemp(path);
+    }
+    browser.refresh();
+    browser.clearSawTempFiles(); // one try per listing, so a stuck one doesn't loop
+    needsRedraw = true;
+}
+
 void handleRecordingInput() {
     if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
-        recorder.stop();
-        browser.refresh(); // so the new file shows up in the list
-        appState = APP_BROWSE;
+        // A failed save stays here with the error showing; the next press leaves.
+        bool wasError = recorder.state() == MidiRecorder::STATE_ERROR;
+        if (recorder.stop() || wasError) {
+            browser.refresh(); // so the new file shows up in the list
+            appState = APP_BROWSE;
+        }
         needsRedraw = true;
+        return;
     }
     // EDIT cancels instead of saving -- skip the confirm entirely if
     // nothing's actually been captured yet (STATE_ARMED, or STATE_
-    // RECORDING with zero events), since there's nothing to lose.
+    // RECORDING with zero events), since there's nothing to lose. After
+    // an error whatever was saved stays, EDIT just leaves.
     if (Input::justPressed(BTN_EDIT)) {
-        if (recorder.eventCount() == 0) {
+        if (recorder.state() == MidiRecorder::STATE_ERROR) {
+            recorder.cancel();
+            browser.refresh();
+            appState = APP_BROWSE;
+            needsRedraw = true;
+        } else if (recorder.eventCount() == 0) {
             recorder.cancel();
             appState = APP_BROWSE;
             needsRedraw = true;
@@ -1872,13 +1924,21 @@ void handleConfirmCancelRecordingInput() {
 // nothing's arrived yet).
 void handleCapturingSysExInput() {
     if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
-        sysexRecorder.stop();
-        browser.refresh(); // so the new file shows up in the list
-        appState = APP_BROWSE;
+        bool wasError = sysexRecorder.state() == SysExRecorder::STATE_ERROR;
+        if (sysexRecorder.stop() || wasError) {
+            browser.refresh(); // so the new file shows up in the list
+            appState = APP_BROWSE;
+        }
         needsRedraw = true;
+        return;
     }
     if (Input::justPressed(BTN_EDIT)) {
-        if (sysexRecorder.messageCount() == 0) {
+        if (sysexRecorder.state() == SysExRecorder::STATE_ERROR) {
+            sysexRecorder.cancel();
+            browser.refresh();
+            appState = APP_BROWSE;
+            needsRedraw = true;
+        } else if (sysexRecorder.messageCount() == 0) {
             sysexRecorder.cancel();
             appState = APP_BROWSE;
             needsRedraw = true;
@@ -2016,6 +2076,7 @@ bool update() {
 
     switch (appState) {
         case APP_BROWSE:
+            if (browser.sawTempFiles()) recoverTempTakes();
             exitRequested = handleBrowseInput();
             break;
 
@@ -2246,6 +2307,9 @@ bool update() {
             break;
 
         case APP_RECORDING: {
+            // Sync and write-failure handling run here in the main loop,
+            // never in the MIDI input callback, see MidiRecorder.
+            recorder.service();
             handleRecordingInput();
 
             // The ARMED -> RECORDING (or -> ERROR) transition happens
@@ -2282,10 +2346,17 @@ bool update() {
         }
 
         case APP_CONFIRM_CANCEL_RECORDING:
+            recorder.service(); // still recording behind the prompt
+            if (recorder.state() == MidiRecorder::STATE_ERROR) {
+                appState = APP_RECORDING; // show the error
+                needsRedraw = true;
+                break;
+            }
             handleConfirmCancelRecordingInput();
             break;
 
         case APP_CAPTURING_SYSEX: {
+            sysexRecorder.service(); // see APP_RECORDING
             handleCapturingSysExInput();
 
             // Same reasoning as APP_RECORDING above: the ARMED->RECORDING
@@ -2314,6 +2385,12 @@ bool update() {
         }
 
         case APP_CONFIRM_CANCEL_SYSEX_CAPTURE:
+            sysexRecorder.service();
+            if (sysexRecorder.state() == SysExRecorder::STATE_ERROR) {
+                appState = APP_CAPTURING_SYSEX;
+                needsRedraw = true;
+                break;
+            }
             handleConfirmCancelSysExCaptureInput();
             break;
 

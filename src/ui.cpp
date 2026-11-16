@@ -1095,8 +1095,10 @@ void drawRecording(const char* filename, const MidiRecorder& recorder,
     }
     if (recorder.state() != MidiRecorder::STATE_ERROR) {
         updateRecordingLog(log, logCount);
+        drawFooter("NAV/LEFT stop & save  EDIT discard");
+    } else {
+        drawFooter("NAV/EDIT back"); // whatever was saved stays
     }
-    drawFooter("NAV/LEFT stop & save  EDIT discard");
 }
 
 void updateRecordingLive(const MidiRecorder& recorder) {
@@ -1190,8 +1192,10 @@ void drawSysExCapture(const char* filename, const SysExRecorder& recorder,
     }
     if (recorder.state() != SysExRecorder::STATE_ERROR) {
         updateRecordingLog(log, logCount);
+        drawFooter("NAV/LEFT stop & save  EDIT discard");
+    } else {
+        drawFooter("NAV/EDIT back"); // whatever was saved stays
     }
-    drawFooter("NAV/LEFT stop & save  EDIT discard");
 }
 
 void updateSysExCaptureLive(const SysExRecorder& recorder) {

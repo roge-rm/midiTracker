@@ -72,6 +72,10 @@ public:
     bool entryIsByIndex(int idx) const { return idx >= 0 && idx < _count && _index[idx].byIndex; }
     int nextRecNumber() const { return _maxRec + 1; }
     int nextDumpNumber() const { return _maxDump + 1; }
+    // True when the last listing saw a recorder temp file (".NAME.part",
+    // see recorderTempPath()). The file player recovers those, then clears it.
+    bool sawTempFiles() const { return _sawTemp; }
+    void clearSawTempFiles() { _sawTemp = false; }
 
     // Drops the heap-allocated index/sort-key buffers, if any, without
     // touching _path -- entryCount() reports 0 until the next
@@ -176,6 +180,7 @@ private:
 
     int _maxRec = 0;  // see nextRecNumber()
     int _maxDump = 0;
+    bool _sawTemp = false;
 
     // On-demand materialization cache backing entry() -- see its
     // implementation. mutable: entry() is logically const (browsing
