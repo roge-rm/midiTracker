@@ -15,6 +15,9 @@
 // through WavPlayer; those print core 0 load, card reads and underruns.
 // PROFILE_WAV_DIR (e.g. "/wav") instead profiles up to 16 .wav files found
 // in that folder, each preceded by a line with its format.
+// PROFILE_MP3_DIR (e.g. "/mp3") plays up to 16 .mp3 files in that folder
+// through Mp3Player, each preceded by a format line, printing core 0 load,
+// decode time per frame, card reads and underruns.
 // With -D PROFILE_SAVER the trackers play with the screensaver's Pattern
 // rain drawing, and each report adds the share of real time it took.
 #ifdef TRACKER_PROFILE
@@ -30,6 +33,7 @@
 #include "it_file.h"
 #include "midi_file.h"
 #include "wav_file.h"
+#include "mp3_file.h"
 #include "midi_output.h"
 #include "pins.h" // SAMPLE_RATE
 #include <hardware/watchdog.h>
@@ -54,6 +58,9 @@
 #endif
 #ifndef PROFILE_WAV_DIR
 #define PROFILE_WAV_DIR ""
+#endif
+#ifndef PROFILE_MP3_DIR
+#define PROFILE_MP3_DIR ""
 #endif
 #ifndef PROFILE_SECONDS
 #define PROFILE_SECONDS 30
@@ -88,6 +95,11 @@ bool isMidi(const char* name) {
 bool isWav(const char* name) {
     const char* dot = strrchr(name, '.');
     return dot && !strcasecmp(dot, ".wav");
+}
+
+bool isMp3(const char* name) {
+    const char* dot = strrchr(name, '.');
+    return dot && !strcasecmp(dot, ".mp3");
 }
 
 enum FindKind { FIND_TRACKER, FIND_MIDI, FIND_WAV };
@@ -464,6 +476,98 @@ void profileWavDir() {
     }
 }
 
+// Plays an .mp3 like a file player would (update() every loop) and prints
+// core 0 load, decode time per frame, card reads and underruns per 5 s and
+// for the run.
+void profileMp3Path(const char* path, const char* want) {
+    static Mp3Player p;
+    if (!p.load(path)) {
+        Serial.printf("PROFILE loadfail %s: %s\n", path, p.errorMessage());
+        return;
+    }
+    uint32_t frameUs = (uint32_t)((uint64_t)p.samplesPerFrame() * 1000000u / p.sampleRate());
+    Serial.printf("PROFILE file %s: MPEG%s layer III, %lu Hz, %d ch, %lu kbps, %s, ID3v2 %lu bytes, %lu ms, frame %lu us; "
+                  "decoder %u bytes, arena %u of %u bytes\n",
+                  path, p.mpegVersion() == 25 ? "2.5" : p.mpegVersion() == 2 ? "2" : "1", (unsigned long)p.sampleRate(),
+                  p.channels(), (unsigned long)(p.bitrate() / 1000),
+                  !strcmp(p.vbrTag(), "Xing") || !strcmp(p.vbrTag(), "VBRI") ? "VBR" : p.vbrTag()[0] ? "CBR (Info)" : "no VBR header",
+                  (unsigned long)p.id3Bytes(), (unsigned long)p.totalMs(), (unsigned long)frameUs,
+                  (unsigned)Mp3Player::decoderBytes(), (unsigned)Mp3Player::arenaBytes(), (unsigned)SharedRamArena::SIZE);
+    p.play();
+    uint32_t start = millis();
+    while (millis() - start < 1000 && p.state() == Mp3Player::STATE_PLAYING) p.update();
+    uint32_t u0 = p.underrunSamples(), e0 = p.elapsedMs();
+    uint32_t busyUs = 0, worstUs = 0, winWorst = 0, winBusy = 0, winU0 = u0;
+    uint32_t t0 = micros(), win = millis(), winT0 = t0;
+    Mp3Player::Profile total = {};
+    Mp3Player::profile = {};
+    auto print = [&](const char* tag, uint32_t busy, uint32_t us, uint32_t worst, const Mp3Player::Profile& r, uint32_t underruns) {
+        int load = us ? (int)(1000.0f * (float)busy / (float)us) : 0;
+        uint32_t avg = r.frames ? r.decodeUs / r.frames : 0;
+        int avgPct = frameUs ? (int)(1000u * avg / frameUs) : 0;
+        int worstPct = frameUs ? (int)(1000u * r.decodeWorstUs / frameUs) : 0;
+        Serial.printf("PROFILE %s %s: core0 load %d.%d%%, worst update %lu us, decode %lu frames avg %lu us (%d.%d%%) worst %lu us (%d.%d%%), "
+                      "errors %lu, reads %lu (%lu KB, %lu ms), underrun samples %lu\n",
+                      tag, want, load / 10, load % 10, (unsigned long)worst, (unsigned long)r.frames, (unsigned long)avg, avgPct / 10,
+                      avgPct % 10, (unsigned long)r.decodeWorstUs, worstPct / 10, worstPct % 10, (unsigned long)r.errors,
+                      (unsigned long)r.reads, (unsigned long)(r.readBytes / 1024), (unsigned long)(r.readUs / 1000), (unsigned long)underruns);
+    };
+    auto add = [](Mp3Player::Profile& t, const Mp3Player::Profile& c) {
+        t.reads += c.reads; t.readBytes += c.readBytes; t.readUs += c.readUs;
+        t.frames += c.frames; t.decodeUs += c.decodeUs; t.errors += c.errors;
+        if (c.decodeWorstUs > t.decodeWorstUs) t.decodeWorstUs = c.decodeWorstUs;
+    };
+    while (millis() - start < 1000u + PROFILE_SECONDS * 1000u && p.state() == Mp3Player::STATE_PLAYING) {
+        uint32_t a = micros();
+        p.update();
+        uint32_t d = micros() - a;
+        busyUs += d;
+        winBusy += d;
+        if (d > worstUs) worstUs = d;
+        if (d > winWorst) winWorst = d;
+        if (millis() - win >= 5000) {
+            Mp3Player::Profile& c = Mp3Player::profile;
+            uint32_t now = micros();
+            print("5s", winBusy, now - winT0, winWorst, c, p.underrunSamples() - winU0);
+            add(total, c);
+            c = {};
+            winBusy = 0;
+            winWorst = 0;
+            winT0 = now;
+            winU0 = p.underrunSamples();
+            win = millis();
+        }
+    }
+    add(total, Mp3Player::profile);
+    uint32_t us = micros() - t0;
+    print("RESULT", busyUs, us, worstUs, total, p.underrunSamples() - u0);
+    Serial.printf("PROFILE RESULT %s: elapsed moved %lu ms in %lu ms\n", want, (unsigned long)(p.elapsedMs() - e0), (unsigned long)(us / 1000));
+    p.stop();
+    printStacks("after the mp3");
+}
+
+// Profiles every .mp3 directly in PROFILE_MP3_DIR, up to 16.
+void profileMp3Dir() {
+    static char names[16][96];
+    int count = 0;
+    FsFile dir;
+    if (!dir.open(PROFILE_MP3_DIR)) { Serial.printf("PROFILE notfound %s\n", PROFILE_MP3_DIR); return; }
+    FsFile e;
+    while (count < 16 && e.openNext(&dir, O_RDONLY)) {
+        char* name = g_name;
+        e.getName(name, sizeof(g_name));
+        if (!e.isDir() && name[0] != '.' && isMp3(name) && strlen(name) < sizeof(names[0])) strcpy(names[count++], name);
+        e.close();
+    }
+    dir.close();
+    Serial.printf("PROFILE mp3 dir %s: %d files\n", PROFILE_MP3_DIR, count);
+    for (int i = 0; i < count; i++) {
+        char path[160];
+        snprintf(path, sizeof(path), "%s/%s", PROFILE_MP3_DIR, names[i]);
+        profileMp3Path(path, names[i]);
+    }
+}
+
 } // namespace
 
 void trackerProfileRun() {
@@ -524,6 +628,7 @@ void trackerProfileRun() {
             profileWav(want);
         }
         if (PROFILE_WAV_DIR[0]) profileWavDir();
+        if (PROFILE_MP3_DIR[0]) profileMp3Dir();
         const char* w = list;
         while (*w) {
             const char* bar = strchr(w, '|');

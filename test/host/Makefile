@@ -10,6 +10,8 @@
 #   make -C test/host look OUT_DIR=dir   render the M12 screens to PNGs in dir (default build/host/look)
 #   make -C test/host players OUT_DIR=dir   the player screens, drawn from host renders of real songs
 #   make -C test/host wav            build build/host/render_wav (WavPlayer over the host ring)
+#   make -C test/host mp3            build build/host/render_mp3 (Mp3Player and lib/helix_mp3 over the host ring)
+#                                    and render_mp3_ops (counts the decoder's long multiplies)
 #   make -C test/host rec-check      MidiRecorder, SysExRecorder and SysExPlayer on an in-memory card
 #   make -C test/host battery-check  the battery gauge on made-up voltage sequences
 ROOT   := $(abspath ../..)
@@ -23,7 +25,7 @@ PLAYER_SRC := $(wildcard $(ROOT)/src/tracker_base.cpp) $(ROOT)/src/ui_tap.cpp $(
 HARNESS_SRC := $(CURDIR)/render.cpp $(CURDIR)/host_stubs.cpp
 SECONDS ?= 60
 
-.PHONY: all baseline check clean midi midi-baseline midi-check look players wav rec-check battery-check
+.PHONY: all baseline check clean midi midi-baseline midi-check look players wav mp3 rec-check battery-check
 all: $(OUT)/render $(OUT)/gen $(OUT)/corr
 
 $(OUT)/corr: $(CURDIR)/corr.cpp
@@ -61,6 +63,24 @@ wav: $(OUT)/render_wav
 $(OUT)/render_wav: $(WAV_SRC) $(wildcard $(CURDIR)/stub/*.h) $(ROOT)/include/wav_file.h $(ROOT)/include/shared_ram_arena.h
 	@mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -o $@ $(WAV_SRC)
+
+# MP3 target: the real mp3_file.cpp and Helix decoder over the host ring and FsFile.
+HELIX := $(ROOT)/lib/helix_mp3/src
+MP3_SRC := $(ROOT)/src/mp3_file.cpp $(ROOT)/src/shared_ram_arena.cpp $(CURDIR)/host_stubs.cpp $(CURDIR)/render_mp3.cpp
+MP3_C := $(wildcard $(HELIX)/*.c)
+MP3_DEPS := $(MP3_SRC) $(MP3_C) $(wildcard $(HELIX)/*.h) $(wildcard $(CURDIR)/stub/*.h) $(ROOT)/include/mp3_file.h $(ROOT)/include/shared_ram_arena.h
+mp3: $(OUT)/render_mp3 $(OUT)/render_mp3_ops $(OUT)/corr
+
+# MP3_EXTRA=-DMP3_MULHS_C uses the M0+ multiply on the host.
+$(OUT)/render_mp3: $(MP3_DEPS)
+	@mkdir -p $(OUT)/mp3obj
+	cd $(OUT)/mp3obj && gcc -O2 -g -w $(MP3_EXTRA) -c $(MP3_C)
+	$(CXX) $(CXXFLAGS) -I$(HELIX) -o $@ $(MP3_SRC) $(OUT)/mp3obj/*.o
+
+$(OUT)/render_mp3_ops: $(MP3_DEPS)
+	@mkdir -p $(OUT)/mp3obj-ops
+	cd $(OUT)/mp3obj-ops && gcc -O2 -g -w -DMP3_COUNT_OPS -c $(MP3_C)
+	$(CXX) $(CXXFLAGS) -DMP3_COUNT_OPS -I$(HELIX) -o $@ $(MP3_SRC) $(OUT)/mp3obj-ops/*.o
 
 # Recorder check: the real recorders over stub-rec/'s in-memory card.
 REC_SRC := $(ROOT)/src/midi_recorder.cpp $(ROOT)/src/sysex_recorder.cpp $(ROOT)/src/sysex_player.cpp $(CURDIR)/rec_check.cpp

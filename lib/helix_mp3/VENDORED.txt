@@ -1,0 +1,11 @@
+Helix fixed-point MP3 decoder (RealNetworks, RPSL 1.0, see LICENSE.txt and RPSL.txt).
+
+Taken from https://github.com/pschatzmann/arduino-libhelix, commit
+f6e55a307c7577c5e3dfe1bf424a61075235fa08, src/libhelix-mp3 (the Helix
+sources only, not the C++ wrapper).
+
+Changes here:
+- buffers.c rewritten: the decoder state comes from one block given with
+  MP3SetPool() (declared in mp3dec.h), no heap.
+- assembly.h: Cortex-M0+ (or MP3_MULHS_C) builds the 32x32 multiply's high
+  word from 16-bit products; MP3_COUNT_OPS counts the long multiplies.
