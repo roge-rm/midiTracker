@@ -878,7 +878,7 @@ void drawMenuRow(const char* label, int idx, int scrollOffset, bool selected) {
     Look::drawTextRow(Look::LIST_TOP + row * ROW_HEIGHT, label, nullptr, 0, selected);
 }
 
-// One line under each mode tile, by position.
+// One line under each mode name, by position.
 const char* const MODE_NOTES[] = {
     "play and record",
     "4 tracks",
@@ -886,9 +886,9 @@ const char* const MODE_NOTES[] = {
     "midi \x7f synth \x7f theme",
 };
 
-void drawModeTileAt(const char* const* labels, int count, int i, bool selected) {
+void drawModeRowAt(const char* const* labels, int count, int i, bool selected) {
     if (i < 0 || i >= count || i >= 4) return;
-    Look::drawModeTile(i, labels[i], MODE_NOTES[i], selected);
+    Look::drawModeRow(i, labels[i], MODE_NOTES[i], selected);
 }
 
 void drawModeSelect(const char* const* labels, int count, int cursor) {
@@ -897,19 +897,18 @@ void drawModeSelect(const char* const* labels, int count, int cursor) {
     st.titleColor = COLOR_ACCENT;
     st.note = VERSIONNUMBER;
     Look::drawStatus(st);
-    Look::clearModeGrid();
-    for (int i = 0; i < count && i < 4; i++) drawModeTileAt(labels, count, i, i == cursor);
+    Look::clearModeList();
+    for (int i = 0; i < count && i < 4; i++) drawModeRowAt(labels, count, i, i == cursor);
     static const Look::Key keys[] = {
-        {"ARROWS", "move", Look::TONE_TEXT},
-        {"RIGHT", "open on right", Look::TONE_TEXT},
-        {"ENT", "open", Look::TONE_SELECT},
+        {"UD", "move", Look::TONE_TEXT},
+        {"RIGHT/ENT", "open", Look::TONE_SELECT},
     };
-    Look::drawKeyFooter(keys, 3);
+    Look::drawKeyFooter(keys, 2);
 }
 
 void updateModeSelectCursor(const char* const* labels, int count, int prevCursor, int newCursor) {
-    drawModeTileAt(labels, count, prevCursor, false);
-    drawModeTileAt(labels, count, newCursor, true);
+    drawModeRowAt(labels, count, prevCursor, false);
+    drawModeRowAt(labels, count, newCursor, true);
 }
 
 void drawEntryMenu(const char* subtitle, const char* const* labels, int count, int cursor, int scrollOffset) {

@@ -188,8 +188,8 @@ void drawKeyFooter(const Key* row1, int n1, const Key* row2 = nullptr, int n2 = 
 // otherwise plain text (key null). Strings point into buf.
 int parseHints(const char* line, char* buf, size_t bufSize, Key* keys, int maxKeys);
 
-// Clears the gaps around the mode tiles.
-void clearModeGrid();
+// Clears the gaps around the mode rows.
+void clearModeList();
 
 // The same look from hint lines such as "UD move  ENTER select": each
 // double-space chunk whose first word is in capitals becomes a key box,
@@ -257,8 +257,8 @@ struct Card {
 void drawCard(const Card& c);
 
 // ---- mode select ----------------------------------------------------------
-// One of the four tiles in a 2x2 grid.
-void drawModeTile(int index, const char* label, const char* note, bool selected);
+// One of the four rows of the mode list, index from the top.
+void drawModeRow(int index, const char* label, const char* note, bool selected);
 
 // ---- splash ---------------------------------------------------------------
 void drawSplash(const char* version);

@@ -828,35 +828,38 @@ void drawCard(const Card& c) {
 // ---- mode select ----------------------------------------------------------
 
 namespace {
-const int GRID_X = 10, GRID_Y = HEADER_H + 10, GAP = 8;
-const int TW = (SCREEN_W - 2 * GRID_X - GAP) / 2;
-const int TH = (SCREEN_H - FOOTER_H1 - GRID_Y - 10 - GAP) / 2;
+// Four rows filling the space between the strip and a one-row footer.
+const int MODE_X = 10, MODE_W = SCREEN_W - 2 * MODE_X;
+const int MODE_ROW_H = 42, MODE_GAP = 6;
+const int MODE_BODY_H = SCREEN_H - FOOTER_H1 - HEADER_H;
+const int MODE_Y = HEADER_H + (MODE_BODY_H - 4 * MODE_ROW_H - 3 * MODE_GAP) / 2;
 }
 
-void clearModeGrid() {
+void clearModeList() {
     TFT_eSPI& g = screen();
     int bottom = SCREEN_H - FOOTER_H1;
-    g.fillRect(0, HEADER_H, SCREEN_W, GRID_Y - HEADER_H, COLOR_BG);
-    g.fillRect(0, GRID_Y + TH, SCREEN_W, GAP, COLOR_BG);
-    g.fillRect(0, GRID_Y + 2 * TH + GAP, SCREEN_W, bottom - (GRID_Y + 2 * TH + GAP), COLOR_BG);
-    int y = GRID_Y, h = 2 * TH + GAP;
-    g.fillRect(0, y, GRID_X, h, COLOR_BG);
-    g.fillRect(GRID_X + TW, y, GAP, h, COLOR_BG);
-    g.fillRect(GRID_X + 2 * TW + GAP, y, SCREEN_W - (GRID_X + 2 * TW + GAP), h, COLOR_BG);
+    int end = MODE_Y + 4 * MODE_ROW_H + 3 * MODE_GAP;
+    g.fillRect(0, HEADER_H, SCREEN_W, MODE_Y - HEADER_H, COLOR_BG);
+    g.fillRect(0, end, SCREEN_W, bottom - end, COLOR_BG);
+    g.fillRect(0, MODE_Y, MODE_X, end - MODE_Y, COLOR_BG);
+    g.fillRect(MODE_X + MODE_W, MODE_Y, SCREEN_W - MODE_X - MODE_W, end - MODE_Y, COLOR_BG);
+    for (int i = 0; i < 3; i++) {
+        g.fillRect(MODE_X, MODE_Y + (i + 1) * MODE_ROW_H + i * MODE_GAP, MODE_W, MODE_GAP, COLOR_BG);
+    }
 }
 
-void drawModeTile(int index, const char* label, const char* note, bool selected) {
-    int x = GRID_X + (index % 2) * (TW + GAP);
-    int y = GRID_Y + (index / 2) * (TH + GAP);
+void drawModeRow(int index, const char* label, const char* note, bool selected) {
+    int x = MODE_X, w = MODE_W, h = MODE_ROW_H;
+    int y = MODE_Y + index * (MODE_ROW_H + MODE_GAP);
     uint16_t bg = selected ? COLOR_HILITE_BG : COLOR_SURFACE;
-    band(x, y, TW, TH, bg, [&](TFT_eSPI& g) {
+    band(x, y, w, h, bg, [&](TFT_eSPI& g) {
         if (selected) {
-            g.drawRect(x, y, TW, TH, COLOR_SELECT);
-            g.drawRect(x + 1, y + 1, TW - 2, TH - 2, COLOR_SELECT);
+            g.drawRect(x, y, w, h, COLOR_SELECT);
+            g.fillRect(x, y, 2, h, COLOR_SELECT);
         } else {
-            g.drawRect(x, y, TW, TH, COLOR_RULE);
+            g.drawRect(x, y, w, h, COLOR_RULE);
         }
-        int ix = x + 9, iy = y + 9;
+        int ix = x + 12, iy = y + (h - 24) / 2;
         switch (index) {
             case 0: drawIcon(g, ICON_FILES, ix, iy, COLOR_SELECT, 2); break;
             case 1: drawIcon(g, ICON_LOOPER, ix, iy, COLOR_ACCENT, 2); break;
@@ -866,13 +869,15 @@ void drawModeTile(int index, const char* label, const char* note, bool selected)
                 drawIcon(g, ICON_KNOBS, ix, iy, COLOR_TEXT, 2);
                 break;
         }
-        int ty = iy + 24 + 7;
-        drawText(g, FONT_LABEL, label, ix, ty, COLOR_TEXT);
+        // Label caps 10 px, 5 px gap, note caps 7 px: 22 px centred on the icon.
+        int tx = ix + 24 + 12, ty = y + (h - 22) / 2;
+        drawText(g, FONT_LABEL, label, tx, ty, selected ? COLOR_SELECT : COLOR_TEXT, 2);
         if (note) {
             char buf[48];
-            fitText(FONT_TEXT, note, TW - 18, buf, sizeof(buf));
-            drawText(g, FONT_TEXT, buf, ix, ty + 5 + 6, COLOR_DIM);
+            fitText(FONT_TEXT, note, x + w - 20 - tx, buf, sizeof(buf));
+            drawText(g, FONT_TEXT, buf, tx, ty + 15, COLOR_DIM);
         }
+        if (selected) drawIcon(g, ICON_PLAY, x + w - 14, y + (h - 7) / 2, COLOR_SELECT);
     });
 }
 

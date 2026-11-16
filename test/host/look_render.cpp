@@ -198,13 +198,12 @@ void modeScreen(bool ledIn, bool ledOut) {
     st.titleColor = COLOR_ACCENT;
     st.note = "0.6.0";
     drawStatus(st);
-    clearModeGrid();
+    clearModeList();
     const char* labels[] = {"FILES", "LOOPER", "PARISYNTH", "SETTINGS"};
     const char* notes[] = {"play and record", "4 tracks", "16 channels", "midi \x7f synth \x7f theme"};
-    for (int i = 0; i < 4; i++) drawModeTile(i, labels[i], notes[i], i == 0);
-    static const Key keys[] = {{"ARROWS", "move", TONE_TEXT}, {"RIGHT", "open on right", TONE_TEXT},
-                               {"ENT", "open", TONE_SELECT}};
-    drawKeyFooter(keys, 3);
+    for (int i = 0; i < 4; i++) drawModeRow(i, labels[i], notes[i], i == 0);
+    static const Key keys[] = {{"UD", "move", TONE_TEXT}, {"RIGHT/ENT", "open", TONE_SELECT}};
+    drawKeyFooter(keys, 2);
 }
 
 void menuScreen() {

@@ -26,7 +26,7 @@ namespace {
 
 enum TopMode { MODE_SELECT, MODE_FILE_PLAYER, MODE_LOOPER, MODE_PARI_SYNTH, MODE_SETTINGS };
 
-// Mode tiles, a 2x2 grid in this order.
+// Mode list, top to bottom.
 const char* MODE_LABELS[] = { "FILES", "LOOPER", "PARISYNTH", "SETTINGS" };
 const int MODE_COUNT = 4;
 
@@ -81,22 +81,18 @@ void moveModeCursor(int to) {
     Ui::updateModeSelectCursor(MODE_LABELS, MODE_COUNT, prev, modeCursor);
 }
 
-// The arrows move around the 2x2 grid. ENTER or PLAY opens, and so does
-// RIGHT pressed on the right column. Opening waits for the release so the
-// new mode doesn't see it.
-bool rightOpens = false;
+// UP/DOWN move through the list, wrapping at the ends like the other menus.
+// RIGHT, ENTER or PLAY opens, on release so the new mode doesn't see it.
+// RIGHT only counts if it was pressed on this screen.
+bool rightPressed = false;
 
 void handleModeSelectInput() {
-    if (Input::justPressed(BTN_UP) && modeCursor >= 2) moveModeCursor(modeCursor - 2);
-    if (Input::justPressed(BTN_DOWN)) moveModeCursor(modeCursor + 2);
-    if (Input::justPressed(BTN_LEFT) && modeCursor % 2 == 1) moveModeCursor(modeCursor - 1);
-    if (Input::justPressed(BTN_RIGHT)) {
-        rightOpens = modeCursor % 2 == 1;
-        if (!rightOpens) moveModeCursor(modeCursor + 1);
-    }
-    bool rightRelease = Input::justReleased(BTN_RIGHT) && rightOpens;
-    if (Input::justReleased(BTN_RIGHT)) rightOpens = false;
-    if (Input::justReleased(BTN_ENTER) || Input::justReleased(BTN_PLAY) || rightRelease) {
+    if (Input::justPressed(BTN_UP)) moveModeCursor(modeCursor > 0 ? modeCursor - 1 : MODE_COUNT - 1);
+    if (Input::justPressed(BTN_DOWN)) moveModeCursor(modeCursor < MODE_COUNT - 1 ? modeCursor + 1 : 0);
+    if (Input::justPressed(BTN_RIGHT)) rightPressed = true;
+    bool rightRelease = Input::justReleased(BTN_RIGHT) && rightPressed;
+    if (Input::justReleased(BTN_RIGHT)) rightPressed = false;
+    if (rightRelease || Input::justReleased(BTN_ENTER) || Input::justReleased(BTN_PLAY)) {
         enterMode(MODE_ORDER[modeCursor]);
     }
 }
