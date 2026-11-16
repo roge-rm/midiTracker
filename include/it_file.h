@@ -10,6 +10,8 @@
 //  - Compressed samples (IT 2.14/2.15) are unpacked once into a cache file
 //    on the card (cacheDir) and streamed from there like plain samples.
 //    Stereo samples are mixed down to mono into the same cache.
+//  - Long samples played 2 or 4 times faster or more also get half and
+//    quarter rate copies in the cache, so those notes read less off the card.
 class ItPlayer : public TrackerPlayer {
 public:
     static const int MAX_CHANNELS = 64;
@@ -66,19 +68,28 @@ private:
     };
 
     struct ItSample;
-    // What a voice plays: the sample with one of its loops (sustain or
-    // normal). A ping-pong loop is unrolled: frames past loopEnd up to
-    // twice the loop length read the loop backwards, see refillChunk().
+    // What a voice plays: the sample, or one of its half or quarter rate
+    // copies (level 1, 2), with one of its loops (sustain or normal).
+    // Frames and loop points are the copy's. A ping-pong loop is unrolled:
+    // frames past the loop's real end up to twice the loop length read the
+    // loop backwards, see refillChunk().
     struct ItSampleView : TrackerSample {
         uint8_t sampleIndex = 0;
         bool pingpong = false;
-        uint32_t realLoopEnd = 0; // loop end in the sample's own frames
+        uint8_t level = 0;        // 0 the sample, 1 half rate, 2 quarter rate
+        bool sustainView = false; // plays the sustain loop
+        // fileOffset is where a copy's frames start in the cache file.
+        // Loop end before the unrolling, 0 == no loop.
+        uint32_t realLoopEnd() const { return pingpong ? (loopEnd + loopStart) / 2 : loopEnd; }
     };
 
     struct ItSample {
         uint32_t length = 0;       // frames
         uint32_t dataOffset = 0;   // first frame (left channel for stereo)
-        uint32_t rightOffset = 0;  // right channel data, 0 == mono
+        // Until openCache(): right channel data, 0 == mono. After it every
+        // sample is mono and this is where the half rate copy starts in the
+        // cache file (the quarter rate one follows it), see levels.
+        union { uint32_t rightOffset = 0; uint32_t copyOffset; };
         uint32_t c5speed = 8363;
         bool is16Bit = false;
         bool isSigned = true;
@@ -89,6 +100,7 @@ private:
         uint8_t defaultPan = 32;   // 0-64
         bool usePan = false;
         bool hasSustain = false;
+        uint8_t levels = 0;        // half (1) and quarter (2) rate copies in the cache file, see it_file.cpp
         uint8_t vibSpeed = 0, vibDepth = 0, vibRate = 0, vibType = 0; // auto-vibrato
         ItSampleView normal;       // plays with the normal loop (or none)
         ItSampleView sustain;      // plays with the sustain loop while the note is held, else same as normal
@@ -173,7 +185,8 @@ private:
     };
 
     // Cache file layout: a 16-byte header (magic, key, data bytes, use
-    // count), then each cached sample's frames as mono signed PCM.
+    // count), then each cached sample's frames as mono signed PCM, then
+    // its half and quarter rate copies.
     bool openCache(const char* path, uint32_t key);
     bool mixDown(FsFile& src, uint32_t srcL, FsFile& dst, uint32_t dstAt, uint32_t srcR, uint32_t frames, bool is16, bool isSigned);
     bool unpackSample(FsFile& cache, ItSample& s, uint32_t srcOffset, bool it215, uint32_t& written,
@@ -182,7 +195,38 @@ private:
     bool loadInstrument(int i, uint32_t offset, bool oldFormat);
     bool loadSample(int i, uint32_t offset);
     void setupViews(ItSample& s, int index, uint8_t flags, uint32_t ls, uint32_t le, uint32_t sls, uint32_t sle);
-    void scanChannels();
+    // Also the highest note (semitones, with the pitch envelope's swing
+    // up) each sample is played at, into maxNote[MAX_SAMPLES].
+    void scanChannels(uint8_t* maxNote);
+
+    // Half and quarter rate copies, see it_file.cpp.
+    // The loop the copies are filtered around: normal, else sustain.
+    static const ItSampleView* wrapLoop(const ItSample& s) {
+        if (s.normal.loopEnd > s.normal.loopStart) return &s.normal;
+        return s.hasSustain ? &s.sustain : nullptr;
+    }
+    // How a level's copy lines up with the sample: copy frame j sits at
+    // sample frame a - 0.5 + (j - aL + 0.5) * den / num, so the loop a..
+    // (den frames) is aL.. (num frames) in the copy. Without a loop a and
+    // aL are 0 and num / den is 1 / 2^level. len is the copy's frames.
+    struct LevelMap { uint32_t a, aL, num, den, len; };
+    static LevelMap levelMap(const ItSample& s, int level);
+    // Sample frame <-> copy frame, in 1/65536 frames.
+    static int64_t toCopy(const LevelMap& m, int64_t x);
+    static int64_t toSample(const LevelMap& m, int64_t q);
+    // Writes one level's copy from the one above it, see it_file.cpp.
+    void makeHalfTaps();
+    bool writeHalf(FsFile& src, uint32_t srcAt, bool srcSigned, uint32_t srcFrames, FsFile& dst, uint32_t dstAt, bool is16,
+                   const LevelMap& m, uint32_t srcLoopEnd, bool loop, bool pingpong, uint32_t totalFrames, uint32_t& doneFrames);
+    static bool levelFits(const ItSample& s, const ItSampleView& base, int level);
+    const ItSampleView* levelView(int sampleIndex, bool sustainView, int level);
+    void moveVoice(ItVoice& v, const ItSampleView* to, bool keepDirection);
+    void startVoiceAtSampleFrame(ItVoice& v, uint32_t frame);
+    // Samples get copies from this long, with loops (if any) from this long.
+    static const uint32_t MIN_LEVEL_FRAMES = 2048, MIN_LEVEL_LOOP = 1024;
+    // Views of copies voices play, made when needed, see levelView().
+    static const int LEVEL_VIEWS = 16;
+    ItSampleView _levelViews[LEVEL_VIEWS];
 
     // Pattern reading. IT packs each pattern with per-channel memory of
     // the last mask and values, so reading starts at the pattern's first
@@ -267,7 +311,7 @@ private:
     static const int MAX_RUN = 4;
     int16_t _chunks[MAX_VOICES][CHUNK_FRAMES];
     void claimSlot(int k);
-    int readFrames(FsFile& f, uint32_t offset, uint32_t start, uint32_t n, bool is16, bool isSigned, int16_t* dest, bool mixIn);
+    int readFrames(FsFile& f, uint32_t offset, uint32_t start, uint32_t n, bool is16, bool isSigned, int16_t* dest);
 
     FsFile _cacheFile;
 

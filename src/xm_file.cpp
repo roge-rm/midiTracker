@@ -383,15 +383,18 @@ bool XmPlayer::load(const char* path) {
     _numAdpcm = 0;
     for (int i = 0; i < (int)numInstrumentsReal; i++) {
         uint32_t instStart = _file.curPosition();
-        uint8_t ih[263];
-        memset(ih, 0, sizeof(ih));
+        // The voice slots are free until play, so the instrument header and
+        // the sample headers go there to keep load()'s stack small.
+        const uint32_t IH_BYTES = 263;
+        uint8_t* ih = (uint8_t*)&_chunks[1][0];
+        memset(ih, 0, IH_BYTES);
         if (_file.read(ih, 29) != 29) break;
         uint32_t isize = le32(ih);
         uint16_t numSamplesReal = le16(ih + 27);
         // The declared size wins; fields past a short header read as zero.
         uint32_t hdrLen = isize < 29 ? 29 : isize;
         if (numSamplesReal > 0) {
-            uint32_t extra = (hdrLen > sizeof(ih) ? (uint32_t)sizeof(ih) : hdrLen) - 29;
+            uint32_t extra = (hdrLen > IH_BYTES ? IH_BYTES : hdrLen) - 29;
             if (extra && _file.read(ih + 29, extra) != (int)extra) break;
         }
         if (numSamplesReal > 64) return loadFail("invalid XM file");
@@ -433,7 +436,8 @@ bool XmPlayer::load(const char* path) {
             uint8_t volume, flags, panning, reserved;
             int8_t finetune, relativeNote;
         };
-        TempSampleInfo temp[64];
+        static_assert(64 * sizeof(TempSampleInfo) <= sizeof(_chunks[0]), "sample headers fit a voice slot");
+        TempSampleInfo* temp = reinterpret_cast<TempSampleInfo*>(&_chunks[0][0]);
         int numSamplesParsed = (int)numSamplesReal;
         for (int k = 0; k < numSamplesParsed; k++) {
             uint32_t shStart = _file.curPosition();

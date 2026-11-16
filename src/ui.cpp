@@ -505,17 +505,9 @@ const char* shortTargetLabel(MidiOutTarget t) {
     }
 }
 
-// Status strip shared by drawBrowser() and drawLoopBrowser(): the folder
-// as "/ music / mods" with the last part bright, plus the truncation note
-// (see SdBrowser::truncationNote()) when the last scan didn't list the
-// whole folder. A long path keeps its end. The file browser shows the MIDI
-// output target on the right, which ALT changes there.
-void drawBrowserHeaderPath(const SdBrowser& browser, const char* title, bool showTarget) {
-    char pathBuf[192];
-    browser.displayPath(pathBuf, sizeof(pathBuf));
-    char note[16];
-    browser.truncationNote(note, sizeof(note));
-
+// Draws the header for pathBuf; kept out of drawBrowserHeaderPath() so its
+// buffers aren't on the stack while displayPath() reads the card.
+static void __attribute__((noinline)) drawHeaderPathText(const char* pathBuf, const char* note, const char* title, bool showTarget) {
     // "/a/b" to "/ a / " and "b".
     char spaced[256];
     size_t n = 0;
@@ -558,6 +550,19 @@ void drawBrowserHeaderPath(const SdBrowser& browser, const char* title, bool sho
     Look::drawStatus(st);
     tft.setTextFont(2);
     tft.setTextDatum(TL_DATUM);
+}
+
+// Status strip shared by drawBrowser() and drawLoopBrowser(): the folder
+// as "/ music / mods" with the last part bright, plus the truncation note
+// (see SdBrowser::truncationNote()) when the last scan didn't list the
+// whole folder. A long path keeps its end. The file browser shows the MIDI
+// output target on the right, which ALT changes there.
+void drawBrowserHeaderPath(const SdBrowser& browser, const char* title, bool showTarget) {
+    char pathBuf[192];
+    browser.displayPath(pathBuf, sizeof(pathBuf));
+    char note[16];
+    browser.truncationNote(note, sizeof(note));
+    drawHeaderPathText(pathBuf, note, title, showTarget);
 }
 
 // Rows, the gap under them and the scrollbar, shared by both browsers.

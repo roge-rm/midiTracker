@@ -36,7 +36,8 @@
 //
 // Compressed samples are unpacked into a cache file on the card the first
 // time a song is opened (progress through progressCallback), then streamed
-// like plain PCM. Unpacking while streaming would need the decoder's state
+// like plain PCM, and the half and quarter rate copies (see below) are
+// made then too. Unpacking while streaming would need the decoder's state
 // at every point a loop or ping-pong turn lands on, which doesn't fit RAM.
 #include "it_file.h"
 #include "ui_tap.h"
@@ -66,6 +67,19 @@ inline void wr32(uint8_t* p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v
 uint32_t fnv(uint32_t h, const uint8_t* p, size_t n) {
     for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
     return h;
+}
+
+// The copy a voice reads at `ratio` source frames per output frame
+// (level 0 the sample, 1 half rate, 2 quarter rate), from the one it reads
+// now. It moves up at 2 and 4 and back down a bit over a semitone lower,
+// so vibrato around a boundary doesn't move it back and forth.
+int levelFor(float ratio, int cur, int maxLevel) {
+    int want = ratio >= 4.0f ? 2 : ratio >= 2.0f ? 1 : 0;
+    if (want < cur) {
+        if (cur == 2 && ratio >= 3.75f) want = 2;
+        else if (ratio >= 1.875f) want = 1;
+    }
+    return want > maxLevel ? maxLevel : want;
 }
 
 // Half a sine cycle, 0-255 (the MOD table).
@@ -228,8 +242,11 @@ bool ItPlayer::load(const char* path) {
         if (_orderTable[i] == 255) { _songLength = i; break; }
     }
 
-    // Offset tables, read through _rawScratch.
-    uint32_t insOff[MAX_INSTRUMENTS], smpOff[MAX_SAMPLES];
+    // Offset tables, read through _rawScratch. They live in the voice
+    // slots, which are free until play, to keep load()'s stack small.
+    uint32_t* insOff = (uint32_t*)&_chunks[MAX_VOICES - 1][0];
+    uint32_t* smpOff = insOff + MAX_INSTRUMENTS;
+    static_assert((MAX_INSTRUMENTS + MAX_SAMPLES) * 4 <= CHUNK_FRAMES * 2, "load()'s offset tables don't fit a voice slot");
     uint32_t tableAt = 0xC0 + ordNum;
     auto readTable = [&](uint32_t at, int count, uint32_t* out, int keep) -> bool {
         if (!_file.seekSet(at)) return false;
@@ -267,7 +284,7 @@ bool ItPlayer::load(const char* path) {
     key = fnv(key, h, sizeof(h));
     uint32_t fileBytes = (uint32_t)_file.fileSize();
     key = fnv(key, (const uint8_t*)&fileBytes, 4);
-    bool anyCached = false;
+    bool anyCached = false, anyLevels = false;
     for (int i = 0; i < smpKeep; i++) {
         if (!loadSample(i, smpOff[i])) _samples[i] = ItSample();
         // The cache key covers every sample header.
@@ -284,13 +301,34 @@ bool ItPlayer::load(const char* path) {
         }
     }
 
-    if (anyCached && !openCache(path, key)) {
-        char msg[sizeof(_error)];
-        strcpy(msg, _error[0] ? _error : "can't write the sample cache");
-        return loadFail(msg);
+    // Half and quarter rate copies for long samples the patterns play at 2
+    // or 4 source frames a frame or faster. The voice slots are free until
+    // play, so the scan's tables go there.
+    uint8_t* maxNote = (uint8_t*)&_chunks[0][0];
+    scanChannels(maxNote);
+    for (ItSampleView& lv : _levelViews) lv = ItSampleView();
+    for (int i = 0; i < smpKeep; i++) {
+        ItSample& s = _samples[i];
+        s.levels = 0;
+        const ItSampleView* w = wrapLoop(s);
+        if (s.length >= MIN_LEVEL_FRAMES && maxNote[i] && (!w || w->realLoopEnd() - w->loopStart >= MIN_LEVEL_LOOP)) {
+            float ratio = (float)s.c5speed * powf(2.0f, (float)(maxNote[i] - 1 - 60) / 12.0f) / (float)SAMPLE_RATE;
+            s.levels = ratio >= 4.0f ? 2 : ratio >= 2.0f ? 1 : 0;
+        }
+        key = fnv(key, &s.levels, 1);
+        if (s.levels) anyLevels = true;
     }
 
-    scanChannels();
+    if ((anyCached || anyLevels) && !openCache(path, key)) {
+        if (anyCached) {
+            char msg[sizeof(_error)];
+            strcpy(msg, _error[0] ? _error : "can't write the sample cache");
+            return loadFail(msg);
+        }
+        // Only the copies needed the cache: play without them.
+        for (int i = 0; i < smpKeep; i++) _samples[i].levels = 0;
+        _error[0] = 0;
+    }
     loadMacros(h[0x2E], tableAt + (insNum + smpNum + patNum) * 4u);
     if (rd16(h + 0x28) < 0x214 && !(h[0x2E] & 8)) {
         // Older IT versions had no filters, as OpenMPT: Zxx does nothing.
@@ -397,7 +435,6 @@ void ItPlayer::setupViews(ItSample& s, int index, uint8_t flg, uint32_t ls, uint
         if (on && e > a + 1) {
             v.loopStart = a;
             v.loopEnd = e;
-            v.realLoopEnd = e;
             if (pp) {
                 // Frames e..2e-a-1 read the loop backwards.
                 v.pingpong = true;
@@ -408,8 +445,12 @@ void ItPlayer::setupViews(ItSample& s, int index, uint8_t flg, uint32_t ls, uint
     };
     make(s.normal, (flg & 0x10) != 0, (flg & 0x40) != 0, ls, le);
     s.hasSustain = (flg & 0x20) && sle > sls + 1 && sls < s.length;
-    if (s.hasSustain) make(s.sustain, true, (flg & 0x80) != 0, sls, sle);
-    else s.sustain = s.normal;
+    if (s.hasSustain) {
+        make(s.sustain, true, (flg & 0x80) != 0, sls, sle);
+        s.sustain.sustainView = true;
+    } else {
+        s.sustain = s.normal;
+    }
 }
 
 bool ItPlayer::loadInstrument(int i, uint32_t offset, bool oldFormat) {
@@ -499,9 +540,16 @@ uint32_t ItPlayer::sampleDataEnd(const ItSample& s) {
     return at;
 }
 
-void ItPlayer::scanChannels() {
-    // Highest channel any pattern uses, for the screen.
+void ItPlayer::scanChannels(uint8_t* maxNote) {
+    // Highest channel any pattern uses, for the screen, and each sample's
+    // highest note (+1, 0 == never played) for openCache(). A note with no
+    // instrument takes the channel's last one in file order, near enough.
     int maxCh = 0;
+    uint8_t* lastNote = maxNote + MAX_SAMPLES;
+    uint8_t* lastInst = lastNote + MAX_CHANNELS;
+    uint8_t* chanInst = lastInst + MAX_CHANNELS;
+    memset(maxNote, 0, MAX_SAMPLES);
+    memset(chanInst, 0, MAX_CHANNELS);
     for (int p = 0; p < MAX_PATTERNS; p++) {
         if (_patternOffsets[p] == 0) continue;
         uint8_t ph[2];
@@ -510,6 +558,8 @@ void ItPlayer::scanChannels() {
         _file.seekSet(_patternOffsets[p]);
         uint8_t mask[MAX_CHANNELS];
         memset(mask, 0, sizeof(mask));
+        memset(lastNote, 0xFF, MAX_CHANNELS);
+        memset(lastInst, 0, MAX_CHANNELS);
         int len = 0, pos = 0;
         auto next = [&](uint8_t& v) -> bool {
             if (pos >= len) {
@@ -530,12 +580,35 @@ void ItPlayer::scanChannels() {
             uint8_t m;
             if (cv & 0x80) { if (!next(m)) break; mask[ch] = m; }
             else m = mask[ch];
-            int skip = ((m & 1) ? 1 : 0) + ((m & 2) ? 1 : 0) + ((m & 4) ? 1 : 0) + ((m & 8) ? 2 : 0);
-            uint8_t d;
+            uint8_t note = 0xFF, inst = 0, d;
             bool ok = true;
+            if (m & 1) { ok = next(note); lastNote[ch] = note; }
+            if (ok && (m & 2)) { ok = next(inst); lastInst[ch] = inst; }
+            int skip = ((m & 4) ? 1 : 0) + ((m & 8) ? 2 : 0);
             for (int k = 0; k < skip && ok; k++) ok = next(d);
             if (!ok) break;
+            if (m & 16) note = lastNote[ch];
+            if (m & 32) inst = lastInst[ch];
+            if (inst) chanInst[ch] = inst;
             if (m & 0xFF) { if (ch + 1 > maxCh) maxCh = ch + 1; }
+            if (note >= 120 || chanInst[ch] == 0) continue;
+            int smp, real = note, swing = 0;
+            if (_instrumentMode) {
+                if (chanInst[ch] > _numInstruments) continue;
+                const ItInstrument& in = _instruments[chanInst[ch] - 1];
+                smp = in.sampleMap[note];
+                real = in.noteMap[note];
+                const ItEnvelope& e = in.pitchEnv;
+                if (e.on() && !(e.flags & 0x80)) {
+                    // y is in half semitones.
+                    for (int k = 0; k < e.numPoints && k < MAX_ENV_POINTS; k++) if ((e.y[k] + 1) / 2 > swing) swing = (e.y[k] + 1) / 2;
+                }
+            } else {
+                smp = chanInst[ch];
+            }
+            if (smp < 1 || smp > _numSamples || real >= 120) continue;
+            int top = real + swing + 1;
+            if (top > maxNote[smp - 1]) maxNote[smp - 1] = (uint8_t)(top > 255 ? 255 : top);
         }
     }
     _numChannels = maxCh > 0 ? maxCh : 1;
@@ -544,18 +617,26 @@ void ItPlayer::scanChannels() {
 // ---------------------------------------------------------------- sample cache
 
 bool ItPlayer::openCache(const char* path, uint32_t key) {
-    // Layout: 16-byte header ("ITC3", key, data bytes, use count), then
-    // each cached sample in order as mono signed PCM. A packed stereo
-    // sample is unpacked side by side and mixed down over its left half.
+    // Layout: 16-byte header ("ITC4", key, data bytes, use count), then
+    // for each sample in it, in order: its frames as mono signed PCM if it
+    // is cached itself, then its half and quarter rate copies (levels).
+    // A packed stereo sample is unpacked side by side and mixed down over
+    // its left half.
     uint32_t at = 16;
     uint32_t totalFrames = 0;
     for (int i = 0; i < _numSamples; i++) {
         ItSample& s = _samples[i];
-        if (!s.inCache) continue;
-        uint32_t bytes = s.length * (s.is16Bit ? 2 : 1);
+        if (!s.inCache && !s.levels) continue;
+        uint32_t bpf = s.is16Bit ? 2 : 1;
         bool stereo = s.rightOffset != 0;
-        at += bytes * (s.packed && stereo ? 2 : 1);
-        totalFrames += s.length * (stereo ? 2 : 1);
+        if (s.inCache) {
+            at += s.length * bpf * (s.packed && stereo ? 2 : 1);
+            totalFrames += s.length * (stereo ? 2 : 1);
+        }
+        for (int l = 1; l <= s.levels; l++) {
+            at += levelMap(s, l).len * bpf;
+            totalFrames += levelMap(s, l - 1).len;
+        }
     }
     uint32_t dataBytes = at - 16;
     key = fnv(key, (const uint8_t*)&dataBytes, 4);
@@ -571,16 +652,12 @@ bool ItPlayer::openCache(const char* path, uint32_t key) {
         FsFile f;
         uint32_t use = 0;
         bool valid = false;
-        if (f.open(name, O_RDONLY) && f.read(hdr, 16) == 16 && (memcmp(hdr, "ITC3", 4) == 0 || memcmp(hdr, "ITC2", 4) == 0)) {
+        // Older versions (ITC2, ITC3) are replaced first.
+        if (f.open(name, O_RDONLY) && f.read(hdr, 16) == 16 && memcmp(hdr, "ITC4", 4) == 0) {
             valid = true;
             use = rd32(hdr + 12);
-            // An ITC3 file is kept even if fragmented (it reads through SdFat).
-            // An ITC2 file is rebuilt once unless it is already in one run of sectors.
-            uint32_t b = 0, e = 0;
-            if (rd32(hdr + 4) == key && rd32(hdr + 8) == dataBytes && f.fileSize() == 16 + (uint64_t)dataBytes) {
-                if (hdr[3] == '3' || f.contiguousRange(&b, &e)) found = slot;
-                else { valid = false; use = 0; }
-            }
+            // Kept even if fragmented (it reads through SdFat).
+            if (rd32(hdr + 4) == key && rd32(hdr + 8) == dataBytes && f.fileSize() == 16 + (uint64_t)dataBytes) found = slot;
         }
         f.close();
         if (use > highestUse) highestUse = use;
@@ -589,7 +666,7 @@ bool ItPlayer::openCache(const char* path, uint32_t key) {
     }
 
     uint8_t hdr[16];
-    memcpy(hdr, "ITC3", 4);
+    memcpy(hdr, "ITC4", 4);
     wr32(hdr + 4, key);
     wr32(hdr + 8, dataBytes);
     wr32(hdr + 12, highestUse + 1);
@@ -609,20 +686,39 @@ bool ItPlayer::openCache(const char* path, uint32_t key) {
         memset(blank, 0, sizeof(blank));
         bool ok = f.write(blank, 16) == 16 && f.sync();
         uint32_t written = 16, doneFrames = 0;
+        bool haveTaps = false;
         for (int i = 0; ok && i < _numSamples; i++) {
             ItSample& s = _samples[i];
-            if (!s.inCache) continue;
+            if (!s.inCache && !s.levels) continue;
             uint32_t start = written;
-            uint32_t bytes = s.length * (s.is16Bit ? 2 : 1);
-            if (s.packed) {
+            uint32_t bpf = s.is16Bit ? 2 : 1;
+            uint32_t bytes = s.length * bpf;
+            if (s.inCache && s.packed) {
                 bool it215 = (s.dataOffset & 0x80000000u) != 0;
                 ok = unpackSample(f, s, s.dataOffset & 0x7FFFFFFFu, it215, written, totalFrames, doneFrames);
                 if (ok && s.rightOffset) ok = mixDown(f, start, f, start, start + bytes, s.length, s.is16Bit, true);
-            } else {
+            } else if (s.inCache) {
                 ok = mixDown(_file, s.dataOffset, f, start, s.rightOffset, s.length, s.is16Bit, s.isSigned);
                 written += bytes;
                 doneFrames += s.length * 2;
                 if (progressCallback && totalFrames > 0) progressCallback((int)((uint64_t)doneFrames * 100 / totalFrames));
+            }
+            // Each copy is made from the one above it.
+            FsFile* src = s.inCache ? &f : &_file;
+            uint32_t srcAt = s.inCache ? start : s.dataOffset;
+            bool srcSigned = s.inCache || s.isSigned;
+            const ItSampleView* w = wrapLoop(s);
+            if (s.levels && !haveTaps) { makeHalfTaps(); haveTaps = true; }
+            for (int l = 1; ok && l <= s.levels; l++) {
+                LevelMap up = levelMap(s, l - 1), m = levelMap(s, l);
+                // This step on its own: from level l - 1's frames to level l's.
+                LevelMap step = w ? LevelMap{up.aL, m.aL, m.num, up.num, m.len} : LevelMap{0, 0, 1, 2, m.len};
+                ok = writeHalf(*src, srcAt, srcSigned, up.len, f, written, s.is16Bit, step, w ? up.aL + up.num : 0,
+                               w != nullptr, w && w->pingpong, totalFrames, doneFrames);
+                src = &f;
+                srcAt = written;
+                srcSigned = true;
+                written += m.len * bpf;
             }
             if (ok && !f.seekSet(written)) ok = false;
         }
@@ -637,19 +733,209 @@ bool ItPlayer::openCache(const char* path, uint32_t key) {
         found = pick;
     }
 
-    // Point the cached samples at the cache.
+    // Point the cached samples and copies at the cache.
     at = 16;
     for (int i = 0; i < _numSamples; i++) {
         ItSample& s = _samples[i];
-        if (!s.inCache) continue;
-        uint32_t bytes = s.length * (s.is16Bit ? 2 : 1);
-        s.dataOffset = at;
-        at += bytes * (s.packed && s.rightOffset ? 2 : 1);
+        uint32_t bpf = s.is16Bit ? 2 : 1;
+        if (s.inCache) {
+            s.dataOffset = at;
+            at += s.length * bpf * (s.packed && s.rightOffset ? 2 : 1);
+            s.isSigned = true;
+        }
         s.rightOffset = 0;
-        s.isSigned = true;
+        if (s.levels) {
+            s.copyOffset = at;
+            for (int l = 1; l <= s.levels; l++) at += levelMap(s, l).len * bpf;
+        }
     }
     snprintf(name, sizeof(name), "%s/%d.bin", cacheDir, found);
     return _cacheFile.open(name, O_RDONLY);
+}
+
+namespace {
+// Modified Bessel function I0, for the Kaiser window.
+float besselI0(float x) {
+    float sum = 1.0f, term = 1.0f;
+    for (int k = 1; k < 40; k++) {
+        float t = x / (2.0f * (float)k);
+        term *= t * t;
+        sum += term;
+        if (term < sum * 1e-9f) break;
+    }
+    return sum;
+}
+
+// writeHalf()'s filter: 96 taps, rows for 33 fractional positions, in
+// the voice slots (free until play) with its buffers after them.
+const int HALF_TAPS = 96, HALF_PHASES = 32;
+const uint32_t HALF_BLOCK = 4096; // copy frames a pass
+const uint32_t HALF_TABLE = (HALF_PHASES + 1) * HALF_TAPS, HALF_WIN = 2 * HALF_BLOCK + 128;
+} // namespace
+
+// Q15 rows of a Kaiser windowed sinc (beta 7.3) cut off at a quarter of
+// the source rate: flat to 0.225 and 75 dB down from 0.275, so what it
+// takes out is above 90% of the copy's own Nyquist. Row p is the filter
+// for a copy frame p / 32 of a source frame past the window's middle.
+void ItPlayer::makeHalfTaps() {
+    int16_t* table = &_chunks[0][0];
+    const float fc = 0.25f, beta = 7.3f, i0b = besselI0(beta), reach = HALF_TAPS / 2;
+    float* row = (float*)_rawScratch;
+    static_assert(HALF_TAPS * sizeof(float) <= sizeof(_rawScratch), "writeHalf's taps don't fit _rawScratch");
+    for (int p = 0; p <= HALF_PHASES; p++) {
+        float sum = 0;
+        for (int n = 0; n < HALF_TAPS; n++) {
+            float t = (float)(n - (HALF_TAPS / 2 - 1)) - (float)p / HALF_PHASES;
+            float x = 2.0f * fc * t * 3.14159265f;
+            float sinc = x == 0 ? 2.0f * fc : 2.0f * fc * sinf(x) / x;
+            float r = t / reach;
+            row[n] = r * r < 1.0f ? sinc * besselI0(beta * sqrtf(1.0f - r * r)) / i0b : 0.0f;
+            sum += row[n];
+        }
+        int32_t total = 0;
+        int16_t* out = table + p * HALF_TAPS;
+        for (int n = 0; n < HALF_TAPS; n++) { out[n] = (int16_t)lroundf(row[n] / sum * 32768.0f); total += out[n]; }
+        // DC gain exactly 1, keeping the half way row symmetric.
+        if (p == HALF_PHASES / 2) {
+            out[HALF_TAPS / 2 - 1] = (int16_t)(out[HALF_TAPS / 2 - 1] + (32768 - total) / 2);
+            out[HALF_TAPS / 2] = (int16_t)(out[HALF_TAPS / 2] + (32768 - total) / 2);
+        } else {
+            out[HALF_TAPS / 2] = (int16_t)(out[HALF_TAPS / 2] + (32768 - total));
+        }
+    }
+}
+
+// Writes the next level's copy of srcFrames frames at srcAt in src (signed
+// or not, 8 or 16 bit) to dst at dstAt as signed PCM of the same width:
+// m.len frames, copy frame j taken at source frame
+// m.a - 0.5 + (j - m.aL + 0.5) * m.den / m.num through makeHalfTaps()'s
+// filter. Frames inside the loop (copy frames m.aL.. m.num of them) filter
+// across the loop's turn the way it plays, so the copy's loop is seamless;
+// the rest filter the plain data.
+bool ItPlayer::writeHalf(FsFile& src, uint32_t srcAt, bool srcSigned, uint32_t srcFrames, FsFile& dst, uint32_t dstAt, bool is16,
+                         const LevelMap& m, uint32_t e, bool loop, bool pingpong, uint32_t totalFrames, uint32_t& doneFrames) {
+    const int16_t* table = &_chunks[0][0];
+    int16_t* taps = &_chunks[0][0] + HALF_TABLE;
+    int16_t* win = taps + HALF_TAPS;
+    uint8_t* out = (uint8_t*)(win + HALF_WIN);
+    static_assert((HALF_TABLE + HALF_TAPS + HALF_WIN + HALF_BLOCK) * 2 <= sizeof(_chunks), "writeHalf's buffers don't fit the voice slots");
+    const uint32_t a = m.a, bpf = is16 ? 2 : 1;
+
+    // count source frames from `from`, decoded into dest, reversed if asked.
+    auto readRun = [&](int16_t* dest, uint32_t from, uint32_t count, bool reverse) -> bool {
+        if (count == 0) return true;
+        uint8_t* raw = (uint8_t*)dest;
+        if (!src.seekSet(srcAt + from * bpf) || src.read(raw, count * bpf) != (int)(count * bpf)) return false;
+        if (is16) {
+            if (!srcSigned) for (uint32_t k = 0; k < count; k++) dest[k] = (int16_t)((uint16_t)dest[k] ^ 0x8000);
+        } else {
+            // In place from the top, each int16 lands at or past its byte.
+            for (uint32_t k = count; k-- > 0;) dest[k] = (int16_t)((int16_t)(int8_t)(raw[k] ^ (srcSigned ? 0 : 0x80)) << 8);
+        }
+        if (reverse) for (uint32_t i = 0, j = count - 1; i < j; i++, j--) { int16_t t = dest[i]; dest[i] = dest[j]; dest[j] = t; }
+        return true;
+    };
+    // Source frames lo..hi-1 into win: across the loop's turn (and, for a
+    // loop from 0, before the start) if wrap, else plain with zeros past
+    // the ends.
+    auto fill = [&](int32_t lo, int32_t hi, bool wrap) -> bool {
+        int16_t* d = win;
+        int32_t lim = wrap ? (int32_t)e : (int32_t)srcFrames;
+        int32_t negEnd = hi < 0 ? hi : 0;
+        if (lo < negEnd) {
+            uint32_t n = (uint32_t)(negEnd - lo);
+            if (wrap && a == 0) {
+                bool ok = pingpong ? readRun(d, (uint32_t)(-negEnd), n, true) : readRun(d, (uint32_t)((int32_t)e + lo), n, false);
+                if (!ok) return false;
+            } else {
+                memset(d, 0, n * 2);
+            }
+            d += n;
+        }
+        int32_t from = lo > 0 ? lo : 0, to = hi < lim ? hi : lim;
+        if (from < to) {
+            if (!readRun(d, (uint32_t)from, (uint32_t)(to - from), false)) return false;
+            d += to - from;
+        }
+        if (from < lim) from = lim;
+        if (from < hi) {
+            uint32_t n = (uint32_t)(hi - from);
+            if (wrap) {
+                bool ok = pingpong ? readRun(d, 2 * e - (uint32_t)hi, n, true) : readRun(d, a + ((uint32_t)from - e), n, false);
+                if (!ok) return false;
+            } else {
+                memset(d, 0, n * 2);
+            }
+        }
+        return true;
+    };
+    // Copy frame j sits at source frame T(j) / (2 * num), whole part ip and
+    // fraction (16 bits) frac.
+    const int64_t num2 = 2 * (int64_t)m.num;
+    auto centre = [&](uint32_t j, int32_t& ip, uint32_t& frac) {
+        int64_t t = (2 * (int64_t)a - 1) * m.num + (2 * ((int64_t)j - m.aL) + 1) * (int64_t)m.den;
+        int64_t q = t >= 0 ? t / num2 : -((-t + num2 - 1) / num2);
+        ip = (int32_t)q;
+        frac = (uint32_t)(((t - q * num2) << 16) / num2);
+    };
+
+    uint32_t outFrames = m.len;
+    uint32_t jA = loop ? m.aL : 0, jE = loop ? m.aL + m.num : 0;
+    if (jE > outFrames) jE = outFrames;
+    if (jA > jE) jA = jE;
+    uint32_t pct = 0xFFFFFFFFu, done0 = doneFrames, lastFrac = 0xFFFFFFFFu;
+    for (uint32_t j0 = 0; j0 < outFrames;) {
+        bool wrap = loop && j0 >= jA && j0 < jE;
+        uint32_t segEnd = !loop ? outFrames : j0 < jA ? jA : j0 < jE ? jE : outFrames;
+        uint32_t n = segEnd - j0 < HALF_BLOCK ? segEnd - j0 : HALF_BLOCK;
+        int32_t ip0, ip1;
+        uint32_t frac;
+        centre(j0, ip0, frac);
+        centre(j0 + n - 1, ip1, frac);
+        int32_t lo = ip0 - (HALF_TAPS / 2 - 1), hi = ip1 + HALF_TAPS / 2 + 1;
+        if (hi - lo > (int32_t)HALF_WIN) return false; // can't happen: num / den is at least a half
+        if (!fill(lo, hi, wrap)) return false;
+        for (uint32_t k = 0; k < n; k++) {
+            int32_t ip;
+            centre(j0 + k, ip, frac);
+            if (frac != lastFrac) {
+                // Taps for this fraction, between two of the table's rows.
+                lastFrac = frac;
+                uint32_t p = frac >> 11, w = frac & 2047;
+                const int16_t* r0 = table + p * HALF_TAPS;
+                for (int t = 0; t < HALF_TAPS; t++) taps[t] = (int16_t)(r0[t] + (((r0[t + HALF_TAPS] - r0[t]) * (int32_t)w) >> 11));
+            }
+            const int16_t* x = win + (ip - lo) - (HALF_TAPS / 2 - 1);
+            int32_t acc = 0;
+            if (frac == 0x8000) {
+                // Half way between two source frames (always so for an even loop or none): the taps are symmetric.
+                for (int t = 0; t < HALF_TAPS / 2; t++) acc += (int32_t)taps[t] * ((int32_t)x[t] + x[HALF_TAPS - 1 - t]);
+            } else {
+                for (int t = 0; t < HALF_TAPS; t++) acc += (int32_t)taps[t] * x[t];
+            }
+            int32_t y = (acc + 16384) >> 15;
+            if (is16) {
+                if (y > 32767) y = 32767;
+                if (y < -32768) y = -32768;
+                out[k * 2] = (uint8_t)y;
+                out[k * 2 + 1] = (uint8_t)((uint32_t)y >> 8);
+            } else {
+                y = (y + 128) >> 8;
+                if (y > 127) y = 127;
+                if (y < -128) y = -128;
+                out[k] = (uint8_t)(int8_t)y;
+            }
+        }
+        if (!dst.seekSet(dstAt + j0 * bpf) || dst.write(out, n * bpf) != n * bpf) return false;
+        j0 += n;
+        doneFrames = done0 + (uint32_t)((uint64_t)j0 * srcFrames / outFrames);
+        if (progressCallback && totalFrames > 0) {
+            uint32_t pc = (uint32_t)((uint64_t)doneFrames * 100 / totalFrames);
+            if (pc != pct) { pct = pc; progressCallback((int)pc); }
+        }
+    }
+    doneFrames = done0 + srcFrames;
+    return true;
 }
 
 // Writes the mono mix of `frames` frames (left at srcL, right at srcR in
@@ -775,9 +1061,8 @@ bool ItPlayer::unpackSample(FsFile& cache, ItSample& s, uint32_t srcOffset, bool
 // ---------------------------------------------------------------- streaming
 
 namespace {
-// Decodes the frames in `got` raw bytes of one side into dest as int16, or
-// adds them halved (mixing the right side into the left).
-inline __attribute__((always_inline)) int decodeSide(const uint8_t* raw, int got, bool is16, bool isSigned, int16_t* dest, bool mixIn) {
+// Decodes the frames in `got` raw bytes into dest as int16.
+inline __attribute__((always_inline)) int decodeFrames(const uint8_t* raw, int got, bool is16, bool isSigned, int16_t* dest) {
     uint32_t bpf = is16 ? 2 : 1;
     if (got <= 0) return 0;
     uint32_t frames = (uint32_t)got / bpf;
@@ -792,14 +1077,14 @@ inline __attribute__((always_inline)) int decodeSide(const uint8_t* raw, int got
             if (!isSigned) u ^= 0x80;
             v = (int16_t)((int16_t)(int8_t)u << 8);
         }
-        dest[i] = mixIn ? (int16_t)(((int32_t)dest[i] + v) >> 1) : v;
+        dest[i] = v;
     }
     return (int)frames;
 }
 } // namespace
 
-// n frames from frame `start` of one side, read in pieces through _rawScratch.
-int __not_in_flash_func(ItPlayer::readFrames)(FsFile& f, uint32_t offset, uint32_t start, uint32_t n, bool is16, bool isSigned, int16_t* dest, bool mixIn) {
+// n frames from frame `start`, read in pieces through _rawScratch.
+int __not_in_flash_func(ItPlayer::readFrames)(FsFile& f, uint32_t offset, uint32_t start, uint32_t n, bool is16, bool isSigned, int16_t* dest) {
     uint32_t bpf = is16 ? 2 : 1, done = 0;
     while (done < n) {
         uint32_t at = offset + (start + done) * bpf;
@@ -807,7 +1092,7 @@ int __not_in_flash_func(ItPlayer::readFrames)(FsFile& f, uint32_t offset, uint32
         if (piece > rawSpan(at)) piece = rawSpan(at) & ~(bpf - 1);
         int got = 0;
         const uint8_t* raw = readSampleBytes(f, at, piece, got);
-        int frames = decodeSide(raw, got, is16, isSigned, dest + done, mixIn);
+        int frames = decodeFrames(raw, got, is16, isSigned, dest + done);
         done += (uint32_t)frames;
         if ((uint32_t)frames * bpf < piece) break;
     }
@@ -822,10 +1107,12 @@ int16_t __not_in_flash_func(ItPlayer::refillChunk)(TrackerVoice& tv, uint32_t in
     const ItSampleView& view = static_cast<const ItSampleView&>(*tv.smp);
     const ItSample& s = _samples[view.sampleIndex];
     uint32_t limit;
-    bool mirrored = view.pingpong && index >= view.realLoopEnd;
+    const uint32_t realLoopEnd = view.realLoopEnd();
+    const uint32_t dataFrames = view.level ? view.length : s.length; // a copy's view only runs past it for a ping-pong loop
+    bool mirrored = view.pingpong && index >= realLoopEnd;
     if (mirrored) limit = view.loopEnd;
-    else if (tv.looping && view.loopEnd > view.loopStart && index < view.realLoopEnd) limit = view.realLoopEnd;
-    else limit = s.length;
+    else if (tv.looping && view.loopEnd > view.loopStart && index < realLoopEnd) limit = realLoopEnd;
+    else limit = dataFrames;
     if (index >= limit) { tv.chunkLen = 0; return 0; }
     int k = (int)(static_cast<ItVoice*>(&tv) - &_voices[0]);
     int run = 1;
@@ -835,8 +1122,8 @@ int16_t __not_in_flash_func(ItPlayer::refillChunk)(TrackerVoice& tv, uint32_t in
     }
     uint32_t frames = limit - index;
     if (frames > (uint32_t)(CHUNK_FRAMES * run)) frames = (uint32_t)(CHUNK_FRAMES * run);
-    uint32_t realStart = mirrored ? (2 * view.realLoopEnd - index - frames) : index;
-    FsFile& f = s.inCache ? _cacheFile : _file;
+    uint32_t realStart = mirrored ? (2 * realLoopEnd - index - frames) : index;
+    FsFile& f = s.inCache || view.level ? _cacheFile : _file;
 #ifdef TRACKER_PROFILE
     uint32_t reads0 = profile.reads;
     struct Attribute {
@@ -851,8 +1138,14 @@ int16_t __not_in_flash_func(ItPlayer::refillChunk)(TrackerVoice& tv, uint32_t in
         }
     } attribute{static_cast<ItVoice&>(tv), reads0};
 #endif
-    int got = readFrames(f, s.dataOffset, realStart, frames, s.is16Bit, s.isSigned, tv.chunkBuf, false);
-    if (got > 0 && s.rightOffset) readFrames(f, s.rightOffset, realStart, (uint32_t)got, s.is16Bit, s.isSigned, tv.chunkBuf, true);
+    // Every sample is mono once the cache is open, see openCache().
+    uint32_t at = s.dataOffset;
+    bool isSigned = s.isSigned;
+    if (view.level) {
+        at = view.fileOffset;
+        isSigned = true;
+    }
+    int got = readFrames(f, at, realStart, frames, s.is16Bit, isSigned, tv.chunkBuf);
     if (got <= 0) { tv.chunkLen = 0; return 0; }
     if (mirrored) {
         // Read forwards, played backwards. A short read keeps the frames
@@ -982,6 +1275,160 @@ void ItPlayer::claimSlot(int k) {
     }
 }
 
+// ---------------------------------------------------------------- half and quarter rate copies
+//
+// A voice stepping 2 or more source frames a frame reads the sample's half
+// rate copy, at 4 or more the quarter rate one, so it reads half or a
+// quarter of the bytes off the card. The copies are low-pass filtered
+// before they're decimated (see writeHalf()), so they only lose what the
+// mixer would alias at that pitch anyway. Each level halves the one above
+// it, rounding the loop it is filtered around (wrapLoop()) up to whole
+// frames: the copy's rate is num / den of the sample's, a hair off half
+// for an odd loop, so the loop stays seamless and in tune.
+
+ItPlayer::LevelMap ItPlayer::levelMap(const ItSample& s, int level) {
+    const ItSampleView* w = wrapLoop(s);
+    if (!w) return LevelMap{0, 0, 1, 1u << level, s.length >> level};
+    uint32_t a = w->loopStart, loopLen = w->realLoopEnd() - a;
+    uint32_t aL = a, num = loopLen, len = s.length;
+    for (int k = 0; k < level; k++) {
+        uint32_t half = (num + 1) >> 1;
+        uint32_t aNext = (uint32_t)((uint64_t)aL * half / num);
+        len = len > aL ? aNext + (uint32_t)((uint64_t)(len - aL) * half / num) : aNext;
+        aL = aNext;
+        num = half;
+    }
+    return LevelMap{a, aL, num, loopLen, len};
+}
+
+// x * n / d rounded down, without overflow for |x| < 2^47 and n, d < 2^26.
+static int64_t mulDivFloor(int64_t x, uint32_t n, uint32_t d) {
+    int64_t q = x / d, r = x % d;
+    if (r < 0) { r += d; q--; }
+    return q * n + r * (int64_t)n / d;
+}
+
+// Positions in 1/65536 frames, rounded down.
+int64_t ItPlayer::toCopy(const LevelMap& m, int64_t x) {
+    return ((int64_t)m.aL << 16) - 32768 + mulDivFloor(x - ((int64_t)m.a << 16) + 32768, m.num, m.den);
+}
+int64_t ItPlayer::toSample(const LevelMap& m, int64_t q) {
+    return ((int64_t)m.a << 16) - 32768 + mulDivFloor(q - ((int64_t)m.aL << 16) + 32768, m.den, m.num);
+}
+
+// A view of a loop plays from a copy if its loop lands on whole copy
+// frames (always so for the loop the copies are made around), or is long
+// enough that rounding it doesn't matter.
+bool ItPlayer::levelFits(const ItSample& s, const ItSampleView& base, int level) {
+    if (level == 0) return true;
+    if (level > s.levels) return false;
+    if (base.loopEnd <= base.loopStart) return true;
+    const ItSampleView* w = wrapLoop(s);
+    if (w && w->loopStart == base.loopStart && w->realLoopEnd() == base.realLoopEnd()) return true;
+    LevelMap m = levelMap(s, level);
+    int64_t da = ((int64_t)base.loopStart - m.a) * m.num, de = ((int64_t)base.realLoopEnd() - m.a) * m.num;
+    if (m.aL + da / (int64_t)m.den < 0) return false;
+    if ((de - da) / (int64_t)m.den < 2) return false;
+    return (da % (int64_t)m.den == 0 && de % (int64_t)m.den == 0) || (de - da) / (int64_t)m.den >= 8192;
+}
+
+// The view of sample si's normal or sustain loop at `level`, made in
+// _levelViews the first time; nullptr if the copy can't play it or every
+// view is in use.
+const ItPlayer::ItSampleView* ItPlayer::levelView(int si, bool sustainView, int level) {
+    const ItSample& s = _samples[si];
+    const ItSampleView& base = sustainView ? s.sustain : s.normal;
+    if (level == 0) return &base;
+    if (!levelFits(s, base, level)) return nullptr;
+    for (ItSampleView& lv : _levelViews) {
+        if (lv.level == level && lv.sampleIndex == si && lv.sustainView == sustainView) return &lv;
+    }
+    ItSampleView* pick = nullptr;
+    for (ItSampleView& lv : _levelViews) {
+        if (lv.level == 0) { pick = &lv; break; }
+    }
+    for (int k = 0; !pick && k < LEVEL_VIEWS; k++) {
+        bool used = false;
+        for (const ItVoice& v : _voices) {
+            if (v.channel != -1 && v.smp == &_levelViews[k]) { used = true; break; }
+        }
+        if (!used) pick = &_levelViews[k];
+    }
+    if (!pick) return nullptr;
+    for (ItVoice& v : _voices) {
+        if (v.chunkSmp == pick) v.chunkSmp = nullptr;
+        if (v.smp == pick) { v.smp = nullptr; v.havePair = false; } // only free voices are left on it
+    }
+    LevelMap m = levelMap(s, level);
+    ItSampleView& lv = *pick;
+    lv = ItSampleView();
+    lv.sampleIndex = (uint8_t)si;
+    lv.pingpong = base.pingpong;
+    lv.level = (uint8_t)level;
+    lv.sustainView = sustainView;
+    lv.length = m.len;
+    lv.fileOffset = s.copyOffset + (level == 2 ? levelMap(s, 1).len * (s.is16Bit ? 2 : 1) : 0);
+    if (base.loopEnd > base.loopStart) {
+        // Nearest whole frames, exact for the loop the copies are made around.
+        auto at = [&](uint32_t x) {
+            int64_t t = ((int64_t)x - m.a) * m.num + m.den / 2, d = m.den;
+            return (uint32_t)((int64_t)m.aL + (t >= 0 ? t / d : -((-t + d - 1) / d)));
+        };
+        uint32_t a = at(base.loopStart), e = at(base.realLoopEnd());
+        lv.loopStart = a;
+        lv.loopEnd = base.pingpong ? 2 * e - a : e;
+        if (lv.length < lv.loopEnd) lv.length = lv.loopEnd;
+    }
+    return &lv;
+}
+
+// Moves v to another view of the same sample at the same point of the
+// sound, keeping the fraction. With keepDirection a voice in the backwards
+// half of a ping-pong loop stays in it.
+void ItPlayer::moveVoice(ItVoice& v, const ItSampleView* to, bool keepDirection) {
+    const ItSampleView& from = *static_cast<const ItSampleView*>(v.smp);
+    const ItSample& s = _samples[from.sampleIndex];
+    // Positions here are in 1/65536 frames.
+    int64_t p = ((int64_t)v.srcIndex << 16) | v.samplePos16;
+    uint32_t endF = from.realLoopEnd();
+    bool mirrored = from.pingpong && v.srcIndex >= endF;
+    if (mirrored) p = ((int64_t)(2 * endF - 1) << 16) - p; // the frame it reads, playing backwards
+    int64_t q = toCopy(levelMap(s, to->level), toSample(levelMap(s, from.level), p));
+    if (q < 0) q = 0;
+    uint32_t endT = to->realLoopEnd();
+    int64_t endQ = (int64_t)endT << 16;
+    if (to->pingpong && keepDirection && mirrored) {
+        q = ((int64_t)(2 * endT - 1) << 16) - q;
+        if (q < endQ) q = endQ;
+    } else if (to->pingpong && endT > 0 && q >= endQ) {
+        q = endQ - 1;
+    }
+    int64_t loopEndQ = (int64_t)to->loopEnd << 16;
+    if (v.looping && to->loopEnd > to->loopStart && q >= loopEndQ) {
+        q = ((int64_t)to->loopStart << 16) + (q - loopEndQ) % ((int64_t)(to->loopEnd - to->loopStart) << 16);
+    }
+    v.smp = to;
+    v.lastHz = -1; // the step depends on the level
+    uint32_t idx = (uint32_t)(q >> 16);
+    if (!v.looping && idx >= to->length) { v.havePair = false; return; }
+    startVoiceAt(v, idx);
+    v.samplePos16 = (uint32_t)(q & 0xFFFF);
+}
+
+// startVoiceAt() for a frame of the sample, on whichever copy v reads.
+void ItPlayer::startVoiceAtSampleFrame(ItVoice& v, uint32_t frame) {
+    const ItSampleView& view = *static_cast<const ItSampleView*>(v.smp);
+    if (view.level == 0) { startVoiceAt(v, frame); return; }
+    int64_t q = toCopy(levelMap(_samples[view.sampleIndex], view.level), (int64_t)frame << 16);
+    if (q < 0) q = 0;
+    uint32_t end = view.pingpong ? view.realLoopEnd() : view.length;
+    uint32_t idx = (uint32_t)(q >> 16);
+    uint32_t frac = (uint32_t)(q & 0xFFFF);
+    if (idx >= end) { idx = end ? end - 1 : 0; frac = 0; }
+    startVoiceAt(v, idx);
+    v.samplePos16 = frac;
+}
+
 int ItPlayer::allocVoice(int forChannel) {
     for (int n = 0; n < MAX_VOICES; n++) {
         int i = SPREAD[n];
@@ -1055,15 +1502,22 @@ void ItPlayer::cutVoice(ItVoice& v) {
 void ItPlayer::voiceNoteOff(ItVoice& v) {
     if (v.channel < 0) return;
     const ItSample& s = _samples[v.sampleIndex];
-    if (!v.keyOff && v.smp == &s.sustain && s.hasSustain) {
-        // Leave the sustain loop: carry on from the same frame of the sample.
-        const ItSampleView& old = s.sustain;
-        uint32_t pos = v.srcIndex;
-        if (old.pingpong && pos >= old.realLoopEnd) pos = 2 * old.realLoopEnd - 1 - pos;
-        v.smp = &s.normal;
+    const ItSampleView* old = static_cast<const ItSampleView*>(v.smp);
+    if (!v.keyOff && old && old->sustainView) {
+        // Leave the sustain loop: carry on from the same frame of the sample
+        // (or copy), else from the same point of the sample.
+        const ItSampleView* to = levelView(v.sampleIndex, false, old->level);
         v.looping = s.normal.loopEnd > s.normal.loopStart;
-        v.srcIndex = pos;
-        if (!v.looping && pos >= s.normal.length) v.havePair = false;
+        if (to) {
+            uint32_t pos = v.srcIndex;
+            uint32_t end = old->realLoopEnd();
+            if (old->pingpong && pos >= end) pos = 2 * end - 1 - pos;
+            v.smp = to;
+            v.srcIndex = pos;
+            if (!v.looping && pos >= to->length) v.havePair = false;
+        } else {
+            moveVoice(v, &s.normal, false);
+        }
     }
     v.keyOff = true;
     if (_instrumentMode && v.instrument >= 1 && v.instrument <= MAX_INSTRUMENTS) {
@@ -1182,13 +1636,21 @@ void ItPlayer::triggerNote(int ch, uint8_t note, uint8_t instArg, bool tonePorta
     v.filt.y1 = v.filt.y2 = 0;
     setupFilter(v, 256, true);
     v.loudness = 64;
+    c.period = noteToPeriod(realNote, s.c5speed);
     v.smp = &s.sustain;
+    if (s.levels) {
+        // Start on the copy the note's pitch reads, so the first read is from it.
+        int level = levelFor(periodToHz(c.period, s.c5speed) / (float)SAMPLE_RATE, 0, s.levels);
+        for (; level > 0; level--) {
+            const ItSampleView* lv = levelView(si, s.sustain.sustainView, level);
+            if (lv) { v.smp = lv; break; }
+        }
+    }
     v.looping = s.sustain.loopEnd > s.sustain.loopStart;
     startVoiceAt(v, 0);
 
     c.sampleIndex = si;
     c.note = note;
-    c.period = noteToPeriod(realNote, s.c5speed);
     c.portaTarget = c.period;
     c.nnaOverride = 0xFF;
     if (in && in->usePan) { c.pan = (uint16_t)(in->defaultPan * 4); c.surround = false; }
@@ -1398,13 +1860,15 @@ void ItPlayer::handleCell(int ch, int note, uint8_t inst, uint8_t vol, uint8_t c
             if (param) c.offsetMem = param;
             uint32_t off = ((uint32_t)c.offsetHigh << 16) | ((uint32_t)c.offsetMem << 8);
             ItVoice& v = _voices[c.voice];
-            const ItSampleView* view = (const ItSampleView*)v.smp;
-            uint32_t end = view->realLoopEnd > 0 && v.looping ? view->realLoopEnd : _samples[v.sampleIndex].length;
+            const ItSample& s = _samples[v.sampleIndex];
+            // The current loop, in the sample's own frames.
+            const ItSampleView* view = static_cast<const ItSampleView*>(v.smp)->sustainView ? &s.sustain : &s.normal;
+            uint32_t end = view->realLoopEnd() > 0 && v.looping ? view->realLoopEnd() : s.length;
             // Past the end (or the loop end), as OpenMPT: new effects play
             // from the start, old effects clip to the end.
-            if (off < end) startVoiceAt(v, off);
+            if (off < end) startVoiceAtSampleFrame(v, off);
             else if (_oldEffects) {
-                if (v.looping) startVoiceAt(v, view->loopStart);
+                if (v.looping) startVoiceAtSampleFrame(v, view->loopStart);
                 else releaseVoice(v);
             }
         }
@@ -1865,7 +2329,24 @@ void ItPlayer::processVoices() {
         if (octaves != 0) hz *= powf(2.0f, octaves);
         if (hz != v.lastHz) {
             v.lastHz = hz;
-            v.sampleStep16 = hz > 0 ? stepForHz(hz) : 0;
+            int level = static_cast<const ItSampleView*>(v.smp)->level;
+            if (smp.levels && hz > 0) {
+                // Move to the copy this pitch reads, nearest it if that one can't play.
+                int cur = level;
+                int want = levelFor(hz / (float)SAMPLE_RATE, cur, smp.levels);
+                bool sus = static_cast<const ItSampleView*>(v.smp)->sustainView;
+                for (; want != cur; want += want > cur ? -1 : 1) {
+                    const ItSampleView* to = levelView(v.sampleIndex, sus, want);
+                    if (to) { moveVoice(v, to, true); level = want; break; }
+                }
+            }
+            float rate = hz;
+            if (level) {
+                // A copy plays num / den frames per sample frame.
+                LevelMap m = levelMap(smp, level);
+                rate = hz * (float)m.num / (float)m.den;
+            }
+            v.sampleStep16 = hz > 0 ? stepForHz(rate) : 0;
         }
     }
 #ifdef TRACKER_PROFILE

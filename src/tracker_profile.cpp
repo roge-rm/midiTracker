@@ -171,8 +171,8 @@ void report(const char* tag, const char* name, const TrackerPlayer::Profile& p, 
     Serial.printf("PROFILE %s %s: core0 load %d.%d%% (refills %d.%d%%, %lu), worst update %lu us, underrun samples %lu\n",
                   tag, name, load / 10, load % 10, refill / 10, refill % 10, (unsigned long)p.refills,
                   (unsigned long)p.worstUs, (unsigned long)underruns);
-    Serial.printf("PROFILE %s %s: reads %lu, seek %lu ms, read %lu ms, frames per refill %lu\n", tag, name,
-                  (unsigned long)p.reads, (unsigned long)(p.seekUs / 1000), (unsigned long)(p.readUs / 1000),
+    Serial.printf("PROFILE %s %s: reads %lu (%lu KB), seek %lu ms, read %lu ms, frames per refill %lu\n", tag, name,
+                  (unsigned long)p.reads, (unsigned long)(p.readBytes / 1024), (unsigned long)(p.seekUs / 1000), (unsigned long)(p.readUs / 1000),
                   (unsigned long)(p.refills ? p.refillFrames / p.refills : 0));
     Serial.printf("PROFILE %s %s: read times <200us %lu (%lu ms), <500 %lu (%lu), <1ms %lu (%lu), <2ms %lu (%lu), <5ms %lu (%lu), more %lu (%lu)\n", tag, name,
                   (unsigned long)p.hist[0], (unsigned long)p.histUs[0] / 1000, (unsigned long)p.hist[1], (unsigned long)p.histUs[1] / 1000,
@@ -200,6 +200,7 @@ void addProfile(TrackerPlayer::Profile& t, const TrackerPlayer::Profile& c) {
     if (c.worstUs > t.worstUs) t.worstUs = c.worstUs;
     t.ticks += c.ticks; t.voiceTicks += c.voiceTicks; t.bgTicks += c.bgTicks; t.q48Ticks += c.q48Ticks;
     t.q48BgTicks += c.q48BgTicks; t.zeroTicks += c.zeroTicks; t.up1Ticks += c.up1Ticks; t.up2Ticks += c.up2Ticks;
+    t.readBytes += c.readBytes;
     t.readsBg += c.readsBg; t.readsQ48 += c.readsQ48; t.readsUp1 += c.readsUp1; t.readsUp2 += c.readsUp2;
     if (c.peakVoices > t.peakVoices) t.peakVoices = c.peakVoices;
 }
@@ -387,11 +388,14 @@ void trackerProfileRun() {
             root.close();
             if (!found) { Serial.printf("PROFILE notfound %s\n", want); continue; }
             TrackerPlayer* p = makePlayer(path);
+            uint32_t loadMs = millis();
             if (!p->load(path)) {
                 Serial.printf("PROFILE loadfail %s: %s\n", path, p->errorMessage());
                 p->~TrackerPlayer();
                 continue;
             }
+            loadMs = millis() - loadMs;
+            Serial.printf("PROFILE load %s: %lu ms\n", want, (unsigned long)loadMs);
             {
                 FsFile f;
                 uint32_t b = 0, e = 0;

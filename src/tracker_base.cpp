@@ -154,6 +154,7 @@ const uint8_t* __not_in_flash_func(TrackerPlayer::readSampleBytes)(FsFile& f, ui
 #ifdef TRACKER_PROFILE
     uint32_t t0 = micros();
     profile.reads++;
+    profile.readBytes += len;
 #endif
     const SampleFile* sf = _sampleFiles[0].f == &f ? &_sampleFiles[0] : _sampleFiles[1].f == &f ? &_sampleFiles[1] : nullptr;
     const uint8_t* data = _rawScratch;

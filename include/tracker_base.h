@@ -129,7 +129,9 @@ public:
         // background), at 0, stepping faster than 1 and 2 source frames a frame.
         // reads* split the SD reads by the same groups.
         uint32_t ticks, voiceTicks, peakVoices, bgTicks, q48Ticks, q48BgTicks, zeroTicks, up1Ticks, up2Ticks;
-        uint32_t readsBg, readsQ48, readsUp1, readsUp2; };
+        uint32_t readsBg, readsQ48, readsUp1, readsUp2;
+        uint32_t readBytes; // bytes asked of the card
+    };
     static Profile profile;
 #endif
 

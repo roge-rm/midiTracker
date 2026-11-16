@@ -158,7 +158,7 @@ private:
     static const int CHUNK_FRAMES = 896;
 
     XmChannel _channels[MAX_CHANNELS];
-    int16_t _chunks[MAX_CHANNELS][CHUNK_FRAMES];
+    alignas(4) int16_t _chunks[MAX_CHANNELS][CHUNK_FRAMES]; // load() also keeps headers here
     TrackerTail _tails[MAX_CHANNELS];
     int16_t _tailPool[TAIL_POOL_FRAMES];
 
