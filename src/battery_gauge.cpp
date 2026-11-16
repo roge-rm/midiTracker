@@ -15,9 +15,6 @@ const int TABLE_N = sizeof(TABLE) / sizeof(TABLE[0]);
 // Smoothing weight in blocks: 120 x 500 ms is about 60 s.
 const uint32_t WEIGHT = 120;
 
-// On power, full from 4150 mV, back to charging below 4120 mV.
-const uint32_t FULL_ON_MV = 4150, FULL_OFF_MV = 4120;
-
 // The percent shown comes from a held voltage that follows the smoothed one
 // only when it moves HOLD_MV or more, past the noise left after smoothing.
 // It follows freely while the average settles, the first QUICK blocks.
@@ -48,14 +45,12 @@ void Gauge::feed(uint32_t mv, bool power) {
     smooth256 = (uint32_t)((int32_t)smooth256 + d / (int32_t)w);
     uint32_t s = smoothedMv();
 
-    // Charging is only known from USB power, so the voltage can't fool it.
-    if (!power) isFull = false;
-    else if (s >= FULL_ON_MV) isFull = true;
-    else if (s < FULL_OFF_MV) isFull = false;
-    isCharging = power && !isFull;
+    // Charging means on USB power. The charger holds the cell near 4.2 V
+    // until it's done, so the voltage can't tell full from charging.
+    isCharging = power;
 
     if (count < QUICK || s >= heldMv + HOLD_MV || s + HOLD_MV <= heldMv) heldMv = s;
-    shown = isFull ? 100 : lipoPercent(heldMv);
+    shown = lipoPercent(heldMv);
     if (shown <= LOW_ON) isLow = true;
     else if (shown > LOW_OFF) isLow = false;
 }

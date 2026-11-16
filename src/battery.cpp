@@ -14,12 +14,14 @@ uint32_t g_lastRaw = 0;     // ADC counts, average of the last block
 uint32_t g_lastMv = 0;      // mV of the last block
 
 // On external power: VBUS sense when the board has it, otherwise a USB
-// host. A charger with no data lines doesn't count without VBUS sense.
+// host that is talking to us. A charger with no data lines doesn't count
+// without VBUS sense. Unplugging leaves the device mounted, but the bus
+// goes idle and TinyUSB reports it suspended within a few ms.
 bool onPower() {
 #ifdef BATTERY_VBUS_PIN
     return digitalRead(BATTERY_VBUS_PIN) != 0;
 #else
-    return TinyUSBDevice.mounted();
+    return TinyUSBDevice.mounted() && !TinyUSBDevice.suspended();
 #endif
 }
 
@@ -38,10 +40,10 @@ void diagPrint(uint32_t now) {
     g_diagAtMs = now;
     int up = readPin24(true);
     int down = readPin24(false);
-    Serial.printf("raw %lu mv %lu smooth %lu pct %u power %d chg %d full %d low %d gp24 down %d up %d BATT\n",
+    Serial.printf("raw %lu mv %lu smooth %lu pct %u power %d chg %d low %d gp24 down %d up %d BATT\n",
                   (unsigned long)g_lastRaw, (unsigned long)g_lastMv,
                   (unsigned long)g_gauge.smoothedMv(), g_gauge.percent(), onPower() ? 1 : 0,
-                  g_gauge.charging() ? 1 : 0, g_gauge.full() ? 1 : 0, g_gauge.low() ? 1 : 0,
+                  g_gauge.charging() ? 1 : 0, g_gauge.low() ? 1 : 0,
                   down, up);
 }
 #endif

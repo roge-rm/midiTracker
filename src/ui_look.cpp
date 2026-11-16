@@ -262,7 +262,9 @@ uint32_t g_battKey = 0xFFFFFFFF;
 const int PAD = 6;
 const int LED = 4;
 const int LED_Y = (STATUS_H - LED) / 2;
-const int BATT_W = 14, BATT_H = 7;
+// Bolt (5 px), a gap, then the battery (14 px with its nub).
+const int BATT_W = 20, BATT_H = 7;
+const int BOLT_W = 6;
 const int BATT_Y = (STATUS_H - BATT_H) / 2;
 
 const PixGlyph* glyphFor(const PixFont& f, unsigned char c) {
@@ -294,15 +296,22 @@ uint32_t batteryKey(int pct, bool charging, bool low, int& fillW, uint16_t& fill
     fillW = (8 * pct + 50) / 100;
     if (pct > 0 && fillW == 0) fillW = 1;
     fill = COLOR_TEXT;
-    if (charging) fill = COLOR_WAV;
-    else if (low) fill = COLOR_ERROR;
-    return ((uint32_t)fill << 8) | (uint32_t)fillW;
+    if (low && !charging) fill = COLOR_ERROR;
+    return (charging ? 1u << 31 : 0) | ((uint32_t)fill << 8) | (uint32_t)fillW;
 }
 
 void drawBattery(TFT_eSPI& g, int x, int y) {
     int fillW;
     uint16_t fill;
     g_battKey = batteryKey(g_battPct, g_battCharging, g_battLow, fillW, fill);
+    // A small green bolt to the left while on USB power.
+    if (g_battCharging) {
+        static const uint8_t BOLT[BATT_H] = {0x03, 0x06, 0x0C, 0x1F, 0x06, 0x0C, 0x18};
+        for (int r = 0; r < BATT_H; r++)
+            for (int c = 0; c < 5; c++)
+                if (BOLT[r] & (0x10 >> c)) g.drawPixel(x + c, y + r, COLOR_WAV);
+    }
+    x += BOLT_W;
     g.drawRect(x, y, 12, BATT_H, COLOR_TEXT);
     g.fillRect(x + 12, y + 2, 2, 3, COLOR_TEXT);
     if (fillW > 0) g.fillRect(x + 2, y + 2, fillW, BATT_H - 4, fill);

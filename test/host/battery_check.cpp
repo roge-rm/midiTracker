@@ -21,7 +21,7 @@ struct Sim {
     Gauge g;
     uint32_t t = 0;
     int slow = 0;
-    int changes = 0, chgFlips = 0, fullFlips = 0;
+    int changes = 0, chgFlips = 0;
     uint32_t minS = 99999, maxS = 0;
     void block(double mv, bool power) {
         uint32_t sum = 0;
@@ -31,12 +31,11 @@ struct Sim {
             t += SAMPLE_MS;
         }
         int p = g.percent();
-        bool c = g.charging(), f = g.full();
+        bool c = g.charging();
         g.feed(sum / BLOCK_READS, power);
         if (g.count > 1) {
             if (p != g.percent()) changes++;
             if (c != g.charging()) chgFlips++;
-            if (f != g.full()) fullFlips++;
         }
     }
     void track() {
@@ -99,14 +98,14 @@ int main() {
             if (v > 4200) v = 4200;
             s.block(v, true);
         }
-        CHECK(s.g.full() && !s.g.charging(), "charged: full %d charging %d", s.g.full(), s.g.charging());
-        CHECK(s.g.percent() == 100, "charged: %d%%", s.g.percent());
-        CHECK(s.chgFlips == 2 && s.fullFlips == 1, "charged: %d charging flips, %d full flips", s.chgFlips, s.fullFlips);
+        CHECK(s.g.charging(), "charged: still on power, not charging");
+        CHECK(s.g.percent() >= 98, "charged: %d%%", s.g.percent());
+        CHECK(s.chgFlips == 1, "charged: %d charging flips", s.chgFlips);
 
         // Unplugged when full, easing to 4.12 V: no charging, percent from voltage.
         for (uint32_t i = 0; i < 10 * PER_MIN; i++) {
             s.block(4160 - (i < 5 * PER_MIN ? 40.0 * i / (5 * PER_MIN) : 40.0), false);
-            CHECK(!s.g.charging() && !s.g.full(), "unplugged: charging %d full %d", s.g.charging(), s.g.full());
+            CHECK(!s.g.charging(), "unplugged: charging %d", s.g.charging());
         }
         CHECK(s.g.percent() >= 90 && s.g.percent() <= 95, "unplugged: %d%%", s.g.percent());
         printf("charge and unplug: ends %d%%\n", s.g.percent());
@@ -116,7 +115,7 @@ int main() {
     {
         Sim s;
         for (uint32_t i = 0; i < 60 * PER_MIN; i++) s.block(4140, true);
-        CHECK(s.fullFlips <= 1, "edge: full flipped %d times", s.fullFlips);
+        CHECK(s.chgFlips == 0, "edge: charging flipped %d times", s.chgFlips);
     }
 
     printf(g_fail ? "battery-check: %d failed\n" : "battery-check: ok\n", g_fail);

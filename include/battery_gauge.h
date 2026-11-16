@@ -20,7 +20,6 @@ struct Gauge {
     uint32_t smoothedMv() const { return (smooth256 + 128) >> 8; }
     uint8_t percent() const { return shown; }
     bool charging() const { return isCharging; }
-    bool full() const { return isFull; }
     bool low() const { return isLow; }
 
     // Exponential average in mV * 256, about 60 s. count ramps the weight
@@ -30,7 +29,6 @@ struct Gauge {
     uint32_t heldMv = 0;   // voltage the percent shown comes from
     uint8_t shown = 100;
     bool isCharging = false;
-    bool isFull = false;
     bool isLow = false;
 };
 
