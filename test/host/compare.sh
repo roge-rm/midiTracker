@@ -2,7 +2,7 @@
 # compare.sh <baseline> <current>: byte-compares each render, prints the first
 # differing frame and how many frames differ.
 base=$1; cur=$2; fail=0
-for b in "$base"/*.raw; do
+for b in "$base"/*.${EXT:-raw}; do
     c="$cur/$(basename "$b")"
     if cmp -s "$b" "$c"; then
         echo "same     $(basename "$b")"

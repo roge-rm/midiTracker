@@ -14,6 +14,11 @@ public:
     FsFile() {}
     FsFile(const FsFile&) = delete;
     FsFile& operator=(const FsFile&) = delete;
+    FsFile(FsFile&& o) { *this = static_cast<FsFile&&>(o); }
+    FsFile& operator=(FsFile&& o) {
+        if (this != &o) { close(); _f = o._f; _pos = o._pos; _size = o._size; o._f = nullptr; o._pos = o._size = 0; }
+        return *this;
+    }
     ~FsFile() { close(); }
 
     bool open(const char* path, int flags = O_RDONLY);
@@ -21,6 +26,7 @@ public:
     explicit operator bool() const { return _f != nullptr; }
     bool isOpen() const { return _f != nullptr; }
     int read(void* buf, size_t n);
+    int read() { uint8_t b; return read(&b, 1) == 1 ? b : -1; }
     bool seekSet(uint64_t pos);
     bool seekCur(int64_t off) { return seekSet((uint64_t)((int64_t)_pos + off)); }
     uint64_t curPosition() const { return _pos; }

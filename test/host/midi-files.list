@@ -1,0 +1,9 @@
+# MIDI test files for the render harness, one path per line (read-only, not in the repo).
+# make midi-baseline copies them into build/host/midi/.
+/media/dan/Windows/Users/dan/sync/games/openttd-jgrpp/content_download/baseset/openmsx-0.3.1/big_man_boogie_redfarn.mid
+/media/dan/Windows/Users/dan/sync/games/openttd-jgrpp/content_download/baseset/openmsx-0.3.1/busy_schedule.mid
+/media/dan/Windows/Users/dan/sync/games/openttd-jgrpp/content_download/baseset/openmsx-0.3.1/chemistry_lab.mid
+/media/dan/Windows/Users/dan/sync/games/openttd-jgrpp/content_download/baseset/openmsx-0.3.1/flying_scotsman.mid
+/media/dan/Windows/Users/dan/sync/games/openttd-jgrpp/content_download/baseset/openmsx-0.3.1/harp_harmony.mid
+/media/dan/Windows/Users/dan/sync/games/openttd-jgrpp/content_download/baseset/openmsx-0.3.1/ttsong_iii_imuh3.mid
+/media/dan/Windows/Users/dan/sync/games/openttd-jgrpp/content_download/baseset/openmsx-0.3.1/wood_whistles.mid

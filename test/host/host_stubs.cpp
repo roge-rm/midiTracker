@@ -9,6 +9,7 @@
 #include <string.h>
 #include "sd_card.h"
 
+#ifndef HOST_MIDI // the MIDI target has its own clock and the real synth, see midi_stubs.cpp
 HostSerial Serial;
 
 static auto g_start = std::chrono::steady_clock::now();
@@ -16,6 +17,7 @@ uint32_t micros() {
     return (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - g_start).count();
 }
 uint32_t millis() { return micros() / 1000; }
+#endif
 
 unsigned long FsFile::readCalls = 0;
 
@@ -96,6 +98,7 @@ bool FsFile::seekSet(uint64_t pos) {
     return true;
 }
 
+#ifndef HOST_MIDI
 namespace {
 const size_t RING_FRAMES = 8192; // same as the firmware's WAV ring
 std::vector<int16_t> g_out;
@@ -126,5 +129,6 @@ void drain() { g_pending = 0; }
 size_t framesCaptured() { return g_out.size() / 2; }
 const int16_t* data() { return g_out.data(); }
 }
+#endif
 
 bool sdOpenPath(FsFile& f, const char* path, int flags) { return f.open(path, flags); }
