@@ -13,6 +13,8 @@
 // (see Synth::ProfileTrace) prints every 2 s and nothing else runs.
 // PROFILE_WAV_FILES (same format, default "") names .wav files to play
 // through WavPlayer; those print core 0 load, card reads and underruns.
+// PROFILE_WAV_DIR (e.g. "/wav") instead profiles up to 16 .wav files found
+// in that folder, each preceded by a line with its format.
 // With -D PROFILE_SAVER the trackers play with the screensaver's Pattern
 // rain drawing, and each report adds the share of real time it took.
 #ifdef TRACKER_PROFILE
@@ -49,6 +51,9 @@
 #endif
 #ifndef PROFILE_WAV_FILES
 #define PROFILE_WAV_FILES ""
+#endif
+#ifndef PROFILE_WAV_DIR
+#define PROFILE_WAV_DIR ""
 #endif
 #ifndef PROFILE_SECONDS
 #define PROFILE_SECONDS 30
@@ -338,6 +343,8 @@ void profileMidi(const char* want) {
 
 // Plays a .wav like the file player does (update() every loop) and
 // prints core 0 load, card reads and underruns per 5 s and for the run.
+void profileWavPath(const char* path, const char* want, bool showFormat);
+
 void profileWav(const char* want) {
     char path[256] = "";
     FsFile root;
@@ -345,6 +352,46 @@ void profileWav(const char* want) {
     bool found = findFile(root, path, sizeof(path), want, 0, FIND_WAV);
     root.close();
     if (!found) { Serial.printf("PROFILE notfound %s\n", want); return; }
+    profileWavPath(path, want, false);
+}
+
+// The format tag from the file's fmt chunk, 0 if it can't be read.
+uint16_t wavFormatTag(const char* path) {
+    FsFile f;
+    if (!f.open(path, O_RDONLY)) return 0;
+    uint8_t h[12];
+    uint16_t tag = 0;
+    if (f.read(h, 12) == 12) {
+        for (int n = 0; n < 64; n++) {
+            uint8_t c[8];
+            if (f.read(c, 8) != 8) break;
+            uint32_t len = c[4] | (c[5] << 8) | (c[6] << 16) | ((uint32_t)c[7] << 24);
+            if (!memcmp(c, "fmt ", 4)) {
+                uint8_t t[2];
+                if (f.read(t, 2) == 2) tag = t[0] | (t[1] << 8);
+                break;
+            }
+            if (!f.seekSet(f.curPosition() + len + (len & 1))) break;
+        }
+    }
+    f.close();
+    return tag;
+}
+
+void profileWavPath(const char* path, const char* want, bool showFormat) {
+    if (showFormat) {
+        uint16_t tag = wavFormatTag(path);
+        const char* tn = tag == 1 ? "PCM" : tag == 0x11 ? "ADPCM" : tag == 3 ? "float" : tag == 0xFFFE ? "EXTENSIBLE" : "other";
+        static WavPlayer probe;
+        if (probe.load(path)) {
+            Serial.printf("PROFILE file %s: %s (tag 0x%04X), %lu Hz, %d ch, %d bit, %lu ms\n", path, tn, tag,
+                          (unsigned long)probe.sampleRate(), probe.channels(), probe.bitsPerSample(), (unsigned long)probe.totalMs());
+        } else {
+            Serial.printf("PROFILE file %s: %s (tag 0x%04X), load error: %s\n", path, tn, tag, probe.errorMessage());
+            return;
+        }
+        probe.stop();
+    }
     static WavPlayer p;
     if (!p.load(path)) {
         Serial.printf("PROFILE loadfail %s: %s\n", path, p.errorMessage());
@@ -393,6 +440,28 @@ void profileWav(const char* want) {
     // The elapsed time should move with real time when nothing underran.
     Serial.printf("PROFILE RESULT %s: elapsed moved %lu ms in %lu ms\n", want, (unsigned long)(p.elapsedMs() - e0), (unsigned long)(us / 1000));
     p.stop();
+}
+
+// Profiles every .wav directly in PROFILE_WAV_DIR, up to 16.
+void profileWavDir() {
+    static char names[16][48];
+    int count = 0;
+    FsFile dir;
+    if (!dir.open(PROFILE_WAV_DIR)) { Serial.printf("PROFILE notfound %s\n", PROFILE_WAV_DIR); return; }
+    FsFile e;
+    while (count < 16 && e.openNext(&dir, O_RDONLY)) {
+        char* name = g_name;
+        e.getName(name, sizeof(g_name));
+        if (!e.isDir() && name[0] != '.' && isWav(name) && strlen(name) < sizeof(names[0])) strcpy(names[count++], name);
+        e.close();
+    }
+    dir.close();
+    Serial.printf("PROFILE wav dir %s: %d files\n", PROFILE_WAV_DIR, count);
+    for (int i = 0; i < count; i++) {
+        char path[128];
+        snprintf(path, sizeof(path), "%s/%s", PROFILE_WAV_DIR, names[i]);
+        profileWavPath(path, names[i], true);
+    }
 }
 
 } // namespace
@@ -454,6 +523,7 @@ void trackerProfileRun() {
             w += n + (bar ? 1 : 0);
             profileWav(want);
         }
+        if (PROFILE_WAV_DIR[0]) profileWavDir();
         const char* w = list;
         while (*w) {
             const char* bar = strchr(w, '|');
