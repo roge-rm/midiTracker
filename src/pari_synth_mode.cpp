@@ -30,6 +30,7 @@ const uint8_t PERCUSSION_CHANNEL = 9;
 enum Screen { SCREEN_PLAY, SCREEN_EDIT_OVERLAY };
 Screen screen = SCREEN_PLAY;
 bool needsRedraw = true;
+bool editorClosed = false; // the grid comes back with an out transition
 
 // Percent, see Synth::setVolume() -- mirrored here so PariSynthGrid has
 // somewhere to write it and the UI can show it, same "each top-level mode
@@ -130,6 +131,7 @@ void begin() {
 
 void enter() {
     screen = SCREEN_PLAY;
+    editorClosed = false;
     // Fresh session: reset first (same as a fresh file-playback load(),
     // see synth.h's resetPrograms() comment), then lay down
     // DEFAULT_CHANNEL_FAMILY's own varied starting point instead of
@@ -178,6 +180,7 @@ bool update() {
         if (SynthEditor::update()) {
             screen = SCREEN_PLAY;
             needsRedraw = true;
+            editorClosed = true;
         }
         return false; // the overlay itself never exits this whole mode
     }
@@ -203,6 +206,8 @@ bool update() {
         needsRedraw = false;
         cellDirty = 0;
         uint16_t active = MidiOutput::activeChannelMask();
+        if (editorClosed) Ui::transitionNext(Ui::TRANSITION_OUT);
+        editorClosed = false;
         Ui::transitionDraw([&] {
             Ui::drawPariSynthPlay(PariSynthGrid::selectedChannel(), active);
             if (PariSynthGrid::volumeOverlayVisible()) Ui::updatePariSynthVolumeOverlay(volume);
@@ -226,8 +231,11 @@ bool update() {
     return false;
 }
 
-bool screensaverAllowed() { return screen == SCREEN_PLAY; }
+bool screensaverAllowed() { return screen == SCREEN_PLAY || SynthEditor::screensaverAllowed(); }
 
-void redrawScreen() { needsRedraw = true; }
+void redrawScreen() {
+    if (screen == SCREEN_EDIT_OVERLAY) SynthEditor::redrawScreen();
+    else needsRedraw = true;
+}
 
 } // namespace PariSynthMode

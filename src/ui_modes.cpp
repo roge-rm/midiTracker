@@ -1047,4 +1047,274 @@ void synthVolume(int volume) {
 
 uint16_t synthDrawnActiveMask() { return g_syn.activeDrawn; }
 
+
+// =============================================================================
+// synth editor
+// =============================================================================
+
+namespace {
+
+// ---- picker -------------------------------------------------------------
+
+void pickRow(const char* const* labels, const uint8_t* families, int count, int idx, int scrollOffset, bool selected) {
+    int row = idx - scrollOffset;
+    if (row < 0 || row >= SYNTH_PICK_ROWS) return;
+    int y = LIST_TOP + row * LIST_ROW_H;
+    if (idx < 0 || idx >= count) {
+        band(0, y, LIST_W, LIST_ROW_H, COLOR_BG, [](TFT_eSPI&) {});
+        return;
+    }
+    listRow(y, LIST_W, selected, [&](TFT_eSPI& g, uint16_t) {
+        int fam = families[idx] > 16 ? 16 : families[idx];
+        Icon icon = {10, 10, FAMILY_ICONS[fam]};
+        drawIcon(g, icon, 10, y + 4, selected ? COLOR_SELECT : (fam == 16 ? COLOR_MIDI : COLOR_DIM));
+        char buf[32];
+        fitText(FONT_TEXT, labels[idx], LIST_W - 34, buf, sizeof(buf));
+        drawText(g, FONT_TEXT, buf, 26, rowTextY(y), COLOR_TEXT);
+    });
+}
+
+// ---- field editor, 320x240 -------------------------------------------------
+const int SE_Y0 = HEADER_H + 4;
+const int SE_ROW_W = 200;
+const int SE_VALUE_X = 90;
+const int SE_BAR_X = 136, SE_BAR_W = 56, SE_BAR_H = 4;
+const int SE_PANEL_X = SE_ROW_W + 4, SE_PANEL_W = SCREEN_W - 4 - SE_PANEL_X;
+const int SE_ENV_Y = SE_Y0, SE_ENV_H = 98;
+const int SE_WAVE_Y = SE_ENV_Y + SE_ENV_H + 4;
+const int SE_WAVE_H = SYNTH_EDIT_MAX_ROWS * LIST_ROW_H - SE_ENV_H - 4;
+const int SE_GX = SE_PANEL_X + 6, SE_GW = SE_PANEL_W - 12; // graph columns in both boxes
+const uint16_t ENV_FILL = rgb(0x1A212B);
+
+bool isEnvPart(SynthEditPart p) { return p >= PART_ATTACK && p <= PART_PITCH; }
+
+void seRow(const SynthEditView& v, int i, bool selected) {
+    int y = SE_Y0 + i * LIST_ROW_H;
+    if (i < 0 || i >= v.count) {
+        band(0, y, SE_ROW_W, LIST_ROW_H, COLOR_BG, [](TFT_eSPI&) {});
+        return;
+    }
+    const SynthEditRow& r = v.rows[i];
+    listRow(y, SE_ROW_W, selected, [&](TFT_eSPI& g, uint16_t) {
+        int ty = rowTextY(y);
+        drawText(g, FONT_TEXT, r.label, 10, ty, COLOR_TEXT);
+        drawText(g, FONT_TEXT, r.value, SE_VALUE_X, ty, selected ? COLOR_SELECT : COLOR_DIM);
+        if (r.fill >= 0) {
+            int by = y + (LIST_ROW_H - SE_BAR_H) / 2;
+            int f = r.fill > 1000 ? 1000 : r.fill;
+            g.fillRect(SE_BAR_X, by, SE_BAR_W, SE_BAR_H, UNLIT);
+            g.fillRect(SE_BAR_X, by, f * SE_BAR_W / 1000, SE_BAR_H, selected ? COLOR_SELECT : COLOR_DIM);
+        }
+    });
+}
+
+// A vertical run joining the last column's y to this one's, so steep edges
+// stay unbroken.
+void plotCol(TFT_eSPI& g, int x, int prevY, int y, uint16_t c) {
+    int lo = prevY < y ? prevY : y, hi = prevY < y ? y : prevY;
+    g.drawFastVLine(x, lo, hi - lo + 1, c);
+}
+
+int lerp(int x, int x0, int x1, int y0, int y1) {
+    if (x1 <= x0) return y1;
+    return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+}
+
+int isqrt(uint32_t v) {
+    uint32_t r = 0;
+    for (uint32_t b = 1u << 15; b; b >>= 1)
+        if ((r + b) * (r + b) <= v) r += b;
+    return (int)r;
+}
+
+// A melodic envelope segment's width: 8 px, plus up to 22 more on a square
+// root scale so short times still show.
+int segW(uint16_t samples) { return 8 + isqrt(samples) * 22 / 256; }
+
+void paintMelodicEnv(TFT_eSPI& g, const SynthEditView& v, SynthEditPart focus, int top, int bottom) {
+    int gh = bottom - top;
+    int a = segW(v.attack), d = segW(v.decay), r = segW(v.release);
+    int x0 = SE_GX, x1 = x0 + a, x2 = x1 + d, x4 = SE_GX + SE_GW, x3 = x4 - r;
+    int susY = bottom - (v.sustain > 100 ? 100 : v.sustain) * gh / 100;
+    const int xs[5] = {x0, x1, x2, x3, x4};
+    const int ys[5] = {bottom, top, susY, susY, bottom};
+    int f = focus >= PART_ATTACK && focus <= PART_RELEASE ? focus - PART_ATTACK : -1;
+    uint16_t focusFill = blend(COLOR_SELECT, COLOR_BG, 56);
+    for (int k = 1; k < 4; k++)
+        for (int y = top; y < bottom; y += 2) g.drawPixel(xs[k], y, TICK_BAR);
+    int prevY = bottom, seg = 0;
+    for (int x = x0; x < x4; x++) {
+        while (seg < 3 && x >= xs[seg + 1]) seg++;
+        int y = lerp(x, xs[seg], xs[seg + 1], ys[seg], ys[seg + 1]);
+        if (y < bottom) g.drawFastVLine(x, y + 1, bottom - y, seg == f ? focusFill : ENV_FILL);
+        plotCol(g, x, x == x0 ? y : prevY, y, seg == f ? COLOR_SELECT : COLOR_TEXT);
+        prevY = y;
+    }
+    const char* names[4] = {"A", "D", "S", "R"};
+    for (int k = 0; k < 4; k++) {
+        int cx = (xs[k] + xs[k + 1]) / 2;
+        drawTextCentre(g, FONT_LABEL, names[k], cx + 1, bottom + 3, k == f ? COLOR_SELECT : COLOR_DIM);
+    }
+}
+
+void paintDrumEnv(TFT_eSPI& g, const SynthEditView& v, SynthEditPart focus, int top, int bottom) {
+    int gh = bottom - top;
+    uint32_t span = v.decay > v.dropTime ? v.decay : v.dropTime;
+    if (span < 441) span = 441;
+    int ampEnd = SE_GX + (int)((uint32_t)v.decay * SE_GW / span);
+    int dropEnd = SE_GX + (int)((uint32_t)v.dropTime * SE_GW / span);
+    if (ampEnd <= SE_GX) ampEnd = SE_GX + 1;
+    int yFrom = bottom - (v.pitchFrom > 1000 ? 1000 : v.pitchFrom) * gh / 1000;
+    int yTo = bottom - (v.pitchTo > 1000 ? 1000 : v.pitchTo) * gh / 1000;
+    bool ampF = focus == PART_AMP, pitchF = focus == PART_PITCH;
+    uint16_t ampLine = ampF ? COLOR_SELECT : COLOR_TEXT;
+    uint16_t pitchLine = pitchF ? COLOR_SELECT : COLOR_MIDI;
+    uint16_t fill = ampF ? blend(COLOR_SELECT, COLOR_BG, 56) : ENV_FILL;
+    int prevA = top, prevP = yFrom;
+    for (int x = SE_GX; x < SE_GX + SE_GW; x++) {
+        int ya = x < ampEnd ? lerp(x, SE_GX, ampEnd, top, bottom) : bottom;
+        if (ya < bottom) g.drawFastVLine(x, ya + 1, bottom - ya, fill);
+        plotCol(g, x, x == SE_GX ? ya : prevA, ya, ampLine);
+        prevA = ya;
+    }
+    // Pitch is drawn while the drum sounds, over the amp line.
+    for (int x = SE_GX; x < ampEnd; x++) {
+        int yp = x < dropEnd ? lerp(x, SE_GX, dropEnd, yFrom, yTo) : yTo;
+        plotCol(g, x, x == SE_GX ? yp : prevP, yp, pitchLine);
+        prevP = yp;
+    }
+}
+
+void seEnv(const SynthEditView& v, SynthEditPart focus) {
+    int x = SE_PANEL_X, y = SE_ENV_Y;
+    band(x, y, SE_PANEL_W, SE_ENV_H, COLOR_BG, [&](TFT_eSPI& g) {
+        g.drawRect(x, y, SE_PANEL_W, SE_ENV_H, COLOR_RULE);
+        int top = y + 17, bottom = y + SE_ENV_H - 10;
+        g.drawFastHLine(SE_GX, bottom, SE_GW, COLOR_RULE);
+        if (v.drum) {
+            int lx = drawText(g, FONT_LABEL, "AMP", x + 6, y + 6, focus == PART_AMP ? COLOR_SELECT : COLOR_TEXT);
+            drawText(g, FONT_LABEL, "PITCH", lx + 6, y + 6, focus == PART_PITCH ? COLOR_SELECT : COLOR_MIDI);
+            paintDrumEnv(g, v, focus, top, bottom);
+        } else {
+            drawText(g, FONT_LABEL, "ENVELOPE", x + 6, y + 6, COLOR_DIM);
+            paintMelodicEnv(g, v, focus, top, bottom);
+        }
+    });
+}
+
+// Two cycles of the wave, -1000 to 1000.
+int waveAt(int wave, int x, uint32_t& seed) {
+    const int P = SE_GW / 2, H = P / 2;
+    int p = x % P;
+    switch (wave) {
+        case 0: { // sine, as two parabolas
+            int q = p < H ? p : p - H;
+            int s = 4000 * q * (H - q) / (H * H);
+            return p < H ? s : -s;
+        }
+        case 1: return p < H ? -1000 + p * 2000 / H : 1000 - (p - H) * 2000 / H;
+        case 2: return -1000 + p * 2000 / P;
+        case 3: return p < H ? 1000 : -1000;
+        default:
+            if ((x & 1) == 0) seed = seed * 1103515245u + 12345u;
+            return (int)((seed >> 16) % 2001) - 1000;
+    }
+}
+
+void seWave(const SynthEditView& v, SynthEditPart focus) {
+    int x = SE_PANEL_X, y = SE_WAVE_Y;
+    band(x, y, SE_PANEL_W, SE_WAVE_H, COLOR_BG, [&](TFT_eSPI& g) {
+        g.drawRect(x, y, SE_PANEL_W, SE_WAVE_H, COLOR_RULE);
+        bool f = focus == PART_WAVE;
+        drawText(g, FONT_LABEL, "WAVE", x + 6, y + 6, COLOR_DIM);
+        int mid = y + 17 + (SE_WAVE_H - 24) / 2, amp = (SE_WAVE_H - 26) / 2;
+        for (int cx = SE_GX; cx < SE_GX + SE_GW; cx += 2) g.drawPixel(cx, mid, TICK_BAR);
+        uint32_t seed = 7; // same noise on every draw
+        int prevY = mid;
+        for (int cx = 0; cx < SE_GW; cx++) {
+            int yy = mid - waveAt(v.wave, cx, seed) * amp / 1000;
+            plotCol(g, SE_GX + cx, cx == 0 ? yy : prevY, yy, f ? COLOR_SELECT : COLOR_TEXT);
+            prevY = yy;
+        }
+    });
+}
+
+SynthEditPart partAt(const SynthEditView& v, int i) { return i >= 0 && i < v.count ? v.rows[i].part : PART_NONE; }
+
+void seFooter() {
+    static const Key r1[] = {{"UD", "move", TONE_TEXT}, {"LEFT", "back", TONE_TEXT}};
+    static const Key r2[] = {{"EDIT+LR", "change", TONE_SELECT}, {"EDIT+UD", "fast", TONE_TEXT}};
+    drawKeyFooter(r1, 2, r2, 2);
+}
+
+} // namespace
+
+void synthPickDraw(const char* const* labels, const uint8_t* families, int count, int cursor, int scrollOffset) {
+    g_looperUp = false;
+    g_synUp = false;
+    Status st;
+    st.icon = &ICON_PARISYNTH;
+    st.iconColor = COLOR_MIDI;
+    st.title = "INSTRUMENTS";
+    drawStatus(st);
+    TFT_eSPI& s = screen();
+    s.fillRect(0, HEADER_H, SCREEN_W, LIST_TOP - HEADER_H, COLOR_BG);
+    for (int r = 0; r < SYNTH_PICK_ROWS; r++) {
+        int idx = scrollOffset + r;
+        pickRow(labels, families, count, idx, scrollOffset, idx == cursor);
+    }
+    int rowsBottom = LIST_TOP + SYNTH_PICK_ROWS * LIST_ROW_H;
+    s.fillRect(0, rowsBottom, SCREEN_W, SCREEN_H - FOOTER_H1 - rowsBottom, COLOR_BG); // one-row footer
+    drawScrollbar(LIST_TOP, SYNTH_PICK_ROWS, count, scrollOffset);
+    static const Key keys[] = {{"UD", "move", TONE_TEXT}, {"RIGHT/ENT", "open", TONE_SELECT}, {"LEFT", "back", TONE_TEXT}};
+    drawKeyFooter(keys, 3);
+}
+
+void synthPickCursor(const char* const* labels, const uint8_t* families, int count, int prevCursor,
+                     int newCursor, int scrollOffset) {
+    pickRow(labels, families, count, prevCursor, scrollOffset, false);
+    pickRow(labels, families, count, newCursor, scrollOffset, true);
+}
+
+void synthEditDraw(const SynthEditView& v, int cursor) {
+    g_looperUp = false;
+    g_synUp = false;
+    int fam = v.family > 16 ? 16 : v.family;
+    Icon icon = {10, 10, FAMILY_ICONS[fam]};
+    Status st;
+    st.icon = &icon;
+    st.iconColor = COLOR_MIDI;
+    st.title = "EDIT";
+    st.textLast = v.name;
+    drawStatus(st);
+    TFT_eSPI& s = screen();
+    int rowsBottom = SE_Y0 + SYNTH_EDIT_MAX_ROWS * LIST_ROW_H;
+    s.fillRect(0, HEADER_H, SCREEN_W, SE_Y0 - HEADER_H, COLOR_BG);
+    s.fillRect(SE_ROW_W, SE_Y0, SE_PANEL_X - SE_ROW_W, rowsBottom - SE_Y0, COLOR_BG);
+    s.fillRect(SE_PANEL_X + SE_PANEL_W, SE_Y0, SCREEN_W - SE_PANEL_X - SE_PANEL_W, rowsBottom - SE_Y0, COLOR_BG);
+    s.fillRect(SE_PANEL_X, SE_ENV_Y + SE_ENV_H, SE_PANEL_W, SE_WAVE_Y - SE_ENV_Y - SE_ENV_H, COLOR_BG);
+    s.fillRect(0, rowsBottom, SCREEN_W, BODY_BOTTOM - rowsBottom, COLOR_BG);
+    for (int i = 0; i < SYNTH_EDIT_MAX_ROWS; i++) seRow(v, i, i == cursor);
+    SynthEditPart focus = partAt(v, cursor);
+    seEnv(v, focus);
+    seWave(v, focus);
+    seFooter();
+}
+
+void synthEditCursor(const SynthEditView& v, int prevCursor, int newCursor) {
+    seRow(v, prevCursor, false);
+    seRow(v, newCursor, true);
+    SynthEditPart a = partAt(v, prevCursor), b = partAt(v, newCursor);
+    if (a == b) return;
+    if (isEnvPart(a) || isEnvPart(b)) seEnv(v, b);
+    if (a == PART_WAVE || b == PART_WAVE) seWave(v, b);
+}
+
+void synthEditValue(const SynthEditView& v, int idx) {
+    seRow(v, idx, true);
+    SynthEditPart p = partAt(v, idx);
+    if (isEnvPart(p)) seEnv(v, p);
+    else if (p == PART_WAVE) seWave(v, p);
+}
+
 } // namespace UiModes

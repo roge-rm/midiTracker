@@ -251,6 +251,7 @@ bool altUsedAsModifier = false;
 // FilePlayerMode's existing MIDI Thru/input handler stays registered
 // throughout (see APP_SYNTH_EDIT's own enum comment).
 bool synthEditShowingGrid = false; // false once the field editor (SynthEditor) has draw/input focus
+bool synthEditorClosed = false;    // the grid comes back with an out transition
 
 // -- shared name-entry editor state (New Recording / New Folder / Rename) --
 NamePurpose namePurpose = NAME_NEW_RECORDING;
@@ -2097,8 +2098,9 @@ bool update() {
                 // itself every call (see synth_editor.h) -- resume the
                 // channel grid once it reports done, same wrapping
                 // PariSynthMode's own play screen does around SynthEditor.
-                if (SynthEditor::update()) {
+                if (SynthEditor::update(pumpPlayer)) {
                     synthEditShowingGrid = true;
+                    synthEditorClosed = true;
                     needsRedraw = true;
                 }
             }
@@ -2355,8 +2357,14 @@ bool update() {
                 // share one default (see drawPariSynthPlay()'s own
                 // comment), which is itself what keeps the footer from
                 // silently drifting out of sync between them again.
-                Ui::drawPariSynthPlay(PariSynthGrid::selectedChannel(), MidiOutput::activeChannelMask());
-                if (PariSynthGrid::volumeOverlayVisible()) Ui::updatePariSynthVolumeOverlay(volume);
+                if (synthEditorClosed) Ui::transitionNext(Ui::TRANSITION_OUT);
+                synthEditorClosed = false;
+                Ui::setDrawPump(pumpPlayer);
+                Ui::transitionDraw([] {
+                    Ui::drawPariSynthPlay(PariSynthGrid::selectedChannel(), MidiOutput::activeChannelMask());
+                    if (PariSynthGrid::volumeOverlayVisible()) Ui::updatePariSynthVolumeOverlay(volume);
+                });
+                Ui::setDrawPump(nullptr);
                 break;
 
             case APP_PLAY_SYSEX:
@@ -2471,7 +2479,7 @@ bool screensaverAllowed() {
         sysexRecorder.state() == SysExRecorder::STATE_RECORDING)
         return false;
     switch (appState) {
-        case APP_SYNTH_EDIT:                   return synthEditShowingGrid;
+        case APP_SYNTH_EDIT:                   return synthEditShowingGrid || SynthEditor::screensaverAllowed();
         case APP_RECORDING:
         case APP_CONFIRM_CANCEL_RECORDING:
         case APP_CAPTURING_SYSEX:
@@ -2525,7 +2533,10 @@ void screensaverInfo(UiSaver::Info& info, void (*&pump)()) {
     pump = pumpPlayer;
 }
 
-void redrawScreen() { needsRedraw = true; }
+void redrawScreen() {
+    if (appState == APP_SYNTH_EDIT && !synthEditShowingGrid) SynthEditor::redrawScreen();
+    else needsRedraw = true;
+}
 
 bool hasPendingLooperImport() { return pendingLooperImport; }
 

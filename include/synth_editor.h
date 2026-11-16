@@ -56,7 +56,15 @@ void openBankMenu();
 // Per-tick: input handling + redraw for whichever of this component's own
 // screens is currently open. Returns true exactly once, on the tick the
 // user backs all the way out (NAV/LEFT from the picker, or from the field
-// editor) -- the host mode should resume its own screen/input then.
-bool update();
+// editor) -- the host mode should resume its own screen/input then, drawn
+// through Ui::transitionDraw() after Ui::transitionNext(TRANSITION_OUT).
+// `pump` is the host's draw pump (see Ui::setDrawPump()), set around this
+// call's draws so playback underneath keeps going; nullptr for none.
+bool update(void (*pump)() = nullptr);
+
+// Screensaver: allowed on the picker, field editor and bank menu.
+// redrawScreen() draws the whole screen again on the next update().
+bool screensaverAllowed();
+void redrawScreen();
 
 } // namespace SynthEditor

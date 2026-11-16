@@ -111,4 +111,56 @@ void synthVolume(int volume);
 
 uint16_t synthDrawnActiveMask();
 
+// ---- synth editor -----------------------------------------------------------
+
+// The instrument picker: 16 families then 8 drums, a family icon on each
+// row. families[i] is 0-15, or 16 for a drum.
+const int SYNTH_PICK_ROWS = 10;
+void synthPickDraw(const char* const* labels, const uint8_t* families, int count, int cursor, int scrollOffset);
+
+// Repaints the two rows the cursor moved between, same scroll.
+void synthPickCursor(const char* const* labels, const uint8_t* families, int count, int prevCursor,
+                     int newCursor, int scrollOffset);
+
+// What a field drives in the panel on the right.
+enum SynthEditPart : uint8_t {
+    PART_NONE,
+    PART_WAVE,
+    PART_ATTACK, PART_DECAY, PART_SUSTAIN, PART_RELEASE, // melodic envelope
+    PART_AMP, PART_PITCH,                                // drum envelope
+};
+
+const int SYNTH_EDIT_MAX_ROWS = 9;
+
+struct SynthEditRow {
+    const char* label;
+    char value[12];
+    int16_t fill;      // bar, 0-1000, -1 for none
+    SynthEditPart part;
+};
+
+// One instrument or drum as the field editor shows it: the field list on the
+// left, the envelope and one cycle of the wave on the right.
+struct SynthEditView {
+    const char* name;  // "Piano", "Drum:Kick"
+    uint8_t family;    // 0-15, 16 for drums
+    bool drum;
+    uint8_t wave;      // 0 sine, 1 triangle, 2 saw, 3 square, 4 noise
+    uint16_t attack, decay, release; // samples
+    uint8_t sustain;                 // percent
+    uint16_t dropTime;               // drum pitch drop, samples (decay is the amp decay)
+    int16_t pitchFrom, pitchTo;      // drum pitch at the start and end of the drop, 0-1000
+    int count;
+    SynthEditRow rows[SYNTH_EDIT_MAX_ROWS];
+};
+
+void synthEditDraw(const SynthEditView& v, int cursor);
+
+// Moves the cursor: the two rows, and the panel parts either row drives.
+void synthEditCursor(const SynthEditView& v, int prevCursor, int newCursor);
+
+// After the value at idx (the cursor's row) changes: that row and the panel
+// part it drives.
+void synthEditValue(const SynthEditView& v, int idx);
+
 } // namespace UiModes

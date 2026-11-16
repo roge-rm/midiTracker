@@ -349,8 +349,7 @@ void updateSettingsPageListCursor(const char* const* labels, const char* const* 
 // Draws a scrollbar (see visibleRows()) when `count` exceeds one
 // screenful, same convention as drawBrowser(). `pageTitle` is shown in
 // the header after "Settings".
-// `footerLine1`/`footerLine2` default to the Settings page hints;
-// SynthEditor's field editor (see synth_editor.cpp) passes its own.
+// `footerLine1`/`footerLine2` default to the Settings page hints.
 void drawSettings(const char* const* labels, const char* const* values, int count, int cursor,
                    int scrollOffset, const char* pageTitle,
                    const char* footerLine1 = "UD move  LEFT back",

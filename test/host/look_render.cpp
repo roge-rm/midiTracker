@@ -422,6 +422,78 @@ void synthScreen(bool volume) {
     g_midiFrame = nullptr;
 }
 
+
+// ---- synth editor ----------------------------------------------------------
+
+void synthPicker() {
+    g_tft.fillScreen(COLOR_BG);
+    statusLeds(false, false);
+    static const char* labels[24];
+    static char drums[8][20];
+    static uint8_t fams[24];
+    const char* drumNames[8] = {"Kick", "Snare", "Closed Hat", "Open Hat", "Tom", "Clap", "Cymbal", "Perc"};
+    for (int i = 0; i < 16; i++) {
+        labels[i] = FAMILY[i];
+        fams[i] = (uint8_t)i;
+    }
+    for (int i = 0; i < 8; i++) {
+        snprintf(drums[i], sizeof(drums[i]), "Drum:%s", drumNames[i]);
+        labels[16 + i] = drums[i];
+        fams[16 + i] = 16;
+    }
+    synthPickDraw(labels, fams, 24, 12, 10);
+}
+
+void synthEditScreen(bool drum, int cursor) {
+    g_tft.fillScreen(COLOR_BG);
+    statusLeds(false, true);
+    SynthEditView v;
+    struct R { const char* label; const char* value; int fill; SynthEditPart part; };
+    if (!drum) {
+        const R rows[] = {{"Waveform", "Saw", -1, PART_WAVE}, {"Attack", "20ms", 76, PART_ATTACK},
+                          {"Decay", "300ms", 450, PART_DECAY}, {"Sustain", "60%", 600, PART_SUSTAIN},
+                          {"Release", "450ms", 552, PART_RELEASE}, {"Cutoff", "2400Hz", 600, PART_NONE},
+                          {"Vibrato", "2.5%", 83, PART_NONE}, {"Tremolo", "0.0%", 0, PART_NONE},
+                          {"PWM(Square)", "10.0%", 333, PART_NONE}};
+        v.name = "SynthLead";
+        v.family = 10;
+        v.drum = false;
+        v.wave = 2;
+        v.attack = 882;
+        v.decay = 13230;
+        v.sustain = 60;
+        v.release = 19845;
+        v.count = 9;
+        for (int i = 0; i < 9; i++) {
+            v.rows[i].label = rows[i].label;
+            snprintf(v.rows[i].value, sizeof(v.rows[i].value), "%s", rows[i].value);
+            v.rows[i].fill = (int16_t)rows[i].fill;
+            v.rows[i].part = rows[i].part;
+        }
+    } else {
+        const R rows[] = {{"Waveform", "Sine", -1, PART_WAVE}, {"Base Pitch", "55Hz", 191, PART_PITCH},
+                          {"Decay", "350ms", 486, PART_AMP}, {"PitchDrop Amt", "180Hz", 627, PART_PITCH},
+                          {"PitchDrop Time", "60ms", 191, PART_PITCH}, {"Cutoff", "8000Hz", 827, PART_NONE}};
+        v.name = "Drum:Kick";
+        v.family = 16;
+        v.drum = true;
+        v.wave = 0;
+        v.decay = 15435;
+        v.dropTime = 2646;
+        v.pitchTo = 169;   // 55 Hz on 20 Hz-8 kHz
+        v.pitchFrom = 478; // 235 Hz
+        v.count = 6;
+        for (int i = 0; i < 6; i++) {
+            v.rows[i].label = rows[i].label;
+            snprintf(v.rows[i].value, sizeof(v.rows[i].value), "%s", rows[i].value);
+            v.rows[i].fill = (int16_t)rows[i].fill;
+            v.rows[i].part = rows[i].part;
+        }
+    }
+    synthEditDraw(v, 0);
+    if (cursor != 0) synthEditCursor(v, 0, cursor);
+}
+
 void fontSheet() {
     g_tft.fillScreen(COLOR_BG);
     char line[40];
@@ -762,6 +834,14 @@ int main(int argc, char** argv) {
     save("parisynth");
     synthScreen(true);
     save("parisynth-vol");
+    synthPicker();
+    save("synthedit-picker");
+    synthEditScreen(false, 2);
+    save("synthedit");
+    synthEditScreen(false, 0);
+    save("synthedit-wave");
+    synthEditScreen(true, 3);
+    save("synthedit-drum");
     fontSheet();
     save("fonts");
     return 0;

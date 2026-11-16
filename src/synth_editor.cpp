@@ -2,10 +2,14 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include <SdFat.h>
 
 #include "input.h"
 #include "ui.h"
+#include "ui_modes.h"
+#include "ui_transition.h"
+#include "ui_strip.h"
 #include "sd_card.h"
 #include "synth.h"
 #include "shared_ram_arena.h"
@@ -27,6 +31,9 @@ enum Screen {
 };
 Screen screen = SCREEN_PICKER;
 bool needsRedraw = true;
+// Set when the editor opens or the picker opens a field list; update()
+// arms the transition just before it draws, in the same loop.
+bool transitionIn = false;
 
 // -- Instrument picker state ------------------------------------------------
 // Melodic entries (0-15) point straight at Synth::instrumentFamilyName()'s
@@ -35,24 +42,26 @@ bool needsRedraw = true;
 const int PICKER_COUNT = Synth::INSTRUMENT_FAMILY_COUNT + Synth::DRUM_PRESET_COUNT;
 char pickerDrumLabels[Synth::DRUM_PRESET_COUNT][20];
 const char* pickerLabelPtrs[PICKER_COUNT];
+uint8_t pickerFamilies[PICKER_COUNT]; // icon per row, 16 for drums
 int pickerCursor = 0;
 int pickerScrollOffset = 0; // see ensurePickerVisible()
 
 void populatePickerLabels() {
     for (int i = 0; i < Synth::INSTRUMENT_FAMILY_COUNT; i++) {
         pickerLabelPtrs[i] = Synth::instrumentFamilyName((uint8_t)i);
+        pickerFamilies[i] = (uint8_t)i;
     }
     for (int i = 0; i < Synth::DRUM_PRESET_COUNT; i++) {
         snprintf(pickerDrumLabels[i], sizeof(pickerDrumLabels[i]), "Drum:%s", Synth::drumPresetName((uint8_t)i));
         pickerLabelPtrs[Synth::INSTRUMENT_FAMILY_COUNT + i] = pickerDrumLabels[i];
+        pickerFamilies[Synth::INSTRUMENT_FAMILY_COUNT + i] = 16;
     }
 }
 
 // Same page-snap scroll-window convention as SettingsMode's
 // ensureThemeVisible().
 void ensurePickerVisible() {
-    int rows = Ui::visibleRows();
-    if (rows <= 0) return;
+    const int rows = UiModes::SYNTH_PICK_ROWS;
     if (pickerCursor < pickerScrollOffset || pickerCursor >= pickerScrollOffset + rows) {
         pickerScrollOffset = (pickerCursor / rows) * rows;
     }
@@ -64,7 +73,6 @@ enum EditTarget { EDIT_MELODIC, EDIT_DRUM };
 EditTarget editTarget = EDIT_MELODIC;
 int editIndex = 0; // family 0-15 (EDIT_MELODIC) or drum type 0-7 (EDIT_DRUM)
 int fieldCursor = 0;
-int scrollOffset = 0;
 
 // Working copies of the record currently open in the editor -- fetched via
 // Synth::getInstrumentPreset()/getDrumPreset() in beginEditor()/
@@ -80,7 +88,8 @@ enum InstField { FIELD_WAVEFORM, FIELD_ATTACK, FIELD_DECAY, FIELD_SUSTAIN, FIELD
                   FIELD_CUTOFF, FIELD_VIBRATO, FIELD_TREMOLO, FIELD_PWM, INST_FIELD_COUNT };
 enum DrumField { DFIELD_WAVEFORM, DFIELD_BASE_PITCH, DFIELD_DECAY, DFIELD_PITCHDROP_AMT,
                   DFIELD_PITCHDROP_TIME, DFIELD_CUTOFF, DRUM_FIELD_COUNT };
-const int MAX_FIELD_COUNT = INST_FIELD_COUNT; // >= DRUM_FIELD_COUNT, sizes the shared scratch buffers below
+static_assert((int)INST_FIELD_COUNT <= UiModes::SYNTH_EDIT_MAX_ROWS && (int)DRUM_FIELD_COUNT <= UiModes::SYNTH_EDIT_MAX_ROWS,
+              "the field list no longer fits one screen");
 
 int currentFieldCount() { return editTarget == EDIT_MELODIC ? (int)INST_FIELD_COUNT : (int)DRUM_FIELD_COUNT; }
 
@@ -223,12 +232,94 @@ void editorPageTitle(char* out, size_t outSize) {
     else snprintf(out, outSize, "%s", Synth::instrumentFamilyName((uint8_t)editIndex));
 }
 
-void buildFieldLists(const char* labelPtrs[MAX_FIELD_COUNT], char values[MAX_FIELD_COUNT][16], const char* valuePtrs[MAX_FIELD_COUNT]) {
-    int count = currentFieldCount();
-    for (int i = 0; i < count; i++) {
-        labelPtrs[i] = fieldLabel(i);
-        formatFieldValue(i, values[i], sizeof(values[i]));
-        valuePtrs[i] = values[i];
+// Bar fills, 0-1000. Times use a square root scale, as the envelope does,
+// so short times still show; frequencies a log scale.
+int16_t timeFill(uint16_t samples) {
+    return (int16_t)(sqrtf((float)samples / 65535.0f) * 1000.0f + 0.5f);
+}
+int16_t logFill(float v, float lo, float hi) {
+    if (v <= lo) return 0;
+    if (v >= hi) return 1000;
+    return (int16_t)(logf(v / lo) / logf(hi / lo) * 1000.0f + 0.5f);
+}
+int16_t linFill(float v, float hi) { return (int16_t)clampF(v / hi * 1000.0f + 0.5f, 0.0f, 1000.0f); }
+
+UiModes::SynthEditPart fieldPart(int index) {
+    if (editTarget == EDIT_DRUM) {
+        switch (index) {
+            case DFIELD_WAVEFORM:       return UiModes::PART_WAVE;
+            case DFIELD_DECAY:          return UiModes::PART_AMP;
+            case DFIELD_BASE_PITCH:
+            case DFIELD_PITCHDROP_AMT:
+            case DFIELD_PITCHDROP_TIME: return UiModes::PART_PITCH;
+            default:                    return UiModes::PART_NONE;
+        }
+    }
+    switch (index) {
+        case FIELD_WAVEFORM: return UiModes::PART_WAVE;
+        case FIELD_ATTACK:   return UiModes::PART_ATTACK;
+        case FIELD_DECAY:    return UiModes::PART_DECAY;
+        case FIELD_SUSTAIN:  return UiModes::PART_SUSTAIN;
+        case FIELD_RELEASE:  return UiModes::PART_RELEASE;
+        default:             return UiModes::PART_NONE;
+    }
+}
+
+int16_t fieldFill(int index) {
+    if (editTarget == EDIT_DRUM) {
+        switch (index) {
+            case DFIELD_BASE_PITCH:     return logFill(editingDrum.basePitchHz, 20.0f, 4000.0f);
+            case DFIELD_DECAY:          return timeFill(editingDrum.decaySamples);
+            case DFIELD_PITCHDROP_AMT:  return logFill(editingDrum.pitchDropStartHz + 1.0f, 1.0f, 4001.0f);
+            case DFIELD_PITCHDROP_TIME: return timeFill(editingDrum.pitchDropSamples);
+            case DFIELD_CUTOFF:         return logFill(editingDrum.cutoffHz, 100.0f, 20000.0f);
+            default:                    return -1;
+        }
+    }
+    switch (index) {
+        case FIELD_ATTACK:  return timeFill(editingInst.attackSamples);
+        case FIELD_DECAY:   return timeFill(editingInst.decaySamples);
+        case FIELD_SUSTAIN: return (int16_t)(editingInst.sustainPercent * 10);
+        case FIELD_RELEASE: return timeFill(editingInst.releaseSamples);
+        case FIELD_CUTOFF:  return logFill(editingInst.cutoffHz, 100.0f, 20000.0f);
+        case FIELD_VIBRATO: return linFill(editingInst.vibratoDepthPercent, 30.0f);
+        case FIELD_TREMOLO: return linFill(editingInst.tremoloDepthPercent, 30.0f);
+        case FIELD_PWM:     return linFill(editingInst.pwmDepthPercent, 30.0f);
+        default:            return -1;
+    }
+}
+
+// The open record as the screen shows it. title is the view's name.
+void buildView(UiModes::SynthEditView& v, char* title, size_t titleSize) {
+    editorPageTitle(title, titleSize);
+    v.name = title;
+    v.drum = editTarget == EDIT_DRUM;
+    v.family = v.drum ? 16 : (uint8_t)editIndex;
+    if (v.drum) {
+        v.wave = (uint8_t)editingDrum.waveform;
+        v.decay = editingDrum.decaySamples;
+        v.dropTime = editingDrum.pitchDropSamples;
+        // Pitch over 20 Hz to 8 kHz on a log scale.
+        v.pitchTo = logFill(editingDrum.basePitchHz, 20.0f, 8000.0f);
+        v.pitchFrom = logFill(editingDrum.basePitchHz + editingDrum.pitchDropStartHz, 20.0f, 8000.0f);
+        v.attack = v.release = 0;
+        v.sustain = 0;
+    } else {
+        v.wave = (uint8_t)editingInst.waveform;
+        v.attack = editingInst.attackSamples;
+        v.decay = editingInst.decaySamples;
+        v.sustain = editingInst.sustainPercent;
+        v.release = editingInst.releaseSamples;
+        v.dropTime = 0;
+        v.pitchFrom = v.pitchTo = 0;
+    }
+    v.count = currentFieldCount();
+    for (int i = 0; i < v.count; i++) {
+        UiModes::SynthEditRow& r = v.rows[i];
+        r.label = fieldLabel(i);
+        formatFieldValue(i, r.value, sizeof(r.value));
+        r.fill = fieldFill(i);
+        r.part = fieldPart(i);
     }
 }
 
@@ -242,40 +333,26 @@ void beginEditor(EditTarget target, int index) {
     editIndex = index;
     refreshEditingFromSynth();
     fieldCursor = 0;
-    scrollOffset = 0;
     screen = SCREEN_EDITOR;
     needsRedraw = true;
+    transitionIn = true;
 }
 
-void ensureFieldVisible() {
-    int rows = Ui::visibleRows();
-    if (rows <= 0) return;
-    if (fieldCursor < scrollOffset || fieldCursor >= scrollOffset + rows) {
-        scrollOffset = (fieldCursor / rows) * rows;
-    }
-    if (scrollOffset < 0) scrollOffset = 0;
-}
-
+// Every field fits one screen, so the list never scrolls.
 void moveFieldCursor(int newCursor) {
     int prevCursor = fieldCursor;
-    int prevScroll = scrollOffset;
     fieldCursor = newCursor;
-    ensureFieldVisible();
-    if (scrollOffset == prevScroll) {
-        const char* labelPtrs[MAX_FIELD_COUNT];
-        char values[MAX_FIELD_COUNT][16];
-        const char* valuePtrs[MAX_FIELD_COUNT];
-        buildFieldLists(labelPtrs, values, valuePtrs);
-        Ui::updateSettingsSelection(labelPtrs, valuePtrs, currentFieldCount(), prevCursor, fieldCursor, scrollOffset);
-    } else {
-        needsRedraw = true;
-    }
+    UiModes::SynthEditView v;
+    char title[24];
+    buildView(v, title, sizeof(title));
+    UiModes::synthEditCursor(v, prevCursor, fieldCursor);
 }
 
 void refreshFieldValue() {
-    char valBuf[16];
-    formatFieldValue(fieldCursor, valBuf, sizeof(valBuf));
-    Ui::updateSettingsValue(fieldLabel(fieldCursor), valBuf, fieldCursor, scrollOffset);
+    UiModes::SynthEditView v;
+    char title[24];
+    buildView(v, title, sizeof(title));
+    UiModes::synthEditValue(v, fieldCursor);
 }
 
 // How much bigger a single EDIT+UP/DOWN step is than EDIT+LEFT/RIGHT's --
@@ -600,7 +677,8 @@ void ensureBankLoadVisible() {
 void beginEditorMenu() {
     editorMenuCursor = 0;
     screen = SCREEN_EDITOR_MENU;
-    Ui::drawEntryMenu("Bank", EDITOR_MENU_LABELS, EDITOR_MENU_COUNT, editorMenuCursor);
+    needsRedraw = true;
+    transitionIn = true;
 }
 
 void beginBankLoadPick() {
@@ -798,7 +876,26 @@ void handleBankLoadPickInput() {
 // Returns true when the user backs all the way out to the host (NAV/LEFT
 // from the field editor -- see synth_editor.h's comment on why this
 // doesn't distinguish "reached via the picker" from "opened directly").
+// A tap of EDIT (nothing else pressed while it was down) steps Waveform to
+// the next wave, wrapping, as Settings does for its list settings.
+void handleEditTap() {
+    static bool armed = false;
+    if (Input::justPressed(BTN_EDIT)) armed = true;
+    for (int b = 0; b < BTN_COUNT; b++) {
+        if (b != BTN_EDIT && Input::justPressed((ButtonId)b)) armed = false;
+    }
+    if (!Input::justReleased(BTN_EDIT)) return;
+    bool tap = armed;
+    armed = false;
+    if (!tap || fieldPart(fieldCursor) != UiModes::PART_WAVE) return;
+    Synth::SynthWaveform& w = editTarget == EDIT_DRUM ? editingDrum.waveform : editingInst.waveform;
+    w = (w >= Synth::SYNTH_WAVE_NOISE) ? (Synth::SynthWaveform)0 : (Synth::SynthWaveform)(w + 1);
+    applyEditingToSynth();
+    refreshFieldValue();
+}
+
 bool handleEditorInput() {
+    handleEditTap();
     if (Input::isDown(BTN_EDIT)) {
         handleFieldAdjust();
         return false;
@@ -817,27 +914,32 @@ bool handleEditorInput() {
 
 // -- Instrument picker ----------------------------------------------------
 
-// Returns true when the user backs out of the picker with nothing opened
-// into the editor (NAV/LEFT). Cursor moves always trigger a full redraw
-// (not a cheap partial update) -- same convention SettingsMode's own
-// Theme/Bank load-pick lists already use for a scrollable entry menu,
-// since a move can cross a scroll-window boundary and there's no user-
-// visible cost to always repainting a list this short a screenful of.
-bool handlePickerInput() {
-    if (Input::justPressed(BTN_UP)) {
-        pickerCursor = (pickerCursor > 0) ? pickerCursor - 1 : PICKER_COUNT - 1;
-        ensurePickerVisible();
+// Repaints the two rows, or the whole list when the move scrolls it.
+void movePickerCursor(int newCursor) {
+    int prev = pickerCursor;
+    int prevScroll = pickerScrollOffset;
+    pickerCursor = newCursor;
+    ensurePickerVisible();
+    if (pickerScrollOffset == prevScroll) {
+        UiModes::synthPickCursor(pickerLabelPtrs, pickerFamilies, PICKER_COUNT, prev, pickerCursor, pickerScrollOffset);
+    } else {
         needsRedraw = true;
     }
+}
+
+// Returns true when the user backs out of the picker with nothing opened
+// into the editor (NAV/LEFT). RIGHT, ENTER or PLAY opens the entry.
+bool handlePickerInput() {
+    if (Input::justPressed(BTN_UP)) {
+        movePickerCursor(pickerCursor > 0 ? pickerCursor - 1 : PICKER_COUNT - 1);
+    }
     if (Input::justPressed(BTN_DOWN)) {
-        pickerCursor = (pickerCursor < PICKER_COUNT - 1) ? pickerCursor + 1 : 0;
-        ensurePickerVisible();
-        needsRedraw = true;
+        movePickerCursor(pickerCursor < PICKER_COUNT - 1 ? pickerCursor + 1 : 0);
     }
     if (Input::justPressed(BTN_NAV) || Input::justPressed(BTN_LEFT)) {
         return true;
     }
-    if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY)) {
+    if (Input::justPressed(BTN_ENTER) || Input::justPressed(BTN_PLAY) || Input::justPressed(BTN_RIGHT)) {
         if (pickerCursor < Synth::INSTRUMENT_FAMILY_COUNT) beginEditor(EDIT_MELODIC, pickerCursor);
         else beginEditor(EDIT_DRUM, pickerCursor - Synth::INSTRUMENT_FAMILY_COUNT);
     }
@@ -892,6 +994,7 @@ void openPicker(int startCursor) {
     ensurePickerVisible();
     screen = SCREEN_PICKER;
     needsRedraw = true;
+    transitionIn = true;
 }
 
 void openForInstrument(uint8_t family) {
@@ -906,58 +1009,64 @@ void openBankMenu() {
     beginEditorMenu();
 }
 
-bool update() {
-    if (handleInput()) return true;
-
-    if (needsRedraw) {
-        needsRedraw = false;
-        switch (screen) {
-            case SCREEN_PICKER:
-                Ui::drawEntryMenu("Edit Instrument", pickerLabelPtrs, PICKER_COUNT, pickerCursor, pickerScrollOffset);
-                break;
-            case SCREEN_EDITOR: {
-                char title[24];
-                editorPageTitle(title, sizeof(title));
-                const char* labelPtrs[MAX_FIELD_COUNT];
-                char values[MAX_FIELD_COUNT][16];
-                const char* valuePtrs[MAX_FIELD_COUNT];
-                buildFieldLists(labelPtrs, values, valuePtrs);
-                // Own footer text, not drawSettings()'s SettingsMode-flavored
-                // default -- this screen doesn't page (LEFT/RIGHT do nothing
-                // here, unlike Settings).
-                Ui::drawSettings(labelPtrs, valuePtrs, currentFieldCount(), fieldCursor, scrollOffset, title,
-                                  "UD move  EDIT+LR change", "EDIT+UD fast change");
-                break;
-            }
-            case SCREEN_EDITOR_MENU:
-                Ui::drawEntryMenu("Bank", EDITOR_MENU_LABELS, EDITOR_MENU_COUNT, editorMenuCursor);
-                break;
-            case SCREEN_SAVE_NAME:
-                Ui::drawNameEntry("Save Bank", bankNameBuf, "",
-                                   bankNameError[0] ? bankNameError : nullptr,
-                                   bankKeyRow, bankKeyCol);
-                break;
-            case SCREEN_SAVE_OVERWRITE: {
-                const char* slash = strrchr(pendingOverwritePath, '/');
-                const char* name = slash ? slash + 1 : pendingOverwritePath;
-                Ui::drawConfirmOverwrite(name, false);
-                break;
-            }
-            case SCREEN_LOAD_PICK:
-                if (bankLoadCount > 0) {
-                    const char* labels[MAX_SAVED_BANKS];
-                    for (int i = 0; i < bankLoadCount; i++) labels[i] = bankLoadNames[i];
-                    Ui::drawEntryMenu("Load Bank", labels, bankLoadCount, bankLoadCursor, bankLoadScrollOffset);
-                } else {
-                    Ui::drawMessage("No saved banks", "NAV back");
-                }
-                break;
-            case SCREEN_FLASH:
-                Ui::drawMessage(g_flashMsg, nullptr);
-                break;
+static void draw() {
+    switch (screen) {
+        case SCREEN_PICKER:
+            UiModes::synthPickDraw(pickerLabelPtrs, pickerFamilies, PICKER_COUNT, pickerCursor, pickerScrollOffset);
+            break;
+        case SCREEN_EDITOR: {
+            UiModes::SynthEditView v;
+            char title[24];
+            buildView(v, title, sizeof(title));
+            UiModes::synthEditDraw(v, fieldCursor);
+            break;
         }
+        case SCREEN_EDITOR_MENU:
+            Ui::drawEntryMenu("Bank", EDITOR_MENU_LABELS, EDITOR_MENU_COUNT, editorMenuCursor);
+            break;
+        case SCREEN_SAVE_NAME:
+            Ui::drawNameEntry("Save Bank", bankNameBuf, "",
+                               bankNameError[0] ? bankNameError : nullptr,
+                               bankKeyRow, bankKeyCol);
+            break;
+        case SCREEN_SAVE_OVERWRITE: {
+            const char* slash = strrchr(pendingOverwritePath, '/');
+            const char* name = slash ? slash + 1 : pendingOverwritePath;
+            Ui::drawConfirmOverwrite(name, false);
+            break;
+        }
+        case SCREEN_LOAD_PICK:
+            if (bankLoadCount > 0) {
+                const char* labels[MAX_SAVED_BANKS];
+                for (int i = 0; i < bankLoadCount; i++) labels[i] = bankLoadNames[i];
+                Ui::drawEntryMenu("Load Bank", labels, bankLoadCount, bankLoadCursor, bankLoadScrollOffset);
+            } else {
+                Ui::drawMessage("No saved banks", "NAV back");
+            }
+            break;
+        case SCREEN_FLASH:
+            Ui::drawMessage(g_flashMsg, nullptr);
+            break;
     }
-    return false;
 }
+
+bool update(void (*pump)()) {
+    Ui::setDrawPump(pump);
+    bool done = handleInput();
+    if (!done && needsRedraw) {
+        needsRedraw = false;
+        if (transitionIn) Ui::transitionNext(Ui::TRANSITION_IN);
+        transitionIn = false;
+        Ui::transitionDraw([] { draw(); });
+    }
+    Ui::setDrawPump(nullptr);
+    return done;
+}
+
+bool screensaverAllowed() {
+    return screen == SCREEN_PICKER || screen == SCREEN_EDITOR || screen == SCREEN_EDITOR_MENU;
+}
+
+void redrawScreen() { needsRedraw = true; }
 
 } // namespace SynthEditor
