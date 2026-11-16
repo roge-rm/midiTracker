@@ -216,8 +216,11 @@ protected:
     // Moves v's gains to the new ones over RAMP_UP or RAMP_DOWN frames.
     static void setRamp(TrackerVoice& v, int32_t tgtL, int32_t tgtR);
     // IT sets this and works out its own gains. Otherwise the base sets
-    // them from mixVolume and mixPan after every tick.
+    // them from voiceGains() after every tick.
     bool _formatGains = false;
+    // A voice's gains after a tick, 32640 is full volume on one side. The
+    // default pans mixVolume linearly by mixPan; XM has its own.
+    virtual void voiceGains(const TrackerVoice& v, int32_t& l, int32_t& r);
     // Where tails live, given by the format; none by default. All tails
     // end within a tick, so the pool is reused from the start each tick.
     void attachTails(TrackerTail* tails, int count, int16_t* pool, uint32_t poolFrames);

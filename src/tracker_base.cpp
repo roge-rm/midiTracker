@@ -280,7 +280,7 @@ void __not_in_flash_func(TrackerPlayer::spawnTail)(TrackerVoice& v) {
     t.left = RAMP_DOWN;
 }
 
-// After every tick (MOD, S3M, XM): ramps to mixVolume and mixPan, and fades
+// After every tick (MOD, S3M, XM): ramps to voiceGains(), and fades
 // out a voice the tick stopped.
 void __not_in_flash_func(TrackerPlayer::applyGains)() {
     for (int i = 0; i < _voiceCount; i++) {
@@ -291,9 +291,16 @@ void __not_in_flash_func(TrackerPlayer::applyGains)() {
             v.rampLeft = 0;
             continue;
         }
-        int32_t vol = v.mixVolume > 64 ? 64 : v.mixVolume;
-        setRamp(v, vol * (255 - v.mixPan) * 2, vol * v.mixPan * 2);
+        int32_t l, r;
+        voiceGains(v, l, r);
+        setRamp(v, l, r);
     }
+}
+
+void __not_in_flash_func(TrackerPlayer::voiceGains)(const TrackerVoice& v, int32_t& l, int32_t& r) {
+    int32_t vol = v.mixVolume > 64 ? 64 : v.mixVolume;
+    l = vol * (255 - v.mixPan) * 2;
+    r = vol * v.mixPan * 2;
 }
 
 #if defined(__not_in_flash)
