@@ -1092,6 +1092,56 @@ namespace SettingsMode
                 refreshValue();
         }
 
+        // True for settings that pick from a fixed list of options.
+        bool isListSetting(int index)
+        {
+            return isBoolSetting(index) || index == SETTING_OUTPUT_LEVEL || index == SETTING_REVERB_TYPE ||
+                   index == SETTING_TIME_SIGNATURE || index == SETTING_BAR_LENGTH || index == SETTING_MIDI_THRU ||
+                   index == SETTING_TRANSITIONS || index == SETTING_SCREENSAVER || index == SETTING_SCREENSAVER_STYLE;
+        }
+
+        // A tap of EDIT (no other button pressed while it was down) moves a list
+        // setting to its next option, wrapping to the first after the last.
+        // adjustSetting() clamps, so a step that changes nothing means the last
+        // option; step back to the first from there.
+        void handleEditTap()
+        {
+            static bool armed = false;
+            if (Input::justPressed(BTN_EDIT))
+                armed = true;
+            for (int b = 0; b < BTN_COUNT; b++)
+            {
+                if (b != BTN_EDIT && Input::justPressed((ButtonId)b))
+                    armed = false;
+            }
+            if (!Input::justReleased(BTN_EDIT))
+                return;
+            bool tap = armed;
+            armed = false;
+
+            SettingIndex idx = currentPageItem(cursor);
+            if (!tap || !isListSetting(idx))
+                return;
+
+            char before[16], after[16];
+            formatValue(idx, before, sizeof(before));
+            adjustSetting(idx, 1);
+            formatValue(idx, after, sizeof(after));
+            if (strcmp(before, after) == 0)
+            {
+                for (int i = 0; i < 16; i++)
+                {
+                    char prev[16];
+                    strcpy(prev, after);
+                    adjustSetting(idx, -1);
+                    formatValue(idx, after, sizeof(after));
+                    if (strcmp(prev, after) == 0)
+                        break;
+                }
+            }
+            refreshValue();
+        }
+
         // Reboots into the RP2040's USB (BOOTSEL) bootloader -- the device
         // stops running this firmware entirely and appears as a mass-
         // storage drive for dragging a new .uf2 onto, until it's power-
@@ -1791,6 +1841,7 @@ namespace SettingsMode
             }
 
             handleBootloaderHold();
+            handleEditTap();
 
             // Saves first so the card holds the current settings while the
             // computer has it.
