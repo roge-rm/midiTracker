@@ -8,10 +8,14 @@
 #include "midi_file.h"
 #include "midi_host.h"
 #include "I2S.h"
+#include "host_snap.h"
+#include <string.h>
 #include <math.h>
 
 extern uint32_t g_hostLevelSamples, g_hostLimitSamples, g_hostTankClips, g_hostGovernorSheds;
 extern bool g_hostGovernorModel;
+extern uint16_t g_hostNoteMask[128];
+extern uint8_t g_hostNoteVel[128];
 static void le32(FILE* f, uint32_t v) { fwrite(&v, 4, 1, f); }
 static void le16(FILE* f, uint16_t v) { fwrite(&v, 2, 1, f); }
 
@@ -47,6 +51,18 @@ int main(int argc, char** argv) {
     size_t maxFrames = (size_t)(maxSec * HOST_SAMPLE_RATE), tailFrames = (size_t)(tailSec * HOST_SAMPLE_RATE);
     size_t endAt = 0; // set once playback is done
     unsigned long updates = 0;
+    // SNAP=<seconds> SNAP_OUT=<file>: the note state over the 280 ms before
+    // that point, for the player screen renders (look_render).
+    static HostSnap::Midi snap;
+    int snapNext = -1;
+    size_t snapAt = 0;
+    if (getenv("SNAP") && getenv("SNAP_OUT")) {
+        memcpy(snap.magic, "MSNP", 4);
+        snap.format = player.format();
+        snap.tracks = player.trackCount();
+        snapAt = (size_t)(atof(getenv("SNAP")) * HOST_SAMPLE_RATE);
+        snapNext = 0;
+    }
     for (;;) {
         size_t have = g_i2sCapture.size() / 2;
         if (have >= maxFrames) break;
@@ -54,6 +70,19 @@ int main(int argc, char** argv) {
         hostSetFrames(have);
         player.update();
         updates++;
+        if (snapNext >= 0 && have >= snapAt - (size_t)(HostSnap::Midi::FRAMES - 1 - snapNext) * HOST_SAMPLE_RATE * 40 / 1000) {
+            HostSnap::MidiFrame& fr = snap.frames[snapNext];
+            fr.elapsedMs = player.elapsedMs();
+            fr.bpm = player.currentBPM();
+            fr.tap = UiTap::g_midi;
+            memcpy(fr.noteMask, g_hostNoteMask, sizeof(fr.noteMask));
+            memcpy(fr.noteVel, g_hostNoteVel, sizeof(fr.noteVel));
+            if (++snapNext == HostSnap::Midi::FRAMES) {
+                snapNext = -1;
+                FILE* f = fopen(getenv("SNAP_OUT"), "wb");
+                if (f) { fwrite(&snap, sizeof(snap), 1, f); fclose(f); }
+            }
+        }
         if (!endAt && player.state() != MidiPlayer::STATE_PLAYING) endAt = have + tailFrames;
         for (size_t i = 0; i < BLOCK; i++) loop1();
     }

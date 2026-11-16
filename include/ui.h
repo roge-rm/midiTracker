@@ -54,49 +54,27 @@ void updateBrowserHeader(const SdBrowser& browser);
 // footer, so it works for either screen unmodified.
 void drawLoopBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffset);
 
-// Full redraw of the now-playing screen. `audioOn` is whether the onboard
-// synth is currently enabled (see MidiOutput::setAudioOutput()); `volume`
-// is its master output level, 0-100 (see Synth::setVolume()) -- both shown
-// regardless of whether audio is actually on, same as the tempo/output
-// rows are always shown regardless of playback state. `stopped` shows
-// "Stopped" instead of "Paused" while State is STATE_PAUSED -- see
-// updatePlayerState()'s comment on why that distinction lives outside
-// MidiPlayer::State itself.
+// The .mid player screen (drawn by ui_player.cpp): time, tempo, output and
+// synth, channel meters and a keybed. `audioOn` is whether the onboard
+// synth is on, `volume` its level 0-100. `stopped` shows Stop instead of
+// Pause while the player is in STATE_PAUSED after NAV.
 void drawPlayer(const char* filename, const MidiPlayer& player, MidiOutTarget target,
                  bool audioOn, int volume, bool stopped);
 
-// Cheap partial redraw of the now-playing screen's elapsed-time and tempo
-// rows (file tempo can change mid-playback via tempo meta events,
-// independent of the user's speed adjustment), plus the live note-
-// activity strip. Meant to be called at a low fixed rate while
-// STATE_PLAYING, but also safe as a one-off right after NAV resets
-// playback to the start (Time/Tempo both changed then too) -- the only
-// hazard is STATE_ERROR, whose completely different layout doesn't have
-// these rows at all; never call this then. Does not touch the header/
-// filename/state/output/volume rows drawn by drawPlayer().
+// Time, tempo, channel meters and keybed, each only when it changed. Call
+// as often as every loop while playing, and once after a seek or tempo
+// change while paused. Not while STATE_ERROR.
 void updatePlayerLive(const MidiPlayer& player);
 
-// Cheap partial redraw of just the volume row, e.g. after the user
-// adjusts it via ENTER+UP/DOWN on the now-playing screen. Does not touch
-// any other row.
+// The volume readout on whichever player screen is up.
 void updateVolume(int volume);
 
-// Cheap partial redraw of just the State value, e.g. after PLAY toggles
-// pause/resume or NAV stops. `stopped` shows "Stopped" instead of
-// "Paused" while state is STATE_PAUSED -- MidiPlayer itself has no
-// separate state for "stopped" (NAV resets to the start and pauses there,
-// same STATE_PAUSED a plain PLAY-pause leaves it in), so FilePlayerMode
-// tracks which one happened and passes it through here. Not valid across
-// a transition into or out of STATE_ERROR -- that swaps the whole screen
-// layout, so use drawPlayer() there instead.
+// The play state in the status strip, after PLAY or NAV. Not across a
+// change into or out of STATE_ERROR, which needs drawPlayer().
 void updatePlayerState(MidiPlayer::State state, bool stopped);
 
-// Cheap partial redraw of just the MIDI-target half of its row, e.g.
-// after ALT cycles hardware/USB/both. Does not touch the Audio field.
+// The output line, after ALT changes the target or ALT+EDIT the synth.
 void updatePlayerOutputTarget(MidiOutTarget target);
-
-// Cheap partial redraw of just the Audio on/off half of its row, e.g.
-// after EDIT toggles the onboard synth. Does not touch the MIDI field.
 void updatePlayerAudioState(bool audioOn);
 
 // -- pariSynth live play screen -------------------------------------------
@@ -171,36 +149,32 @@ void updatePariSynthSelection(int prevChannel, int newChannel, bool prevActive, 
 // that redraw repaints every cell including this one.
 void updatePariSynthVolumeOverlay(int volume);
 
-// Full redraw of the WAV "Now Playing" screen -- Filename/State/Time
-// (total known up front, unlike MidiPlayer)/Volume/format info (sample
-// rate, bit depth, channel count), no Tempo/Tracks/MIDI-target rows since
-// none apply to WAV playback. `stopped` is the same NAV-vs-PLAY-pause
-// distinction drawPlayer() uses, see updatePlayerState()'s comment.
+// The WAV player screen (ui_player.cpp): time and length, a waveform that
+// fills in as it plays, and peak meters. `stopped` as drawPlayer().
 void drawWavPlayer(const char* filename, const WavPlayer& player, int volume, bool stopped);
 
-// Cheap partial redraw of just the State value -- same convention as
-// updatePlayerState(), including the same STATE_ERROR caveat: a
-// transition into or out of STATE_ERROR swaps the whole screen layout
-// (see drawWavPlayer()), so use that instead in that case.
+// The play state, same rules as updatePlayerState().
 void updateWavPlayerState(WavPlayer::State state, bool stopped);
 
-// Cheap partial redraw of the WAV screen's elapsed-time row. Meant to be
-// called at a low fixed rate while STATE_PLAYING, and as a one-off after
-// a seek/NAV-stop (Time changed then too). Does not touch Filename/State/
-// Volume/format rows.
+// Time, waveform and peak meters. Call as often as every loop while
+// playing, and once after a seek or stop.
 void updateWavPlayerLive(const WavPlayer& player);
 
-// Full redraw of the tracker (MOD/S3M/XM/IT) "Now Playing" screen:
-// Filename/State/Time (elapsed only, a tracker song has no fixed length)/
-// Volume/`Pattern: N/M  Row: R`/channel and instrument counts.
+// The tracker player screen (MOD, S3M, XM, IT; ui_player.cpp): time,
+// scope, speed and tempo, channel lanes with a row trail and meters, and
+// the order position.
 void drawTrackerPlayer(const char* filename, const TrackerPlayer& player, int volume, bool stopped);
 
-// Cheap partial redraw of just the State value.
+// The play state, same rules as updatePlayerState().
 void updateTrackerPlayerState(TrackerPlayer::State state, bool stopped);
 
-// Cheap partial redraw of the elapsed time and pattern position. Meant to
-// be called at a low fixed rate while STATE_PLAYING.
+// Time, position, lanes, meters and scope. Call as often as every loop
+// while playing.
 void updateTrackerPlayerLive(const TrackerPlayer& player);
+
+// After a tracker song or WAV ends, keep the live updates going until this
+// is true: the ring has played out and the meters are down.
+bool playerLiveSettled();
 
 // Full redraw of the on-screen QWERTY name entry screen shared by New
 // Recording, New Folder, and Rename. `title` labels what's being named,

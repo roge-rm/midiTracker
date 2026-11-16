@@ -9,9 +9,34 @@
 #include "s3m_file.h"
 #include "xm_file.h"
 #include "it_file.h"
+#include "ui_tap.h"
+#include "host_snap.h"
 #include <new>
 #include <string>
 #include <strings.h>
+
+// SNAP=<seconds> SNAP_OUT=<file>: the UI hand-overs at that point, for
+// the player screen renders (look_render).
+static size_t snapFrames = 0;
+
+template <class P>
+static void writeTrackerSnap(const P& p) {
+    HostSnap::Tracker s = {};
+    memcpy(s.magic, "TSNP", 4);
+    s.channels = p.channelCount();
+    s.instruments = p.instrumentCount();
+    s.songLength = p.songLength();
+    s.order = p.patternOrderPosition();
+    s.row = p.currentRow();
+    s.speed = p.speed();
+    s.tempo = p.tempo();
+    s.written = (uint32_t)HostRing::framesCaptured();
+    s.tap = UiTap::g_tracker;
+    FILE* f = fopen(getenv("SNAP_OUT"), "wb");
+    if (!f) { perror("SNAP_OUT"); return; }
+    fwrite(&s, sizeof(s), 1, f);
+    fclose(f);
+}
 
 template <class P>
 static int run(const char* path, double seconds, FILE* out) {
@@ -40,6 +65,10 @@ static int run(const char* path, double seconds, FILE* out) {
         if (p->state() != P::STATE_PLAYING) break;
         p->update();
         loops++;
+        if (snapFrames && HostRing::framesCaptured() >= snapFrames) {
+            snapFrames = 0;
+            writeTrackerSnap(*p);
+        }
     }
     fprintf(stderr, "%s: %zu frames, %lu updates, %lu reads, state %d ch %d inst %d order %d/%d row %d\n",
             path, written, loops, FsFile::readCalls, (int)p->state(), p->channelCount(), p->instrumentCount(),
@@ -56,6 +85,7 @@ int main(int argc, char** argv) {
     }
     const char* path = argv[1];
     double seconds = atof(argv[2]);
+    if (getenv("SNAP") && getenv("SNAP_OUT")) snapFrames = (size_t)(atof(getenv("SNAP")) * 44100.0);
     FILE* out = fopen(argv[3], "wb");
     if (!out) { perror(argv[3]); return 1; }
     const char* dot = strrchr(path, '.');

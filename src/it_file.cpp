@@ -39,6 +39,7 @@
 // like plain PCM. Unpacking while streaming would need the decoder's state
 // at every point a loop or ping-pong turn lands on, which doesn't fit RAM.
 #include "it_file.h"
+#include "ui_tap.h"
 #include "pins.h" // SAMPLE_RATE
 #include <string.h>
 #include <math.h>
@@ -900,7 +901,16 @@ void ItPlayer::readRow(bool apply) {
         if (mask & 32) inst = _lastInst[ch];
         if (mask & 64) vol = _lastVol[ch];
         if (mask & 128) { cmd = _lastCmd[ch]; param = _lastParam[ch]; }
-        if (apply) handleCell(ch, hasNote ? rawNote : NO_NOTE, inst, vol, cmd, param);
+        if (apply) {
+            if (ch < _numChannels) {
+                uint8_t uiNote = !hasNote ? UiTap::NOTE_NONE
+                               : rawNote < 120 ? (uint8_t)(rawNote + 1)
+                               : rawNote == 255 ? UiTap::NOTE_OFF
+                               : rawNote == 254 ? UiTap::NOTE_CUT : UiTap::NOTE_FADE;
+                UiTap::cell(ch, uiNote, inst);
+            }
+            handleCell(ch, hasNote ? rawNote : NO_NOTE, inst, vol, cmd, param);
+        }
     }
 }
 

@@ -1,5 +1,6 @@
 #include "sd_card.h"
 #include "s3m_file.h"
+#include "ui_tap.h"
 #include "pins.h" // SAMPLE_RATE
 #include <string.h>
 
@@ -439,7 +440,12 @@ void S3mPlayer::decodeRow(bool apply) {
             param = cb[1];
         }
         uint8_t slot = _chanSlot[flag & 0x1F];
-        if (apply && slot != 0xFF) applyCell(slot, note, sample, volume, command, param);
+        if (apply && slot != 0xFF) {
+            uint8_t uiNote = note < 0xF0 ? (uint8_t)((note >> 4) * 12 + (note & 0x0F) + 1)
+                           : note == 0xFE ? UiTap::NOTE_CUT : UiTap::NOTE_NONE;
+            UiTap::cell(slot, uiNote, sample);
+            applyCell(slot, note, sample, volume, command, param);
+        }
     }
 }
 

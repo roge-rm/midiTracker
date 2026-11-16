@@ -1,0 +1,76 @@
+#pragma once
+#include <stdint.h>
+
+// The player screens: tracker (MOD, S3M, XM, IT), .mid and WAV. Core 0 only.
+//
+// The screens take plain info structs, so ui.cpp fills them from the
+// players and the host renderer from a render. The live parts read the
+// players' hand-overs in ui_tap.h, and the scope, waveform and peak meters
+// read what's about to play from the WAV ring (Synth::wavStreamPeek()).
+//
+// The *Live() calls can come every loop: each part keeps its own rate and
+// draws only when it changed. Meters, lanes, scope and waveform are
+// DRAW_METER draws, so they wait while the slice is spent or the ring runs
+// low; time, position and state always draw.
+namespace UiPlayer {
+
+enum PlayState : uint8_t { PS_IDLE, PS_PLAYING, PS_PAUSED, PS_STOPPED, PS_DONE, PS_ERROR };
+
+struct TrackerInfo {
+    const char* name;
+    const char* format; // "XM"
+    int channels, instruments;
+    int songLength, order, row;
+    int speed, tempo;
+    uint32_t elapsedMs;
+    PlayState state;
+    const char* error;
+    int volume;
+};
+
+struct MidiInfo {
+    const char* name;
+    int format, tracks;
+    uint32_t elapsedMs;
+    unsigned bpm;
+    int tempoPct;
+    PlayState state;
+    const char* error;
+    int volume;
+    const char* out; // "HW+USB"
+    bool audioOn;
+};
+
+struct WavInfo {
+    const char* name;
+    uint32_t fileKey; // a hash of the full path
+    uint32_t elapsedMs, totalMs;
+    uint32_t sampleRate;
+    int bits, channels;
+    PlayState state;
+    const char* error;
+    int volume;
+};
+
+void drawTracker(const TrackerInfo& t);
+void trackerState(PlayState s);
+void trackerLive(const TrackerInfo& t);
+
+void drawMidi(const MidiInfo& m);
+void midiState(PlayState s);
+void midiLive(const MidiInfo& m);
+void midiOutput(const char* out, bool audioOn);
+
+void drawWav(const WavInfo& w);
+void wavState(PlayState s);
+void wavLive(const WavInfo& w);
+
+// True once a tracker or WAV screen has nothing left to show from the ring:
+// it has played out and the meters are down. Keep the *Live() calls going
+// after the end until then.
+bool liveSettled();
+
+// The volume readout on whichever player screen is up.
+void setVolume(int volume);
+
+} // namespace UiPlayer

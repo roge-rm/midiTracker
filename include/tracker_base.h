@@ -60,6 +60,9 @@ struct TrackerVoice {
     // on one side), moving by stepL/stepR for rampLeft more frames.
     int32_t curL = 0, curR = 0, stepL = 0, stepR = 0;
     uint16_t rampLeft = 0;
+    // Largest |sample| at the end of each block this tick, for the UI's
+    // channel meters. Cleared once a tick.
+    uint16_t uiPeak = 0;
 };
 
 // Resonant filter coefficients (Q24) and state, see mixVoiceBlock().
@@ -108,6 +111,8 @@ public:
     int currentRow() const { return _row < 0 ? 0 : _row; } // -1 right after load(), before the first row
     int channelCount() const { return _numChannels; }
     int instrumentCount() const { return _numInstruments; }
+    int speed() const { return _speed; } // ticks per row
+    int tempo() const { return _tempo; } // BPM
 
     // Highest step the resampler takes, 8 source frames per output frame
     // (three octaves above 44.1 kHz). Notes in real files rarely pass
@@ -158,6 +163,10 @@ protected:
     virtual void advanceRow() = 0;
     virtual void processTickEffects() = 0;
     virtual void tickEnd() {}
+
+    // The voice pattern channel ch plays on, for the UI's channel meters,
+    // or nullptr. Voice ch by default; IT has its own mapping.
+    virtual TrackerVoice* laneVoice(int ch);
 
     // Fills v's cache so it holds `index` (already loop-wrapped and below
     // the sample length) and returns that frame, or 0 when the read fails.
@@ -282,6 +291,8 @@ protected:
 
 private:
     void advanceTick();
+    void publishLevels();
+    int _uiOrder = -1, _uiRow = -1; // last row handed to UiTap
     void applyGains();
     void spawnTail(TrackerVoice& v);
     void mixTail(TrackerTail& t, int32_t* acc, uint32_t n);

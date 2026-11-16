@@ -122,6 +122,14 @@ size_t wavStreamFree() { return RING_FRAMES - g_pending; }
 void wavStreamEnd() {}
 bool wavStreamTookUnderrun() { return false; }
 uint32_t wavStreamUnderrunSamples() { return 0; }
+uint32_t wavStreamWritten() { return (uint32_t)(g_out.size() / 2); }
+uint32_t wavStreamPlayed() { return (uint32_t)(g_out.size() / 2 - g_pending); }
+// The frames written since the last drain, as if none had played yet.
+size_t wavStreamPeek(int16_t* out, size_t frames) {
+    size_t n = frames < g_pending ? frames : g_pending;
+    memcpy(out, g_out.data() + (g_out.size() - g_pending * 2), n * 4);
+    return n;
+}
 }
 
 namespace HostRing {

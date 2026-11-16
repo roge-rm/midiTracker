@@ -225,6 +225,10 @@ private:
     void setupFilter(ItVoice& v, int envMod, bool noteRow);
 
     void advanceRow() override;
+    TrackerVoice* laneVoice(int ch) override {
+        int v = ch < MAX_CHANNELS ? _channels[ch].voice : -1;
+        return v >= 0 && v < MAX_VOICES ? &_voices[v] : nullptr;
+    }
     void processTickEffects() override;
     void tickEnd() override { processVoices(); }
     uint32_t tickLength() override;

@@ -1,5 +1,6 @@
 #include "sd_card.h"
 #include "mod_file.h"
+#include "ui_tap.h"
 #include "pins.h" // SAMPLE_RATE
 #include <string.h>
 
@@ -405,7 +406,13 @@ void ModPlayer::advanceRow() {
     }
 
     for (int ch = 0; ch < _numChannels; ch++) {
-        processCellTriggers(ch, &rowBuf[ch * 4]);
+        const uint8_t* cell = &rowBuf[ch * 4];
+        if (ch < UiTap::LANES) {
+            uint16_t rawPeriod = (uint16_t)(((cell[0] & 0x0F) << 8) | cell[1]);
+            UiTap::cell(ch, rawPeriod ? (uint8_t)(noteForPeriod(rawPeriod) + 1) : UiTap::NOTE_NONE,
+                        (uint8_t)((cell[0] & 0xF0) | (cell[2] >> 4)));
+        }
+        processCellTriggers(ch, cell);
         // A row starts at the base pitch, dropping last tick's vibrato or arpeggio.
         ModChannel& c = _channels[ch];
         if (c.stepPeriod != c.period) recomputeStep(c);

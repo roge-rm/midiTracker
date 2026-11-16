@@ -1,5 +1,6 @@
 #include "sd_card.h"
 #include "xm_file.h"
+#include "ui_tap.h"
 #include "pins.h" // SAMPLE_RATE
 #include <string.h>
 
@@ -816,6 +817,7 @@ void XmPlayer::decodeRow(bool apply) {
         if (apply && ch < _numChannels) {
             if (b[0] > 97) b[0] = 0;
             if (b[3] > 35) b[3] = b[4] = 0;
+            UiTap::cell(ch, b[0] == 97 ? UiTap::NOTE_OFF : b[0], b[1]);
             rowCell(ch, b[0], b[1], b[2], b[3], b[4]);
         }
     }

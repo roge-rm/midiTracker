@@ -11,6 +11,9 @@ size_t wavStreamFree();
 void wavStreamEnd();
 bool wavStreamTookUnderrun();
 uint32_t wavStreamUnderrunSamples();
+uint32_t wavStreamWritten();
+uint32_t wavStreamPlayed();
+size_t wavStreamPeek(int16_t* out, size_t frames);
 }
 
 // Harness side of the ring.

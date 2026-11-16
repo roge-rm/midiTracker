@@ -303,6 +303,14 @@ bool wavStreamIsActive();
 // True after wavStreamEnd(), until the next reset: the ring drains on purpose.
 bool wavStreamIsEnded();
 
+// For the player screens, core 0 only. Frames written and frames played
+// since boot (they wrap at 2^32 and only ever go up), and a copy of the
+// next `frames` frames due to play, without taking them. Returns the
+// frames copied, fewer when less is buffered, 0 while a reset is pending.
+uint32_t wavStreamWritten();
+uint32_t wavStreamPlayed();
+size_t wavStreamPeek(int16_t* out, size_t frames);
+
 // No more source data coming (EOF reached). Once the consumer drains
 // what's already buffered, it stops mixing WAV audio in on its own --
 // this is a normal, expected drain, not treated as an underrun.

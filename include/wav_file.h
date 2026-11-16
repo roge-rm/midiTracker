@@ -56,6 +56,7 @@ public:
     uint32_t elapsedMs() const; // wall-clock based, deliberately independent of
                                   // how far ahead the ring buffer has been filled
     uint32_t totalMs() const;    // known immediately after load() -- no prescan needed
+    uint32_t pathKey() const { return _pathKey; } // hash of the loaded path, for the UI's waveform cache
 
     // See this class's header comment for PCM-vs-ADPCM cost. Either way,
     // no file reopen. Discards whatever's currently buffered
@@ -78,6 +79,7 @@ private:
     State _state = STATE_IDLE;
     char _error[64] = {0};
 
+    uint32_t _pathKey = 0;
     uint32_t _dataChunkStart = 0;
     uint32_t _dataChunkLen = 0;
     uint32_t _srcSampleRate = 0;

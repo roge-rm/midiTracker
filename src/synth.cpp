@@ -2776,6 +2776,27 @@ size_t Synth::wavStreamFree() {
 
 size_t Synth::wavStreamCapacity() { return WAV_RING_FRAMES; }
 
+uint32_t Synth::wavStreamWritten() { return (uint32_t)g_wavHead; }
+
+uint32_t Synth::wavStreamPlayed() { return (uint32_t)wavStreamProducerTail(); }
+
+// Core 0 is the only writer, so the slots between tail and head stay put
+// while they're copied, even if core 1 moves tail on meanwhile.
+size_t Synth::wavStreamPeek(int16_t* out, size_t frames) {
+    if (g_wavResetSeen != g_wavResetSeq) return 0;
+    size_t tail = g_wavTail;
+    __dmb(); // acquire: tail read before the data behind it
+    size_t head = g_wavHead;
+    size_t have = head - tail;
+    size_t n = frames < have ? frames : have;
+    for (size_t i = 0; i < n; i++) {
+        size_t idx = (tail + i) & WAV_RING_MASK;
+        out[i * 2 + 0] = g_wavRing[idx * 2 + 0];
+        out[i * 2 + 1] = g_wavRing[idx * 2 + 1];
+    }
+    return n;
+}
+
 bool Synth::wavStreamIsActive() { return g_wavActive; }
 
 bool Synth::wavStreamIsEnded() { return g_wavEnded; }

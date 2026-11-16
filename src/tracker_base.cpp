@@ -2,6 +2,7 @@
 #include "synth.h"
 #include "sd_card.h"
 #include "pins.h" // SAMPLE_RATE
+#include "ui_tap.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -55,6 +56,9 @@ void TrackerPlayer::resetSequencer(uint8_t speed, uint16_t tempo) {
     _elapsedMsFrozen = 0;
     _lastResumeMicros = micros();
     _state = STATE_PAUSED;
+    _uiOrder = _uiRow = -1;
+    UiTap::trackerReset();
+    UiTap::g_tracker.tickAt = Synth::wavStreamWritten();
 }
 
 void TrackerPlayer::close() {
@@ -204,15 +208,54 @@ void TrackerPlayer::startVoiceAt(TrackerVoice& v, uint32_t index) {
     }
 }
 
+TrackerVoice* TrackerPlayer::laneVoice(int ch) {
+    return ch < _voiceCount ? &voiceAt(ch) : nullptr;
+}
+
+// Channel levels for the tick that just ended: the block-end sample peak
+// times the voice's gain, 0-255.
+void TrackerPlayer::publishLevels() {
+    UiTap::Levels& lv = UiTap::levelsSlot();
+    for (int ch = 0; ch < UiTap::LANES; ch++) {
+        uint32_t l = 0;
+        TrackerVoice* v = ch < _numChannels ? laneVoice(ch) : nullptr;
+        if (v) {
+            int32_t gl = v->curL < 0 ? -v->curL : v->curL;
+            int32_t gr = v->curR < 0 ? -v->curR : v->curR;
+            uint32_t g = (uint32_t)(gl > gr ? gl : gr) >> 12;
+            if (v->smp && v->havePair) l = ((uint32_t)v->uiPeak * g) >> 22;
+            if (l > 255) l = 255;
+        }
+        lv.level[ch] = (uint8_t)l;
+    }
+    // Every voice, so background (NNA) voices don't carry an old peak.
+    for (int i = 0; i < _voiceCount; i++) voiceAt(i).uiPeak = 0;
+    UiTap::levelsDone(Synth::wavStreamWritten());
+}
+
 void TrackerPlayer::advanceTick() {
+    publishLevels();
     tickStart();
     _tick++;
     if (_tick >= _speed) {
         _tick = 0;
         // A pattern delay holds the row for more full tick cycles: tick
         // effects keep running, notes don't retrigger.
-        if (_patternDelayRepeatsLeft > 0) _patternDelayRepeatsLeft--;
-        else advanceRow();
+        if (_patternDelayRepeatsLeft > 0) {
+            _patternDelayRepeatsLeft--;
+        } else {
+            UiTap::rowBegin();
+            advanceRow();
+            // Every row is handed on, except a delay repeat (S3M SEx, XM
+            // EEx), which comes back at the same position with no notes.
+            // Pattern loops and self-jumps on one row have notes, so they go.
+            bool repeat = _orderPos == _uiOrder && _row == _uiRow && UiTap::rowEmpty();
+            if (_state != STATE_DONE && !repeat) {
+                _uiOrder = _orderPos;
+                _uiRow = _row;
+                UiTap::rowEnd(Synth::wavStreamWritten(), _orderPos, _row);
+            }
+        }
     } else {
         processTickEffects();
     }
@@ -438,6 +481,8 @@ void __not_in_flash_func(TrackerPlayer::mixVoiceBlock)(TrackerVoice& v, TrackerF
         if (f) mixVoice<true, false>(v, f, acc + 2 * r, n - r);
         else mixVoice<false, false>(v, nullptr, acc + 2 * r, n - r);
     }
+    int32_t a = v.lastSrcSample < 0 ? -v.lastSrcSample : v.lastSrcSample;
+    if (a > v.uiPeak) v.uiPeak = (uint16_t)a;
 }
 
 void __not_in_flash_func(TrackerPlayer::mixTail)(TrackerTail& t, int32_t* acc, uint32_t n) {

@@ -4,12 +4,19 @@
 // The screens are put together here the way ui.cpp does it, with made-up
 // data, so the layout can be checked without the device.
 #include "ui_look.h"
+#include "ui_player.h"
+#include "ui_tap.h"
+#include "synth.h"
+#include "midi_output.h"
+#include "host_snap.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string>
 #include <vector>
 
 uint16_t g_hostFrame[240][320];
+uint32_t g_hostMs = 1000;
 
 namespace {
 TFT_eSPI g_tft;
@@ -27,7 +34,39 @@ TFT_eSprite& stripBegin(int x, int y, int w, int h, uint16_t bg) {
     return g_sprite;
 }
 void stripSend() {}
+bool sliceAllows(DrawKind) { return true; }
+void sliceCharge(uint32_t) {}
 } // namespace Ui
+
+// ---- the player screens' sources, played back from host renders ----------
+
+namespace {
+std::vector<int16_t> g_raw; // stereo frames of a render
+uint32_t g_played = 0;
+const HostSnap::MidiFrame* g_midiFrame = nullptr;
+}
+
+namespace Synth {
+uint32_t wavStreamWritten() { return (uint32_t)(g_raw.size() / 2); }
+uint32_t wavStreamPlayed() { return g_played; }
+size_t wavStreamPeek(int16_t* out, size_t frames) {
+    size_t have = g_raw.size() / 2 > g_played ? g_raw.size() / 2 - g_played : 0;
+    size_t n = frames < have ? frames : have;
+    memcpy(out, g_raw.data() + (size_t)g_played * 2, n * 4);
+    return n;
+}
+}
+
+namespace MidiOutput {
+bool isNoteActive(uint8_t n) { return n < 128 && g_midiFrame && g_midiFrame->noteMask[n]; }
+bool isNotePercussion(uint8_t n) { return n < 128 && g_midiFrame && (g_midiFrame->noteMask[n] & (1u << 9)); }
+uint8_t noteVelocity(uint8_t n) { return n < 128 && g_midiFrame ? g_midiFrame->noteVel[n] : 0; }
+uint16_t activeChannelMask() {
+    uint16_t m = 0;
+    for (int n = 0; g_midiFrame && n < 128; n++) m |= g_midiFrame->noteMask[n];
+    return m;
+}
+}
 
 using namespace Look;
 
@@ -260,13 +299,157 @@ void fontSheet() {
     drawText(g_tft, FONT_LABEL, "MIDITRACKER", 150, 175, COLOR_ACCENT, 2);
 }
 
+
+// ---- player screens from host renders ----------------------------------------
+
+template <class T>
+bool readFile(const std::string& path, std::vector<T>& out) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { perror(path.c_str()); return false; }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    out.resize((size_t)n / sizeof(T));
+    size_t got = fread(out.data(), sizeof(T), out.size(), f);
+    fclose(f);
+    return got == out.size();
+}
+
+const uint32_t RATE = 44100;
+const uint32_t STEP_MS = 20; // the live update rate file_player_mode uses
+
+// The tracker screen as it looks at the snapshot: drawn 600 ms before it,
+// then the live updates run up to it, so the meters have their history.
+bool trackerScreen(const std::string& dir, const char* base, const char* name, int volume) {
+    std::vector<uint8_t> buf;
+    if (!readFile(dir + "/" + base + ".snap", buf) || buf.size() < sizeof(HostSnap::Tracker)) return false;
+    HostSnap::Tracker s;
+    memcpy(&s, buf.data(), sizeof(s));
+    if (!readFile(dir + "/" + base + ".raw", g_raw)) return false;
+    UiTap::g_tracker = s.tap;
+    const char* dot = strrchr(name, '.');
+    char fmt[6] = {0};
+    for (int i = 0; dot && dot[i + 1] && i < 5; i++) fmt[i] = (char)toupper((unsigned char)dot[i + 1]);
+    UiPlayer::TrackerInfo t = {};
+    t.name = name;
+    t.format = fmt;
+    t.channels = s.channels;
+    t.instruments = s.instruments;
+    t.songLength = s.songLength;
+    t.order = s.order;
+    t.row = s.row;
+    t.speed = s.speed;
+    t.tempo = s.tempo;
+    t.state = UiPlayer::PS_PLAYING;
+    t.volume = volume;
+    g_played = s.written - RATE * 600 / 1000;
+    t.elapsedMs = (uint32_t)((uint64_t)g_played * 1000 / RATE);
+    g_tft.fillScreen(COLOR_BG);
+    UiPlayer::drawTracker(t);
+    for (uint32_t ms = 0; ms < 600; ms += STEP_MS) {
+        g_hostMs += STEP_MS;
+        g_played += RATE * STEP_MS / 1000;
+        t.elapsedMs = (uint32_t)((uint64_t)g_played * 1000 / RATE);
+        UiPlayer::trackerLive(t);
+    }
+    return true;
+}
+
+bool midiScreen(const std::string& dir, const char* base, const char* name) {
+    std::vector<uint8_t> buf;
+    if (!readFile(dir + "/" + base + ".snap", buf) || buf.size() < sizeof(HostSnap::Midi)) return false;
+    static HostSnap::Midi s;
+    memcpy(&s, buf.data(), sizeof(s));
+    UiPlayer::MidiInfo m = {};
+    m.name = name;
+    m.format = s.format;
+    m.tracks = s.tracks;
+    m.tempoPct = 100;
+    m.state = UiPlayer::PS_PLAYING;
+    m.volume = 80;
+    m.out = "HW+USB";
+    m.audioOn = true;
+    g_tft.fillScreen(COLOR_BG);
+    for (int i = 0; i < HostSnap::Midi::FRAMES; i++) {
+        g_midiFrame = &s.frames[i];
+        UiTap::g_midi = s.frames[i].tap;
+        m.elapsedMs = s.frames[i].elapsedMs;
+        m.bpm = s.frames[i].bpm;
+        g_hostMs += 40;
+        if (i == 0) UiPlayer::drawMidi(m);
+        else UiPlayer::midiLive(m);
+    }
+    return true;
+}
+
+// The WAV screen with a render as the file, played to 60% so the waveform
+// has filled in that far.
+bool wavScreen(const std::string& dir, const char* base, const char* name) {
+    if (!readFile(dir + "/" + base + ".raw", g_raw)) return false;
+    UiPlayer::WavInfo w = {};
+    w.name = name;
+    w.fileKey = 1;
+    w.totalMs = (uint32_t)((uint64_t)(g_raw.size() / 2) * 1000 / RATE);
+    w.sampleRate = RATE;
+    w.bits = 16;
+    w.channels = 2;
+    w.state = UiPlayer::PS_PLAYING;
+    w.volume = 80;
+    g_played = 0;
+    g_tft.fillScreen(COLOR_BG);
+    UiPlayer::drawWav(w);
+    for (uint32_t ms = 0; ms < w.totalMs * 6 / 10; ms += STEP_MS) {
+        g_hostMs += STEP_MS;
+        w.elapsedMs = ms;
+        g_played = (uint32_t)((uint64_t)ms * RATE / 1000);
+        UiPlayer::wavLive(w);
+    }
+    return true;
+}
+
+// The paused state, and an error.
+void stateScreens(const std::string& dir) {
+    if (trackerScreen(dir, "s3m", "CMD - The Reflex.s3m", 80)) {
+        UiPlayer::trackerState(UiPlayer::PS_PAUSED);
+        save("tracker-paused");
+    }
+    UiPlayer::TrackerInfo t = {};
+    t.name = "broken.xm";
+    t.format = "XM";
+    t.state = UiPlayer::PS_ERROR;
+    t.error = "Not an XM file (bad header)";
+    g_tft.fillScreen(COLOR_BG);
+    UiPlayer::drawTracker(t);
+    save("tracker-error");
+}
+
+int playerScreens(const std::string& dir) {
+    struct { const char* base; const char* name; } trackers[] = {
+        {"mod", "AXELF.MOD"},
+        {"s3m", "CMD - The Reflex.s3m"},
+        {"xm", "Kenetic & Seenix - Our Little Fantasy.xm"},
+        {"it", "Katie Cadet - Lucky Star.it"},
+    };
+    for (auto& tr : trackers) {
+        if (!trackerScreen(dir, tr.base, tr.name, 80)) return 1;
+        save((std::string("tracker-") + tr.base).c_str());
+    }
+    if (!midiScreen(dir, "mid", "busy_schedule.mid")) return 1;
+    save("midi");
+    if (!wavScreen(dir, "s3m", "the reflex render.wav")) return 1;
+    save("wav");
+    stateScreens(dir);
+    return 0;
+}
 } // namespace
 
+// look_render <out dir> [--players <snapshot dir>]
 int main(int argc, char** argv) {
     g_outDir = argc > 1 ? argv[1] : ".";
     crcInit();
     setScreen(&g_tft);
     statusBattery(70, false);
+    if (argc > 3 && strcmp(argv[2], "--players") == 0) return playerScreens(argv[3]);
 
     drawSplash("0.6.0");
     save("splash");

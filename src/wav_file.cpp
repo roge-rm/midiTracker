@@ -64,6 +64,8 @@ int16_t decodeImaNibble(int32_t& predictor, int& stepIndex, uint8_t nibble) {
 bool WavPlayer::load(const char* path) {
     close();
     _error[0] = '\0';
+    _pathKey = 2166136261u;
+    for (const char* c = path; c && *c; c++) _pathKey = (_pathKey ^ (uint8_t)*c) * 16777619u;
 
     if (!sdOpenPath(_file, path, O_RDONLY)) {
         strncpy(_error, "could not open file", sizeof(_error) - 1);

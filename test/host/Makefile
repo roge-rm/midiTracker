@@ -8,25 +8,26 @@
 #   fluid_compare.sh                 compare the midi renders with fluidsynth's
 #   openmpt_compare.sh <list> <outdir> [secs]   correlate .it renders with openmpt123 (uses build/host/corr)
 #   make -C test/host look OUT_DIR=dir   render the M12 screens to PNGs in dir (default build/host/look)
+#   make -C test/host players OUT_DIR=dir   the player screens, drawn from host renders of real songs
 ROOT   := $(abspath ../..)
 OUT    := $(ROOT)/build/host
 CXX    ?= g++
 CXXFLAGS := -std=gnu++17 -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable \
             -Wno-unused-function -Wno-missing-field-initializers \
             -I$(CURDIR)/stub -I$(ROOT)/include
-PLAYER_SRC := $(wildcard $(ROOT)/src/tracker_base.cpp) $(ROOT)/src/mod_file.cpp \
+PLAYER_SRC := $(wildcard $(ROOT)/src/tracker_base.cpp) $(ROOT)/src/ui_tap.cpp $(ROOT)/src/mod_file.cpp \
               $(ROOT)/src/s3m_file.cpp $(ROOT)/src/xm_file.cpp $(ROOT)/src/it_file.cpp $(ROOT)/src/shared_ram_arena.cpp
 HARNESS_SRC := $(CURDIR)/render.cpp $(CURDIR)/host_stubs.cpp
 SECONDS ?= 60
 
-.PHONY: all baseline check clean midi midi-baseline midi-check look
+.PHONY: all baseline check clean midi midi-baseline midi-check look players
 all: $(OUT)/render $(OUT)/gen $(OUT)/corr
 
 $(OUT)/corr: $(CURDIR)/corr.cpp
 	@mkdir -p $(OUT)
 	$(CXX) -std=gnu++17 -O2 -Wall -o $@ $<
 
-$(OUT)/render: $(PLAYER_SRC) $(HARNESS_SRC) $(wildcard $(CURDIR)/stub/*.h) $(wildcard $(ROOT)/include/*.h)
+$(OUT)/render: $(PLAYER_SRC) $(HARNESS_SRC) $(CURDIR)/host_snap.h $(wildcard $(CURDIR)/stub/*.h) $(wildcard $(ROOT)/include/*.h)
 	@mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -o $@ $(PLAYER_SRC) $(HARNESS_SRC)
 
@@ -51,7 +52,7 @@ clean:
 	rm -rf $(OUT)
 
 # MIDI target: the real synth.cpp and midi_file.cpp with a stub MidiOutput and I2S.
-MIDI_SRC := $(ROOT)/src/synth.cpp $(ROOT)/src/midi_file.cpp $(CURDIR)/midi_stubs.cpp $(CURDIR)/render_midi.cpp $(CURDIR)/host_stubs.cpp
+MIDI_SRC := $(ROOT)/src/synth.cpp $(ROOT)/src/midi_file.cpp $(ROOT)/src/ui_tap.cpp $(CURDIR)/midi_stubs.cpp $(CURDIR)/render_midi.cpp $(CURDIR)/host_stubs.cpp
 MIDI_FLAGS := $(filter-out -I%,$(CXXFLAGS)) -DHOST_MIDI -I$(CURDIR)/stub-midi -I$(CURDIR)/stub -I$(ROOT)/include
 MIDI_DIR := $(OUT)/midi
 
@@ -61,7 +62,7 @@ $(OUT)/envcorr: $(CURDIR)/envcorr.cpp
 	@mkdir -p $(OUT)
 	$(CXX) -std=gnu++17 -O2 -Wall -o $@ $<
 
-$(OUT)/render_midi: $(MIDI_SRC) $(wildcard $(CURDIR)/stub*/*.h) $(wildcard $(ROOT)/include/*.h) $(CURDIR)/midi_host.h
+$(OUT)/render_midi: $(MIDI_SRC) $(wildcard $(CURDIR)/stub*/*.h) $(wildcard $(ROOT)/include/*.h) $(CURDIR)/midi_host.h $(CURDIR)/host_snap.h
 	@mkdir -p $(OUT)
 	$(CXX) $(MIDI_FLAGS) -o $@ $(MIDI_SRC)
 
@@ -77,14 +78,29 @@ midi-check: midi $(MIDI_DIR)/.copied
 	SECONDS=$(SECONDS) $(CURDIR)/render_midi_all.sh $(OUT)/render_midi $(MIDI_DIR) $(OUT)/midi-current
 	EXT=wav $(CURDIR)/compare.sh $(OUT)/midi-baseline $(OUT)/midi-current
 
-# M12 look: the real ui_look.cpp drawn into a framebuffer, written as PNGs.
-LOOK_SRC := $(ROOT)/src/ui_look.cpp $(CURDIR)/look_render.cpp
+# M12 look: the real ui_look.cpp and ui_player.cpp drawn into a framebuffer, written as PNGs.
+LOOK_SRC := $(ROOT)/src/ui_look.cpp $(ROOT)/src/ui_player.cpp $(ROOT)/src/ui_tap.cpp $(CURDIR)/look_render.cpp
+LOOK_H := $(wildcard $(CURDIR)/stub-look/*.h) $(ROOT)/include/ui_look.h $(ROOT)/include/ui_strip.h \
+          $(ROOT)/include/ui_player.h $(ROOT)/include/ui_tap.h $(CURDIR)/host_snap.h $(wildcard $(ROOT)/include/fonts/*.h)
 OUT_DIR ?= $(OUT)/look
 
-$(OUT)/look_render: $(LOOK_SRC) $(wildcard $(CURDIR)/stub-look/*.h) $(ROOT)/include/ui_look.h $(ROOT)/include/ui_strip.h $(wildcard $(ROOT)/include/fonts/*.h)
+$(OUT)/look_render: $(LOOK_SRC) $(LOOK_H)
 	@mkdir -p $(OUT)
-	$(CXX) -std=gnu++17 -O2 -g -Wall -Wextra -Wno-unused-parameter -I$(CURDIR)/stub-look -I$(ROOT)/include -o $@ $(LOOK_SRC)
+	$(CXX) -std=gnu++17 -O2 -g -Wall -Wextra -Wno-unused-parameter -I$(CURDIR)/stub-look -I$(CURDIR) -I$(ROOT)/include -o $@ $(LOOK_SRC)
 
 look: $(OUT)/look_render
 	@mkdir -p $(OUT_DIR)
 	$(OUT)/look_render $(OUT_DIR)
+
+# Player screens: renders a few songs, snapshots the UI hand-overs partway
+# in, then draws the screens from them.
+SNAP_DIR := $(OUT)/snap
+TT := $(ROOT)/trackertunes
+players: $(OUT)/render $(OUT)/render_midi $(OUT)/look_render $(OUT)/files.txt $(MIDI_DIR)/.copied
+	@mkdir -p $(SNAP_DIR) $(OUT_DIR)
+	SNAP=12 SNAP_OUT=$(SNAP_DIR)/mod.snap $(OUT)/render "$$(grep AXELF $(OUT)/files.txt)" 14 $(SNAP_DIR)/mod.raw
+	SNAP=40 SNAP_OUT=$(SNAP_DIR)/s3m.snap $(OUT)/render "$(TT)/artists/cmd/CMD - The Reflex.s3m" 60 $(SNAP_DIR)/s3m.raw
+	SNAP=40 SNAP_OUT=$(SNAP_DIR)/xm.snap $(OUT)/render "$(TT)/various/Kenetic & Seenix - Our Little Fantasy.xm" 42 $(SNAP_DIR)/xm.raw
+	SNAP=40 SNAP_OUT=$(SNAP_DIR)/it.snap $(OUT)/render "$(TT)/various/Katie Cadet - Lucky Star.it" 42 $(SNAP_DIR)/it.raw
+	SNAP=30 SNAP_OUT=$(SNAP_DIR)/mid.snap $(OUT)/render_midi $(MIDI_DIR)/busy_schedule.mid $(SNAP_DIR)/mid.wav 31 0
+	$(OUT)/look_render $(OUT_DIR) --players $(SNAP_DIR)

@@ -6,6 +6,8 @@
 #include "synth.h" // pariSynth play screen -- see drawPariSynthPlay()
 #include "ui_strip.h"
 #include "ui_look.h"
+#include "ui_player.h"
+#include <ctype.h>
 #include <TFT_eSPI.h>
 #include <hardware/clocks.h>
 #include <string.h>
@@ -110,36 +112,8 @@ const int ROW_HEIGHT = 18;
 const int HEADER_HEIGHT = Look::HEADER_H;
 const int FOOTER_HEIGHT = Look::FOOTER_H;
 
-// Now-playing screen layout. Short stats are packed two-per-row (a left
-// item at x=8, a right one at STAT_COL2_X) rather than one full-width row
-// each, since every one of these strings is short enough to leave most of
-// a 320px-wide row empty otherwise. That reclaimed height goes straight
-// to the note strip, which is the whole point of this screen -- see
-// STRIP_HEIGHT below. Tempo and the MIDI/Audio line are long enough that
-// pairing them risks running into whatever's on the other side of that
-// same row (see updateStatValue()'s comment), so those two keep a full
-// row to themselves instead.
-//
-// Fixed (rather than accumulated inline) so the live-update path can
-// repaint just the parts that actually change during playback (elapsed
-// time, tempo -- see updatePlayerLive()) without redrawing the rest.
-// These offsets only apply to the non-error player state, which is the
-// only state the live tick runs in.
-const int PLAYER_FILENAME_Y = HEADER_HEIGHT + 8;
-const int PLAYER_ROW2_Y = PLAYER_FILENAME_Y + ROW_HEIGHT + 4; // State | Time
-const int PLAYER_ROW3_Y = PLAYER_ROW2_Y + ROW_HEIGHT;         // Tempo (alone)
-const int PLAYER_ROW4_Y = PLAYER_ROW3_Y + ROW_HEIGHT;         // Tracks | Volume
-const int PLAYER_ROW5_Y = PLAYER_ROW4_Y + ROW_HEIGHT;         // MIDI target + Audio on/off (alone)
-const int PLAYER_STRIP_Y = PLAYER_ROW5_Y + ROW_HEIGHT + 6;
-const int STRIP_HEIGHT      = 74; // was 30 pre-rejigger; the stat-row packing above buys this back
+const int STRIP_HEIGHT      = 74; // note strip height on the pariSynth screen, before it's cut to fit
 const int STRIP_MIN_BAR_HEIGHT = 4; // floor so even the softest note stays visible
-
-// Fixed x for the second column on paired stat rows (State|Time,
-// Tracks|Volume). Left-aligned rather than right-aligned-to-edge like the
-// first version of this layout -- a stable, known x is what lets
-// updateStatValue() clear/redraw just a value substring without needing
-// to also touch (or re-measure) a label right next to it.
-const int STAT_COL2_X = 164;
 
 // Note-activity strip range: standard 88-key piano (A0..C8). Notes
 // outside this range (rare outside percussion channels) just don't show.
@@ -337,82 +311,6 @@ void stripText(int x, int y, int w, int h, const char* text, int tx, uint16_t fg
     }
 }
 
-// Draws one stat row: `left` at x=8, and, if non-null, `right` at
-// STAT_COL2_X. Used for rows whose content never changes after the
-// initial draw (State, Tracks, Volume, MIDI/Sound) -- see updateStatValue()
-// below for the two fields that *do* need periodic updating.
-void drawStatRow(int y, const char* left, const char* right) {
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString(left, 8, y);
-    if (right && right[0]) tft.drawString(right, STAT_COL2_X, y);
-}
-
-// Partial redraw of just the right half of a stat row, for a value that
-// changes independently of whatever's on the left (e.g. Volume, which the
-// live-update path never touches -- see Ui::updateVolume()). Safe here
-// specifically because Volume/MIDI-target strings are short and bounded.
-void updateStatRight(int y, const char* text) {
-    stripText(STAT_COL2_X, y, tft.width() - STAT_COL2_X, ROW_HEIGHT, text, 0, COLOR_DIM, COLOR_BG);
-}
-
-// Cached last-drawn value strings for Time and Tempo, the two fields
-// updatePlayerLive() polls every 50ms during playback -- see
-// updateStatValue() below. Reset to empty in drawPlayer() so a freshly
-// opened file always draws its real starting value on the first tick
-// rather than skipping a stale match left over from a previous file.
-char g_lastTimeStr[16] = {0};
-char g_lastTempoStr[24] = {0};
-
-// Draws (or re-draws) just a field's *value*, immediately after a label
-// that's drawn once elsewhere and never touched again (see TIME_LABEL/
-// TEMPO_LABEL below). `x` is where the value starts -- i.e. labelX +
-// tft.textWidth(label), computed by the caller since only it knows which
-// label this value follows.
-//
-// Two things keep this from ever blinking more than the field actually
-// needs to:
-//  - No-ops entirely if `value` matches `cache` (this field's own
-//    persistent last-drawn-value buffer, e.g. g_lastTempoStr) -- so a
-//    value that rarely changes, like Tempo between tempo-meta-events,
-//    doesn't get cleared and redrawn on every single poll.
-//  - When it does redraw, only clears max(old width, new width) -- not
-//    the label, not a neighboring column/row -- using tft.textWidth() to
-//    measure exactly rather than assuming a fixed column boundary. That
-//    was the bug in an earlier version of this screen: "Tempo: 120 BPM
-//    (100%)" could render wider than a fixed half-row clear accounted
-//    for, leaving stale pixels behind next to Tracks.
-void updateStatValue(int x, int y, const char* value, char* cache, size_t cacheSize) {
-    if (strncmp(cache, value, cacheSize) == 0) return;
-
-    int oldWidth = tft.textWidth(cache);
-    int newWidth = tft.textWidth(value);
-    int clearWidth = (oldWidth > newWidth ? oldWidth : newWidth) + 2;
-
-    stripText(x, y, clearWidth, ROW_HEIGHT, value, 0, COLOR_DIM, COLOR_BG);
-
-    strncpy(cache, value, cacheSize - 1);
-    cache[cacheSize - 1] = '\0';
-}
-
-const char* TIME_LABEL = "Time: ";
-const char* TEMPO_LABEL = "Tempo: ";
-const char* STATE_LABEL = "State: ";
-
-// Cached last-drawn State value, same purpose/pattern as g_lastTimeStr/
-// g_lastTempoStr above -- lets Ui::updatePlayerState() no-op on a
-// pause/resume that (in principle) didn't actually change anything, and
-// only clear+redraw the value substring rather than the whole row.
-char g_lastStateStr[16] = {0};
-
-// Partial redraw of just the left half of a stat row -- the mirror image
-// of updateStatRight() above, for a field whose *label* lives at x=8 and
-// whose value can change independently of whatever's in the right column
-// (e.g. MIDI target, which the live-update path never touches). Safe here
-// specifically because MIDI-target strings are short and bounded well
-// under the STAT_COL2_X boundary.
-void updateStatLeft(int y, const char* text) {
-    stripText(8, y, STAT_COL2_X - 8 - 4, ROW_HEIGHT, text, 0, COLOR_DIM, COLOR_BG);
-}
 
 // Header beat-indicator row (see drawLooperBeatIndicator()) -- BEATS_MAX
 // matches TIME_SIG_PRESETS' widest numerator, 7 (7/8), in looper_mode.cpp;
@@ -472,20 +370,6 @@ const char* targetLabel(MidiOutTarget t) {
         case MIDI_OUT_HARDWARE: return "HW MIDI";
         case MIDI_OUT_USB:      return "USB MIDI";
         default:                return "HW+USB";
-    }
-}
-
-// `stopped` distinguishes NAV's "reset to the start" from PLAY's plain
-// pause -- both leave the player in STATE_PAUSED (there's no separate
-// MidiPlayer state for it), so FilePlayerMode tracks which one happened
-// itself and passes it through here.
-const char* stateLabel(MidiPlayer::State s, bool stopped) {
-    switch (s) {
-        case MidiPlayer::STATE_PLAYING: return "Playing";
-        case MidiPlayer::STATE_PAUSED:  return stopped ? "Stopped" : "Paused";
-        case MidiPlayer::STATE_DONE:    return "Finished";
-        case MidiPlayer::STATE_ERROR:   return "Error";
-        default:                        return "Idle";
     }
 }
 
@@ -917,162 +801,71 @@ void updateBrowserSelection(const SdBrowser& browser, int prevIndex, int newInde
     drawBrowserRow(browser, newIndex, scrollOffset, true);
 }
 
+// The player screens are in ui_player.cpp; these fill its info structs.
+
+UiPlayer::PlayState playState(MidiPlayer::State s, bool stopped) {
+    switch (s) {
+        case MidiPlayer::STATE_PLAYING: return UiPlayer::PS_PLAYING;
+        case MidiPlayer::STATE_PAUSED:  return stopped ? UiPlayer::PS_STOPPED : UiPlayer::PS_PAUSED;
+        case MidiPlayer::STATE_DONE:    return UiPlayer::PS_DONE;
+        case MidiPlayer::STATE_ERROR:   return UiPlayer::PS_ERROR;
+        default:                        return UiPlayer::PS_IDLE;
+    }
+}
+
+// Remembered for the live updates, which don't get them.
+MidiOutTarget g_playerTarget = MIDI_OUT_BOTH;
+bool g_playerAudio = false;
+int g_playerVolume = 0;
+bool g_playerStopped = false;
+
+UiPlayer::MidiInfo midiInfo(const char* filename, const MidiPlayer& player) {
+    UiPlayer::MidiInfo m;
+    m.name = filename;
+    m.format = player.format();
+    m.tracks = player.trackCount();
+    m.elapsedMs = player.elapsedMs();
+    m.bpm = player.currentBPM();
+    m.tempoPct = (int)(player.tempoScale() * 100.0f + 0.5f);
+    m.state = playState(player.state(), g_playerStopped);
+    m.error = player.errorMessage();
+    m.volume = g_playerVolume;
+    m.out = targetLabel(g_playerTarget);
+    m.audioOn = g_playerAudio;
+    return m;
+}
+
 void drawPlayer(const char* filename, const MidiPlayer& player, MidiOutTarget target,
                  bool audioOn, int volume, bool stopped) {
-    statusBar("MIDI", &Look::ICON_NOTE, COLOR_MIDI);
-
-    // None of these rows fill their own background the way e.g.
-    // drawBrowserRow() does -- they're short strings on an otherwise-bare
-    // row, previously left to a blanket fillScreen() to establish a clean
-    // canvas. Now that that's removed (it caused a visible full-screen
-    // black flash on every redraw, same fix as drawBrowser()'s/
-    // drawLooper()'s), each row clears its own exact width immediately
-    // before drawing into it instead, so the transition is a quick
-    // sequence of small per-row flashes rather than one big one -- same
-    // technique, just applied per-row here instead of via each row
-    // drawing its own content.
-    tft.fillRect(0, HEADER_HEIGHT, tft.width(), PLAYER_FILENAME_Y - HEADER_HEIGHT, COLOR_BG);
-
-    // Clears through to PLAYER_ROW2_Y, not just ROW_HEIGHT -- the two are
-    // PLAYER_ROW2_Y - PLAYER_FILENAME_Y apart (ROW_HEIGHT + a 4px gap), so
-    // clearing only ROW_HEIGHT left that trailing 4px strip uncleared,
-    // showing leftover file-browser text there.
-    tft.fillRect(0, PLAYER_FILENAME_Y, tft.width(), PLAYER_ROW2_Y - PLAYER_FILENAME_Y, COLOR_BG);
-    tft.setTextColor(COLOR_TEXT, COLOR_BG);
-    tft.drawString(filename, 8, PLAYER_FILENAME_Y);
-
-    char buf[48];
-    tft.fillRect(0, PLAYER_ROW2_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.drawString(STATE_LABEL, 8, PLAYER_ROW2_Y);
-
-    // A fresh file: none of the cached values can still be valid (they
-    // may belong to whatever was playing before), so force every field
-    // below to draw for real on the first tick rather than skipping a
-    // stale match -- see updateStatValue().
-    g_lastTimeStr[0] = '\0';
-    g_lastTempoStr[0] = '\0';
-    g_lastStateStr[0] = '\0';
-    updateStatValue(8 + tft.textWidth(STATE_LABEL), PLAYER_ROW2_Y,
-                     stateLabel(player.state(), stopped), g_lastStateStr, sizeof(g_lastStateStr));
-
-    bool isError = player.state() == MidiPlayer::STATE_ERROR;
-    if (isError) {
-        // Error replaces everything below State -- there's no elapsed
-        // time/tempo/tracks/output to show for a file that never started.
-        tft.fillRect(0, PLAYER_ROW3_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-        tft.setTextColor(COLOR_ERROR, COLOR_BG);
-        tft.drawString(player.errorMessage(), 8, PLAYER_ROW3_Y);
-    } else {
-        tft.drawString(TIME_LABEL, STAT_COL2_X, PLAYER_ROW2_Y);
-        char timeStr[16];
-        formatDuration(player.elapsedMs(), timeStr, sizeof(timeStr));
-        updateStatValue(STAT_COL2_X + tft.textWidth(TIME_LABEL), PLAYER_ROW2_Y,
-                         timeStr, g_lastTimeStr, sizeof(g_lastTimeStr));
-
-        tft.fillRect(0, PLAYER_ROW3_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-        tft.drawString(TEMPO_LABEL, 8, PLAYER_ROW3_Y);
-        snprintf(buf, sizeof(buf), "%u BPM (%d%%)", player.currentBPM(),
-                 (int)(player.tempoScale() * 100.0f + 0.5f));
-        updateStatValue(8 + tft.textWidth(TEMPO_LABEL), PLAYER_ROW3_Y,
-                         buf, g_lastTempoStr, sizeof(g_lastTempoStr));
-
-        tft.fillRect(0, PLAYER_ROW4_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-        snprintf(buf, sizeof(buf), "Tracks: %u", player.trackCount());
-        char volBuf[16];
-        snprintf(volBuf, sizeof(volBuf), "Volume: %d%%", volume);
-        drawStatRow(PLAYER_ROW4_Y, buf, volBuf);
-
-        // Two fixed columns, like Tracks|Volume above, rather than one
-        // concatenated string -- lets updatePlayerOutputTarget()/
-        // updatePlayerAudioState() repaint just their own half.
-        tft.fillRect(0, PLAYER_ROW5_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-        char midiBuf[24];
-        snprintf(midiBuf, sizeof(midiBuf), "MIDI: %s", targetLabel(target));
-        char audioBuf[16];
-        snprintf(audioBuf, sizeof(audioBuf), "Audio: %s", audioOn ? "On" : "Off");
-        drawStatRow(PLAYER_ROW5_Y, midiBuf, audioBuf);
-    }
-
-    // Everything from here down to the footer is either drawNoteStrip()'s
-    // own area (which fully repaints its own covered width every call
-    // regardless of note state -- see its comment) or otherwise unused in
-    // this state. Cleared as one span down to the footer, covering the
-    // full width (so the strip's own right-edge remainder, from 320px not
-    // dividing evenly by its 88 columns, is included too) -- simpler and
-    // more robust than tracking each branch's own exact row count, with
-    // no risk of a gap slipping through between them.
-    int contentBottom = isError ? (PLAYER_ROW3_Y + ROW_HEIGHT) : (PLAYER_ROW5_Y + ROW_HEIGHT);
-    int fy = tft.height() - FOOTER_HEIGHT;
-    if (fy > contentBottom) {
-        tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
-    }
-    drawNoteStrip(PLAYER_STRIP_Y, STRIP_HEIGHT, true);
-    // Row-grouped (see pins.h): line 1 = UP/PLAY/EDIT, with EDIT+UP/DOWN
-    // (volume) woven into UD's own hint since EDIT is a modifier there
-    // (as opposed to its own tap, which toggles Audio) -- same reasoning
-    // ALT gets woven into hints elsewhere instead of a separate mention
-    // wherever it's a modifier rather than its own tap action. Line 2
-    // similarly weaves in ENTER+LEFT/RIGHT (scrub).
-    drawFooter("UD tempo/EDIT+UD vol  PLAY tog  EDIT inst", "ENT+LR seek  ALT midi/+EDIT aud  NAV stop");
+    g_playerTarget = target;
+    g_playerAudio = audioOn;
+    g_playerVolume = volume;
+    g_playerStopped = stopped;
+    UiPlayer::drawMidi(midiInfo(filename, player));
 }
 
-// Repaints only the volume half of its row (right side of ROW4, next to
-// Tracks) -- see the comment on Ui::updateVolume().
 void updateVolume(int volume) {
-    char buf[24];
-    snprintf(buf, sizeof(buf), "Volume: %d%%", volume);
-    updateStatRight(PLAYER_ROW4_Y, buf);
+    g_playerVolume = volume;
+    UiPlayer::setVolume(volume);
 }
 
-// Partial redraw of just the State value, e.g. after PLAY toggles
-// pause/resume or NAV stops. Caller must not use this for a transition
-// into or out of STATE_ERROR -- that swaps the whole row layout (see
-// drawPlayer()) and needs a full redraw instead.
 void updatePlayerState(MidiPlayer::State state, bool stopped) {
-    updateStatValue(8 + tft.textWidth(STATE_LABEL), PLAYER_ROW2_Y,
-                     stateLabel(state, stopped), g_lastStateStr, sizeof(g_lastStateStr));
+    g_playerStopped = stopped;
+    UiPlayer::midiState(playState(state, stopped));
 }
 
-// Partial redraw of just the MIDI-target half of its row (left side of
-// ROW5, next to Audio), e.g. after ALT cycles it. Does not touch Audio.
 void updatePlayerOutputTarget(MidiOutTarget target) {
-    char buf[24];
-    snprintf(buf, sizeof(buf), "MIDI: %s", targetLabel(target));
-    updateStatLeft(PLAYER_ROW5_Y, buf);
+    g_playerTarget = target;
+    UiPlayer::midiOutput(targetLabel(target), g_playerAudio);
 }
 
-// Partial redraw of just the Audio half of its row (right side of ROW5,
-// next to MIDI target), e.g. after EDIT toggles it. Does not touch MIDI.
 void updatePlayerAudioState(bool audioOn) {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "Audio: %s", audioOn ? "On" : "Off");
-    updateStatRight(PLAYER_ROW5_Y, buf);
+    g_playerAudio = audioOn;
+    UiPlayer::midiOutput(targetLabel(g_playerTarget), audioOn);
 }
 
 void updatePlayerLive(const MidiPlayer& player) {
-    // Callers must not use this while STATE_ERROR -- that swaps the whole
-    // row layout (see drawPlayer()) and needs a full redraw instead; every
-    // other state shares the same non-error row offsets, so this applies
-    // unconditionally otherwise (the periodic tick only calls it while
-    // STATE_PLAYING, but a seek can also change Time/Tempo while PAUSED or
-    // DONE -- see handleSeekHold()). State/Tracks/MIDI/Sound/Volume don't
-    // change on their own during playback, so they're not touched here at
-    // all -- only Time and Tempo are, and each via updateStatValue() so a
-    // poll that finds no actual change (Tempo between tempo-meta-events;
-    // Time within the same displayed second) doesn't redraw anything.
-    char timeStr[16];
-    formatDuration(player.elapsedMs(), timeStr, sizeof(timeStr));
-    updateStatValue(STAT_COL2_X + tft.textWidth(TIME_LABEL), PLAYER_ROW2_Y,
-                     timeStr, g_lastTimeStr, sizeof(g_lastTimeStr));
-
-    char buf[24];
-    snprintf(buf, sizeof(buf), "%u BPM (%d%%)", player.currentBPM(),
-             (int)(player.tempoScale() * 100.0f + 0.5f));
-    updateStatValue(8 + tft.textWidth(TEMPO_LABEL), PLAYER_ROW3_Y,
-                     buf, g_lastTempoStr, sizeof(g_lastTempoStr));
-
-    drawNoteStrip(PLAYER_STRIP_Y);
+    UiPlayer::midiLive(midiInfo(nullptr, player));
 }
 
 // -- pariSynth play screen -----------------------------------------------
@@ -1142,265 +935,103 @@ void updatePariSynthVolumeOverlay(int volume) {
     tft.setTextDatum(TL_DATUM);
 }
 
-// -- WAV player screen -------------------------------------------------
-//
-// Reuses drawPlayer()'s row Y constants (PLAYER_FILENAME_Y/ROW2_Y/ROW4_Y/
-// ROW5_Y) and Ui::updateVolume() unchanged -- Volume sits at ROW4_Y's
-// right column, the same position MIDI's Tracks | Volume occupies,
-// specifically so handleVolumeHold() (shared verbatim between both
-// screens, see file_player_mode.cpp) can redraw Volume through the exact
-// same call without a WAV-specific variant; ROW4_Y's left column is left
-// blank rather than sharing the row with format info, which would
-// otherwise run into Volume's column on a long format string ("44100 Hz
-// 16-bit Stereo" is wider than the left column leaves room for). ROW3_Y
-// (Tempo, for MIDI) is unused here -- WAV has no per-file tempo. A steady
-// elapsed/total progress bar occupies ROW5_Y downward in place of the
-// note-activity strip (meaningless for audio) and MIDI-target/Audio rows
-// (neither applies to WAV), with the format info line below the bar,
-// where it has the full row width to itself.
+// -- WAV and tracker player screens (ui_player.cpp) ----------------------
 
-char g_lastWavTimeStr[24] = {0};
-char g_lastWavStateStr[16] = {0};
-
-const int WAV_BAR_Y = PLAYER_ROW5_Y + 4;
-const int WAV_BAR_H = 24;
-const int WAV_FORMAT_Y = WAV_BAR_Y + WAV_BAR_H + 6;
-
-const char* wavStateLabel(WavPlayer::State s, bool stopped) {
+UiPlayer::PlayState playState(WavPlayer::State s, bool stopped) {
     switch (s) {
-        case WavPlayer::STATE_PLAYING: return "Playing";
-        case WavPlayer::STATE_PAUSED:  return stopped ? "Stopped" : "Paused";
-        case WavPlayer::STATE_DONE:    return "Finished";
-        case WavPlayer::STATE_ERROR:   return "Error";
-        default:                       return "Idle";
+        case WavPlayer::STATE_PLAYING: return UiPlayer::PS_PLAYING;
+        case WavPlayer::STATE_PAUSED:  return stopped ? UiPlayer::PS_STOPPED : UiPlayer::PS_PAUSED;
+        case WavPlayer::STATE_DONE:    return UiPlayer::PS_DONE;
+        case WavPlayer::STATE_ERROR:   return UiPlayer::PS_ERROR;
+        default:                       return UiPlayer::PS_IDLE;
     }
 }
 
-// Steady elapsed/total fill -- no activity flash the way
-// drawSysExProgress() has, since WAV streaming isn't message-bursty the
-// way SysEx sending is.
-int g_wavFill = -1;
+UiPlayer::PlayState playState(TrackerPlayer::State s, bool stopped) {
+    switch (s) {
+        case TrackerPlayer::STATE_PLAYING: return UiPlayer::PS_PLAYING;
+        case TrackerPlayer::STATE_PAUSED:  return stopped ? UiPlayer::PS_STOPPED : UiPlayer::PS_PAUSED;
+        case TrackerPlayer::STATE_DONE:    return UiPlayer::PS_DONE;
+        case TrackerPlayer::STATE_ERROR:   return UiPlayer::PS_ERROR;
+        default:                           return UiPlayer::PS_IDLE;
+    }
+}
 
-// `full` repaints the whole bar, otherwise only what changed.
-void drawWavProgressBar(const WavPlayer& player, bool full) {
-    uint32_t total = player.totalMs();
-    uint32_t elapsed = player.elapsedMs();
-    if (elapsed > total) elapsed = total;
-
-    int barX = 8, barW = tft.width() - 16;
-    int fillW = total > 0 ? (int)(((uint64_t)barW * elapsed) / total) : 0;
-    if (full) g_wavFill = -1;
-    if (fillW == g_wavFill) return;
-    if (g_wavFill >= 0 && !sliceAllows(DRAW_METER)) return;
-    SliceTimer timer;
-    paintBarDelta(barX, WAV_BAR_Y, WAV_BAR_H, barW, fillW, g_wavFill, COLOR_ACCENT, false);
-    g_wavFill = fillW;
+UiPlayer::WavInfo wavInfo(const char* filename, const WavPlayer& player) {
+    UiPlayer::WavInfo w;
+    w.name = filename;
+    w.fileKey = player.pathKey();
+    w.elapsedMs = player.elapsedMs();
+    w.totalMs = player.totalMs();
+    w.sampleRate = player.sampleRate();
+    w.bits = player.bitsPerSample();
+    w.channels = player.channels();
+    w.state = playState(player.state(), g_playerStopped);
+    w.error = player.errorMessage();
+    w.volume = g_playerVolume;
+    return w;
 }
 
 void drawWavPlayer(const char* filename, const WavPlayer& player, int volume, bool stopped) {
-    statusBar("WAV", &Look::ICON_WAVE, COLOR_WAV);
-
-    tft.fillRect(0, HEADER_HEIGHT, tft.width(), PLAYER_FILENAME_Y - HEADER_HEIGHT, COLOR_BG);
-    tft.fillRect(0, PLAYER_FILENAME_Y, tft.width(), PLAYER_ROW2_Y - PLAYER_FILENAME_Y, COLOR_BG);
-    tft.setTextColor(COLOR_TEXT, COLOR_BG);
-    tft.drawString(filename, 8, PLAYER_FILENAME_Y);
-
-    tft.fillRect(0, PLAYER_ROW2_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.drawString(STATE_LABEL, 8, PLAYER_ROW2_Y);
-
-    // A fresh file: force every field below to draw for real on the
-    // first tick rather than skipping a stale match -- see drawPlayer()'s
-    // identical reasoning for g_lastTimeStr/g_lastStateStr.
-    g_lastWavTimeStr[0] = '\0';
-    g_lastWavStateStr[0] = '\0';
-    updateStatValue(8 + tft.textWidth(STATE_LABEL), PLAYER_ROW2_Y,
-                     wavStateLabel(player.state(), stopped), g_lastWavStateStr, sizeof(g_lastWavStateStr));
-
-    bool isError = player.state() == WavPlayer::STATE_ERROR;
-    tft.fillRect(0, PLAYER_ROW3_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    if (isError) {
-        // Same "error replaces everything below State" convention as
-        // drawPlayer() -- there's no Time/Volume/format to show for a
-        // file that never loaded.
-        tft.setTextColor(COLOR_ERROR, COLOR_BG);
-        tft.drawString(player.errorMessage(), 8, PLAYER_ROW3_Y);
-    } else {
-        tft.setTextColor(COLOR_DIM, COLOR_BG);
-        tft.drawString(TIME_LABEL, STAT_COL2_X, PLAYER_ROW2_Y);
-        char timeStr[24];
-        char elapsedBuf[16], totalBuf[16];
-        formatDuration(player.elapsedMs(), elapsedBuf, sizeof(elapsedBuf));
-        formatDuration(player.totalMs(), totalBuf, sizeof(totalBuf));
-        snprintf(timeStr, sizeof(timeStr), "%s / %s", elapsedBuf, totalBuf);
-        updateStatValue(STAT_COL2_X + tft.textWidth(TIME_LABEL), PLAYER_ROW2_Y,
-                         timeStr, g_lastWavTimeStr, sizeof(g_lastWavTimeStr));
-
-        // Clears through to WAV_BAR_Y, not just ROW_HEIGHT -- the two are
-        // a few px apart (a small gap before the bar), so clearing only
-        // ROW_HEIGHT left that gap uncleared, showing leftover browser
-        // text there. Same "clear through to the next row's Y, not just
-        // this row's own height" fix drawPlayer() already uses for its
-        // filename-to-State gap.
-        tft.fillRect(0, PLAYER_ROW4_Y, tft.width(), WAV_BAR_Y - PLAYER_ROW4_Y, COLOR_BG);
-        char volBuf[16];
-        snprintf(volBuf, sizeof(volBuf), "Volume: %d%%", volume);
-        drawStatRow(PLAYER_ROW4_Y, "", volBuf);
-
-        // drawWavProgressBar() only ever paints the inset bar itself
-        // (barX=8, barW=width-16), never the two narrow margins beside
-        // it -- clear the full row here, once, on entry, so nothing left
-        // over from whatever screen was showing before (e.g. a file
-        // browser row's selection-highlight background) lingers in those
-        // margins for the rest of the playback session. Every later tick
-        // only redraws through drawWavProgressBar() (see
-        // updateWavPlayerLive()), which never touches the margins either,
-        // so they stay clean once cleared here.
-        tft.fillRect(0, WAV_BAR_Y, tft.width(), WAV_BAR_H, COLOR_BG);
-        drawWavProgressBar(player, true);
-
-        // Same reasoning as the fillRect above -- clears from right after
-        // the bar's own bottom edge (not just this row's own height), so
-        // the small gap between the bar and this text doesn't go uncleared.
-        tft.fillRect(0, WAV_BAR_Y + WAV_BAR_H, tft.width(), (WAV_FORMAT_Y + ROW_HEIGHT) - (WAV_BAR_Y + WAV_BAR_H), COLOR_BG);
-        tft.setTextColor(COLOR_DIM, COLOR_BG);
-        char formatBuf[32];
-        snprintf(formatBuf, sizeof(formatBuf), "%lu Hz  %u-bit  %s",
-                 (unsigned long)player.sampleRate(), player.bitsPerSample(),
-                 player.channels() == 2 ? "Stereo" : "Mono");
-        tft.drawString(formatBuf, 8, WAV_FORMAT_Y);
-    }
-
-    int contentBottom = isError ? (PLAYER_ROW3_Y + ROW_HEIGHT) : (WAV_FORMAT_Y + ROW_HEIGHT);
-    int fy = tft.height() - FOOTER_HEIGHT;
-    if (fy > contentBottom) {
-        tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
-    }
-    // No ALT (no MIDI output target -- WAV never goes out a MIDI port)
-    // and no bare-EDIT-tap action (WAV playback is always audible, no
-    // separate on/off toggle) -- EDIT only ever acts as a hold-modifier
-    // here, same weaving convention drawPlayer()'s footer uses.
-    drawFooter("EDIT+UD vol  PLAY tog", "ENT+LR seek  NAV stop");
+    g_playerVolume = volume;
+    g_playerStopped = stopped;
+    UiPlayer::drawWav(wavInfo(filename, player));
 }
 
 void updateWavPlayerState(WavPlayer::State state, bool stopped) {
-    updateStatValue(8 + tft.textWidth(STATE_LABEL), PLAYER_ROW2_Y,
-                     wavStateLabel(state, stopped), g_lastWavStateStr, sizeof(g_lastWavStateStr));
+    g_playerStopped = stopped;
+    UiPlayer::wavState(playState(state, stopped));
 }
 
 void updateWavPlayerLive(const WavPlayer& player) {
-    // Same STATE_ERROR caveat as updatePlayerLive() -- callers must not
-    // use this across a transition into/out of it.
-    char timeStr[24];
-    char elapsedBuf[16], totalBuf[16];
-    formatDuration(player.elapsedMs(), elapsedBuf, sizeof(elapsedBuf));
-    formatDuration(player.totalMs(), totalBuf, sizeof(totalBuf));
-    snprintf(timeStr, sizeof(timeStr), "%s / %s", elapsedBuf, totalBuf);
-    updateStatValue(STAT_COL2_X + tft.textWidth(TIME_LABEL), PLAYER_ROW2_Y,
-                     timeStr, g_lastWavTimeStr, sizeof(g_lastWavTimeStr));
-
-    drawWavProgressBar(player, false);
+    UiPlayer::wavLive(wavInfo(nullptr, player));
 }
 
-// -- Tracker player screen (MOD/S3M/XM/IT) --------------------------------
-//
-// Same rows as the WAV screen (PLAYER_FILENAME_Y/ROW2_Y/ROW4_Y), Volume at
-// ROW4_Y's right column so Ui::updateVolume() redraws it. No progress bar:
-// a tracker can loop, so Time is elapsed only and the pattern position and
-// format info take the bar's place.
-
-char g_lastTrackerTimeStr[16] = {0};
-char g_lastTrackerStateStr[16] = {0};
-char g_lastTrackerPosStr[32] = {0};
-
-const int TRACKER_POS_Y = PLAYER_ROW5_Y;                     // "Pattern: N/M  Row: R"
-const int TRACKER_FORMAT_Y = TRACKER_POS_Y + ROW_HEIGHT + 6; // format info line
-
-const char* trackerStateLabel(TrackerPlayer::State s, bool stopped) {
-    switch (s) {
-        case TrackerPlayer::STATE_PLAYING: return "Playing";
-        case TrackerPlayer::STATE_PAUSED:  return stopped ? "Stopped" : "Paused";
-        case TrackerPlayer::STATE_DONE:    return "Finished";
-        case TrackerPlayer::STATE_ERROR:   return "Error";
-        default:                           return "Idle";
+// The format from the file name: "XM".
+void trackerFormat(const char* filename, char* out, size_t outSize) {
+    const char* dot = filename ? strrchr(filename, '.') : nullptr;
+    size_t n = 0;
+    if (dot) {
+        for (const char* p = dot + 1; *p && n + 1 < outSize; p++) out[n++] = (char)toupper((unsigned char)*p);
     }
+    out[n] = '\0';
 }
 
-void drawTrackerPosition(const TrackerPlayer& player) {
-    char posBuf[32];
-    snprintf(posBuf, sizeof(posBuf), "Pattern: %d/%d  Row: %d",
-             player.patternOrderPosition(), player.songLength(), player.currentRow());
-    updateStatValue(8, TRACKER_POS_Y, posBuf, g_lastTrackerPosStr, sizeof(g_lastTrackerPosStr));
-}
-
-void drawTrackerTime(const TrackerPlayer& player) {
-    char timeStr[16];
-    formatDuration(player.elapsedMs(), timeStr, sizeof(timeStr));
-    updateStatValue(STAT_COL2_X + tft.textWidth(TIME_LABEL), PLAYER_ROW2_Y,
-                     timeStr, g_lastTrackerTimeStr, sizeof(g_lastTrackerTimeStr));
+UiPlayer::TrackerInfo trackerInfo(const char* filename, const TrackerPlayer& player, const char* format) {
+    UiPlayer::TrackerInfo t;
+    t.name = filename;
+    t.format = format;
+    t.channels = player.channelCount();
+    t.instruments = player.instrumentCount();
+    t.songLength = player.songLength();
+    t.order = player.patternOrderPosition();
+    t.row = player.currentRow();
+    t.speed = player.speed();
+    t.tempo = player.tempo();
+    t.elapsedMs = player.elapsedMs();
+    t.state = playState(player.state(), g_playerStopped);
+    t.error = player.errorMessage();
+    t.volume = g_playerVolume;
+    return t;
 }
 
 void drawTrackerPlayer(const char* filename, const TrackerPlayer& player, int volume, bool stopped) {
-    statusBar("TRACKER", &Look::ICON_TRACKER, COLOR_ACCENT);
-
-    tft.fillRect(0, HEADER_HEIGHT, tft.width(), PLAYER_FILENAME_Y - HEADER_HEIGHT, COLOR_BG);
-    tft.fillRect(0, PLAYER_FILENAME_Y, tft.width(), PLAYER_ROW2_Y - PLAYER_FILENAME_Y, COLOR_BG);
-    tft.setTextColor(COLOR_TEXT, COLOR_BG);
-    tft.drawString(filename, 8, PLAYER_FILENAME_Y);
-
-    tft.fillRect(0, PLAYER_ROW2_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    tft.setTextColor(COLOR_DIM, COLOR_BG);
-    tft.drawString(STATE_LABEL, 8, PLAYER_ROW2_Y);
-
-    // A fresh screen: make every field below draw on the first update.
-    g_lastTrackerTimeStr[0] = '\0';
-    g_lastTrackerStateStr[0] = '\0';
-    g_lastTrackerPosStr[0] = '\0';
-    updateStatValue(8 + tft.textWidth(STATE_LABEL), PLAYER_ROW2_Y,
-                     trackerStateLabel(player.state(), stopped), g_lastTrackerStateStr, sizeof(g_lastTrackerStateStr));
-
-    bool isError = player.state() == TrackerPlayer::STATE_ERROR;
-    tft.fillRect(0, PLAYER_ROW3_Y, tft.width(), ROW_HEIGHT, COLOR_BG);
-    if (isError) {
-        tft.setTextColor(COLOR_ERROR, COLOR_BG);
-        tft.drawString(player.errorMessage(), 8, PLAYER_ROW3_Y);
-    } else {
-        tft.setTextColor(COLOR_DIM, COLOR_BG);
-        tft.drawString(TIME_LABEL, STAT_COL2_X, PLAYER_ROW2_Y);
-        drawTrackerTime(player);
-
-        // Clears down to TRACKER_POS_Y so no stale gap is left above it.
-        tft.fillRect(0, PLAYER_ROW4_Y, tft.width(), TRACKER_POS_Y - PLAYER_ROW4_Y, COLOR_BG);
-        char volBuf[16];
-        snprintf(volBuf, sizeof(volBuf), "Volume: %d%%", volume);
-        drawStatRow(PLAYER_ROW4_Y, "", volBuf);
-
-        tft.fillRect(0, TRACKER_POS_Y, tft.width(), (TRACKER_FORMAT_Y + ROW_HEIGHT) - TRACKER_POS_Y, COLOR_BG);
-        drawTrackerPosition(player);
-
-        char formatBuf[32];
-        snprintf(formatBuf, sizeof(formatBuf), "%dch  %d instruments", player.channelCount(), player.instrumentCount());
-        tft.setTextColor(COLOR_DIM, COLOR_BG);
-        tft.drawString(formatBuf, 8, TRACKER_FORMAT_Y);
-    }
-
-    int contentBottom = isError ? (PLAYER_ROW3_Y + ROW_HEIGHT) : (TRACKER_FORMAT_Y + ROW_HEIGHT);
-    int fy = tft.height() - FOOTER_HEIGHT;
-    if (fy > contentBottom) {
-        tft.fillRect(0, contentBottom, tft.width(), fy - contentBottom, COLOR_BG);
-    }
-    // No ALT (no MIDI target), no seek, no bare-EDIT action.
-    drawFooter("EDIT+UD vol  PLAY tog", "NAV stop");
+    g_playerVolume = volume;
+    g_playerStopped = stopped;
+    char format[6];
+    trackerFormat(filename, format, sizeof(format));
+    UiPlayer::drawTracker(trackerInfo(filename, player, format));
 }
 
 void updateTrackerPlayerState(TrackerPlayer::State state, bool stopped) {
-    updateStatValue(8 + tft.textWidth(STATE_LABEL), PLAYER_ROW2_Y,
-                     trackerStateLabel(state, stopped), g_lastTrackerStateStr, sizeof(g_lastTrackerStateStr));
+    g_playerStopped = stopped;
+    UiPlayer::trackerState(playState(state, stopped));
 }
 
+bool playerLiveSettled() { return UiPlayer::liveSettled(); }
+
 void updateTrackerPlayerLive(const TrackerPlayer& player) {
-    drawTrackerTime(player);
-    drawTrackerPosition(player);
+    UiPlayer::trackerLive(trackerInfo(nullptr, player, nullptr));
 }
 
 // Draws a single keyboard key at its grid position, highlighted or not.

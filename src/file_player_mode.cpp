@@ -174,6 +174,10 @@ int selectedIndex = 0;
 int scrollOffset = 0;
 bool needsRedraw = true;
 
+// How often the player screens' live update runs. Each part has its own
+// slower rate inside, see ui_player.h.
+const uint32_t LIVE_MS = 20;
+
 // Remembers selectedIndex per directory level, so LEFT/NAV ("go up")
 // restores the cursor to wherever it was before descending, instead of
 // always landing back on the first entry. Pushed right before entering a
@@ -2029,12 +2033,11 @@ bool update() {
             }
             midiWasPlaying = midiPlaying;
 
-            // Elapsed time and the note-activity strip change continuously
-            // while playing. Rather than trigger a full-screen needsRedraw,
-            // repaint just those parts directly at a low fixed rate.
+            // The live parts of the screen keep their own rates and draw
+            // only what changed, see ui_player.h.
             static uint32_t lastPlayTick = 0;
             uint32_t now = millis();
-            if (player->state() == MidiPlayer::STATE_PLAYING && now - lastPlayTick >= 50) {
+            if (player->state() == MidiPlayer::STATE_PLAYING && now - lastPlayTick >= LIVE_MS) {
                 lastPlayTick = now;
                 Ui::setDrawPump(pumpPlayer);
                 Ui::updatePlayerLive(*player);
@@ -2116,7 +2119,9 @@ bool update() {
 
             static uint32_t lastWavPlayTick = 0;
             uint32_t now = millis();
-            if (wavPlayer.state() == WavPlayer::STATE_PLAYING && now - lastWavPlayTick >= 50) {
+            if ((wavPlayer.state() == WavPlayer::STATE_PLAYING ||
+                 (wavPlayer.state() == WavPlayer::STATE_DONE && !Ui::playerLiveSettled())) &&
+                now - lastWavPlayTick >= LIVE_MS) {
                 lastWavPlayTick = now;
                 Ui::setDrawPump(pumpPlayer);
                 Ui::updateWavPlayerLive(wavPlayer);
@@ -2130,11 +2135,11 @@ bool update() {
             handlePlayModInput();
             if (appState != APP_PLAY_MOD) break;
 
-            // 200ms, not 50ms -- see the identical change (and the
-            // real-hardware measurement behind it) on APP_PLAY_S3M below.
             static uint32_t lastModPlayTick = 0;
             uint32_t now = millis();
-            if (modPlayer->state() == ModPlayer::STATE_PLAYING && now - lastModPlayTick >= 200) {
+            if ((modPlayer->state() == ModPlayer::STATE_PLAYING ||
+                 (modPlayer->state() == ModPlayer::STATE_DONE && !Ui::playerLiveSettled())) &&
+                now - lastModPlayTick >= LIVE_MS) {
                 lastModPlayTick = now;
                 Ui::setDrawPump(pumpPlayer);
                 Ui::updateTrackerPlayerLive(*modPlayer);
@@ -2148,13 +2153,11 @@ bool update() {
             handlePlayS3mInput();
             if (appState != APP_PLAY_S3M) break;
 
-            // 200ms, not 50ms -- a busy S3M passage's own mixing cost
-            // leaves little headroom for a frequent SPI redraw on top of
-            // it; a "Row: N" counter updating 5x/sec instead of 20x/sec
-            // is imperceptible, so widening the throttle is free headroom.
             static uint32_t lastS3mPlayTick = 0;
             uint32_t now = millis();
-            if (s3mPlayer->state() == S3mPlayer::STATE_PLAYING && now - lastS3mPlayTick >= 200) {
+            if ((s3mPlayer->state() == S3mPlayer::STATE_PLAYING ||
+                 (s3mPlayer->state() == S3mPlayer::STATE_DONE && !Ui::playerLiveSettled())) &&
+                now - lastS3mPlayTick >= LIVE_MS) {
                 lastS3mPlayTick = now;
                 Ui::setDrawPump(pumpPlayer);
                 Ui::updateTrackerPlayerLive(*s3mPlayer);
@@ -2168,11 +2171,11 @@ bool update() {
             handlePlayXmInput();
             if (appState != APP_PLAY_XM) break;
 
-            // 200ms, not 50ms -- see the identical change (and the
-            // real-hardware measurement behind it) on APP_PLAY_S3M above.
             static uint32_t lastXmPlayTick = 0;
             uint32_t now = millis();
-            if (xmPlayer->state() == XmPlayer::STATE_PLAYING && now - lastXmPlayTick >= 200) {
+            if ((xmPlayer->state() == XmPlayer::STATE_PLAYING ||
+                 (xmPlayer->state() == XmPlayer::STATE_DONE && !Ui::playerLiveSettled())) &&
+                now - lastXmPlayTick >= LIVE_MS) {
                 lastXmPlayTick = now;
                 Ui::setDrawPump(pumpPlayer);
                 Ui::updateTrackerPlayerLive(*xmPlayer);
@@ -2185,10 +2188,11 @@ bool update() {
             itPlayer->update();
             handlePlayItInput();
             if (appState != APP_PLAY_IT) break;
-            // 200ms, same as APP_PLAY_XM above.
             static uint32_t lastItPlayTick = 0;
             uint32_t now = millis();
-            if (itPlayer->state() == ItPlayer::STATE_PLAYING && now - lastItPlayTick >= 200) {
+            if ((itPlayer->state() == ItPlayer::STATE_PLAYING ||
+                 (itPlayer->state() == ItPlayer::STATE_DONE && !Ui::playerLiveSettled())) &&
+                now - lastItPlayTick >= LIVE_MS) {
                 lastItPlayTick = now;
                 Ui::setDrawPump(pumpPlayer);
                 Ui::updateTrackerPlayerLive(*itPlayer);

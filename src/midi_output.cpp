@@ -2,6 +2,7 @@
 #include "pins.h"
 #include "config.h"
 #include "synth.h"
+#include "ui_tap.h"
 
 #include <Adafruit_TinyUSB.h>
 #include <MIDI.h>
@@ -240,6 +241,7 @@ void sendNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
         if (velocity > 0) {
             g_noteChannelMask[note] |= (uint16_t)(1u << channel);
             g_noteVelocity[note] = velocity;
+            UiTap::midiNoteOn(channel, note, velocity);
         } else {
             g_noteChannelMask[note] &= (uint16_t)~(1u << channel);
         }
