@@ -6,6 +6,19 @@
 #include <string.h>
 #include <hardware/sync.h>
 
+#ifdef HOST_MIDI
+// Host only: samples where the leveler was below unity or the soft limit's knee was passed.
+uint32_t g_hostLevelSamples = 0, g_hostLimitSamples = 0;
+uint32_t g_hostTankClips = 0; // comb writes clamped to int16
+// Host only: when set, the render governor sees a modelled cycle count
+// (see loop1()) and counts the voices it sheds.
+bool g_hostGovernorModel = false;
+uint32_t g_hostGovernorSheds = 0;
+#else
+#include <hardware/structs/systick.h>
+#include <hardware/clocks.h>
+#endif
+
 namespace {
 
 // Cross-core message format, one 32-bit word per event in the message
@@ -97,6 +110,7 @@ inline uint32_t packPressureMsg(uint8_t channel, uint8_t pressure) {
 // with no data cache to create a visibility problem.
 volatile bool g_readyForPioInit = false;
 
+
 // Core 0 -> core 1 message ring: single producer (core 0, pushMsg() from
 // the Synth:: methods) and single consumer (core 1, popMsg() in loop1()),
 // lock-free. head/tail are ever-increasing counts masked at index time,
@@ -144,13 +158,19 @@ bool __not_in_flash_func(popMsg)(uint32_t& msg) {
 // helpers and pushMsg() above, from Synth::noteOn() etc. ----
 
 const int SINE_TABLE_SIZE = 256;
-int16_t g_sineTable[SINE_TABLE_SIZE];
+// One extra entry (a copy of [0]) so the interpolated read needs no wrap.
+int16_t g_sineTable[SINE_TABLE_SIZE + 1];
 
 // Filled once in setup1() from PRESETS[i].cutoffHz (see cutoffHzToAlphaQ14())
 // -- avoids repeating the expf() conversion on every single note-on. The
 // drum-kit equivalent (g_drumFilterAlpha) is declared further down, once
 // DRUM_TYPE_COUNT exists to size it.
 uint32_t g_presetFilterAlpha[16];
+// The preset cutoff as an index into CUTOFF_ALPHA_Q14 (nearest semitone),
+// or CUTOFF_UNTRACKED for a cutoff of 18 kHz and up ("off"), which skips
+// key and velocity tracking.
+const uint8_t CUTOFF_UNTRACKED = 0xFF;
+uint8_t g_presetCutoffSemi[16];
 
 // Filled once in setup1() from PRESETS[i].vibratoDepthPercent.
 uint32_t g_presetVibratoDepthQ16[16];
@@ -242,6 +262,8 @@ const int NUM_MELODIC_VOICES = 24;
 const int NUM_DRUM_VOICES = 8;
 // envTimeToK(100): 40 dB down in 100 samples (~2 ms), prompt but click-free.
 const uint16_t PANIC_RELEASE_K = 2950;
+// envTimeToK(400): an open hi-hat choked by a closed one, about 9 ms.
+const uint16_t CHOKE_RELEASE_K = 750;
 const uint8_t PERCUSSION_CHANNEL = 9; // MIDI channel 10, 0-indexed
 
 // Per-voice headroom. With up to 32 voices now, a literal "all voices at
@@ -300,11 +322,16 @@ const int32_t HARD_LIMIT = 32000;
 // and still isn't enough.
 const int32_t LEVELER_TARGET = 26000; // ~79% of full scale
 const int LEVELER_UPDATE_PERIOD = 256; // samples between gain recomputes (~5.8ms)
+// WAV and tracker playback's leveler state (see Leveler, further down).
+// It keeps releasing while no WAV plays, so the next file starts the
+// way it did when the leveler ran on every sample.
 int32_t g_levelerEnvelope = 0;
 uint32_t g_levelerGainQ16 = 65536; // unity; never set above this -- attenuate-only
 int g_levelerUpdateCounter = 0;
 
-enum Waveform : uint8_t { WAVE_SINE, WAVE_TRIANGLE, WAVE_SAW, WAVE_SQUARE, WAVE_NOISE };
+// WAVE_NOISE_HP is internal (hats and cymbals, see DRUM_TYPE_HIGH_PASS);
+// the editor only ever sees the first five.
+enum Waveform : uint8_t { WAVE_SINE, WAVE_TRIANGLE, WAVE_SAW, WAVE_SQUARE, WAVE_NOISE, WAVE_NOISE_HP };
 enum EnvStage : uint8_t { ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE };
 
 struct Voice {
@@ -316,6 +343,35 @@ struct Voice {
     uint8_t family = 0;    // preset family at note-on, for recomputing vibratoRange on bend/mod
     bool held = false;     // note-off arrived while sustain (or sostenuto, see sostLatched) held it
     bool sostLatched = false; // was sounding when CC66 went down
+    // VOICE_MOD_* bits, which of vibrato, PWM, tremolo and pitch drop are
+    // on (see setModFlags()), so renderVoice() tests one byte for all four.
+    uint8_t modFlags = 0;
+    // Note-on transpose from the program's tweak (see PROGRAM_TWEAK), in
+    // semitones. `note` stays the MIDI note so note-offs still match.
+    int8_t transpose = 0;
+    // A stolen voice fades out before the note that stole it starts (see
+    // startStealFade()). pendVel 0 = nothing waiting. pendChan is the
+    // channel plus PEND_OFF and PEND_SOST_LATCHED; pendProg is the
+    // channel's program at the note-on.
+    uint8_t pendNote = 0;
+    uint8_t pendVel = 0;
+    uint8_t pendChan = 0;
+    uint8_t pendProg = 0;
+
+    // The halfwords renderVoice() reads every sample sit here, inside the
+    // M0+'s 62-byte ldrh offset reach. filterAlpha: see filterState below.
+    // gainL, gainR (Q15) and sendGain (Q14) come from the channel's volume,
+    // expression, pan and reverb send at note-on and when one of those CCs
+    // arrives (see applyChannelGains()); sendGain can go past unity.
+    uint16_t filterAlpha = 16384;
+    uint16_t gainL = 0;
+    uint16_t gainR = 0;
+    uint16_t sendGain = 0;
+    // Exponential decay/release rates, Q16 fraction of the remaining
+    // distance per sample (see envTimeToK()). decayK 0 skips the decay stage.
+    uint16_t decayK = 0;
+    uint16_t releaseK = 0;
+
     uint32_t startOrder = 0; // g_voiceStartCounter at note-on, for oldest-voice stealing
 
     uint32_t phase = 0;    // 32-bit accumulator, one full cycle == 2^32
@@ -328,10 +384,6 @@ struct Voice {
     int32_t envFloor = 0;  // decay/release: distance left at which the stage ends (see envStageFloor())
     int32_t peakLevel = 0;    // end-of-attack level (velocity-scaled)
     int32_t sustainLevel = 0; // end-of-decay level; 0 for one-shot percussion
-    // Exponential decay/release rates, Q16 fraction of the remaining
-    // distance per sample (see envTimeToK()). decayK 0 skips the decay stage.
-    uint16_t decayK = 0;
-    uint16_t releaseK = 0;
 
     // Percussion-only: extra phase-inc contribution that decays to 0, for
     // a kick/tom pitch-drop ("thump"). 0/0 for everything else.
@@ -345,7 +397,9 @@ struct Voice {
     // and is otherwise constant for the voice's lifetime -- no filter
     // envelope/LFO at this scope, just a fixed per-instrument brightness.
     int32_t filterState = 0;
-    uint32_t filterAlpha = 16384;
+    // PolyBLEP: 2^31 / (phaseInc >> 16), worked out with phaseInc at
+    // note-on and on a bend, so renderVoice() never divides.
+    uint32_t blepInv = 0;
 
     // Max phase-inc deviation from the shared vibrato LFO (see g_lfoPhase
     // above and renderVoice() below), computed once at note-on from the
@@ -363,15 +417,27 @@ struct Voice {
     // per-sample work entirely, same as vibratoRange == 0 does.
     uint32_t tremoloDepthQ16 = 0;
     uint32_t pwmDepthQ16 = 0;
-
-    // Q15 gains, set from the channel's volume, expression, pan and reverb
-    // send at note-on and when one of those CCs arrives (see
-    // applyChannelGains()). sendGain is Q14 so CC91 above 40 can go past
-    // unity.
-    uint16_t gainL = 0;
-    uint16_t gainR = 0;
-    uint16_t sendGain = 0;
 };
+static_assert(sizeof(Voice) == 88, "Voice layout");
+
+// pendChan flags. PEND_OFF: the note-off came during the fade while a
+// pedal held it, so it starts held. PEND_SOST_LATCHED: sostenuto went down
+// during the fade, which latches it like any other key still down.
+const uint8_t PEND_OFF = 0x80;
+const uint8_t PEND_SOST_LATCHED = 0x40;
+
+const uint8_t VOICE_MOD_VIBRATO = 1;
+const uint8_t VOICE_MOD_PWM = 2;
+const uint8_t VOICE_MOD_TREMOLO = 4;
+const uint8_t VOICE_MOD_PITCH_DROP = 8;
+
+// After any change to vibratoRange, pwmDepthQ16, tremoloDepthQ16 or pitchDrop.
+inline void setModFlags(Voice& v) {
+    v.modFlags = (v.vibratoRange ? VOICE_MOD_VIBRATO : 0) |
+                 (v.pwmDepthQ16 ? VOICE_MOD_PWM : 0) |
+                 (v.tremoloDepthQ16 ? VOICE_MOD_TREMOLO : 0) |
+                 (v.pitchDrop > 0 || v.pitchDropStep != 0 ? VOICE_MOD_PITCH_DROP : 0);
+}
 
 // Both pools in one array so renderSample() renders them in one loop
 // (one inlined copy of renderVoice() in RAM instead of two).
@@ -566,29 +632,70 @@ int16_t __not_in_flash_func(nextNoise)() {
     return (int16_t)(g_noiseState >> 16);
 }
 
-// phase represents one full waveform cycle over its entire 32-bit range;
-// the sine table is indexed by the top 8 bits (256 entries), and the
-// algorithmic waveforms below use the top 16 bits as a 0..65535 ramp.
-// pulseWidth is only meaningful for WAVE_SQUARE (the duty-cycle threshold,
-// 32768 == fixed 50% -- see Voice::pwmDepthQ16 for who modulates it and
-// why); every other waveform ignores it.
-ALWAYS_INLINE int16_t __not_in_flash_func(waveformSample)(Waveform w, uint32_t phase, uint16_t pulseWidth) {
-    uint16_t p16 = (uint16_t)(phase >> 16);
-    switch (w) {
-        case WAVE_TRIANGLE:
-            if (p16 < 32768) return (int16_t)(p16 * 2 - 32768);
-            return (int16_t)(32767 - (int32_t)(p16 - 32768) * 2);
-        case WAVE_SAW:
-            return (int16_t)(p16 - 32768);
-        case WAVE_SQUARE:
-            return (p16 < pulseWidth) ? (int16_t)30000 : (int16_t)(-30000);
-        case WAVE_NOISE:
-            return nextNoise();
-        default: { // WAVE_SINE
-            int tableIdx = (phase >> 24) & (SINE_TABLE_SIZE - 1);
-            return g_sineTable[tableIdx];
+// int16 saturation in three cycles when nothing clips.
+ALWAYS_INLINE int32_t clampInt16(int32_t x) {
+    if ((int16_t)x != x) x = (x >> 31) ^ 0x7FFF;
+    return x;
+}
+
+// PolyBLEP residual for an edge at phase 0, in Q15 of the step's half
+// height, positive just before the edge and negative just after. w is the
+// phase (top 16 bits) plus dt, so the edge region is w < 2 * dt; outside it
+// this returns 0 after one compare.
+ALWAYS_INLINE int32_t __not_in_flash_func(blepResidual)(uint32_t w, uint32_t dt, uint32_t inv) {
+    if (w >= 2 * dt) return 0;
+    // r = distance to the region's outer end over dt, Q15, at most 32768.
+    uint32_t d = w < dt ? w : 2 * dt - w;
+    uint32_t r = (d * inv) >> 16;
+    int32_t e = (int32_t)((r * r) >> 15);
+    return w < dt ? e : -e;
+}
+
+// phase represents one full waveform cycle over its entire 32-bit range.
+// Sine reads the 256-entry table at the top 8 bits and interpolates on the
+// next 8; the others use the top 16 bits as a 0..65535 ramp. Saw and square
+// are PolyBLEP band-limited with the voice's nominal dt (phaseInc >> 16)
+// and blepInv. pulseWidth is only meaningful for WAVE_SQUARE (the
+// duty-cycle threshold, 32768 == 50%, see Voice::pwmDepthQ16).
+ALWAYS_INLINE int32_t __not_in_flash_func(waveformSample)(Voice& v, uint32_t phase, uint16_t pulseWidth) {
+    // An if tree, not a switch: six cases make GCC use a jump table, and
+    // that would sit in flash.
+    uint32_t p16 = phase >> 16;
+    Waveform w = v.waveform;
+    if (w < WAVE_SAW) {
+        if (w == WAVE_SINE) {
+            uint32_t idx = phase >> 24;
+            int32_t s0 = g_sineTable[idx];
+            int32_t s1 = g_sineTable[idx + 1];
+            return s0 + (((s1 - s0) * (int32_t)(p16 & 0xFF)) >> 8);
         }
+        if (p16 < 32768) return (int32_t)(p16 * 2) - 32768; // triangle
+        return 32767 - (int32_t)(p16 - 32768) * 2;
     }
+    if (w <= WAVE_SQUARE) {
+        uint32_t dt = v.phaseInc >> 16;
+        if (w == WAVE_SAW) {
+            // Falls by a full 65536 at the wrap.
+            return (int32_t)p16 - 32768 - blepResidual((p16 + dt) & 0xFFFF, dt, v.blepInv);
+        }
+        // Square, +-30000: rises at 0, falls at pulseWidth. The residual is
+        // for a step of 65536, scaled to 60000 here.
+        int32_t out = p16 < pulseWidth ? 30000 : -30000;
+        uint32_t w1 = (p16 + dt) & 0xFFFF, w2 = (p16 - pulseWidth + dt) & 0xFFFF;
+        if ((w1 < 2 * dt) | (w2 < 2 * dt)) {
+            int32_t e = blepResidual(w1, dt, v.blepInv) - blepResidual(w2, dt, v.blepInv);
+            // Near Nyquist both edge regions overlap; keep the filter's int32 maths safe.
+            out = clampInt16(out + ((e * 15000) >> 14));
+        }
+        return out;
+    }
+    int32_t n = nextNoise();
+    if (w == WAVE_NOISE) return n;
+    // WAVE_NOISE_HP: first difference of the noise, a gentle high-pass.
+    // Noise voices have no use for phase, so it holds the last noise value.
+    int32_t out = (n - (int32_t)phase) >> 1;
+    v.phase = (uint32_t)n;
+    return out;
 }
 
 // Converts a filter cutoff in Hz to a one-pole low-pass coefficient in
@@ -688,6 +795,50 @@ const uint32_t CENT_RATIO_Q30[100] = {
     1131037800, 1131691302, 1132345181, 1132999438, 1133654074, 1134309087,
     1134964479, 1135620249, 1136276399, 1136932927,
 };
+
+// One-pole alpha (Q14, see cutoffHzToAlphaQ14()) for a cutoff at MIDI
+// note n's pitch, n = 0..135 (8 Hz to 19.9 kHz), for the note-on key and
+// velocity tracking in startMelodicVoice().
+const int CUTOFF_SEMI_COUNT = 136;
+const uint16_t CUTOFF_ALPHA_Q14[CUTOFF_SEMI_COUNT] = {
+    19, 20, 21, 23, 24, 25, 27, 29, 30, 32, 34, 36, 38, 40, 43, 45, 48,
+    51, 54, 57, 60, 64, 68, 72, 76, 81, 85, 91, 96, 102, 108, 114, 121, 128,
+    135, 143, 152, 161, 170, 181, 191, 203, 215, 227, 241, 255, 270, 286, 303, 320, 339,
+    359, 380, 403, 426, 451, 478, 506, 535, 566, 599, 634, 671, 710, 752, 795, 841, 890,
+    941, 996, 1053, 1113, 1177, 1244, 1315, 1390, 1469, 1552, 1639, 1732, 1829, 1931, 2038, 2151, 2269,
+    2394, 2525, 2662, 2806, 2957, 3115, 3280, 3453, 3634, 3822, 4019, 4225, 4438, 4661, 4892, 5131, 5380,
+    5637, 5904, 6178, 6462, 6753, 7053, 7360, 7674, 7995, 8323, 8656, 8993, 9335, 9680, 10027, 10375, 10723,
+    11069, 11414, 11754, 12089, 12418, 12739, 13050, 13351, 13641, 13917, 14180, 14428, 14660, 14876, 15076, 15258, 15424,
+};
+
+// Per-program tweaks on top of the family preset, so the 8 programs in a
+// GM family differ. The editor and pariSynth (program family * 8) use the
+// family preset as is, so each family's first program is 0. Bits 0-1:
+// octave (1 up, 2 down); bits 2-4: cutoff offset in steps of 4 semitones,
+// signed (-4..3); bits 5-7: waveform (0 the family's, 1 sine, 2 triangle,
+// 3 saw, 4 square, 5 noise).
+const uint8_t PROGRAM_TWEAK[128] = {
+    0x00, 0x08, 0x04, 0x64, 0x20, 0x44, 0x68, 0x84, //   0 Piano
+    0x00, 0x01, 0x41, 0x40, 0x5C, 0x5D, 0x18, 0x70, //   8 Chromatic percussion
+    0x00, 0x1C, 0x64, 0x5C, 0x18, 0x7C, 0x18, 0x78, //  16 Organ
+    0x00, 0x04, 0x54, 0x1C, 0x10, 0x84, 0x68, 0x21, //  24 Guitar
+    0x00, 0x1C, 0x08, 0x20, 0x68, 0x88, 0x04, 0x0C, //  32 Bass
+    0x00, 0x1C, 0x18, 0x14, 0x04, 0x5C, 0x40, 0x38, //  40 Strings
+    0x00, 0x1C, 0x04, 0x84, 0x40, 0x20, 0x44, 0x08, //  48 Ensemble
+    0x00, 0x1C, 0x18, 0x14, 0x58, 0x60, 0x64, 0x04, //  56 Brass
+    0x00, 0x7C, 0x78, 0x74, 0x60, 0x1C, 0x18, 0x04, //  64 Reed
+    0x00, 0x01, 0x40, 0x50, 0x54, 0x58, 0x41, 0x5C, //  72 Pipe
+    0x00, 0x00, 0x40, 0x20, 0x84, 0x58, 0x1C, 0x02, //  80 Synth lead
+    0x00, 0x78, 0x60, 0x04, 0x7C, 0x80, 0x20, 0x64, //  88 Synth pad
+    0x00, 0x70, 0x01, 0x74, 0x7C, 0x90, 0x58, 0x41, //  96 Synth effects
+    0x00, 0x68, 0x60, 0x04, 0x20, 0x80, 0x7C, 0x84, // 104 Ethnic
+    0x00, 0x20, 0x40, 0x21, 0x22, 0x42, 0x58, 0xA0, // 112 Percussive
+    0x00, 0xB4, 0xB8, 0x01, 0x9C, 0x7A, 0xA0, 0xBC, // 120 Sound effects
+};
+
+// RMS of each waveform at full level, so a program tweak that changes the
+// waveform keeps its family's loudness.
+const uint16_t WAVE_RMS[6] = {22627, 18919, 18919, 30000, 18919, 13377};
 
 // Per-sample Q16 fraction for an exponential stage that falls 40 dB in
 // `samples` (the time the editor shows), about how long the old linear
@@ -879,6 +1030,15 @@ DrumPreset DRUM_PRESETS[DRUM_TYPE_COUNT];
 // function existed).
 void recomputeInstrumentPresetCache(int family) {
     g_presetFilterAlpha[family] = cutoffHzToAlphaQ14(PRESETS[family].cutoffHz);
+    float fc = PRESETS[family].cutoffHz;
+    if (fc >= 18000.0f) {
+        g_presetCutoffSemi[family] = CUTOFF_UNTRACKED;
+    } else {
+        int32_t semi = (int32_t)lroundf(69.0f + 12.0f * log2f((fc > 8.0f ? fc : 8.0f) / 440.0f));
+        if (semi < 0) semi = 0;
+        if (semi > CUTOFF_SEMI_COUNT - 1) semi = CUTOFF_SEMI_COUNT - 1;
+        g_presetCutoffSemi[family] = (uint8_t)semi;
+    }
     // Capped at 30% (the editor's own limit) so renderVoice()'s vibrato
     // multiply can't overflow int32 at note 127.
     float vib = PRESETS[family].vibratoDepthPercent;
@@ -909,17 +1069,71 @@ void recomputeDrumPresetCache(int drumType) {
     g_drumPitchDropStep[drumType] = step;
 }
 
-DrumType classifyDrum(uint8_t note) {
-    switch (note) {
-        case 35: case 36: return DRUM_KICK;
-        case 37: case 38: case 39: case 40: return DRUM_SNARE;
-        case 42: case 44: case 54: case 56: return DRUM_CLOSED_HAT;
-        case 46: return DRUM_OPEN_HAT;
-        case 41: case 43: case 45: case 47: case 48: case 50: return DRUM_TOM;
-        case 49: case 51: case 52: case 53: case 55: case 57: case 59: return DRUM_CYMBAL;
-        case 75: case 76: case 77: return DRUM_WOODBLOCK; // Claves, Hi/Lo Wood Block
-        default: return DRUM_DEFAULT;
-    }
+// GM percussion notes 35-81: which preset plays each, a pitch ratio on the
+// preset's base pitch and pitch drop (Q8, 256 = as set), and a decay rate
+// shift (positive is shorter, each step halves the time). Toms spread from
+// 80 to 157 Hz around the preset's 120; bongos, congas and timbales are
+// short high toms, cowbell, agogos and triangles are woodblock tones.
+// Notes outside the table play DRUM_DEFAULT as set.
+struct DrumNote { uint8_t type; int8_t decayShift; uint16_t ratioQ8; };
+const uint8_t DRUM_NOTE_FIRST = 35, DRUM_NOTE_LAST = 81;
+const DrumNote DRUM_NOTES[DRUM_NOTE_LAST - DRUM_NOTE_FIRST + 1] = {
+    {DRUM_KICK, 0, 256},       // 35 Acoustic Bass Drum
+    {DRUM_KICK, 0, 256},       // 36 Bass Drum 1
+    {DRUM_SNARE, 0, 256},      // 37 Side Stick
+    {DRUM_SNARE, 0, 256},      // 38 Acoustic Snare
+    {DRUM_SNARE, 0, 256},      // 39 Hand Clap
+    {DRUM_SNARE, 0, 256},      // 40 Electric Snare
+    {DRUM_TOM, 0, 171},        // 41 Low Floor Tom
+    {DRUM_CLOSED_HAT, 0, 256}, // 42 Closed Hi-Hat
+    {DRUM_TOM, 0, 197},        // 43 High Floor Tom
+    {DRUM_CLOSED_HAT, 0, 256}, // 44 Pedal Hi-Hat
+    {DRUM_TOM, 0, 224},        // 45 Low Tom
+    {DRUM_OPEN_HAT, 0, 256},   // 46 Open Hi-Hat
+    {DRUM_TOM, 0, 256},        // 47 Low-Mid Tom
+    {DRUM_TOM, 0, 293},        // 48 Hi-Mid Tom
+    {DRUM_CYMBAL, 0, 256},     // 49 Crash Cymbal 1
+    {DRUM_TOM, 0, 336},        // 50 High Tom
+    {DRUM_CYMBAL, 0, 256},     // 51 Ride Cymbal 1
+    {DRUM_CYMBAL, 0, 256},     // 52 Chinese Cymbal
+    {DRUM_CYMBAL, 0, 256},     // 53 Ride Bell
+    {DRUM_CLOSED_HAT, 0, 256}, // 54 Tambourine
+    {DRUM_CYMBAL, 0, 256},     // 55 Splash Cymbal
+    {DRUM_WOODBLOCK, -1, 159}, // 56 Cowbell, 560 Hz
+    {DRUM_CYMBAL, 0, 256},     // 57 Crash Cymbal 2
+    {DRUM_DEFAULT, 0, 256},    // 58 Vibraslap
+    {DRUM_CYMBAL, 0, 256},     // 59 Ride Cymbal 2
+    {DRUM_TOM, 2, 896},        // 60 Hi Bongo
+    {DRUM_TOM, 2, 666},        // 61 Low Bongo
+    {DRUM_TOM, 3, 704},        // 62 Mute Hi Conga
+    {DRUM_TOM, 1, 704},        // 63 Open Hi Conga
+    {DRUM_TOM, 1, 486},        // 64 Low Conga
+    {DRUM_TOM, 1, 768},        // 65 High Timbale
+    {DRUM_TOM, 1, 563},        // 66 Low Timbale
+    {DRUM_WOODBLOCK, -1, 256}, // 67 High Agogo
+    {DRUM_WOODBLOCK, -1, 192}, // 68 Low Agogo
+    {DRUM_CLOSED_HAT, 0, 256}, // 69 Cabasa
+    {DRUM_CLOSED_HAT, 0, 256}, // 70 Maracas
+    {DRUM_DEFAULT, 0, 256},    // 71 Short Whistle
+    {DRUM_DEFAULT, 0, 256},    // 72 Long Whistle
+    {DRUM_DEFAULT, 0, 256},    // 73 Short Guiro
+    {DRUM_DEFAULT, 0, 256},    // 74 Long Guiro
+    {DRUM_WOODBLOCK, 0, 711},  // 75 Claves
+    {DRUM_WOODBLOCK, 0, 256},  // 76 Hi Wood Block (the looper's metronome)
+    {DRUM_WOODBLOCK, 0, 192},  // 77 Low Wood Block
+    {DRUM_DEFAULT, 0, 256},    // 78 Mute Cuica
+    {DRUM_DEFAULT, 0, 256},    // 79 Open Cuica
+    {DRUM_WOODBLOCK, 0, 1152}, // 80 Mute Triangle
+    {DRUM_WOODBLOCK, -2, 1152},// 81 Open Triangle
+};
+
+// Hats and cymbals play first-differenced noise (WAVE_NOISE_HP) when their
+// preset is noise, so they lose the low end before the low-pass.
+const bool DRUM_TYPE_HIGH_PASS[DRUM_TYPE_COUNT] = {false, false, true, true, false, true, false, false};
+
+DrumNote drumNote(uint8_t note) {
+    if (note < DRUM_NOTE_FIRST || note > DRUM_NOTE_LAST) return {DRUM_DEFAULT, 0, 256};
+    return DRUM_NOTES[note - DRUM_NOTE_FIRST];
 }
 
 // Musical, not CPU, motivation (see recomputeInstrumentPresetCache()'s
@@ -961,6 +1175,7 @@ int activeModulatedVoiceCount(const Voice* exclude) {
 }
 
 void releaseVoice(Voice& v);
+void startPending(Voice& v);
 
 // -- Channel controllers (core 1) ------------------------------------------
 // All of this runs from handleMessage() or at note-on, never per sample:
@@ -1007,20 +1222,31 @@ uint32_t modDepthQ16(uint8_t channel) {
     return (m * 1935) >> 7; // 127 -> 1919, 2^(50/1200) - 1
 }
 
+// See Voice::blepInv. Runs at note-on and when the pitch changes.
+void setBlepInv(Voice& v) {
+    uint32_t dt = v.phaseInc >> 16;
+    v.blepInv = dt ? 0x80000000u / dt : 0;
+}
+
 // Melodic voices only: phaseInc from the note and the channel's bend, and
 // vibratoRange from that and the preset plus mod depth.
 void applyPitch(Voice& v) {
-    uint32_t inc = NOTE_PHASE_INC[v.note & 0x7F];
+    int32_t n = (int32_t)(v.note & 0x7F) + v.transpose;
+    if (n < 0) n = 0;
+    if (n > 127) n = 127;
+    uint32_t inc = NOTE_PHASE_INC[n];
     uint32_t r = g_chanBendQ28[v.channel];
     if (r != BEND_UNITY_Q28) {
         uint64_t bent = ((uint64_t)inc * r) >> 28;
         inc = bent > 0x7FFFFFFFu ? 0x7FFFFFFFu : (uint32_t)bent; // Nyquist
     }
     v.phaseInc = inc;
+    setBlepInv(v);
     uint32_t depth = g_presetVibratoDepthQ16[v.family] + modDepthQ16(v.channel);
     // >>24, 8 bits more than Q16, so renderVoice()'s multiply stays int32.
     uint64_t range = ((uint64_t)inc * depth) >> 24;
     v.vibratoRange = range > VIBRATO_RANGE_MAX ? VIBRATO_RANGE_MAX : (uint32_t)range;
+    setModFlags(v);
 }
 
 void updateBendRatio(uint8_t channel) {
@@ -1054,6 +1280,14 @@ void startRelease(Voice& v) {
 
 // A note-off for a melodic voice: held while the sustain pedal is down, or
 // while sostenuto is down and it was sounding when the pedal went down.
+// Note-off for a note still queued behind a steal fade: it starts held if
+// a pedal holds it, else it's dropped.
+void noteOffPending(Voice& v) {
+    const ChannelState& c = g_chan[v.pendChan & 0x0F];
+    if (c.sustain || (c.sostenuto && (v.pendChan & PEND_SOST_LATCHED))) v.pendChan |= PEND_OFF;
+    else v.pendVel = 0;
+}
+
 void noteOffVoice(Voice& v) {
     const ChannelState& c = g_chan[v.channel];
     if (v.stage == ENV_RELEASE || v.held) return;
@@ -1066,6 +1300,10 @@ void releaseUnheld(uint8_t channel) {
     const ChannelState& c = g_chan[channel];
     for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
         Voice& v = g_melodicVoices[i];
+        if (v.pendVel && (v.pendChan & 0x0F) == channel && (v.pendChan & PEND_OFF) &&
+            !(c.sustain || (c.sostenuto && (v.pendChan & PEND_SOST_LATCHED)))) {
+            v.pendVel = 0; // its note-off came during the fade, nothing holds it now
+        }
         if (!v.active || v.channel != channel || !v.held) continue;
         if (c.sustain || (c.sostenuto && v.sostLatched)) continue;
         startRelease(v);
@@ -1078,13 +1316,19 @@ void setSostenuto(uint8_t channel, bool on) {
     c.sostenuto = on;
     for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
         Voice& v = g_melodicVoices[i];
+        if (v.pendVel && (v.pendChan & 0x0F) == channel) {
+            // A queued note's key is down unless its note-off came.
+            if (on && !(v.pendChan & PEND_OFF)) v.pendChan |= PEND_SOST_LATCHED;
+        }
         if (!v.active || v.channel != channel) continue;
         if (on) v.sostLatched = v.stage != ENV_RELEASE && !v.held; // key still down
     }
     if (!on) {
         releaseUnheld(channel);
         for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
-            if (g_melodicVoices[i].channel == channel) g_melodicVoices[i].sostLatched = false;
+            Voice& v = g_melodicVoices[i];
+            if (v.channel == channel) v.sostLatched = false;
+            if ((v.pendChan & 0x0F) == channel) v.pendChan &= ~PEND_SOST_LATCHED;
         }
     }
 }
@@ -1154,7 +1398,11 @@ void handleControlChange(uint8_t channel, uint8_t cc, uint8_t value) {
         case 120: // All Sound Off: fast release, pedals or not
             for (int i = 0; i < NUM_VOICES; i++) {
                 Voice& v = g_voices[i];
-                if (v.channel != channel) continue;
+                if (v.pendVel && (v.pendChan & 0x0F) == channel) v.pendVel = 0;
+                if (v.channel != channel || !v.active) continue;
+                // A note queued for another channel starts now, in place of
+                // the fade it was waiting for.
+                if (v.pendVel) { startPending(v); continue; }
                 v.held = false;
                 v.sostLatched = false;
                 releaseVoice(v);
@@ -1164,7 +1412,8 @@ void handleControlChange(uint8_t channel, uint8_t cc, uint8_t value) {
         case 123: case 124: case 125: case 126: case 127: // All Notes Off, and the mode messages that imply it
             for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
                 Voice& v = g_melodicVoices[i];
-                if (v.active && v.channel == channel) noteOffVoice(v);
+                if (v.pendVel && (v.pendChan & 0x0F) == channel) noteOffPending(v);
+                if (v.active && v.channel == channel) noteOffVoice(v); // a fading voice is already in release
             }
             break;
         default: break;
@@ -1185,7 +1434,8 @@ void handleChannelPressure(uint8_t channel, uint8_t pressure) {
     updateChannelVoices(channel, false, true);
 }
 
-void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity) {
+// program -1 takes the channel's current program.
+void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity, int program = -1) {
     // Retriggering an already-sounding note, or stealing a busy voice
     // (more notes than NUM_MELODIC_VOICES at once), means `v.amplitude`
     // (and `v.phase`) may already be mid-flight here. Ramp amplitude from
@@ -1197,8 +1447,11 @@ void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity
     int32_t startAmplitude = v.amplitude;
     bool wasActive = v.active;
 
-    uint8_t family = (g_channelProgram[channel] >> 3) & 0x0F;
+    if (program < 0) program = g_channelProgram[channel];
+    program &= 0x7F;
+    uint8_t family = (uint8_t)program >> 3;
     const InstrumentPreset& preset = PRESETS[family];
+    uint8_t tweak = PROGRAM_TWEAK[program];
 
     v.active = true;
     v.note = note;
@@ -1207,14 +1460,15 @@ void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity
     v.held = false;
     v.sostLatched = false;
     v.startOrder = ++g_voiceStartCounter;
-    v.waveform = preset.waveform;
+    v.waveform = (tweak >> 5) ? (Waveform)((tweak >> 5) - 1) : preset.waveform;
     if (!wasActive) { v.phase = 0; v.filterState = 0; }
     v.pitchDrop = 0;
     v.pitchDropStep = 0;
-    v.filterAlpha = g_presetFilterAlpha[family];
+    v.transpose = (tweak & 3) == 1 ? 12 : (tweak & 3) == 2 ? -12 : 0;
     applyPitch(v); // phaseInc and vibratoRange, with the channel's bend and mod
     v.tremoloDepthQ16 = g_presetTremoloDepthQ16[family];
-    v.pwmDepthQ16 = g_presetPwmDepthQ16[family];
+    // PWM only means something on a square.
+    v.pwmDepthQ16 = v.waveform == WAVE_SQUARE ? g_presetPwmDepthQ16[family] : 0;
     // See g_maxModulatedVoices' own comment: cap how many voices wobble at
     // once, not which families are allowed to. A voice that already has
     // neither (the common case -- most families use neither effect) skips
@@ -1224,11 +1478,32 @@ void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity
         v.tremoloDepthQ16 = 0;
         v.pwmDepthQ16 = 0;
     }
+    setModFlags(v);
     applyChannelGains(v, false);
 
     // CC67 soft pedal: about 0.7 of the velocity.
     if (g_chan[channel].soft) velocity = (uint8_t)((velocity * 179) >> 8);
+
+    // Cutoff: the program's offset, plus half key tracking around middle C
+    // and velocity (+3 semitones at 127, -12 at 1) unless the preset's
+    // filter is off. With no change the preset's exact alpha is kept.
+    int32_t delta = ((int32_t)(int8_t)(uint8_t)(tweak << 3) >> 5) * 4;
+    uint8_t semi = g_presetCutoffSemi[family];
+    if (semi != CUTOFF_UNTRACKED) {
+        delta += ((int32_t)(v.note & 0x7F) + v.transpose - 60) / 2 + (((int32_t)(velocity & 0x7F) - 100) >> 3);
+    }
+    if (delta == 0) {
+        v.filterAlpha = (uint16_t)g_presetFilterAlpha[family];
+    } else {
+        int32_t idx = (semi == CUTOFF_UNTRACKED ? CUTOFF_SEMI_COUNT - 1 : semi) + delta;
+        if (idx < 0) idx = 0;
+        if (idx > CUTOFF_SEMI_COUNT - 1) idx = CUTOFF_SEMI_COUNT - 1;
+        v.filterAlpha = CUTOFF_ALPHA_Q14[idx];
+    }
+
     int32_t peak = ((int32_t)VOICE_PEAK * GM_CURVE_Q15[velocity & 0x7F]) >> 15;
+    // A program's own waveform plays at the family waveform's RMS level.
+    if (v.waveform != preset.waveform) peak = peak * WAVE_RMS[preset.waveform] / WAVE_RMS[v.waveform];
     if (peak < 1) peak = 1;
     v.peakLevel = peak << 16;
     v.sustainLevel = ((peak * preset.sustainPercent) / 100) << 16;
@@ -1244,7 +1519,8 @@ void startMelodicVoice(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity
 }
 
 void startPercussionVoice(Voice& v, uint8_t note, uint8_t velocity) {
-    DrumType drumType = classifyDrum(note);
+    DrumNote dn = drumNote(note);
+    DrumType drumType = (DrumType)dn.type;
     const DrumPreset& p = DRUM_PRESETS[drumType];
 
     // A retriggered or stolen voice keeps its phase and filter state and
@@ -1255,14 +1531,28 @@ void startPercussionVoice(Voice& v, uint8_t note, uint8_t velocity) {
     v.note = note;
     v.channel = PERCUSSION_CHANNEL;
     v.startOrder = ++g_voiceStartCounter;
-    v.waveform = p.waveform;
-    v.filterAlpha = g_drumFilterAlpha[drumType];
+    Waveform wave = (p.waveform == WAVE_NOISE && DRUM_TYPE_HIGH_PASS[drumType]) ? WAVE_NOISE_HP : p.waveform;
+    // The high-passed noise keeps its last value in phase, so a change of
+    // waveform on a retriggered or stolen voice starts phase from 0.
+    if (wave != v.waveform) v.phase = 0;
+    v.waveform = wave;
+    v.transpose = 0;
+    v.filterAlpha = (uint16_t)g_drumFilterAlpha[drumType];
     v.held = false;
     v.sostLatched = false;
     applyChannelGains(v, true); // centred unless channel 10 sent CC10
     v.phaseInc = g_drumPhaseInc[drumType];
     v.pitchDrop = g_drumPitchDrop[drumType];
     v.pitchDropStep = g_drumPitchDropStep[drumType];
+    if (dn.ratioQ8 != 256) {
+        // >> 8 first keeps it in 32 bits; the ratio is under 8.
+        v.phaseInc = (v.phaseInc >> 8) * dn.ratioQ8;
+        v.pitchDrop = (v.pitchDrop >> 8) * dn.ratioQ8;
+        v.pitchDropStep = (v.pitchDropStep * (int32_t)dn.ratioQ8) >> 8;
+        if (v.pitchDrop > 0 && v.pitchDropStep == 0) v.pitchDropStep = -1;
+    }
+    setBlepInv(v);
+    setModFlags(v);
 
     // A modest prominence boost (x1.125, shift-friendly rather than a real
     // multiply): real drum mixes are usually pushed hot specifically so
@@ -1302,7 +1592,11 @@ void startPercussionVoice(Voice& v, uint8_t note, uint8_t velocity) {
     }
     v.peakLevel = peak << 16;
     v.sustainLevel = 0; // one-shot: decays fully to silence, ignores note-off
-    v.decayK = g_drumDecayK[drumType];
+    uint32_t k = g_drumDecayK[drumType];
+    if (dn.decayShift > 0) k <<= dn.decayShift;
+    else if (dn.decayShift < 0) k >>= -dn.decayShift;
+    if (g_drumDecayK[drumType] != 0 && k == 0) k = 1;
+    v.decayK = (uint16_t)(k > 65535 ? 65535 : k);
     v.releaseK = 0; // unused, see handleNoteOff(); releaseVoice() sets its own
 
     v.stage = ENV_ATTACK;
@@ -1318,26 +1612,65 @@ void startPercussionVoice(Voice& v, uint8_t note, uint8_t velocity) {
 
 // Voice to steal when a pool is full: the quietest voice already in
 // release, else the oldest. Note-on only, so a linear scan is fine.
+// Voices already fading for a steal are skipped unless every one is.
 Voice& pickStealVoice(Voice* pool, int count) {
     Voice* quietestRelease = nullptr;
-    Voice* oldest = &pool[0];
+    Voice* oldest = nullptr;
+    Voice* quietestPending = nullptr;
     uint32_t oldestAge = 0;
     for (int i = 0; i < count; i++) {
         Voice& v = pool[i];
+        if (v.pendVel) {
+            if (!quietestPending || v.amplitude < quietestPending->amplitude) quietestPending = &v;
+            continue;
+        }
         if (v.stage == ENV_RELEASE &&
             (!quietestRelease || v.amplitude < quietestRelease->amplitude)) {
             quietestRelease = &v;
         }
         uint32_t age = g_voiceStartCounter - v.startOrder;
-        if (age > oldestAge) { oldestAge = age; oldest = &v; }
+        if (!oldest || age > oldestAge) { oldestAge = age; oldest = &v; }
     }
-    return quietestRelease ? *quietestRelease : *oldest;
+    if (quietestRelease) return *quietestRelease;
+    if (oldest) return *oldest;
+    // Every voice already has a note queued: one of them has to go, so the
+    // newest note takes the queue of the voice furthest through its fade.
+    return *quietestPending;
+}
+
+// envTimeToK(32): 40 dB down in 32 samples, -60 dB (the release floor) in about 48.
+const uint16_t STEAL_FADE_K = 8784;
+
+// Fades a stolen voice out quickly and queues the new note on it, so the
+// old note's waveform and filter never jump. renderVoice() calls
+// startPending() when the fade ends.
+void startStealFade(Voice& v, uint8_t channel, uint8_t note, uint8_t velocity) {
+    v.pendNote = note;
+    v.pendVel = velocity;
+    v.pendChan = channel;
+    v.pendProg = g_channelProgram[channel];
+    v.held = false;
+    v.sostLatched = false;
+    v.stage = ENV_RELEASE;
+    v.releaseK = STEAL_FADE_K;
+    v.envFloor = envStageFloor(v.amplitude);
 }
 
 void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     if (channel == PERCUSSION_CHANNEL) {
+        // Closed and pedal hi-hat choke the open hi-hat.
+        if (note == 42 || note == 44) {
+            for (int i = 0; i < NUM_DRUM_VOICES; i++) {
+                Voice& d = g_drumVoices[i];
+                if (d.active && d.note == 46 && d.stage != ENV_RELEASE) {
+                    d.stage = ENV_RELEASE;
+                    d.releaseK = CHOKE_RELEASE_K;
+                    d.envFloor = envStageFloor(d.amplitude);
+                }
+            }
+        }
         for (int i = 0; i < NUM_DRUM_VOICES; i++) {
-            if (g_drumVoices[i].active && g_drumVoices[i].note == note) {
+            if (g_drumVoices[i].active && g_drumVoices[i].note == note && !g_drumVoices[i].pendVel) {
                 startPercussionVoice(g_drumVoices[i], note, velocity);
                 return;
             }
@@ -1348,8 +1681,8 @@ void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
                 return;
             }
         }
-        // Drum voices never enter release, so this takes the oldest hit.
-        startPercussionVoice(pickStealVoice(g_drumVoices, NUM_DRUM_VOICES), note, velocity);
+        // Drum voices only enter release when choked, so this mostly takes the oldest hit.
+        startStealFade(pickStealVoice(g_drumVoices, NUM_DRUM_VOICES), channel, note, velocity);
         return;
     }
 
@@ -1357,7 +1690,7 @@ void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
     // take a free voice, else steal one (see pickStealVoice()).
     for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
         Voice& v = g_melodicVoices[i];
-        if (v.active && v.note == note && v.channel == channel) {
+        if (v.active && v.note == note && v.channel == channel && !v.pendVel) {
             // A retriggered note keeps its sostenuto latch while the pedal is down.
             bool latch = v.sostLatched && g_chan[channel].sostenuto;
             startMelodicVoice(v, channel, note, velocity);
@@ -1371,7 +1704,7 @@ void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
             return;
         }
     }
-    startMelodicVoice(pickStealVoice(g_melodicVoices, NUM_MELODIC_VOICES), channel, note, velocity);
+    startStealFade(pickStealVoice(g_melodicVoices, NUM_MELODIC_VOICES), channel, note, velocity);
 }
 
 // Releases `note` on `channel` only, so two parts sharing a pitch don't
@@ -1380,12 +1713,34 @@ void handleNoteOn(uint8_t channel, uint8_t note, uint8_t velocity) {
 void handleNoteOff(uint8_t channel, uint8_t note) {
     for (int i = 0; i < NUM_MELODIC_VOICES; i++) {
         Voice& v = g_melodicVoices[i];
-        if (v.active && v.note == note && v.channel == channel) noteOffVoice(v);
+        if (v.pendVel && v.pendNote == note && (v.pendChan & 0x0F) == channel) noteOffPending(v);
+        else if (v.active && v.note == note && v.channel == channel) noteOffVoice(v);
+    }
+}
+
+// Starts the note a steal queued once the old one has faded (see
+// startStealFade()), from silence. Called from renderVoice(), so it stays
+// out of line; it only runs once per steal.
+__attribute__((noinline)) void startPending(Voice& v) {
+    uint8_t channel = v.pendChan & 0x0F;
+    bool off = (v.pendChan & PEND_OFF) != 0;
+    bool latched = (v.pendChan & PEND_SOST_LATCHED) != 0;
+    uint8_t note = v.pendNote, velocity = v.pendVel;
+    v.pendVel = 0;
+    v.active = false;
+    v.amplitude = 0;
+    if (channel == PERCUSSION_CHANNEL) {
+        startPercussionVoice(v, note, velocity);
+    } else {
+        startMelodicVoice(v, channel, note, velocity, v.pendProg);
+        v.sostLatched = latched && g_chan[channel].sostenuto;
+        if (off) noteOffVoice(v); // a pedal held it, so it goes to held
     }
 }
 
 void releaseVoice(Voice& v) {
     v.held = false;
+    v.pendVel = 0;
     if (!v.active) return;
     v.stage = ENV_RELEASE;
     v.releaseK = PANIC_RELEASE_K;
@@ -1403,60 +1758,64 @@ void handlePanic() {
 ALWAYS_INLINE void __not_in_flash_func(renderVoice)(Voice& v, int16_t lfoValue, int32_t& outL, int32_t& outR, int32_t& outSend) {
     if (!v.active) { outL = 0; outR = 0; outSend = 0; return; }
 
-    // pitchDrop (percussion pitch sweep, >= 0) and the shared vibrato LFO
-    // (either sign) nudge phaseInc. Plain uint32 adds: a negative nudge
-    // wraps to the right value since the sum itself stays in range.
+    // One flag test skips vibrato, PWM, tremolo and pitch drop for a voice
+    // that has none. Tremolo and PWM are on at most g_maxModulatedVoices
+    // voices; vibrato can be on every voice (the mod wheel), and so can
+    // pitch drop on the drums.
     uint32_t effectivePhaseInc = v.phaseInc;
-    if (v.pitchDrop > 0) effectivePhaseInc += (uint32_t)v.pitchDrop;
-    if (v.vibratoRange != 0) {
-        // lfoValue is g_sineTable's output, ~-32000..32000. vibratoRange
-        // already lost 8 bits at note-start, so the remaining >>7 is split
-        // into >>5 on lfoValue before the multiply and >>2 after, keeping
-        // it a plain int32 multiply: at note 127 and the editor's 30% cap
-        // vibratoRange is ~1.43e6, times |lfo>>5| <= 1000 is ~1.43e9.
-        effectivePhaseInc += (uint32_t)(((int32_t)v.vibratoRange * (lfoValue >> 5)) >> 2);
-    }
-
-    // PWM: the same shared LFO nudges the square wave's duty cycle around
-    // its fixed 50% (32768) center instead of pitch. Only WAVE_SQUARE
-    // voices ever have a nonzero pwmDepthQ16 (see PRESETS), so this is a
-    // no-op shift+add for every other waveform.
-    // Plain int32 multiply, not int64: pwmDepthQ16 is a preset-fixed
-    // percentage (max ~15%, see PRESETS), never phaseInc-scaled the way
-    // vibratoRange is, so (max ~9830) * (lfoValue up to ~32768) tops out
-    // around 3.2e8 -- nowhere near int32 overflow. See cutoffHzToAlphaQ14()'s
-    // comment for why this matters on a Cortex-M0+ (no hardware 64-bit
-    // multiply).
     uint16_t pulseWidth = 32768;
-    if (v.pwmDepthQ16 != 0) {
-        int32_t swing = ((int32_t)v.pwmDepthQ16 * lfoValue) >> 15;
-        pulseWidth = (uint16_t)(int32_t)(32768 + swing);
+    uint8_t mod = v.modFlags;
+    if (mod) {
+        // pitchDrop (percussion pitch sweep, >= 0) and the shared vibrato
+        // LFO (either sign) nudge phaseInc. Plain uint32 adds: a negative
+        // nudge wraps to the right value since the sum itself stays in range.
+        if (mod & VOICE_MOD_PITCH_DROP) {
+            effectivePhaseInc += (uint32_t)v.pitchDrop;
+            v.pitchDrop += v.pitchDropStep;
+            if (v.pitchDrop <= 0) {
+                v.pitchDrop = 0;
+                v.pitchDropStep = 0;
+                v.modFlags = mod & ~VOICE_MOD_PITCH_DROP;
+            }
+        }
+        if (mod & VOICE_MOD_VIBRATO) {
+            // lfoValue is g_sineTable's output, ~-32000..32000. vibratoRange
+            // already lost 8 bits at note-start, so the remaining >>7 is
+            // split into >>5 on lfoValue before the multiply and >>2 after,
+            // keeping it a plain int32 multiply: at note 127 and the
+            // editor's 30% cap vibratoRange is ~1.43e6, times |lfo>>5| <=
+            // 1000 is ~1.43e9.
+            effectivePhaseInc += (uint32_t)(((int32_t)v.vibratoRange * (lfoValue >> 5)) >> 2);
+        }
+        // PWM: the shared LFO swings the square's duty cycle around 50%.
+        // pwmDepthQ16 is at most ~15%, so the multiply fits int32.
+        if (mod & VOICE_MOD_PWM) {
+            int32_t swing = ((int32_t)v.pwmDepthQ16 * lfoValue) >> 15;
+            pulseWidth = (uint16_t)(int32_t)(32768 + swing);
+        }
     }
-    int16_t raw = waveformSample(v.waveform, v.phase, pulseWidth);
+    // The phase moves on before the waveform is worked out, which frees a
+    // register for the rest. Noise voices (phaseInc 0) keep their last
+    // value in phase, see waveformSample().
+    uint32_t phase = v.phase;
+    v.phase = phase + effectivePhaseInc;
+    int32_t raw = waveformSample(v, phase, pulseWidth);
 
-    // One-pole low-pass, applied to the raw oscillator before the envelope
-    // (VCF-before-VCA, the usual analog-synth order) so the filter's own
-    // brightness is independent of where the envelope happens to be. Q14
-    // fixed point (see cutoffHzToAlphaQ14()'s comment for why Q14, not
-    // Q16) -- plain int32 multiply, no int64_t needed: diff up to 65535 *
-    // alpha up to 16384 tops out around 1.07e9, safely inside int32 range.
-    int32_t diff = (int32_t)raw - v.filterState;
-    v.filterState += (diff * (int32_t)v.filterAlpha) >> 14;
+    // One-pole low-pass, Q14 (see cutoffHzToAlphaQ14()), on the raw
+    // oscillator before the envelope. diff up to 65535 times alpha up to
+    // 16384 fits int32. A fully open filter just passes raw through.
+    int32_t alpha = v.filterAlpha;
+    int32_t filtered = raw;
+    if (alpha != 16384) filtered = v.filterState + (((raw - v.filterState) * alpha) >> 14);
+    v.filterState = filtered;
 
     // amplitude is Q16: >>13 here and >>14 after is the same >>(16 +
     // VOICE_PEAK_SHIFT) as one shift, kept in int32 (32767 * 23040 max).
-    int32_t contribution = (v.filterState * (v.amplitude >> 13)) >> (VOICE_PEAK_SHIFT + 3);
-    // Tremolo: same shared LFO again, this time as a gain wobble around
-    // unity (65536 Q16) rather than a pitch or duty-cycle nudge. Applied
-    // post-envelope so it modulates the note's own current loudness
-    // rather than fighting the attack/decay/release shape. tremMod itself
-    // is a safe plain int32 multiply (same reasoning as PWM's swing
-    // above), but contribution (up to ~32767) times the Q16 gain (up to
-    // ~77332 at max depth) can exceed int32 -- contribution is shifted
-    // down 2 bits first (negligible precision loss for a modulation
-    // effect) to keep this a 32-bit multiply too; the final shift is
-    // adjusted from 16 to 14 to compensate.
-    if (v.tremoloDepthQ16 != 0) {
+    int32_t contribution = (filtered * (v.amplitude >> 13)) >> (VOICE_PEAK_SHIFT + 3);
+    // Tremolo: a gain wobble around unity after the envelope. contribution
+    // is shifted down 2 bits first so the Q16 gain (up to ~77332) multiply
+    // stays int32, and the final shift is 14 to make up for it.
+    if (mod & VOICE_MOD_TREMOLO) {
         int32_t tremMod = ((int32_t)v.tremoloDepthQ16 * lfoValue) >> 15;
         contribution = ((contribution >> 2) * (65536 + tremMod)) >> 14;
     }
@@ -1465,12 +1824,6 @@ ALWAYS_INLINE void __not_in_flash_func(renderVoice)(Voice& v, int16_t lfoValue, 
     outL = (contribution * (int32_t)v.gainL) >> 15;
     outR = (contribution * (int32_t)v.gainR) >> 15;
     outSend = (contribution * (int32_t)v.sendGain) >> 14;
-    v.phase += effectivePhaseInc;
-
-    if (v.pitchDropStep != 0) {
-        v.pitchDrop += v.pitchDropStep;
-        if (v.pitchDrop < 0) { v.pitchDrop = 0; v.pitchDropStep = 0; }
-    }
 
     switch (v.stage) {
         case ENV_ATTACK:
@@ -1504,7 +1857,11 @@ ALWAYS_INLINE void __not_in_flash_func(renderVoice)(Voice& v, int16_t lfoValue, 
             break; // held
         case ENV_RELEASE:
             v.amplitude = envExpStep(v.amplitude, v.releaseK);
-            if (v.amplitude <= v.envFloor) { v.amplitude = 0; v.active = false; }
+            if (v.amplitude <= v.envFloor) {
+                v.amplitude = 0;
+                v.active = false;
+                if (v.pendVel) startPending(v); // a steal's fade is done
+            }
             break;
     }
 }
@@ -1523,9 +1880,84 @@ int32_t __not_in_flash_func(softLimit)(int32_t mix) {
     return mag * sign;
 }
 
+// -- Synth output -------------------------------------------------------------
+// The synth's mix goes straight to the output through one gain (volume,
+// output level and SYNTH_MAKEUP_Q8) and is then soft-limited against a
+// ceiling in output units: the DAC's full scale, or SYNTH_HEADROOM times
+// what the old pre-volume limiter allowed at this volume and level, if
+// that's lower. So at the default Headphone Low and volume 80 the synth
+// can peak at -12 dBFS (it was held at -24 dBFS), and a typical file never
+// reaches the knee. Past about volume 63 on Line or 80 on Headphone High
+// the ceiling is full scale itself and loudness has nowhere to go, so a
+// peak limiter (synthLevelerStep()) runs on the synth then and rides the
+// gain down instead of the soft limit flattening the peaks. WAV and tracker
+// playback keep their own leveler and limiter before the volume (see
+// renderSample()).
+const int32_t SYNTH_MAKEUP_Q8 = 256;
+const int32_t SYNTH_HEADROOM = 4;
+int32_t g_synthGainHi = 0, g_synthGainLo = 0; // Q16 gain split in bytes
+int32_t g_synthKnee = SOFT_KNEE_START, g_synthCeiling = HARD_LIMIT;
+bool g_synthCapped = false; // ceiling at full scale, the synth leveler runs
+
+// Attenuate-only gain riding for the synth while its ceiling is at full
+// scale, see synthLevelerStep().
+struct Leveler {
+    int32_t envelope;
+    uint32_t gainQ16;
+    int counter;
+};
+Leveler g_synthLeveler = {0, 65536, 0};
+
+// The synth's leveler is a peak limiter: the follower jumps to each new
+// peak and falls back in ~186 ms, and the gain, worked out every
+// SYNTH_LEVELER_PERIOD samples, holds peaks at the limiter's knee (the
+// soft limit only catches what gets past between updates).
+const int SYNTH_LEVELER_PERIOD = 16;
+ALWAYS_INLINE void __not_in_flash_func(synthLevelerStep)(Leveler& l, int32_t magnitude) {
+    if (magnitude > l.envelope) l.envelope = magnitude;
+    else l.envelope -= l.envelope >> 13;
+    if (++l.counter >= SYNTH_LEVELER_PERIOD) {
+        l.counter = 0;
+        // A knee of at most 24576, << 16, fits uint32.
+        l.gainQ16 = l.envelope > g_synthKnee ? ((uint32_t)g_synthKnee << 16) / (uint32_t)l.envelope : 65536;
+    }
+}
+
+// x times the leveler's gain (< 65536), split in bytes to stay in int32.
+ALWAYS_INLINE int32_t levelerApply(const Leveler& l, int32_t x) {
+    int32_t hi = (int32_t)(l.gainQ16 >> 8), lo = (int32_t)(l.gainQ16 & 0xFF);
+    return ((x * hi) >> 8) + ((x * lo) >> 16);
+}
+
+// After a volume or output level change (core 1, not per sample).
+void updateSynthOutput() {
+    uint32_t g = ((g_masterGainQ16 * (uint32_t)SYNTH_MAKEUP_Q8) >> 8) >> g_outputLevelShift;
+    g_synthGainHi = (int32_t)(g >> 8);
+    g_synthGainLo = (int32_t)(g & 0xFF);
+    uint32_t ceiling = (((uint32_t)(SYNTH_HEADROOM * HARD_LIMIT) * (g_masterGainQ16 >> 4)) >> 12) >> g_outputLevelShift;
+    if (ceiling > (uint32_t)HARD_LIMIT) ceiling = HARD_LIMIT;
+    g_synthCeiling = (int32_t)ceiling;
+    g_synthKnee = (int32_t)((ceiling * (uint32_t)SOFT_KNEE_START) / (uint32_t)HARD_LIMIT);
+    bool capped = ceiling == (uint32_t)HARD_LIMIT;
+    if (capped != g_synthCapped) g_synthLeveler = {0, 65536, 0};
+    g_synthCapped = capped;
+}
+
+// softLimit()'s curve, at g_synthKnee and g_synthCeiling.
+ALWAYS_INLINE int32_t __not_in_flash_func(synthLimit)(int32_t x) {
+    int32_t mag = x < 0 ? -x : x;
+    if (mag <= g_synthKnee) return x;
+#ifdef HOST_MIDI
+    g_hostLimitSamples++;
+#endif
+    mag = g_synthKnee + ((mag - g_synthKnee) >> 2);
+    if (mag > g_synthCeiling) mag = g_synthCeiling;
+    return x < 0 ? -mag : mag;
+}
+
 // -- Lo-fi reverb -----------------------------------------------------------
-// A small mono Freeverb-style tank (4 parallel comb filters + 2 series
-// allpass filters) fed from the onboard MIDI synth's own voices only --
+// A small Freeverb-style tank (4 parallel comb filters, two of them into
+// an allpass for each side) fed from the onboard MIDI synth's own voices only --
 // see renderSample()'s sendSum, built from the voices before WAV/tracker
 // content is mixed in -- so a WAV or tracker file playing back never reaches the
 // tank, only actual synth notes do. The wet output still gets added into
@@ -1557,9 +1989,14 @@ int16_t g_reverbCombBuf2[REVERB_COMB_LEN2];
 int16_t g_reverbCombBuf3[REVERB_COMB_LEN3];
 int16_t g_reverbAllpassBuf0[REVERB_ALLPASS_LEN0];
 int16_t g_reverbAllpassBuf1[REVERB_ALLPASS_LEN1];
-size_t g_reverbCombPos0 = 0, g_reverbCombPos1 = 0, g_reverbCombPos2 = 0, g_reverbCombPos3 = 0;
-size_t g_reverbAllpassPos0 = 0, g_reverbAllpassPos1 = 0;
-int32_t g_reverbDampState0 = 0, g_reverbDampState1 = 0, g_reverbDampState2 = 0, g_reverbDampState3 = 0;
+// Positions (combs 0-3, then allpasses 0-1) count down, and the comb
+// low-pass states are Q4. One struct so the tank reaches them all from one
+// base address.
+struct ReverbState {
+    uint32_t pos[6];
+    int32_t damp[4];
+};
+ReverbState g_reverbState = {};
 
 // Q16 fixed point. FEEDBACK sets decay time (higher = longer tail);
 // DAMP_ALPHA is a one-pole lowpass *inside* each comb's feedback path,
@@ -1569,6 +2006,8 @@ int32_t g_reverbDampState0 = 0, g_reverbDampState1 = 0, g_reverbDampState2 = 0, 
 // instead of ringing brightly forever.
 const int32_t REVERB_COMB_FEEDBACK_Q16 = 53740;  // ~0.82
 const int32_t REVERB_DAMP_ALPHA_Q16 = 13107;      // ~0.2
+const int32_t REVERB_COMB_FEEDBACK_Q12 = REVERB_COMB_FEEDBACK_Q16 >> 4;
+const int32_t REVERB_DAMP_ALPHA_Q12 = REVERB_DAMP_ALPHA_Q16 >> 4;
 const int32_t REVERB_ALLPASS_FEEDBACK_Q16 = 32768; // 0.5, the standard Schroeder allpass value
 
 // Ceiling for the Settings "Reverb Mix" percent (see reverbMixPercentToQ16()
@@ -1616,49 +2055,63 @@ uint32_t reverbMixPercentToQ16(uint8_t percent) {
 // comment). `input` (the raw mix sum, not clamped to int16 range) is only
 // ever added, never multiplied, so its larger magnitude doesn't risk
 // overflow here either.
-int32_t __not_in_flash_func(reverbComb)(int16_t* buf, size_t& pos, int len, int32_t input, int32_t& dampState) {
+// A multiply by a constant that GCC would otherwise expand into a chain of
+// shifts and adds; the M0+'s muls takes one cycle.
+ALWAYS_INLINE int32_t mulConst(int32_t x, int32_t k) {
+    asm("" : "+r"(k));
+    return x * k;
+}
+
+ALWAYS_INLINE int32_t __not_in_flash_func(reverbComb)(int16_t* buf, uint32_t& pos, int len, int32_t input, int32_t& dampState) {
+    if (pos == 0) pos = len;
+    pos--;
     int32_t delayed = buf[pos];
-    dampState += ((delayed - dampState) * REVERB_DAMP_ALPHA_Q16) >> 16;
-    int32_t fedBack = input + ((dampState * REVERB_COMB_FEEDBACK_Q16) >> 16);
-    if (fedBack > 32767) fedBack = 32767;
-    if (fedBack < -32768) fedBack = -32768;
-    buf[pos] = (int16_t)fedBack;
-    pos++;
-    if (pos >= (size_t)len) pos = 0;
+    // dampState is Q4 and the feedback multiply rounds towards zero, so the
+    // loop decays to 0 instead of sticking on an offset (the wet path's
+    // gain makes that audible). Q12 coefficients keep the products in int32
+    // (|dampState| < 2^19.1).
+    dampState += mulConst((delayed << 4) - dampState, REVERB_DAMP_ALPHA_Q12) >> 12;
+    int32_t f = mulConst(dampState, REVERB_COMB_FEEDBACK_Q12);
+    int32_t fedBack = input + ((f + ((f >> 31) & 0xFFFF)) >> 16);
+#ifdef HOST_MIDI
+    if (fedBack > 32767 || fedBack < -32768) g_hostTankClips++;
+#endif
+    buf[pos] = (int16_t)clampInt16(fedBack);
     return delayed;
 }
 
-int32_t __not_in_flash_func(reverbAllpass)(int16_t* buf, size_t& pos, int len, int32_t input) {
+ALWAYS_INLINE int32_t __not_in_flash_func(reverbAllpass)(int16_t* buf, uint32_t& pos, int len, int32_t input) {
+    if (pos == 0) pos = len;
+    pos--;
     int32_t bufOut = buf[pos];
     int32_t output = bufOut - input;
-    int32_t fedBack = input + ((bufOut * REVERB_ALLPASS_FEEDBACK_Q16) >> 16);
-    if (fedBack > 32767) fedBack = 32767;
-    if (fedBack < -32768) fedBack = -32768;
-    buf[pos] = (int16_t)fedBack;
-    pos++;
-    if (pos >= (size_t)len) pos = 0;
+    static_assert(REVERB_ALLPASS_FEEDBACK_Q16 == 32768, "allpass feedback is a halving");
+    int32_t fedBack = input + bufOut / 2; // towards zero, see reverbComb()
+    buf[pos] = (int16_t)clampInt16(fedBack);
     return output;
 }
 
-// Runs the tank every sample (see this block's header comment on why),
-// returns the full-rate wet signal -- reverbProcess()'s caller is what
-// applies the decimate/bitcrush lo-fi treatment to what it reads out.
-int32_t __not_in_flash_func(reverbProcess)(int32_t input) {
-    int32_t combSum = 0;
-    combSum += reverbComb(g_reverbCombBuf0, g_reverbCombPos0, REVERB_COMB_LEN0, input, g_reverbDampState0);
-    combSum += reverbComb(g_reverbCombBuf1, g_reverbCombPos1, REVERB_COMB_LEN1, input, g_reverbDampState1);
-    combSum += reverbComb(g_reverbCombBuf2, g_reverbCombPos2, REVERB_COMB_LEN2, input, g_reverbDampState2);
-    combSum += reverbComb(g_reverbCombBuf3, g_reverbCombPos3, REVERB_COMB_LEN3, input, g_reverbDampState3);
-    combSum >>= 2; // 4 combs summed -- bring back down to roughly single-signal scale
-
-    int32_t out = reverbAllpass(g_reverbAllpassBuf0, g_reverbAllpassPos0, REVERB_ALLPASS_LEN0, combSum);
-    out = reverbAllpass(g_reverbAllpassBuf1, g_reverbAllpassPos1, REVERB_ALLPASS_LEN1, out);
-    return out;
+// Runs the tank every sample (see this block's header comment on why) and
+// gives the full-rate wet signal in stereo: combs 0 and 2 through the first
+// allpass for the left, 1 and 3 through the second for the right. The
+// caller applies the Lo-fi, Lush or Shimmer treatment.
+void __not_in_flash_func(reverbProcess)(int32_t input, int32_t& outL, int32_t& outR) {
+    ReverbState& r = g_reverbState;
+    int32_t c0 = reverbComb(g_reverbCombBuf0, r.pos[0], REVERB_COMB_LEN0, input, r.damp[0]);
+    int32_t c1 = reverbComb(g_reverbCombBuf1, r.pos[1], REVERB_COMB_LEN1, input, r.damp[1]);
+    int32_t c2 = reverbComb(g_reverbCombBuf2, r.pos[2], REVERB_COMB_LEN2, input, r.damp[2]);
+    int32_t c3 = reverbComb(g_reverbCombBuf3, r.pos[3], REVERB_COMB_LEN3, input, r.damp[3]);
+    outL = reverbAllpass(g_reverbAllpassBuf0, r.pos[4], REVERB_ALLPASS_LEN0, (c0 + c2) >> 1);
+    outR = reverbAllpass(g_reverbAllpassBuf1, r.pos[5], REVERB_ALLPASS_LEN1, (c1 + c3) >> 1);
 }
 
+// The tank runs this many bits below the send sum, see renderSample().
+const int REVERB_SEND_SHIFT = 5;
 const int REVERB_DECIMATE = 4; // hold the wet output for this many samples -- ~11kHz effective
-const int32_t REVERB_BIT_MASK = ~0x3F; // keep roughly the top 10 bits -- crude bitcrush grit
-int32_t g_reverbHeld = 0;
+// Keeps roughly the top 10 bits of the tank (0x3F at the send's own scale),
+// crude bitcrush grit.
+const int32_t REVERB_BIT_MASK = ~(0x3F >> REVERB_SEND_SHIFT);
+int32_t g_reverbHeldL = 0, g_reverbHeldR = 0;
 int g_reverbDecimateCounter = 0;
 
 // -- Lush/modulated reverb (Reverb Type: Lush) -------------------------------
@@ -1759,6 +2212,7 @@ size_t g_shimmerWritePos = 0;
 int32_t g_shimmerReadPosQ16[2] = {0, 0};
 int32_t g_shimmerGrainPos[2] = {0, SHIMMER_GRAIN_LEN / 2}; // half a grain apart, so their crossfades interleave
 int32_t g_shimmerFeedbackHeld = 0;
+int32_t g_shimmerDcQ8 = 0; // DC in the feedback, see renderSample()
 
 int32_t __not_in_flash_func(shimmerReadTap)(int tapIdx) {
     int32_t posQ16 = g_shimmerReadPosQ16[tapIdx];
@@ -1834,6 +2288,7 @@ void reverbTypeChanged(uint8_t newType) {
         g_shimmerGrainPos[0] = 0;
         g_shimmerGrainPos[1] = SHIMMER_GRAIN_LEN / 2;
         g_shimmerFeedbackHeld = 0;
+        g_shimmerDcQ8 = 0;
     }
     g_reverbType = newType;
 }
@@ -1843,6 +2298,21 @@ void reverbTypeChanged(uint8_t newType) {
 // channel's CC7, CC11 and CC10, see applyChannelGains()), and a WAV stream
 // (genuinely stereo -- see popWavFrame()) adds in on top of that; softLimit()/
 // the leveler/volume then apply per-channel.
+// One WAV leveler step with no WAV playing (magnitude 0), the same maths
+// as in renderSample(). Out of line: it only runs for a few seconds after
+// a WAV or tracker file ends.
+__attribute__((noinline)) void __not_in_flash_func(wavLevelerIdle)() {
+    g_levelerEnvelope += (0 - g_levelerEnvelope) >> 17;
+    if (++g_levelerUpdateCounter >= LEVELER_UPDATE_PERIOD) {
+        g_levelerUpdateCounter = 0;
+        if (g_levelerEnvelope > LEVELER_TARGET) {
+            g_levelerGainQ16 = ((uint32_t)LEVELER_TARGET << 16) / (uint32_t)g_levelerEnvelope;
+        } else {
+            g_levelerGainQ16 = 65536;
+        }
+    }
+}
+
 void __not_in_flash_func(renderSample)(int16_t& outLeft, int16_t& outRight) {
     // One shared LFO lookup for this whole sample -- see g_lfoPhase's
     // comment -- rather than each voice maintaining (and advancing) its
@@ -1862,16 +2332,28 @@ void __not_in_flash_func(renderSample)(int16_t& outLeft, int16_t& outRight) {
     // synth voices feed it, so WAV and tracker playback never reach the tank.
     int32_t mixL = 0, mixR = 0, sendSum = 0;
     for (int i = 0; i < NUM_VOICES; i++) {
+        if (!g_voices[i].active) continue;
         int32_t l, r, snd;
         renderVoice(g_voices[i], lfoValue, l, r, snd);
+#ifdef __thumb__
+        // The sums live in high registers (add to one is a single cycle on
+        // the M0+); left to itself GCC spills two of them to the stack.
+        asm("add %0, %1" : "+h"(mixL) : "l"(l));
+        asm("add %0, %1" : "+h"(mixR) : "l"(r));
+        asm("add %0, %1" : "+h"(sendSum) : "l"(snd));
+#else
         mixL += l; mixR += r; sendSum += snd;
+#endif
     }
 
-    if (g_wavActive) {
+    // WAV and tracker frames keep their own path below.
+    bool wavLive = g_wavActive;
+    int32_t wavL = 0, wavR = 0;
+    if (wavLive) {
         int16_t wl, wr;
         if (popWavFrame(wl, wr)) {
-            mixL += wl;
-            mixR += wr;
+            wavL = wl;
+            wavR = wr;
         } else if (g_wavEnded) {
             g_wavActive = false; // fully drained after EOF -- stop checking every sample
         } else {
@@ -1880,59 +2362,93 @@ void __not_in_flash_func(renderSample)(int16_t& outLeft, int16_t& outRight) {
         }
     }
 
-    // Reverb send: the per-channel send sum (see sendSum above) feeds the
-    // tank (see reverbProcess()'s header comment); which
-    // post-processing runs on the tank's output depends on Reverb Type
-    // (see g_reverbType's own comment for why all three share one tank).
-    // The wet signal gets added back identically to both (full,
-    // WAV-included) channels -- placed here (before the leveler/limiter)
-    // so it's covered by the same headroom management as everything else,
-    // not an uncontrolled extra on top of it. Skipped entirely (tank
-    // included) when off -- see Synth::setReverbEnabled() -- so a
-    // disabled reverb costs nothing, and re-enabling it starts from a
-    // cold (silent) tank rather than resuming a stale one, unnoticeable
-    // for an ambience effect like this.
+    // Reverb: the per-channel send sum (see sendSum above) feeds the tank
+    // REVERB_SEND_SHIFT down, so CC91 127 on many voices stays inside the
+    // int16 delay lines, and the wet signal comes back up by the same at
+    // the mix. Which post-processing runs depends on Reverb Type (see
+    // g_reverbType's own comment for why all three share one tank). Lush
+    // and Shimmer run on the mid of the stereo tank and add its side back.
+    // Skipped entirely (tank included) when off, see Synth::setReverbEnabled().
     if (g_reverbEnabled) {
-        int32_t monoSend = sendSum;
-        int32_t wetSignal;
+        int32_t tankIn = sendSum >> REVERB_SEND_SHIFT;
+        int32_t tankL, tankR, wetL, wetR;
 
         if (g_reverbType == REVERB_TYPE_SHIMMER) {
             // Regenerative: last sample's (already-decaying, see
             // SHIMMER_FEEDBACK_Q16) pitch-shifted output feeds back into
             // this sample's tank input, on top of the dry send.
-            int32_t tankWet = reverbProcess(monoSend + g_shimmerFeedbackHeld);
-            int32_t shimmerOut = shimmerProcess(tankWet);
-            g_shimmerFeedbackHeld = (shimmerOut * SHIMMER_FEEDBACK_Q16) >> 16;
+            reverbProcess(tankIn + g_shimmerFeedbackHeld, tankL, tankR);
+            int32_t shimmerOut = shimmerProcess((tankL + tankR) >> 1);
+            // The loop's gain at DC is over 1 (combs 5.5x, feedback 0.4, and
+            // an octave up of DC is still DC), so the feedback is DC-blocked
+            // (one-pole, ~27 Hz, state in Q8).
+            int32_t fb = (shimmerOut * SHIMMER_FEEDBACK_Q16) >> 16;
+            g_shimmerDcQ8 += fb - (g_shimmerDcQ8 >> 8);
+            g_shimmerFeedbackHeld = fb - (g_shimmerDcQ8 >> 8);
             // Tank halved so the pitched wash (the actual point of this
             // mode) leads rather than just riding underneath a full-level
             // plain reverb.
-            wetSignal = (tankWet >> 1) + shimmerOut;
+            wetL = (tankL >> 1) + shimmerOut;
+            wetR = (tankR >> 1) + shimmerOut;
         } else {
-            int32_t tankWet = reverbProcess(monoSend);
+            reverbProcess(tankIn, tankL, tankR);
             if (g_reverbType == REVERB_TYPE_LUSH) {
-                wetSignal = chorusProcess(tankWet);
+                int32_t mid = chorusProcess((tankL + tankR) >> 1);
+                int32_t side = (tankL - tankR) >> 1;
+                wetL = mid + side;
+                wetR = mid - side;
             } else { // REVERB_TYPE_LOFI
                 if (g_reverbDecimateCounter == 0) {
-                    g_reverbHeld = tankWet & REVERB_BIT_MASK;
+                    g_reverbHeldL = tankL & REVERB_BIT_MASK;
+                    g_reverbHeldR = tankR & REVERB_BIT_MASK;
                 }
                 g_reverbDecimateCounter++;
                 if (g_reverbDecimateCounter >= REVERB_DECIMATE) g_reverbDecimateCounter = 0;
-                wetSignal = g_reverbHeld;
+                wetL = g_reverbHeldL;
+                wetR = g_reverbHeldR;
             }
         }
 
-        // Plain int32: wetSignal stays within a few x +-32767 across all
-        // three modes (see each mode's own overflow comments above),
-        // g_reverbMixQ16 maxes out at REVERB_WET_MAX_Q16 (14417) -- worst
-        // case product is nowhere near int32 overflow.
-        int32_t reverbWetOut = (wetSignal * (int32_t)g_reverbMixQ16) >> 16;
-        mixL += reverbWetOut;
-        mixR += reverbWetOut;
+        // wet is within a few x +-32767 and g_reverbMixQ16 at most 14417, so
+        // the product fits int32; the shift puts back REVERB_SEND_SHIFT.
+        mixL += (wetL * (int32_t)g_reverbMixQ16) >> (16 - REVERB_SEND_SHIFT);
+        mixR += (wetR * (int32_t)g_reverbMixQ16) >> (16 - REVERB_SEND_SHIFT);
     }
 
-    // Auto-leveler: track loudness, then (rarely) update the attenuation.
-    int32_t magL = mixL < 0 ? -mixL : mixL;
-    int32_t magR = mixR < 0 ? -mixR : mixR;
+    // Synth: scaled straight to the output (volume, output level and
+    // makeup in one gain, split in bytes so a mix up to ~8M stays int32),
+    // then limited against the output's own ceiling, see updateSynthOutput().
+    int32_t gHi = g_synthGainHi, gLo = g_synthGainLo;
+    int32_t synL = ((mixL * gHi) >> 8) + ((mixL * gLo) >> 16);
+    int32_t synR = ((mixR * gHi) >> 8) + ((mixR * gLo) >> 16);
+    if (g_synthCapped) {
+        Leveler& sl = g_synthLeveler;
+        int32_t magL = synL < 0 ? -synL : synL;
+        int32_t magR = synR < 0 ? -synR : synR;
+        synthLevelerStep(sl, magL > magR ? magL : magR);
+        if (sl.gainQ16 != 65536) {
+            synL = levelerApply(sl, synL);
+            synR = levelerApply(sl, synR);
+#ifdef HOST_MIDI
+            g_hostLevelSamples++;
+#endif
+        }
+    }
+    synL = synthLimit(synL);
+    synR = synthLimit(synR);
+
+    if (!wavLive) {
+        // The WAV leveler goes on releasing towards silence.
+        if (g_levelerEnvelope != 0 || g_levelerGainQ16 != 65536) wavLevelerIdle();
+        outLeft = (int16_t)synL;
+        outRight = (int16_t)synR;
+        return;
+    }
+
+    // WAV and tracker: attenuate-only leveler, soft limit, then volume and
+    // output level, as before the synth had its own path.
+    int32_t magL = wavL < 0 ? -wavL : wavL;
+    int32_t magR = wavR < 0 ? -wavR : wavR;
     int32_t magnitude = magL > magR ? magL : magR;
     if (magnitude > g_levelerEnvelope) {
         g_levelerEnvelope += (magnitude - g_levelerEnvelope) >> 13; // ~186ms attack
@@ -1948,32 +2464,25 @@ void __not_in_flash_func(renderSample)(int16_t& outLeft, int16_t& outRight) {
         }
     }
     // Unity (the usual case) skips this. The gain (< 65536) is split into
-    // its high and low bytes so both multiplies stay in int32 for a mix up
-    // to ~8M.
+    // its high and low bytes so both multiplies stay in int32.
     if (g_levelerGainQ16 != 65536) {
-        int32_t gHi = (int32_t)(g_levelerGainQ16 >> 8), gLo = (int32_t)(g_levelerGainQ16 & 0xFF);
-        mixL = ((mixL * gHi) >> 8) + ((mixL * gLo) >> 16);
-        mixR = ((mixR * gHi) >> 8) + ((mixR * gLo) >> 16);
+        int32_t lHi = (int32_t)(g_levelerGainQ16 >> 8), lLo = (int32_t)(g_levelerGainQ16 & 0xFF);
+        wavL = ((wavL * lHi) >> 8) + ((wavL * lLo) >> 16);
+        wavR = ((wavR * lHi) >> 8) + ((wavR * lLo) >> 16);
     }
-
-    int32_t limitedL = softLimit(mixL);
-    int32_t limitedR = softLimit(mixR);
-    // Q16 multiply-shift against the precomputed taper gain (see
-    // volumePercentToGainQ16()) rather than a runtime percent/100 divide --
-    // cheaper (no hardware divide on the Cortex-M0+) and, unlike the old
-    // divide, correct by construction for the audio taper. g_outputLevelShift
-    // (see its own comment) is a final plain right-shift on top -- the
-    // Headphone Low/High/Line Level coarse attenuation.
-    // Plain int32 multiply, not int64_t: limitedL/R are softLimit()'s
-    // output, hard-bounded to +-HARD_LIMIT (32000), and g_masterGainQ16
-    // maxes out at 65536 -- worst case 32000*65536 = 2,097,152,000, safely
-    // inside int32's +-2,147,483,647 range (see cutoffHzToAlphaQ14()'s
-    // comment for why this class of fix matters on a Cortex-M0+, which has
-    // no hardware 32x32->64 multiply and would otherwise emulate this in
-    // software every single sample, unconditionally, regardless of voice
-    // count).
-    outLeft = (int16_t)(((limitedL * (int32_t)g_masterGainQ16) >> 16) >> g_outputLevelShift);
-    outRight = (int16_t)(((limitedR * (int32_t)g_masterGainQ16) >> 16) >> g_outputLevelShift);
+#ifdef HOST_MIDI
+    if (g_levelerGainQ16 != 65536) g_hostLevelSamples++;
+    if (wavL > SOFT_KNEE_START || -wavL > SOFT_KNEE_START || wavR > SOFT_KNEE_START || -wavR > SOFT_KNEE_START) g_hostLimitSamples++;
+#endif
+    // softLimit() bounds to +-32000, times g_masterGainQ16 <= 65536 fits int32.
+    int32_t outL = (((softLimit(wavL) * (int32_t)g_masterGainQ16) >> 16) >> g_outputLevelShift) + synL;
+    int32_t outR = (((softLimit(wavR) * (int32_t)g_masterGainQ16) >> 16) >> g_outputLevelShift) + synR;
+    if (outL > 32767) outL = 32767;
+    if (outL < -32768) outL = -32768;
+    if (outR > 32767) outR = 32767;
+    if (outR < -32768) outR = -32768;
+    outLeft = (int16_t)outL;
+    outRight = (int16_t)outR;
 }
 
 } // namespace
@@ -2244,6 +2753,8 @@ uint32_t Synth::wavStreamUnderrunSamples() {
 // core 1 automatically (weak symbols, picked up because they're defined
 // here) essentially in parallel with setup()/loop() on core 0 -- hence
 // the wait below, see Synth::begin()'s comment in synth.h.
+void setupGovernor(); // see the render governor above loop1()
+
 void setup1() {
     while (!g_readyForPioInit) {
         // Busy-wait for core 0 to finish claiming PIO resources for the SD
@@ -2253,6 +2764,8 @@ void setup1() {
     for (int i = 0; i < SINE_TABLE_SIZE; i++) {
         g_sineTable[i] = (int16_t)(32000.0f * sinf(2.0f * (float)M_PI * i / SINE_TABLE_SIZE));
     }
+    g_sineTable[SINE_TABLE_SIZE] = g_sineTable[0];
+    setupGovernor();
 
     // PRESETS/DRUM_PRESETS were seeded by Synth::begin() before the flag
     // above. Core 0 may already be editing them; its dirty doorbells
@@ -2262,6 +2775,7 @@ void setup1() {
     g_lfoPhaseInc = hzToPhaseInc(LFO_RATE_HZ);
     g_reverbChorusLfoPhaseInc = hzToPhaseInc(REVERB_CHORUS_LFO_RATE_HZ);
     g_masterGainQ16 = volumePercentToGainQ16(80); // matches the previous default percent
+    updateSynthOutput();
     g_reverbMixQ16 = reverbMixPercentToQ16(70); // matches the level this effect first shipped at
     for (int i = 0; i < 16; i++) resetChannel((uint8_t)i, true);
 
@@ -2298,11 +2812,13 @@ __attribute__((noinline)) void handleMessage(uint32_t msg) {
     uint32_t type = msg >> 28;
     if (type == MSG_TYPE_VOLUME) {
         g_masterGainQ16 = volumePercentToGainQ16((uint8_t)(msg & 0xFF));
+        updateSynthOutput();
         return;
     }
     if (type == MSG_TYPE_OUTPUT_LEVEL) {
         uint8_t level = (uint8_t)(msg & 0xFF);
         if (level < OUTPUT_LEVEL_COUNT) g_outputLevelShift = OUTPUT_LEVEL_SHIFT[level];
+        updateSynthOutput();
         return;
     }
     if (type == MSG_TYPE_REVERB_ENABLED) {
@@ -2377,12 +2893,94 @@ void drainMessages(int maxMessages) {
 
 } // namespace
 
+// -- Render governor ----------------------------------------------------------
+// Core 1 times each sample's render with SysTick (the
+// Arduino core runs it on core 1 at the CPU clock, 24 bits, counting down).
+// Over a block of GOVERNOR_BLOCK samples, if that passes 90% of the block's
+// time, one voice is faded out fast: the quietest one in release, or if
+// none is, the quietest one. The block after a shed is skipped so the fade
+// has time to land before the next decision.
+const int GOVERNOR_BLOCK = 32;
+uint32_t g_governorLimit = 0xFFFFFFFF; // cycles per block, set in setup1()
+uint32_t g_governorUsed = 0;
+uint32_t g_governorCount = 0;
+bool g_governorHold = false;
+uint32_t g_governorSheds = 0;     // voices shed since boot, for debugging
+uint32_t g_governorPeakUsed = 0;  // busiest block since boot, in cycles
+
+void setupGovernor() {
+#ifndef HOST_MIDI
+    uint32_t perSample = clock_get_hz(clk_sys) / SAMPLE_RATE;
+#else
+    uint32_t perSample = 200000000u / SAMPLE_RATE;
+#endif
+    g_governorLimit = perSample * GOVERNOR_BLOCK / 10 * 9;
+}
+
+void __not_in_flash_func(governorShed)() {
+    Voice* best = nullptr;
+    bool bestReleasing = false;
+    for (int i = 0; i < NUM_VOICES; i++) {
+        Voice& v = g_voices[i];
+        // Skip voices already fading fast and ones queued for a steal.
+        if (!v.active || v.pendVel || (v.stage == ENV_RELEASE && v.releaseK >= STEAL_FADE_K)) continue;
+        bool releasing = v.stage == ENV_RELEASE;
+        if (!best || (releasing && !bestReleasing) ||
+            (releasing == bestReleasing && v.amplitude < best->amplitude)) {
+            best = &v;
+            bestReleasing = releasing;
+        }
+    }
+    if (!best) return;
+    best->held = false;
+    best->sostLatched = false;
+    best->stage = ENV_RELEASE;
+    best->releaseK = STEAL_FADE_K;
+    best->envFloor = envStageFloor(best->amplitude);
+    g_governorSheds++;
+#ifdef HOST_MIDI
+    g_hostGovernorSheds++;
+#endif
+}
+
+ALWAYS_INLINE void __not_in_flash_func(governorTick)(uint32_t used) {
+    g_governorUsed += used;
+    if (++g_governorCount < (uint32_t)GOVERNOR_BLOCK) return;
+    if (g_governorUsed > g_governorPeakUsed) g_governorPeakUsed = g_governorUsed;
+    if (g_governorUsed > g_governorLimit && !g_governorHold) {
+        governorShed();
+        g_governorHold = true;
+    } else {
+        g_governorHold = false;
+    }
+    g_governorCount = 0;
+    g_governorUsed = 0;
+}
+
 void __not_in_flash_func(loop1)() {
     // A cap per sample keeps a long burst from holding up one sample; the
     // rest wait for the next sample.
     drainMessages(32);
+#ifndef HOST_MIDI
+    uint32_t start = systick_hw->cvr; // render time only, see governorTick()
+#endif
 
     int16_t left, right;
     renderSample(left, right);
+#ifndef HOST_MIDI
+    governorTick((start - systick_hw->cvr) & 0x00FFFFFF);
+#else
+    if (g_hostGovernorModel) {
+        // About what the disassembly gives: 125 cycles a voice, 150 with
+        // vibrato or another modulation on, the fixed costs with reverb,
+        // and the synth leveler while it runs.
+        uint32_t used = g_synthCapped ? 680 : 650;
+        for (int i = 0; i < NUM_VOICES; i++) {
+            const Voice& v = g_voices[i];
+            used += !v.active ? 9 : v.modFlags ? 150 : 125;
+        }
+        governorTick(used);
+    }
+#endif
     g_i2s.write16(left, right); // blocks until DMA buffer space is free, paces this loop
 }

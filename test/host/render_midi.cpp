@@ -10,6 +10,8 @@
 #include "I2S.h"
 #include <math.h>
 
+extern uint32_t g_hostLevelSamples, g_hostLimitSamples, g_hostTankClips, g_hostGovernorSheds;
+extern bool g_hostGovernorModel;
 static void le32(FILE* f, uint32_t v) { fwrite(&v, 4, 1, f); }
 static void le16(FILE* f, uint16_t v) { fwrite(&v, 2, 1, f); }
 
@@ -32,6 +34,13 @@ int main(int argc, char** argv) {
     hostSetFrames(0);
     Synth::begin();
     setup1();
+    // MT_LEVEL (0-2), MT_VOLUME (0-100), MT_REVERB (0/1) and MT_REVERB_TYPE (0-2) override the device defaults.
+    if (getenv("MT_REVERB")) Synth::setReverbEnabled(atoi(getenv("MT_REVERB")) != 0);
+    if (getenv("MT_REVERB_TYPE")) Synth::setReverbType((uint8_t)atoi(getenv("MT_REVERB_TYPE")));
+    if (getenv("MT_LEVEL")) Synth::setOutputLevel((uint8_t)atoi(getenv("MT_LEVEL")));
+    if (getenv("MT_VOLUME")) Synth::setVolume((uint8_t)atoi(getenv("MT_VOLUME")));
+    // MT_GOVERNOR=1 runs the render governor on a modelled cycle count.
+    g_hostGovernorModel = getenv("MT_GOVERNOR") && atoi(getenv("MT_GOVERNOR"));
     MidiPlayer player;
     if (!player.load(argv[1])) { fprintf(stderr, "load failed: %s\n", player.errorMessage()); return 1; }
     player.play();
@@ -58,9 +67,9 @@ int main(int argc, char** argv) {
         sum += (double)s * s;
     }
     double rms = frames ? sqrt(sum / (frames * 2)) : 0;
-    fprintf(stderr, "%s: %.1f s, %lu updates, track end %s, peak %d (%.1f dBFS), clips %zu, rms %.1f dBFS\n", argv[1],
+    fprintf(stderr, "%s: %.1f s, %lu updates, track end %s, peak %d (%.1f dBFS), clips %zu, rms %.1f dBFS, leveler %u, limit %u, tank clips %u, shed %u\n", argv[1],
             (double)frames / HOST_SAMPLE_RATE, updates, endAt ? "reached" : "not reached", peak,
-            peak ? 20 * log10(peak / 32768.0) : -99.0, clips, rms > 0 ? 20 * log10(rms / 32768.0) : -99.0);
+            peak ? 20 * log10(peak / 32768.0) : -99.0, clips, rms > 0 ? 20 * log10(rms / 32768.0) : -99.0, g_hostLevelSamples, g_hostLimitSamples, g_hostTankClips, g_hostGovernorSheds);
     player.stop();
     return writeWav(argv[2], g_i2sCapture) ? 0 : 1;
 }

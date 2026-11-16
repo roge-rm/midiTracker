@@ -76,10 +76,11 @@ void resetControllers();
 // so the synth doesn't leave notes stuck on when playback halts.
 void allNotesOff();
 
-// Master output volume, 0-100. Applied as a final attenuation after the
-// mix's soft limiter (see renderSample() in synth.cpp), so it's a pure
-// output level control -- it doesn't change limiting/clipping behavior at
-// a given polyphony, just how loud the result comes out. Defaults to 80.
+// Master output volume, 0-100. WAV and tracker playback take it after
+// their leveler and soft limiter. The synth takes it before its own
+// limiter, whose ceiling follows the volume and output level up to full
+// scale (about volume 63 on Line, 80 on Headphone High); past that the
+// synth gets louder only until its leveler holds it back. Defaults to 80.
 // `percent` is a UI-facing slider position, not a linear gain: internally
 // it's mapped through a cubic audio taper (see volumePercentToGainQ16() in
 // synth.cpp) so the perceived loudness scales roughly evenly across the
