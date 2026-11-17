@@ -476,12 +476,20 @@ bool anyJustPressed() {
     return false;
 }
 
-// NAV's stop: at once on the press, unless ALT is down for the keylock.
-bool navStop() { return Input::justPressed(BTN_NAV) && !Input::isDown(BTN_ALT); }
+// True if ALT was down at any point while NAV has been held.
+bool navHadAlt = false;
+
+// NAV's stop: on release, unless ALT was down during the press (the keylock
+// combo). A lock toggle mutes the release.
+bool navStop() {
+    return Input::justReleased(BTN_NAV) && !navHadAlt && !Input::isDown(BTN_ALT);
+}
 
 // Runs before a player screen's own keys. True when the lock takes this
 // tick's keys.
 bool handleKeylock() {
+    if (Input::justPressed(BTN_NAV)) navHadAlt = false;
+    if (Input::isDown(BTN_NAV) && Input::isDown(BTN_ALT)) navHadAlt = true;
     if (!keyLocked && playerErrored()) {
         lockHolding = false;
         return false;
