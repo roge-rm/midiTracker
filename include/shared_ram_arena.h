@@ -20,8 +20,10 @@
 // Mp3Player uses it too, from load() until close(): the start of the arena
 // holds the Helix decoder's state, the compressed input ring and one decoded
 // frame (Mp3Player::arenaBytes(), about 40 KB), and core 1 reads and writes
-// it while an MP3 plays. FilePlayerMode opens an MP3 only once tracks[] is
-// down and no tracker player holds the arena.
+// it while an MP3 plays. FlacPlayer does the same with dr_flac's state, one
+// decoded block, the input ring and one output chunk (FlacPlayer::arenaUsed(),
+// up to all of it). FilePlayerMode opens an MP3 or FLAC only once tracks[]
+// is down and no tracker player holds the arena.
 //
 // Backing all four with the same static bytes instead of separate heap
 // allocations means claiming any one of them is never subject to heap

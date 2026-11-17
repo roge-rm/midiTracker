@@ -162,6 +162,7 @@ void drawBrowserRow(const SdBrowser& browser, int idx, int scrollOffset, bool se
             case FILE_WAV: r.type = Look::ROW_WAV;     r.typeLabel = "WAV"; break;
             case FILE_MP3: r.type = Look::ROW_WAV;     r.typeLabel = "MP3"; break;
             case FILE_AIFF: r.type = Look::ROW_WAV;    r.typeLabel = "AIFF"; break;
+            case FILE_FLAC: r.type = Look::ROW_WAV;    r.typeLabel = "FLAC"; break;
             case FILE_MOD: r.type = Look::ROW_TRACKER; r.typeLabel = "MOD"; break;
             case FILE_S3M: r.type = Look::ROW_TRACKER; r.typeLabel = "S3M"; break;
             case FILE_XM:  r.type = Look::ROW_TRACKER; r.typeLabel = "XM"; break;
@@ -446,7 +447,7 @@ void updateBrowserHeader(const SdBrowser& browser) {
 
 void drawBrowser(const SdBrowser& browser, int selectedIndex, int scrollOffset) {
     drawBrowserHeaderPath(browser, "FILES", true);
-    drawBrowserList(browser, selectedIndex, scrollOffset, "no .mid .syx .wav .aif .mp3 .mod .s3m .xm .it files");
+    drawBrowserList(browser, selectedIndex, scrollOffset, "no .mid .syx .wav .aif .mp3 .flac .mod .s3m .xm .it files");
     // PLAY and RIGHT open too. ALT held with UP/DOWN pages.
     static const Look::Key row1[] = {
         {"UP", "up", Look::TONE_TEXT},

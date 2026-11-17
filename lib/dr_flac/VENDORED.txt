@@ -1,0 +1,12 @@
+dr_flac v0.13.4 (2026-10-31) by David Reid, public domain or MIT-0, your
+choice; the licence text is at the end of src/dr_flac.h.
+
+Taken from https://github.com/mackron/dr_libs, tag flac-0.13.4
+(commit 806ee9ada8ca9827b22f76827f739c290f37ba48), dr_flac.h only.
+sha256 b8078eeb5d523502eb7964508cd7ec8450bc79d383bec90aa17fd9e2fefd9c24.
+
+src/dr_flac.h is unchanged. src/dr_flac_config.h sets the options (no
+stdio, Ogg, wchar or SIMD, a 2 KB read buffer, no heap or assert) and is
+the header to include; src/dr_flac.c builds the implementation with them.
+Memory comes from the allocation callbacks FlacPlayer passes (the shared
+RAM arena), see src/flac_file.cpp.

@@ -41,6 +41,11 @@ bool SdBrowser::isAiffFilename(const char* name) {
     return strcasecmp(dot, ".aif") == 0 || strcasecmp(dot, ".aiff") == 0 || strcasecmp(dot, ".aifc") == 0;
 }
 
+bool SdBrowser::isFlacFilename(const char* name) {
+    const char* dot = strrchr(name, '.');
+    return dot && strcasecmp(dot, ".flac") == 0;
+}
+
 bool SdBrowser::isModFilename(const char* name) {
     size_t len = strlen(name);
     if (len < 4) return false;
@@ -132,6 +137,7 @@ bool SdBrowser::classifyEntry(FsFile& file, const char* name, bool& isDirOut, ui
     if (isWavFilename(name))   { kindOut = FILE_WAV; return true; }
     if (isMp3Filename(name))   { kindOut = FILE_MP3; return true; }
     if (isAiffFilename(name))  { kindOut = FILE_AIFF; return true; }
+    if (isFlacFilename(name))  { kindOut = FILE_FLAC; return true; }
     if (isModFilename(name))   { kindOut = FILE_MOD; return true; }
     if (isS3mFilename(name))   { kindOut = FILE_S3M; return true; }
     if (isXmFilename(name))    { kindOut = FILE_XM;  return true; }

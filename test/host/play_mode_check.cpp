@@ -42,6 +42,7 @@ int main() {
         {false, FILE_WAV, true},  // 6
         {false, FILE_IT, true},   // 7
         {false, FILE_AIFF, true}, // 8
+        {false, FILE_FLAC, true}, // 9
     };
     bool played;
     std::vector<int> tried;
@@ -54,7 +55,8 @@ int main() {
     expect("tried the xm first", tried.size() == 2 && tried[0] == 5, 1);
 
     expect("aiff plays", step(list, 7, played, tried), 8);
-    expect("wraps from the last", step(list, 8, played, tried), 2);
+    expect("flac plays", step(list, 8, played, tried), 9);
+    expect("wraps from the last", step(list, 9, played, tried), 2);
     expect("wrap played", played, 1);
 
     expect("nextPlayable order", nextPlayable((int)list.size(), 6, [&](int i) {

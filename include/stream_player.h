@@ -3,7 +3,7 @@
 #include <stddef.h>
 
 // What the file player's audio screen needs from a file that plays through
-// Synth's WAV stream: WavPlayer and Mp3Player. Core 0 only.
+// Synth's WAV stream: WavPlayer, Mp3Player and FlacPlayer. Core 0 only.
 class StreamPlayer {
 public:
     enum State { STATE_IDLE, STATE_PLAYING, STATE_PAUSED, STATE_DONE, STATE_ERROR };
@@ -26,7 +26,7 @@ public:
     uint32_t pathKey() const { return _pathKey; } // hash of the loaded path, for the UI's waveform cache
     virtual uint32_t underrunSamples() const = 0;
 
-    // For the player screen: "WAV" or "MP3", and the format line after the
+    // For the player screen: "WAV", "MP3" or "FLAC", and the format line after the
     // sample rate, e.g. "16BIT" or "320K CBR".
     virtual const char* typeLabel() const = 0;
     virtual void formatText(char* out, size_t size) const = 0;

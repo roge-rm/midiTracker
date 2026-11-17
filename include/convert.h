@@ -7,6 +7,7 @@
 
 class WavPlayer;
 class Mp3Player;
+class FlacPlayer;
 class MidiPlayer;
 
 // File conversion from the browser: a file goes through a ConvertSource,
@@ -91,10 +92,12 @@ private:
 };
 
 // Decodes on the calling core, one frame per read() call that needs one
-// (about 9 ms on the device), see Mp3Player::decodeNext().
-class Mp3ConvertSource : public ConvertSource {
+// (about 9 ms on the device for an MP3), see Mp3Player::decodeNext() and
+// FlacPlayer::decodeNext(). Player is Mp3Player or FlacPlayer.
+template <class Player>
+class DecoderConvertSource : public ConvertSource {
 public:
-    explicit Mp3ConvertSource(Mp3Player& p) : _p(p) {}
+    explicit DecoderConvertSource(Player& p) : _p(p) {}
     bool open(const char* path) override;
     const char* error() const override;
     uint32_t rate() const override;
@@ -105,11 +108,13 @@ public:
     bool usesArena() const override { return true; }
 
 private:
-    Mp3Player& _p;
+    Player& _p;
     const int16_t* _pcm = nullptr;
     int _frames = 0, _pos = 0;
     uint8_t _pcmChannels = 2;
 };
+using Mp3ConvertSource = DecoderConvertSource<Mp3Player>;
+using FlacConvertSource = DecoderConvertSource<FlacPlayer>;
 
 // A MIDI file through the synth, rendered on the calling core (core 0)
 // while core 1 is parked, see Synth::offlineBegin(). MIDI out is off and

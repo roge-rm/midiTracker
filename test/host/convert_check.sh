@@ -3,7 +3,7 @@
 # MIDI files (MIDI_SONGS, default the host build's midi/ copies) and one
 # module of each format from trackertunes/ are converted too and compared
 # sample by sample with render_midi and render beside convert_check.
-# Makes test WAVs and MP3s with ffmpeg in workdir (emptied first), converts
+# Makes test WAVs, AIFFs, FLACs and MP3s with ffmpeg in workdir (emptied first), converts
 # each to its targets with convert_check, and compares the output with
 # ffmpeg's conversion of the same file: header (ours and ffprobe's view),
 # correlation per channel and length. Then cancel, card full and free
@@ -40,6 +40,9 @@ make_src 44100 a44_16.aif pcm_s16be 2
 make_src 44100 a44_16m.aif pcm_s16be 1
 make_src 22050 a22_8m.aiff pcm_s8 1
 make_src 44100 a44_sowt.aifc pcm_s16le 2
+ff -f lavfi -i "aevalsrc='${SIG}':s=44100:d=12" -c:a flac "$DIR/f44.flac"
+ff -f lavfi -i "aevalsrc='${SIG}':s=48000:d=12" -ac 1 -c:a flac -sample_fmt s32 "$DIR/f48_24m.flac"
+ff -f lavfi -i "aevalsrc='${SIG}':s=96000:d=12" -c:a flac -sample_fmt s32 -frame_size 4096 "$DIR/f96_24.flac" # ffmpeg picks 8192 at 96k, which FlacPlayer refuses
 ff -f lavfi -i "aevalsrc='${SIG}':s=44100:d=12" -c:a libmp3lame -b:a 192k "$DIR/m44.mp3"
 ff -f lavfi -i "aevalsrc='${SIG}':s=48000:d=12" -ac 1 -c:a libmp3lame -q:a 4 "$DIR/m48m.mp3"
 ff -f lavfi -i "aevalsrc='${SIG}':s=22050:d=12" -c:a libmp3lame -b:a 64k "$DIR/m22.mp3"
@@ -106,6 +109,19 @@ for f in "$DIR"/a*.aif*; do
         convert "$f" "$t"
     done
 done
+for f in "$DIR"/f*.flac; do
+    targets=$("$BIN" run "$f" list 2>/dev/null | sed -n 's/^targets://p')
+    echo "== $(basename "$f"):$targets"
+    n=$(echo "$targets" | grep -o '[0-9](' | wc -l)
+    [ "$n" = 2 ] || bad "$f: $n targets, should be 2"
+    for t in $(echo "$targets" | grep -o '[0-9](' | tr -d '('); do
+        convert "$f" "$t"
+    done
+done
+echo "junk" > "$DIR/junk.flac"
+targets=$("$BIN" run "$DIR/junk.flac" list | sed -n 's/^targets://p')
+[ -z "$targets" ] || bad "junk.flac targets:$targets"
+rm -f "$DIR/junk.flac"
 for f in "$DIR"/m*.mp3 "$DIR"/x_*.mp3; do
     [ -e "$f" ] || continue
     echo "== $(basename "$f")"

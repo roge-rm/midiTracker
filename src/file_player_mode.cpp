@@ -10,6 +10,7 @@
 #include "midi_file.h"
 #include "wav_file.h"
 #include "mp3_file.h"
+#include "flac_file.h"
 #include "mod_file.h"
 #include "s3m_file.h"
 #include "xm_file.h"
@@ -40,7 +41,7 @@ enum AppState {
     APP_BROWSE,
     APP_PLAY,
     APP_PLAY_SYSEX,   // sending a .syx dump back out (see openSelected())
-    APP_PLAY_WAV,     // playing back a .wav or .mp3 file through `audio` (see openSelected())
+    APP_PLAY_WAV,     // playing back a .wav, .aif, .mp3 or .flac file through `audio` (see openSelected())
     APP_PLAY_MOD,     // playing back a .mod file (see openSelected())
     APP_PLAY_S3M,     // playing back a .s3m file (see openSelected())
     APP_PLAY_XM,      // playing back a .xm file (see openSelected())
@@ -119,7 +120,9 @@ WavPlayer wavPlayer;
 // Holds its decoder in SharedRamArena while loaded, so it goes through the
 // same free-tracks gate as the tracker players.
 Mp3Player mp3Player;
-// Whichever of the two APP_PLAY_WAV plays.
+// The same for FLAC; never loaded together with mp3Player.
+FlacPlayer flacPlayer;
+// Whichever of the three APP_PLAY_WAV plays.
 StreamPlayer* audio = &wavPlayer;
 ModPlayer* modPlayer = nullptr;
 S3mPlayer* s3mPlayer = nullptr;
@@ -316,7 +319,7 @@ bool deleteFailed = false;
 // -- APP_CONVERT_PICK / APP_CONVERTING --
 // The targets beginEntryMenu() found for the selected file, and the
 // running conversion. converter is on the heap only while APP_CONVERTING
-// (2.6 KB); the sources wrap wavPlayer and mp3Player, idle in the browser.
+// (2.6 KB); the sources wrap wavPlayer, mp3Player and flacPlayer, idle in the browser.
 const int CONVERT_MAX = 4;
 ConvertTarget convertTargetList[CONVERT_MAX];
 int convertTargetCount = 0;
@@ -325,11 +328,12 @@ char convertName[MAX_FILENAME_LEN] = {0}; // the source's display name
 ConvertFormat convertFmt;      // from convertProbe(), for the rows' text
 bool convertFmtKnown = false;
 FileKind convertKind = FILE_WAV;
-bool pendingConvert = false; // the looper's free-tracks gate is up for an MP3 convert
+bool pendingConvert = false; // the looper's free-tracks gate is up for an MP3 or FLAC convert
 Converter* converter = nullptr;
 Converter::State lastConvertState = Converter::STATE_IDLE;
 WavConvertSource wavConvertSource(wavPlayer);
 Mp3ConvertSource mp3ConvertSource(mp3Player);
+FlacConvertSource flacConvertSource(flacPlayer);
 MidiConvertSource midiConvertSource(player);
 TrackerConvertSource trackerConvertSource;
 
@@ -642,8 +646,9 @@ void openSelected() {
         return;
     }
 
-    if (e.kind == FILE_MOD || e.kind == FILE_S3M || e.kind == FILE_XM || e.kind == FILE_IT || e.kind == FILE_MP3) {
-        // The big tracker-format players and the MP3 decoder are the only
+    if (e.kind == FILE_MOD || e.kind == FILE_S3M || e.kind == FILE_XM || e.kind == FILE_IT || e.kind == FILE_MP3 ||
+        e.kind == FILE_FLAC) {
+        // The big tracker-format players and the MP3 and FLAC decoders are the only
         // reason File Player needs LooperMode's tracks[] RAM back --
         // browsing, MIDI preview, and WAV playback never hit this. Only worth the interactive gate
         // if there's actually something to lose; otherwise free (a no-op
@@ -671,6 +676,19 @@ void openSelected() {
             mp3Player.refuse("RAM in use, can't open");
         } else if (mp3Player.load(path)) {
             mp3Player.play();
+        }
+        appState = APP_PLAY_WAV;
+        needsRedraw = true;
+        return;
+    }
+
+    if (e.kind == FILE_FLAC) {
+        // As the MP3 above: the decoder takes the start of SharedRamArena.
+        audio = &flacPlayer;
+        if (LooperMode::tracksAllocated() || modPlayer || s3mPlayer || xmPlayer || itPlayer) {
+            flacPlayer.refuse("RAM in use, can't open");
+        } else if (flacPlayer.load(path)) {
+            flacPlayer.play();
         }
         appState = APP_PLAY_WAV;
         needsRedraw = true;
@@ -831,6 +849,7 @@ const char* extensionForKind(FileKind kind) {
         case FILE_WAV: return ".wav";
         case FILE_AIFF: return ".aiff";
         case FILE_MP3: return ".mp3";
+        case FILE_FLAC: return ".flac";
         case FILE_MOD: return ".mod";
         case FILE_S3M: return ".s3m";
         case FILE_XM:  return ".xm";
@@ -2016,6 +2035,7 @@ ConvertSource* convertSourceFor(FileKind kind) {
         case FILE_WAV:
         case FILE_AIFF: return &wavConvertSource;
         case FILE_MP3: return &mp3ConvertSource;
+        case FILE_FLAC: return &flacConvertSource;
         case FILE_MID: return &midiConvertSource;
         case FILE_MOD:
         case FILE_S3M:

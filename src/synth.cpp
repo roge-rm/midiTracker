@@ -21,6 +21,7 @@ uint32_t g_hostGovernorSheds = 0;
 
 #if defined(MP3_PLAYER) && !defined(HOST_MIDI)
 #include "mp3_file.h"
+#include "flac_file.h"
 #endif
 
 #if defined(TRACKER_PROFILE) && !defined(HOST_MIDI)
@@ -2363,7 +2364,7 @@ void reverbTypeChanged(uint8_t newType) {
 // (genuinely stereo -- see popWavFrame()) adds in on top of that; softLimit()/
 // the leveler/volume then apply per-channel.
 #ifdef MP3_PLAYER
-// Core 1, while an MP3 is loaded (see loop1Mp3()). g_mp3Block: renderSample()
+// Core 1, while an MP3 or FLAC is loaded (see loop1Mp3()). g_mp3Block: renderSample()
 // runs in block output. g_mp3NoVoices: no voice was active when the block
 // started, so the voice loop is skipped (voices only start from messages,
 // which are drained at the block's start).
@@ -3221,7 +3222,7 @@ ALWAYS_INLINE void __not_in_flash_func(governorTick)(uint32_t used) {
 }
 
 #if defined(MP3_PLAYER) && !defined(HOST_MIDI)
-// Core 1 while an MP3 is loaded: renders MP3_BLOCK samples, writes them to
+// Core 1 while an MP3 or FLAC is loaded: renders MP3_BLOCK samples, writes them to
 // I2S in one go, then moves decoded audio into the WAV ring and decodes the
 // next frame when it's due. Messages are drained once per block, so notes
 // start on a block boundary (0.7 ms).
@@ -3294,10 +3295,13 @@ void __not_in_flash_func(loop1Mp3)() {
 #endif
     // A decode only starts with at most one 256-frame I2S buffer free, so
     // 7 of the 8 (40 ms) are queued; a frame takes about 10 ms.
+    // A FLAC decodes the same way, one FLAC frame at most per call.
     PROF_WHERE1(Synth::PW_MP3_PUSH);
-    if (Mp3Player::core1Push() && g_i2s.availableForWrite() <= 256 * 4) {
+    bool flac = FlacPlayer::core1Active();
+    if ((flac ? FlacPlayer::core1Push() : Mp3Player::core1Push()) && g_i2s.availableForWrite() <= 256 * 4) {
         PROF_WHERE1(Synth::PW_MP3_DECODE);
-        Mp3Player::core1Decode();
+        if (flac) FlacPlayer::core1Decode();
+        else Mp3Player::core1Decode();
     }
 }
 #endif
@@ -3313,7 +3317,7 @@ void __not_in_flash_func(loop1)() {
     if (g_offlineParked) g_offlineParked = false;
 #endif
 #if defined(MP3_PLAYER) && !defined(HOST_MIDI)
-    if (Mp3Player::core1Active()) {
+    if (Mp3Player::core1Active() || FlacPlayer::core1Active()) {
         loop1Mp3();
         return;
     }

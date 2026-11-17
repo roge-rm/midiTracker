@@ -2,6 +2,7 @@
 #include "sd_card.h"
 #include "wav_file.h"
 #include "mp3_file.h"
+#include "flac_file.h"
 #include <Arduino.h>
 #include <string.h>
 #include <ctype.h>
@@ -129,6 +130,12 @@ bool convertProbe(FileKind kind, const char* path, WavPlayer& wav, ConvertFormat
         fmt.pcm16 = true; // what it decodes to
         return ok;
     }
+    if (kind == FILE_FLAC) {
+        uint8_t bits = 0;
+        bool ok = FlacPlayer::probe(path, fmt.rate, fmt.channels, bits);
+        fmt.pcm16 = bits == 16;
+        return ok;
+    }
     if (kind != FILE_WAV && kind != FILE_AIFF) return false;
     bool ok = wav.load(path);
     if (ok) {
@@ -153,9 +160,10 @@ int convertTargets(FileKind kind, const ConvertFormat* fmt, ConvertTarget* out, 
             if (!(fmt->rate == OUT_RATE_44K && fmt->channels == 1)) add(CONVERT_WAV_44K_MONO);
             break;
         case FILE_WAV:
-        case FILE_AIFF: {
+        case FILE_AIFF:
+        case FILE_FLAC: {
             if (!fmt || !fmt->rate) break; // unreadable
-            // An AIFF is still worth converting when it's already 44.1k 16-bit, for the container.
+            // An AIFF or FLAC is still worth converting when it's already 44.1k 16-bit, for the container.
             bool same44 = kind == FILE_WAV && fmt->pcm16 && fmt->rate == OUT_RATE_44K;
             if (!(same44 && fmt->channels == 2)) add(CONVERT_WAV_44K_STEREO);
             if (!(same44 && fmt->channels == 1)) add(CONVERT_WAV_44K_MONO);
@@ -229,22 +237,22 @@ void WavConvertSource::progress(uint32_t& done, uint32_t& total) const {
 
 void WavConvertSource::close() { _p.close(); }
 
-bool Mp3ConvertSource::open(const char* path) {
+template <class P> bool DecoderConvertSource<P>::open(const char* path) {
     _pcm = nullptr;
     _frames = _pos = 0;
     return _p.openOffline(path);
 }
-const char* Mp3ConvertSource::error() const { return _p.errorMessage(); }
-uint32_t Mp3ConvertSource::rate() const { return _p.sampleRate(); }
-uint8_t Mp3ConvertSource::channels() const { return _p.channels(); }
+template <class P> const char* DecoderConvertSource<P>::error() const { return _p.errorMessage(); }
+template <class P> uint32_t DecoderConvertSource<P>::rate() const { return _p.sampleRate(); }
+template <class P> uint8_t DecoderConvertSource<P>::channels() const { return _p.channels(); }
 
-int Mp3ConvertSource::read(int16_t* out, int max) {
+template <class P> int DecoderConvertSource<P>::read(int16_t* out, int max) {
     if (_pos >= _frames) {
         int n = _p.decodeNext(_pcm, _pcmChannels);
         if (n < 0) return _p.readFailed() ? READ_FAILED : READ_END;
         _frames = n;
         _pos = 0;
-        if (n == 0) return 0; // a frame with no audio
+        if (n == 0) return 0; // a frame with no audio, or a FLAC frame that didn't decode
     }
     int n = _frames - _pos;
     if (n > max) n = max;
@@ -258,9 +266,12 @@ int Mp3ConvertSource::read(int16_t* out, int max) {
     return n;
 }
 
-void Mp3ConvertSource::progress(uint32_t& done, uint32_t& total) const { _p.inputProgress(done, total); }
+template <class P> void DecoderConvertSource<P>::progress(uint32_t& done, uint32_t& total) const { _p.inputProgress(done, total); }
 
-void Mp3ConvertSource::close() { _p.close(); }
+template <class P> void DecoderConvertSource<P>::close() { _p.close(); }
+
+template class DecoderConvertSource<Mp3Player>;
+template class DecoderConvertSource<FlacPlayer>;
 
 // ---- converter ------------------------------------------------------------------
 

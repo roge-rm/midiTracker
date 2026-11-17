@@ -13,6 +13,9 @@
 #   make -C test/host aiff-check AIFF_DIR=dir   AIFF and AIFF-C through render_wav against the same audio as WAV
 #   make -C test/host mp3            build build/host/render_mp3 (Mp3Player and lib/helix_mp3 over the host ring)
 #                                    and render_mp3_ops (counts the decoder's long multiplies)
+#   make -C test/host flac           build build/host/render_flac (FlacPlayer and lib/dr_flac over the host ring)
+#                                    and render_flac_ops (counts the residual samples on each prediction path)
+#   make -C test/host flac-check FLAC_DIR=dir   FLACs made with ffmpeg in dir against their WAVs, seeks, bad files
 #   make -C test/host rec-check      MidiRecorder, SysExRecorder and SysExPlayer on an in-memory card
 #   make -C test/host battery-check  the battery gauge on made-up voltage sequences
 #   make -C test/host play-mode-check  Folder play mode's next-file choice on made-up folders
@@ -31,7 +34,7 @@ PLAYER_SRC := $(wildcard $(ROOT)/src/tracker_base.cpp) $(ROOT)/src/ui_tap.cpp $(
 HARNESS_SRC := $(CURDIR)/render.cpp $(CURDIR)/host_stubs.cpp
 SECONDS ?= 60
 
-.PHONY: all baseline check clean midi midi-baseline midi-check look players wav mp3 rec-check battery-check play-mode-check convert-check mp3-seek-check aiff-check
+.PHONY: all baseline check clean midi midi-baseline midi-check look players wav mp3 rec-check battery-check play-mode-check convert-check mp3-seek-check aiff-check flac flac-check
 all: $(OUT)/render $(OUT)/gen $(OUT)/corr
 
 $(OUT)/corr: $(CURDIR)/corr.cpp
@@ -94,6 +97,38 @@ $(OUT)/render_mp3_ops: $(MP3_DEPS)
 	cd $(OUT)/mp3obj-ops && gcc -O2 -g -w -DMP3_COUNT_OPS -c $(MP3_C)
 	$(CXX) $(CXXFLAGS) -DMP3_COUNT_OPS -I$(HELIX) -o $@ $(MP3_SRC) $(OUT)/mp3obj-ops/*.o
 
+# FLAC target: the real flac_file.cpp and dr_flac over the host ring and FsFile.
+DRFLAC := $(ROOT)/lib/dr_flac/src
+FLAC_SRC := $(ROOT)/src/flac_file.cpp $(ROOT)/src/shared_ram_arena.cpp $(CURDIR)/host_stubs.cpp $(CURDIR)/render_flac.cpp
+FLAC_DEPS := $(FLAC_SRC) $(wildcard $(DRFLAC)/*) $(wildcard $(CURDIR)/stub/*.h) $(ROOT)/include/flac_file.h $(ROOT)/include/shared_ram_arena.h
+flac: $(OUT)/render_flac $(OUT)/render_flac_ops
+
+$(OUT)/flacobj/dr_flac.o: $(wildcard $(DRFLAC)/*)
+	@mkdir -p $(OUT)/flacobj
+	gcc -O2 -g -w -c -o $@ $(DRFLAC)/dr_flac.c
+
+$(OUT)/render_flac: $(FLAC_DEPS) $(OUT)/flacobj/dr_flac.o
+	$(CXX) $(CXXFLAGS) -I$(DRFLAC) -o $@ $(FLAC_SRC) $(OUT)/flacobj/dr_flac.o
+
+# A copy of dr_flac that counts the residual samples on its 32 and 64-bit
+# prediction paths and their multiplies, in flacOps[path][samples, multiplies].
+$(OUT)/flacops/dr_flac.o: $(wildcard $(DRFLAC)/*)
+	@mkdir -p $(OUT)/flacops
+	cp $(DRFLAC)/dr_flac_config.h $(DRFLAC)/dr_flac.c $(OUT)/flacops/
+	sed '/^static drflac_bool32 drflac__decode_samples_with_residual__rice__scalar(/,/^}/ s/^    if (lpcOrder == 0) {$$/    { int w = drflac__use_64_bit_prediction(bitsPerSample, lpcOrder, lpcPrecision) ? 1 : 0; flacOps[w][0] += count; flacOps[w][1] += (unsigned long long)count * lpcOrder; }\n&/' \
+		$(DRFLAC)/dr_flac.h > $(OUT)/flacops/dr_flac.h
+	grep -q 'flacOps\[w\]' $(OUT)/flacops/dr_flac.h
+	echo 'unsigned long long flacOps[2][2];' > $(OUT)/flacops/ops.h
+	cd $(OUT)/flacops && gcc -O2 -g -w -include ops.h -c -o dr_flac.o dr_flac.c
+
+$(OUT)/render_flac_ops: $(FLAC_DEPS) $(OUT)/flacops/dr_flac.o
+	$(CXX) $(CXXFLAGS) -DFLAC_COUNT_OPS -I$(DRFLAC) -o $@ $(FLAC_SRC) $(OUT)/flacops/dr_flac.o
+
+# FLACs made with ffmpeg in FLAC_DIR (emptied first) against the WAVs they come from.
+FLAC_DIR ?= $(OUT)/flac
+flac-check: $(OUT)/render_flac $(OUT)/render_flac_ops $(OUT)/render_wav
+	$(CURDIR)/flac_check.sh $(OUT)/render_flac $(OUT)/render_wav $(FLAC_DIR) $(OUT)/render_flac_ops
+
 $(OUT)/tail_check: $(CURDIR)/tail_check.cpp
 	@mkdir -p $(OUT)
 	$(CXX) -std=gnu++17 -O2 -Wall -o $@ $<
@@ -101,18 +136,19 @@ $(OUT)/tail_check: $(CURDIR)/tail_check.cpp
 mp3-seek-check: $(OUT)/render_mp3 $(OUT)/tail_check
 	$(CURDIR)/mp3_seek_check.sh $(OUT)/render_mp3 $(OUT)/tail_check $(SEEK_DIR)
 
-# Convert check: the real convert.cpp, convert_render.cpp, wav_file.cpp, mp3_file.cpp, the
+# Convert check: the real convert.cpp, convert_render.cpp, wav_file.cpp, mp3_file.cpp, flac_file.cpp, the
 # tracker players and the synth with MidiPlayer (built as the MIDI target is) over host files.
 # MIDI and module conversions are checked against render_midi and render.
 CONVERT_SRC := $(ROOT)/src/convert.cpp $(ROOT)/src/convert_render.cpp $(ROOT)/src/wav_file.cpp $(ROOT)/src/mp3_file.cpp \
+               $(ROOT)/src/flac_file.cpp \
                $(ROOT)/src/synth.cpp $(ROOT)/src/midi_file.cpp $(PLAYER_SRC) \
                $(CURDIR)/midi_stubs.cpp $(CURDIR)/host_stubs.cpp $(CURDIR)/convert_check.cpp
 CONVERT_DIR ?= $(OUT)/convert
 
-$(OUT)/convert_check: $(CONVERT_SRC) $(MP3_C) $(wildcard $(HELIX)/*.h) $(wildcard $(CURDIR)/stub*/*.h) $(wildcard $(ROOT)/include/*.h) $(CURDIR)/midi_host.h
+$(OUT)/convert_check: $(CONVERT_SRC) $(MP3_C) $(OUT)/flacobj/dr_flac.o $(wildcard $(HELIX)/*.h) $(wildcard $(CURDIR)/stub*/*.h) $(wildcard $(ROOT)/include/*.h) $(CURDIR)/midi_host.h
 	@mkdir -p $(OUT)/mp3obj-convert
 	cd $(OUT)/mp3obj-convert && gcc -O2 -g -w -DMP3_POLY_SPLIT -c $(MP3_C)
-	$(CXX) $(MIDI_FLAGS) -DHOST_REAL_CLOCK -I$(HELIX) -o $@ $(CONVERT_SRC) $(OUT)/mp3obj-convert/*.o
+	$(CXX) $(MIDI_FLAGS) -DHOST_REAL_CLOCK -I$(HELIX) -I$(DRFLAC) -o $@ $(CONVERT_SRC) $(OUT)/mp3obj-convert/*.o $(OUT)/flacobj/dr_flac.o
 
 convert-check: $(OUT)/convert_check $(OUT)/render $(OUT)/render_midi $(OUT)/midi/.copied
 	$(CURDIR)/convert_check.sh $(OUT)/convert_check $(CONVERT_DIR) $(MP3_DIR)

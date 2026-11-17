@@ -20,6 +20,7 @@ uint32_t millis() { return micros() / 1000; }
 #endif
 
 unsigned long FsFile::readCalls = 0;
+unsigned long FsFile::readBytes = 0;
 
 bool FsFile::open(const char* path, int flags) {
     close();
@@ -76,6 +77,7 @@ int FsFile::read(void* buf, size_t n) {
     if (fseek(_f, (long)_pos, SEEK_SET) != 0) return -1;
     size_t got = fread(buf, 1, n, _f);
     _pos += got;
+    readBytes += got;
     return (int)got;
 }
 

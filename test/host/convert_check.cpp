@@ -19,6 +19,7 @@
 #include "convert.h"
 #include "wav_file.h"
 #include "mp3_file.h"
+#include "flac_file.h"
 #include "midi_file.h"
 #include "it_file.h"
 #include "synth.h"
@@ -35,15 +36,18 @@ static int run(int argc, char** argv) {
     long takeAfter = argc > 6 ? atol(argv[6]) : -1;
     static WavPlayer wav;
     static Mp3Player mp3;
+    static FlacPlayer flac;
     static MidiPlayer* midi = nullptr;
     WavConvertSource wavSrc(wav);
     Mp3ConvertSource mp3Src(mp3);
+    FlacConvertSource flacSrc(flac);
     MidiConvertSource midiSrc(midi);
     TrackerConvertSource trackerSrc;
     const char* dot = strrchr(src, '.');
     FileKind kind = FILE_WAV;
     if (dot) {
         if (!strcasecmp(dot, ".mp3")) kind = FILE_MP3;
+        else if (!strcasecmp(dot, ".flac")) kind = FILE_FLAC;
         else if (!strcasecmp(dot, ".mid")) kind = FILE_MID;
         else if (!strcasecmp(dot, ".aif") || !strcasecmp(dot, ".aiff") || !strcasecmp(dot, ".aifc")) kind = FILE_AIFF;
         else if (!strcasecmp(dot, ".mod")) kind = FILE_MOD;
@@ -53,6 +57,7 @@ static int run(int argc, char** argv) {
     }
     trackerSrc.setKind(kind);
     ConvertSource& cs = kind == FILE_MP3 ? (ConvertSource&)mp3Src
+                      : kind == FILE_FLAC ? (ConvertSource&)flacSrc
                       : kind == FILE_WAV || kind == FILE_AIFF ? (ConvertSource&)wavSrc
                       : kind == FILE_MID ? (ConvertSource&)midiSrc : (ConvertSource&)trackerSrc;
 
@@ -280,6 +285,11 @@ static int names(int argc, char** argv) {
     f.rate = 48000; f.channels = 1;
     expect(convertTargets(FILE_MP3, &f, t, 4) == 2, "48k mono mp3: two");
     expect(convertTargets(FILE_MP3, nullptr, t, 4) == 0, "unreadable mp3: none");
+    f.rate = 44100; f.channels = 2; f.pcm16 = true;
+    expect(convertTargets(FILE_FLAC, &f, t, 4) == 2, "44.1k 16-bit stereo flac: both");
+    f.channels = 1;
+    expect(convertTargets(FILE_FLAC, &f, t, 4) == 2, "44.1k 16-bit mono flac: both");
+    expect(convertTargets(FILE_FLAC, nullptr, t, 4) == 0, "unreadable flac: none");
     for (FileKind k : {FILE_MID, FILE_MOD, FILE_S3M, FILE_XM, FILE_IT}) {
         ConvertFormat pf;
         static WavPlayer none;
