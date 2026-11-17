@@ -3098,6 +3098,9 @@ static DRFLAC_INLINE drflac_int32 drflac__calculate_prediction_32_s32(drflac_uin
 
 static DRFLAC_INLINE drflac_int32 drflac__calculate_prediction_64_s32(drflac_uint32 order, drflac_int32 shift, const drflac_int32* coefficients, drflac_int32* pDecodedSamples)
 {
+#ifdef DRFLAC_PREDICTION_64_S32 /* midiTracker: see dr_flac.c */
+    return DRFLAC_PREDICTION_64_S32(order, shift, coefficients, pDecodedSamples);
+#else
     drflac_int64 prediction;
 
     DRFLAC_ASSERT(order <= 32);
@@ -3275,6 +3278,7 @@ static DRFLAC_INLINE drflac_int32 drflac__calculate_prediction_64_s32(drflac_uin
 #endif
 
     return (drflac_int32)(prediction >> shift);
+#endif
 }
 
 

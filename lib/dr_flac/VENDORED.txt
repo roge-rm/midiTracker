@@ -5,7 +5,11 @@ Taken from https://github.com/mackron/dr_libs, tag flac-0.13.4
 (commit 806ee9ada8ca9827b22f76827f739c290f37ba48), dr_flac.h only.
 sha256 b8078eeb5d523502eb7964508cd7ec8450bc79d383bec90aa17fd9e2fefd9c24.
 
-src/dr_flac.h is unchanged. src/dr_flac_config.h sets the options (no
+One change to src/dr_flac.h, made 2026-11-16 and marked "midiTracker":
+drflac__calculate_prediction_64_s32() returns DRFLAC_PREDICTION_64_S32()
+when that is defined. src/dr_flac.c defines it as flacPredict64(), the
+same sums from 32-bit products (asm in RAM on the RP2040, C on the host),
+exact while samples fit in 25 bits. src/dr_flac_config.h sets the options (no
 stdio, Ogg, wchar or SIMD, a 2 KB read buffer, no heap or assert) and is
 the header to include; src/dr_flac.c builds the implementation with them.
 Memory comes from the allocation callbacks FlacPlayer passes (the shared
