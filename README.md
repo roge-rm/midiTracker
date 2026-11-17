@@ -39,6 +39,7 @@ Dan
 - [Building](#building)
 - [Good to know](#good-to-know)
 - [Credits](#credits)
+- [Licence](#licence)
 
 ## What you need
 
@@ -488,3 +489,7 @@ The screen uses the [Silkscreen](https://github.com/googlefonts/silkscreen) and 
 It's built on the [arduino-pico](https://github.com/earlephilhower/arduino-pico) core by Earle F. Philhower, with [TFT_eSPI](https://github.com/Bodmer/TFT_eSPI) by Bodmer, [SdFat](https://github.com/greiman/SdFat) by Bill Greiman, the [Arduino MIDI Library](https://github.com/FortySevenEffects/arduino_midi_library) by FortySevenEffects and the [Adafruit TinyUSB Library](https://github.com/adafruit/Adafruit_TinyUSB_Arduino).
 
 The tracker players are my own, checked against [OpenMPT](https://openmpt.org/)'s openmpt123 to sound like it.
+
+## Licence
+
+midiTracker is under the MIT licence (see [LICENSE](LICENSE)). The Helix MP3 decoder in lib/helix_mp3 stays under the RPSL 1.0, dr_flac under its own licence and the fonts under the SIL Open Font License, as above.
