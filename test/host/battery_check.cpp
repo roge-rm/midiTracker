@@ -102,9 +102,9 @@ int main() {
         CHECK(s.g.percent() >= 98, "charged: %d%%", s.g.percent());
         CHECK(s.chgFlips == 1, "charged: %d charging flips", s.chgFlips);
 
-        // Unplugged when full, easing to 4.12 V: no charging, percent from voltage.
+        // Unplugged when full, easing to 4.02 V: no charging, percent from voltage.
         for (uint32_t i = 0; i < 10 * PER_MIN; i++) {
-            s.block(4160 - (i < 5 * PER_MIN ? 40.0 * i / (5 * PER_MIN) : 40.0), false);
+            s.block(4060 - (i < 5 * PER_MIN ? 40.0 * i / (5 * PER_MIN) : 40.0), false);
             CHECK(!s.g.charging(), "unplugged: charging %d", s.g.charging());
         }
         CHECK(s.g.percent() >= 90 && s.g.percent() <= 95, "unplugged: %d%%", s.g.percent());

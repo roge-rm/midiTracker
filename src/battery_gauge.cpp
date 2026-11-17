@@ -5,9 +5,10 @@ namespace {
 
 struct Point { uint16_t mv; uint8_t pct; };
 
-// Typical single LiPo at light load, highest first.
+// Single LiPo at light load, highest first. This board reads a full cell
+// at about 4.05 V once the charger stops, so that's 100%.
 const Point TABLE[] = {
-    {4200, 100}, {4100, 90}, {4000, 80}, {3900, 68}, {3800, 55}, {3750, 45},
+    {4050, 100}, {4000, 88}, {3900, 68}, {3800, 55}, {3750, 45},
     {3700, 35},  {3650, 25}, {3600, 15}, {3500, 7},  {3400, 3},  {3300, 0},
 };
 const int TABLE_N = sizeof(TABLE) / sizeof(TABLE[0]);
