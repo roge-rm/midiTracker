@@ -12,6 +12,7 @@
 #include "synth.h"
 #include "midi_output.h"
 #include "host_snap.h"
+#include "version.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -197,7 +198,7 @@ void modeScreen(bool ledIn, bool ledOut) {
     Status st;
     st.title = "MIDITRACKER";
     st.titleColor = COLOR_ACCENT;
-    st.note = "0.6.0";
+    st.note = VERSIONNUMBER;
     drawStatus(st);
     clearModeList();
     const char* labels[] = {"FILES", "LOOPER", "PARISYNTH", "SETTINGS"};
@@ -839,7 +840,7 @@ int playerScreens(const std::string& dir) {
 void bootScreens() {
     g_tft.fillScreen(rgb(0xFF00FF)); // anything the animation doesn't draw shows up
     uint32_t t0 = g_hostMs;
-    UiSaver::bootStart("0.6.0", t0);
+    UiSaver::bootStart(VERSIONNUMBER, t0);
     save("boot-0");
     struct { uint32_t ms; const char* name; } shots[] = {{80, "boot-in"}, {240, "boot-rain"}, {420, "boot-mid"}, {700, "boot-late"}};
     for (auto& s : shots) {
@@ -855,7 +856,7 @@ void bootScreens() {
 int bootFrames() {
     g_tft.fillScreen(rgb(0xFF00FF));
     uint32_t t0 = g_hostMs;
-    UiSaver::bootStart("0.6.0", t0);
+    UiSaver::bootStart(VERSIONNUMBER, t0);
     int n = 0;
     char name[32];
     for (bool more = true; more; n++) {
