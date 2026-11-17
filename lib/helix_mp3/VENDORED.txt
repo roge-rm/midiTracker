@@ -15,3 +15,9 @@ Changes here, all made 2026-11-16 (each changed file says so at the top):
   on the M0+) runs the polyphase filter as dot products of 16-bit pieces
   with 32-bit sums (xmp3_PolyDot(), asm in RAM on the M0+), from a table in
   the decoder state built by MP3InitDecoder(). Exact to the bit.
+- 2026-11-16: MPEG-2.5 on and safer on bad data, from helix-mp3-pico
+  d5e39cf: mp3common.h takes the 11-bit syncword; bitstream.c rejects the
+  reserved version; mp3dec.c rejects layers 1 and 2, cut-off headers and
+  side info and bad slot counts, keeps free-bitrate state only while frames
+  stay free bitrate and keeps MP3FindFreeSync() in the buffer; huffman.c and
+  stproc.c keep table indexes in range.

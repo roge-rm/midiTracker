@@ -1,3 +1,10 @@
+/* Changed for helix-mp3-pico, from arduino-libhelix's copy:
+ * 2026-11-16: MPEG-2.5 and bad data: MP3Decode() rejects layers 1 and 2,
+ *   checks the header (6 bytes with a CRC) and side info are in the buffer,
+ *   keeps free-mode state only while frames stay free mode, and rejects a
+ *   slot count that's negative or too big for mainBuf. MP3FindFreeSync()
+ *   doesn't read past nBytes and doesn't return 0 or less.
+ * See VENDORED.txt. */
 /* ***** BEGIN LICENSE BLOCK ***** 
  * Version: RCSL 1.0/RPSL 1.0 
  *  
@@ -156,14 +163,14 @@ static int MP3FindFreeSync(unsigned char *buf, unsigned char firstFH[4], int nBy
 	 */
 	while (1) {
 		offset = MP3FindSyncWord(bufPtr, nBytes);
-		bufPtr += offset;
-		if (offset < 0) {
+		if (offset < 0 || offset + 2 >= nBytes)
 			return -1;
-		} else if ( (bufPtr[0] == firstFH[0]) && (bufPtr[1] == firstFH[1]) && ((bufPtr[2] & 0xfc) == (firstFH[2] & 0xfc)) ) {
+		bufPtr += offset;
+		if ( (bufPtr[0] == firstFH[0]) && (bufPtr[1] == firstFH[1]) && ((bufPtr[2] & 0xfc) == (firstFH[2] & 0xfc)) ) {
 			/* want to return number of bytes per frame, NOT counting the padding byte, so subtract one if padFlag == 1 */
 			if ((firstFH[2] >> 1) & 0x01)
 				bufPtr--;
-			return bufPtr - buf;
+			return (bufPtr - buf > 0) ? (int)(bufPtr - buf) : -1;
 		}
 		bufPtr += 3;
 		nBytes -= (offset + 3);
@@ -286,7 +293,7 @@ static void MP3ClearBadFrame(MP3DecInfo *mp3DecInfo, short *outbuf)
 int MP3Decode(HMP3Decoder hMP3Decoder, unsigned char **inbuf, int *bytesLeft, short *outbuf, int useSize)
 {
 	int offset, bitOffset, mainBits, gr, ch, fhBytes, siBytes, freeFrameBytes;
-	int prevBitOffset, sfBlockBits, huffBlockBits;
+	int prevBitOffset, sfBlockBits, huffBlockBits, freeMode;
 	unsigned char *mainPtr;
 	MP3DecInfo *mp3DecInfo = (MP3DecInfo *)hMP3Decoder;
 	
@@ -297,13 +304,19 @@ int MP3Decode(HMP3Decoder hMP3Decoder, unsigned char **inbuf, int *bytesLeft, sh
 	if (!mp3DecInfo)
 		return ERR_MP3_NULL_POINTER;
 
-	if (*bytesLeft < 4)
+	if (*bytesLeft < 4 || (*bytesLeft < 6 && !((*inbuf)[1] & 0x01)))	/* 4 bytes, 6 with a CRC */
 		return ERR_MP3_INDATA_UNDERFLOW;
 
 	/* unpack frame header */
 	fhBytes = UnpackFrameHeader(mp3DecInfo, *inbuf);
 	if (fhBytes < 0)	
 		return ERR_MP3_INVALID_FRAMEHEADER;		/* don't clear outbuf since we don't know size (failed to parse header) */
+	/* only layer 3 is decoded, and the header and side info have to be in the buffer */
+	if (mp3DecInfo->layer != 3)
+		return ERR_MP3_INVALID_FRAMEHEADER;
+	if (*bytesLeft < fhBytes + sideBytesTab[mp3DecInfo->version][mp3DecInfo->nChans == 1 ? 0 : 1])
+		return ERR_MP3_INDATA_UNDERFLOW;
+	freeMode = ((*inbuf)[2] & 0xf0) == 0;
 	*inbuf += fhBytes;
 	
 #ifdef PROFILE
@@ -323,16 +336,19 @@ int MP3Decode(HMP3Decoder hMP3Decoder, unsigned char **inbuf, int *bytesLeft, sh
 #endif
 	
 	
-	/* if free mode, need to calculate bitrate and nSlots manually, based on frame size */
-	if (mp3DecInfo->bitrate == 0 || mp3DecInfo->freeBitrateFlag) {
+	/* if free mode, need to calculate bitrate and nSlots manually, based on frame size
+	 * (the flag is only kept while frames stay free mode, so a false sync can't leave a bad slot count) */
+	if (!freeMode)
+		mp3DecInfo->freeBitrateFlag = 0;
+	if (freeMode) {
 		if (!mp3DecInfo->freeBitrateFlag) {
 			/* first time through, need to scan for next sync word and figure out frame size */
-			mp3DecInfo->freeBitrateFlag = 1;
 			mp3DecInfo->freeBitrateSlots = MP3FindFreeSync(*inbuf, *inbuf - fhBytes - siBytes, *bytesLeft);
 			if (mp3DecInfo->freeBitrateSlots < 0) {
 				MP3ClearBadFrame(mp3DecInfo, outbuf);
 				return ERR_MP3_FREE_BITRATE_SYNC;
 			}
+			mp3DecInfo->freeBitrateFlag = 1;
 			freeFrameBytes = mp3DecInfo->freeBitrateSlots + fhBytes + siBytes;
 			mp3DecInfo->bitrate = (freeFrameBytes * mp3DecInfo->samprate * 8) / (mp3DecInfo->nGrans * mp3DecInfo->nGranSamps);
 		}
@@ -359,6 +375,12 @@ int MP3Decode(HMP3Decoder hMP3Decoder, unsigned char **inbuf, int *bytesLeft, sh
 		*inbuf += mp3DecInfo->nSlots;
 		*bytesLeft -= (mp3DecInfo->nSlots);
 	} else {
+		/* a slot count that can't fit mainBuf (bad free-mode frame size) */
+		if (mp3DecInfo->nSlots < 0 || mp3DecInfo->nSlots > MAINBUF_SIZE -
+		    (mp3DecInfo->mainDataBytes >= mp3DecInfo->mainDataBegin ? mp3DecInfo->mainDataBegin : mp3DecInfo->mainDataBytes)) {
+			MP3ClearBadFrame(mp3DecInfo, outbuf);
+			return ERR_MP3_INVALID_FRAMEHEADER;
+		}
 		/* out of data - assume last or truncated frame */
 		if (mp3DecInfo->nSlots > *bytesLeft) {
 			MP3ClearBadFrame(mp3DecInfo, outbuf);

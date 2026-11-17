@@ -1,3 +1,6 @@
+/* Changed for helix-mp3-pico, from arduino-libhelix's copy:
+ * 2026-11-16: the 11-bit syncword, so MPEG-2.5 frames are found.
+ * See VENDORED.txt. */
 /* ***** BEGIN LICENSE BLOCK ***** 
  * Version: RCSL 1.0/RPSL 1.0 
  *  
@@ -52,14 +55,14 @@
 #define NGRANS_MPEG2	1
 
 /* 11-bit syncword if MPEG 2.5 extensions are enabled */
-/*
 #define	SYNCWORDH		0xff
 #define	SYNCWORDL		0xe0
-*/
 
 /* 12-bit syncword if MPEG 1,2 only are supported */
+/*
 #define	SYNCWORDH		0xff
 #define	SYNCWORDL		0xf0
+*/
 
 typedef struct _MP3DecInfo {
 	/* pointers to platform-specific data structures */

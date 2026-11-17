@@ -1,3 +1,7 @@
+/* Changed for helix-mp3-pico, from arduino-libhelix's copy:
+ * 2026-11-16: DecodeHuffman() keeps the region 2 index in sfBand->l[] on
+ *   a bad frame.
+ * See VENDORED.txt. */
 /* ***** BEGIN LICENSE BLOCK ***** 
  * Version: RCSL 1.0/RPSL 1.0 
  *  
@@ -416,7 +420,8 @@ int DecodeHuffman(MP3DecInfo *mp3DecInfo, unsigned char *buf, int *bitOffset, in
 		r2Start = MAX_NSAMP;	/* short blocks don't have region 2 */
 	} else {
 		r1Start = fh->sfBand->l[sis->region0Count + 1];
-		r2Start = fh->sfBand->l[sis->region0Count + 1 + sis->region1Count + 1];
+		/* region0Count + region1Count can reach 22 on a bad frame, l[] has 23 entries */
+		r2Start = fh->sfBand->l[MIN(sis->region0Count + 1 + sis->region1Count + 1, 22)];
 	}
 
 	/* offset rEnd index by 1 so first region = rEnd[1] - rEnd[0], etc. */

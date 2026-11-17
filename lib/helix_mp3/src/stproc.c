@@ -1,3 +1,7 @@
+/* Changed for helix-mp3-pico, from arduino-libhelix's copy:
+ * 2026-11-16: intensity stereo keeps scale factors from a bad frame inside
+ *   ISFMpeg1 and ISFMpeg2.
+ * See VENDORED.txt. */
 /* ***** BEGIN LICENSE BLOCK ***** 
  * Version: RCSL 1.0/RPSL 1.0 
  *  
@@ -139,7 +143,7 @@ void IntensityProcMPEG1(int x[MAX_NCHAN][MAX_NSAMP], int nSamps, FrameHeader *fh
 	/* long blocks */
 	for (cb = cbStartL; cb < cbEndL && sampsLeft > 0; cb++) {
 		isf = sfis->l[cb];
-		if (isf == 7) {
+		if (isf >= 7) {		/* 7 is the illegal position, more only comes from a bad frame (ISFMpeg1 has 7) */
 			fl = ISFIIP[midSideFlag][0];
 			fr = ISFIIP[midSideFlag][1];
 		} else {
@@ -159,7 +163,7 @@ void IntensityProcMPEG1(int x[MAX_NCHAN][MAX_NSAMP], int nSamps, FrameHeader *fh
 	for (cb = cbStartS; cb < cbEndS && sampsLeft >= 3; cb++) {
 		for (w = 0; w < 3; w++) {
 			isf = sfis->s[cb][w];
-			if (isf == 7) {
+			if (isf >= 7) {
 				fls[w] = ISFIIP[midSideFlag][0];
 				frs[w] = ISFIIP[midSideFlag][1];
 			} else {
@@ -243,7 +247,7 @@ void IntensityProcMPEG2(int x[MAX_NCHAN][MAX_NSAMP], int nSamps, FrameHeader *fh
 				fl = ISFIIP[midSideFlag][0];
 				fr = ISFIIP[midSideFlag][1];
 			} else {
-				isf = (sfis->l[cb] + 1) >> 1;
+				isf = MIN((sfis->l[cb] + 1) >> 1, 15);	/* a 5-bit sf gives 16 on a bad frame, ISFMpeg2 has 16 */
 				fl = isfTab[(sfIdx & 0x01 ? isf : 0)];
 				fr = isfTab[(sfIdx & 0x01 ? 0 : isf)];
 			}
@@ -275,7 +279,7 @@ void IntensityProcMPEG2(int x[MAX_NCHAN][MAX_NSAMP], int nSamps, FrameHeader *fh
 					fl = ISFIIP[midSideFlag][0];
 					fr = ISFIIP[midSideFlag][1];
 				} else {
-					isf = (sfis->s[cb][w] + 1) >> 1;
+					isf = MIN((sfis->s[cb][w] + 1) >> 1, 15);
 					fl = isfTab[(sfIdx & 0x01 ? isf : 0)];
 					fr = isfTab[(sfIdx & 0x01 ? 0 : isf)];
 				}

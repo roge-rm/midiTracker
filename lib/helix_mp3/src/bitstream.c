@@ -1,3 +1,6 @@
+/* Changed for helix-mp3-pico, from arduino-libhelix's copy:
+ * 2026-11-16: UnpackFrameHeader() rejects the reserved version (01).
+ * See VENDORED.txt. */
 /* ***** BEGIN LICENSE BLOCK ***** 
  * Version: RCSL 1.0/RPSL 1.0 
  *  
@@ -243,7 +246,7 @@ int UnpackFrameHeader(MP3DecInfo *mp3DecInfo, unsigned char *buf)
 	fh->emphasis =   (buf[3] >> 0) & 0x03;
 
 	/* check parameters to avoid indexing tables with bad values */
-	if (fh->srIdx == 3 || fh->layer == 4 || fh->brIdx == 15)
+	if (verIdx == 1 || fh->srIdx == 3 || fh->layer == 4 || fh->brIdx == 15)
 		return -1;
 
 	fh->sfBand = &sfBandTable[fh->ver][fh->srIdx];	/* for readability (we reference sfBandTable many times in decoder) */
