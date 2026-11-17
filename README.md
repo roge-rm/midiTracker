@@ -2,11 +2,9 @@
 
 midiTracker is an alternate firmware for the picoTracker v2 PCB. You can order your own [from xiphonics](https://xiphonics.com/products/picotracker-pcb-kit).
 
-It plays MIDI files, tracker modules (MOD, S3M, XM and IT) and audio files (WAV, AIFF, MP3 and FLAC), records MIDI and SysEx to the SD card, and has a 4 track MIDI looper and a 16 channel synth, pariSynth, that you can play over MIDI. It can also turn MIDI files, modules and audio files into WAVs.
+It plays MIDI files, tracker modules (MOD, S3M, XM and IT) and audio files (WAV, AIFF, MP3 and FLAC), records MIDI and SysEx to the SD card, and has a 4 track MIDI looper and a 16 channel multitimbral synth, pariSynth, that you can play over MIDI. It can also turn MIDI files, modules and audio files into WAVs.
 
 Questions, bug reports or ideas go in #miditracker [on my discord](https://discord.gg/9Wun47jGC6), or open an issue here.
-
-I'm not a great programmer, and this was made with Claude Opus 5.0 and 5.5.
 
 Enjoy!<br>
 Dan
