@@ -228,6 +228,7 @@ void drawModeTag() {
 
 // Lock icon just past the play mode tag.
 bool g_locked = false;
+const char* g_lockNote = nullptr; // shown in the footer, in the accent colour
 
 void drawLock() {
     int x = g_chipX + CHIP_W + MODE_GAP + MODE_W + 2;
@@ -252,7 +253,9 @@ void paintTime(TFT_eSPI& g, const char* t) {
 // Puts the footer up for the screen, PLAY's action from the state.
 void drawFooterFor(Screen s, PlayState st) {
     const char* play = st == PS_PLAYING ? "pause" : "play";
-    if (g_locked) {
+    if (g_lockNote) {
+        drawHintFooter(g_locked ? "ALT+NAV unlock" : "ALT+NAV lock", g_lockNote, COLOR_ACCENT);
+    } else if (g_locked) {
         drawHintFooter("ALT+NAV unlock", nullptr);
     } else if (s == SCREEN_MIDI) {
         Key r1[] = {{"UD", "tempo", TONE_TEXT}, {"PLAY", play, TONE_PLAY}, {"EDIT", "inst", TONE_TEXT},
@@ -1108,11 +1111,9 @@ void setLocked(bool locked, bool redraw) {
     drawFooterFor(g_screen, g_state);
 }
 
-void lockCard(bool locked) {
-    Card c;
-    c.line1 = locked ? "Locked, hold ALT+NAV" : "Unlocked";
-    dimBody();
-    drawCard(c);
+void setLockNote(const char* note, bool redraw) {
+    g_lockNote = note;
+    if (redraw && g_screen != SCREEN_NONE) drawFooterFor(g_screen, g_state);
 }
 
 void formatNote(uint8_t note, char* out) { noteText(note, out); }

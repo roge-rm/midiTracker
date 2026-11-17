@@ -192,7 +192,7 @@ WAV, AIFF, MP3 and FLAC show the time and length, the format, the waveform so fa
 
 ## Locking the keys
 
-Hold ALT and NAV together for a second on any player screen to lock the keys. A lock shows at the top. While locked no key does anything, and a press shows "Locked, hold ALT+NAV". Hold ALT and NAV again for a second to unlock.
+Hold ALT and NAV together for a second on any player screen to lock the keys. A lock shows at the top. While locked no key does anything, and a press shows "Locked" at the bottom. Hold ALT and NAV again for a second to unlock.
 
 The lock stays on through the screensaver and when Repeat or Folder moves to the next file. It goes off when you leave the player or a file can't play, and it isn't saved.
 

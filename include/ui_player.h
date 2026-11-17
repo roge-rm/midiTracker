@@ -86,10 +86,10 @@ void setPlayMode(const char* tag, bool lit, bool redraw = false);
 // screen that was drawn last.
 void setLocked(bool locked, bool redraw = false);
 
-// A card over the player screen saying it's locked or unlocked. Only a full
-// draw*() takes it away, and the *Live() calls draw over it, so hold them
-// off while it's up.
-void lockCard(bool locked);
+// A note in the footer, such as "Locked", kept for the next draw*() until
+// set to nullptr. With redraw, the footer is also drawn now on the player
+// screen that was drawn last. The rest of the screen keeps drawing.
+void setLockNote(const char* note, bool redraw = false);
 
 // The .mid screen's keybed somewhere else (pariSynth): y and h take in its
 // two rule lines. keybedDraw() puts it up with the notes down now, and
