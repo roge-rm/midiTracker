@@ -223,6 +223,18 @@ const uint16_t DIR_ROWS[] = {
     0xC000, // ##.
     0x8000, // #..
 };
+// 7x9
+const uint16_t LOCK_ROWS[] = {
+    0x3800, // ..###..
+    0x4400, // .#...#.
+    0x4400, // .#...#.
+    0xFE00, // #######
+    0xFE00, // #######
+    0xEE00, // ###.###
+    0xEE00, // ###.###
+    0xFE00, // #######
+    0xFE00, // #######
+};
 
 } // namespace
 
@@ -240,6 +252,7 @@ const Icon ICON_WARNING = {12, 12, WARNING_ROWS};
 const Icon ICON_METRONOME = {12, 12, METRONOME_ROWS};
 const Icon ICON_PLAY = {7, 7, PLAY_ROWS};
 const Icon ICON_DIR = {3, 5, DIR_ROWS};
+const Icon ICON_LOCK = {7, 9, LOCK_ROWS};
 
 namespace {
 

@@ -7,6 +7,13 @@
 #include <stdio.h>
 #include "mp3dec.h"
 
+// RPSL 1.0 section 2.1(e): the notice that the Helix source is available,
+// kept in the binary (referenced in Mp3Player::open()).
+extern "C" __attribute__((used)) const char kHelixRpslNotice[] =
+    "MP3 decoding uses Helix code under the RealNetworks Public Source License 1.0. "
+    "Source: github.com/roge-rm/midiTracker lib/helix_mp3 and github.com/roge-rm/helix-mp3-pico. "
+    "Copyright (c) 1995-2002 RealNetworks, Inc. and/or its licensors. All Rights Reserved.";
+
 // What load() saw while looking for layer III frames, to say why it found
 // none: layer I or II frames with the next frame's header where it should
 // be, and free format layer III headers (no bitrate, so no length) that
@@ -882,6 +889,7 @@ bool Mp3Player::load(const char* path) { return open(path, false); }
 bool Mp3Player::openOffline(const char* path) { return open(path, true); }
 
 bool Mp3Player::open(const char* path, bool offline) {
+    asm volatile("" : : "r"(kHelixRpslNotice)); // keeps the notice past --gc-sections
     close();
     _offline = offline;
     _readFailed = false;

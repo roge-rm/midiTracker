@@ -99,6 +99,7 @@ extern const Icon ICON_WARNING;   // 12x12
 extern const Icon ICON_METRONOME; // 12x12
 extern const Icon ICON_PLAY;      // 7x7
 extern const Icon ICON_DIR;       // 3x5, folder badge
+extern const Icon ICON_LOCK;      // 7x9, keylock
 
 void drawIcon(TFT_eSPI& g, const Icon& icon, int x, int y, uint16_t c, int scale = 1);
 

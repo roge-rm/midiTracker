@@ -687,6 +687,20 @@ void stateScreens(const std::string& dir) {
 }
 
 
+// The keylock: a locked screen, its card and the unlocked card.
+void lockScreens(const std::string& dir) {
+    UiPlayer::setLocked(true);
+    if (trackerScreen(dir, "xm", "Kenetic & Seenix - Our Little Fantasy.xm", 80)) {
+        save("tracker-locked");
+        UiPlayer::lockCard(true);
+        save("tracker-locked-card");
+    }
+    if (wavScreen(dir, "s3m", "the reflex render.flac", "FLAC", "16BIT")) save("wav-locked");
+    UiPlayer::setLocked(false, true);
+    UiPlayer::lockCard(false);
+    save("wav-unlocked-card");
+}
+
 // ---- screensaver views from the same snapshots -------------------------------
 
 // Runs a view for ms, a frame at its rate, then saves it.
@@ -831,6 +845,7 @@ int playerScreens(const std::string& dir) {
     UiPlayer::drawWav(e);
     save("mp3-error");
     stateScreens(dir);
+    lockScreens(dir);
     return saverScreens(dir);
 }
 

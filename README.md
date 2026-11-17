@@ -22,6 +22,7 @@ Dan
 - [The home screen](#the-home-screen)
 - [Files](#files)
 - [Playing files](#playing-files)
+- [Locking the keys](#locking-the-keys)
 - [Play modes and seeking](#play-modes-and-seeking)
 - [Convert](#convert)
 - [Recording MIDI](#recording-midi)
@@ -64,6 +65,7 @@ LEFT  DOWN  RIGHT  ENTER
 - The arrows move around. RIGHT or ENTER goes into something and LEFT comes back out.
 - PLAY plays, pauses and starts things. NAV stops, or goes back.
 - EDIT and ALT are held to change what the arrows do. Holding EDIT and pressing LEFT or RIGHT changes a value on most screens.
+- In a player, hold ALT and NAV together for a second to lock the keys, and the same again to unlock them.
 - Lists wrap from the bottom back to the top.
 
 Every screen has a footer that shows what the keys do there. Below, UD means UP or DOWN, LR means LEFT or RIGHT, and EDIT+LR means hold EDIT and press LEFT or RIGHT.
@@ -144,6 +146,7 @@ The screen shows the time, tempo and file type, a meter for each of the 16 chann
 | **ALT+EDIT** | the onboard synth on and off |
 | **EDIT** | the pariSynth grid, to change the instruments while it plays |
 | **LEFT** | back to the browser |
+| **ALT+NAV** | hold to lock the keys (see [Locking the keys](#locking-the-keys)) |
 
 The onboard synth plays 24 notes and 8 drums at once. It sounds very chiptuney, which is part of the fun, and you can change its sounds in [pariSynth](#parisynth).
 
@@ -160,6 +163,7 @@ The screen shows the song, time, speed and BPM, a scope, the notes on the patter
 | **EDIT+UD** | volume |
 | **RIGHT** | play mode |
 | **LEFT** | back to the browser |
+| **ALT+NAV** | hold to lock the keys (see [Locking the keys](#locking-the-keys)) |
 
 They're played to sound as close as I could get to OpenMPT. Volume changes, cuts and new notes are ramped so they don't click.
 
@@ -183,6 +187,13 @@ WAV, AIFF, MP3 and FLAC show the time and length, the format, the waveform so fa
 | **ENTER+LR** | seek. Hold for faster |
 | **RIGHT** | play mode |
 | **LEFT** | back to the browser |
+| **ALT+NAV** | hold to lock the keys (see [Locking the keys](#locking-the-keys)) |
+
+## Locking the keys
+
+Hold ALT and NAV together for a second on any player screen to lock the keys. A lock shows at the top. While locked no key does anything, and a press shows "Locked, hold ALT+NAV". Hold ALT and NAV again for a second to unlock.
+
+The lock stays on through the screensaver and when Repeat or Folder moves to the next file. It goes off when you leave the player or a file can't play, and it isn't saved.
 
 ## Play modes and seeking
 

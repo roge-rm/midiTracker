@@ -226,6 +226,16 @@ void drawModeTag() {
     });
 }
 
+// Lock icon just past the play mode tag.
+bool g_locked = false;
+
+void drawLock() {
+    int x = g_chipX + CHIP_W + MODE_GAP + MODE_W + 2;
+    band(x, 0, ICON_LOCK.w + 2, STATUS_H, COLOR_SURFACE, [&](TFT_eSPI& g) {
+        if (g_locked) drawIcon(g, ICON_LOCK, x + 1, (STATUS_H - ICON_LOCK.h) / 2, COLOR_ACCENT);
+    });
+}
+
 // Name at 2x on the left, an info line in Silkscreen on the right.
 void paintTitle(TFT_eSPI& g, const char* name, const char* info) {
     int infoW = info ? textWidth(FONT_LABEL, info) : 0;
@@ -242,20 +252,23 @@ void paintTime(TFT_eSPI& g, const char* t) {
 // Puts the footer up for the screen, PLAY's action from the state.
 void drawFooterFor(Screen s, PlayState st) {
     const char* play = st == PS_PLAYING ? "pause" : "play";
-    if (s == SCREEN_MIDI) {
+    if (g_locked) {
+        drawHintFooter("ALT+NAV unlock", nullptr);
+    } else if (s == SCREEN_MIDI) {
         Key r1[] = {{"UD", "tempo", TONE_TEXT}, {"PLAY", play, TONE_PLAY}, {"EDIT", "inst", TONE_TEXT},
-                    {"ALT", "out", TONE_TEXT}, {"NAV", "stop", TONE_TEXT}};
+                    {"ALT", "out", TONE_TEXT}, {"NAV", "stop", TONE_TEXT}, {"ALT+NAV", "lock", TONE_TEXT}};
         Key r2[] = {{"LEFT", "back", TONE_TEXT}, {"RIGHT", "mode", TONE_TEXT}, {"EDIT+UD", "vol", TONE_TEXT},
                     {"ENT+LR", "seek", TONE_TEXT}, {"ALT+EDIT", "synth", TONE_TEXT}};
-        drawKeyFooter(r1, 5, r2, 5);
+        drawKeyFooter(r1, 6, r2, 5);
     } else if (s == SCREEN_WAV) {
         Key r1[] = {{"PLAY", play, TONE_PLAY}, {"EDIT+UD", "vol", TONE_TEXT}, {"NAV", "stop", TONE_TEXT}};
-        Key r2[] = {{"LEFT", "back", TONE_TEXT}, {"RIGHT", "mode", TONE_TEXT}, {"ENT+LR", "seek", TONE_TEXT}};
-        drawKeyFooter(r1, 3, r2, 3);
+        Key r2[] = {{"LEFT", "back", TONE_TEXT}, {"RIGHT", "mode", TONE_TEXT}, {"ENT+LR", "seek", TONE_TEXT},
+                    {"ALT+NAV", "lock", TONE_TEXT}};
+        drawKeyFooter(r1, 3, r2, 4);
     } else {
         Key r1[] = {{"PLAY", play, TONE_PLAY}, {"EDIT+UD", "vol", TONE_TEXT}, {"NAV", "stop", TONE_TEXT}};
-        Key r2[] = {{"LEFT", "back", TONE_TEXT}, {"RIGHT", "mode", TONE_TEXT}};
-        drawKeyFooter(r1, 3, r2, 2);
+        Key r2[] = {{"LEFT", "back", TONE_TEXT}, {"RIGHT", "mode", TONE_TEXT}, {"ALT+NAV", "lock", TONE_TEXT}};
+        drawKeyFooter(r1, 3, r2, 3);
     }
 }
 
@@ -805,6 +818,7 @@ void drawTracker(const TrackerInfo& t) {
     drawStatusFor(ICON_TRACKER, COLOR_ACCENT, "TRACKER");
     drawChip(t.state);
     drawModeTag();
+    drawLock();
     if (t.state == PS_PLAYING) drawBeat();
 
     char info[40];
@@ -921,6 +935,7 @@ void drawMidi(const MidiInfo& m) {
     drawStatusFor(ICON_NOTE, COLOR_MIDI, "MIDI");
     drawChip(m.state);
     drawModeTag();
+    drawLock();
     band(0, HEADER_H, SCREEN_W, TOP_Y - 2 - HEADER_H, COLOR_BG, [&](TFT_eSPI& g) { paintTitle(g, m.name, nullptr); });
     if (m.state == PS_ERROR) {
         drawErrorBody(SCREEN_MIDI, m.error);
@@ -998,6 +1013,7 @@ void drawWav(const WavInfo& w) {
     drawStatusFor(ICON_WAVE, COLOR_WAV, w.type ? w.type : "WAV");
     drawChip(w.state);
     drawModeTag();
+    drawLock();
     char info[48];
     snprintf(info, sizeof(info), "%lu.%luK %s %s %s %s", (unsigned long)(w.sampleRate / 1000),
              (unsigned long)(w.sampleRate % 1000 / 100), MIDDOT, w.format ? w.format : "", MIDDOT,
@@ -1083,6 +1099,20 @@ void setPlayMode(const char* tag, bool lit, bool redraw) {
     g_modeTag = tag;
     g_modeLit = lit;
     if (redraw && g_screen != SCREEN_NONE) drawModeTag();
+}
+
+void setLocked(bool locked, bool redraw) {
+    g_locked = locked;
+    if (!redraw || g_screen == SCREEN_NONE) return;
+    drawLock();
+    drawFooterFor(g_screen, g_state);
+}
+
+void lockCard(bool locked) {
+    Card c;
+    c.line1 = locked ? "Locked, hold ALT+NAV" : "Unlocked";
+    dimBody();
+    drawCard(c);
 }
 
 void formatNote(uint8_t note, char* out) { noteText(note, out); }

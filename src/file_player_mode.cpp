@@ -28,6 +28,7 @@
 #include "input.h"
 #include "ui.h"
 #include "ui_strip.h"
+#include "ui_player.h"
 #include "ui_transition.h"
 #include "ui_rec.h"
 #include "keyboard_layout.h"
@@ -417,6 +418,127 @@ bool scrubbedToEnd = false;
 void handlePlayModeKey() {
     if (Input::justPressed(BTN_PLAY) || Input::justPressed(BTN_NAV) || Input::justPressed(BTN_RIGHT)) quickEnds = 0;
     if (rightTap) cyclePlayMode();
+}
+
+// ---- keylock ---------------------------------------------------------------
+// On a player screen, ALT+NAV held for KEYLOCK_HOLD_MS locks and unlocks the
+// keys. While locked a press only shows a card. Never saved; leaving the
+// player or a file error clears it.
+const uint32_t KEYLOCK_HOLD_MS = 1000;
+const uint32_t LOCK_CARD_MS = 1500;
+bool keyLocked = false;
+bool lockHolding = false;
+uint32_t lockHoldStartMs = 0;
+uint32_t lockCardUntilMs = 0; // 0 while no card is up
+
+bool onPlayerScreen() {
+    switch (appState) {
+        case APP_PLAY:
+        case APP_PLAY_WAV:
+        case APP_PLAY_MOD:
+        case APP_PLAY_S3M:
+        case APP_PLAY_XM:
+        case APP_PLAY_IT:  return true;
+        default:           return false;
+    }
+}
+
+bool playerErrored() {
+    switch (appState) {
+        case APP_PLAY:     return player && player->state() == MidiPlayer::STATE_ERROR;
+        case APP_PLAY_WAV: return audio->state() == StreamPlayer::STATE_ERROR;
+        case APP_PLAY_MOD: return modPlayer && modPlayer->state() == TrackerPlayer::STATE_ERROR;
+        case APP_PLAY_S3M: return s3mPlayer && s3mPlayer->state() == TrackerPlayer::STATE_ERROR;
+        case APP_PLAY_XM:  return xmPlayer && xmPlayer->state() == TrackerPlayer::STATE_ERROR;
+        case APP_PLAY_IT:  return itPlayer && itPlayer->state() == TrackerPlayer::STATE_ERROR;
+        default:           return false;
+    }
+}
+
+bool lockCardUp() { return lockCardUntilMs != 0; }
+
+// The next full draw of the player screen takes the card away.
+void dismissLockCard() {
+    if (!lockCardUntilMs) return;
+    lockCardUntilMs = 0;
+    needsRedraw = true;
+}
+
+void showLockCard(bool locked) {
+    // While locked a card already up is the locked one, so only its time moves.
+    if (!(locked && lockCardUp())) UiPlayer::lockCard(locked);
+    lockCardUntilMs = (millis() + LOCK_CARD_MS) | 1;
+}
+
+bool anyJustPressed() {
+    for (int i = 0; i < BTN_COUNT; i++)
+        if (Input::justPressed((ButtonId)i)) return true;
+    return false;
+}
+
+// NAV's stop: at once on the press, unless ALT is down for the keylock.
+bool navStop() { return Input::justPressed(BTN_NAV) && !Input::isDown(BTN_ALT); }
+
+// Runs before a player screen's own keys. True when the lock takes this
+// tick's keys.
+bool handleKeylock() {
+    if (!keyLocked && playerErrored()) {
+        lockHolding = false;
+        return false;
+    }
+    if (Input::isDown(BTN_ALT) && Input::isDown(BTN_NAV)) {
+        altUsedAsModifier = true; // ALT's release doesn't cycle the output
+        uint32_t now = millis();
+        if (!lockHolding) {
+            lockHolding = true;
+            lockHoldStartMs = now;
+        } else if (now - lockHoldStartMs >= KEYLOCK_HOLD_MS) {
+            lockHolding = false;
+            keyLocked = !keyLocked;
+            // The held keys read as up until all are let go, so no release acts.
+            Input::muteUntilReleased();
+            disarmArrowTaps();
+            if (keyLocked) {
+                if (lockCardUp()) {
+                    UiPlayer::setLocked(true);
+                    dismissLockCard();
+                } else {
+                    UiPlayer::setLocked(true, true);
+                }
+            } else {
+                UiPlayer::setLocked(false);
+                showLockCard(false);
+            }
+            return true;
+        }
+    } else {
+        lockHolding = false;
+    }
+    if (keyLocked) {
+        if (anyJustPressed()) showLockCard(true);
+        return true;
+    }
+    if (lockCardUp() && anyJustPressed()) dismissLockCard();
+    return false;
+}
+
+// Called at the end of update(): the card's time, and the lock goes when the
+// player does.
+void keylockTick() {
+    if (lockCardUntilMs && (int32_t)(millis() - lockCardUntilMs) >= 0) dismissLockCard();
+    if (!onPlayerScreen()) {
+        lockCardUntilMs = 0;
+        lockHolding = false;
+        if (keyLocked) {
+            keyLocked = false;
+            UiPlayer::setLocked(false);
+        }
+    } else if (keyLocked && playerErrored()) {
+        keyLocked = false;
+        UiPlayer::setLocked(false);
+        lockCardUntilMs = 0;
+        needsRedraw = true;
+    }
 }
 
 void adjustVolume(int delta) {
@@ -1503,7 +1625,7 @@ void handlePlayWavInput() {
     // handler. Always ends paused regardless of prior state (unlike a
     // plain seekTo(0), which preserves PLAYING) -- that's what makes this
     // "Stop" rather than "seek to the start".
-    if (Input::justPressed(BTN_NAV)) {
+    if (navStop()) {
         if (audio->state() == StreamPlayer::STATE_PLAYING ||
             audio->state() == StreamPlayer::STATE_PAUSED ||
             audio->state() == StreamPlayer::STATE_DONE) {
@@ -1565,7 +1687,7 @@ void handlePlayModInput() {
     }
     // NAV stops playback: reloads to the start and pauses there, shown as
     // "Stopped" -- same stoppedViaNav convention as the other two players.
-    if (Input::justPressed(BTN_NAV)) {
+    if (navStop()) {
         if (modPlayer->state() == ModPlayer::STATE_PLAYING ||
             modPlayer->state() == ModPlayer::STATE_PAUSED ||
             modPlayer->state() == ModPlayer::STATE_DONE) {
@@ -1620,7 +1742,7 @@ void handlePlayS3mInput() {
     }
     // NAV stops playback: reloads to the start and pauses there, shown as
     // "Stopped" -- same stoppedViaNav convention as the other players.
-    if (Input::justPressed(BTN_NAV)) {
+    if (navStop()) {
         if (s3mPlayer->state() == S3mPlayer::STATE_PLAYING ||
             s3mPlayer->state() == S3mPlayer::STATE_PAUSED ||
             s3mPlayer->state() == S3mPlayer::STATE_DONE) {
@@ -1678,7 +1800,7 @@ void handleTrackerInput(P*& p, bool (*restartFromTop)()) {
     }
     // NAV stops playback: reloads to the start and pauses there, shown as
     // "Stopped" -- same stoppedViaNav convention as the other players.
-    if (Input::justPressed(BTN_NAV)) {
+    if (navStop()) {
         if (player->state() == P::STATE_PLAYING ||
             player->state() == P::STATE_PAUSED ||
             player->state() == P::STATE_DONE) {
@@ -1781,7 +1903,7 @@ void handlePlayInput() {
     // internal close() doesn't send an all-notes-off, so a note held at
     // the moment of a PLAYING->reload transition would otherwise never
     // get its note-off.
-    if (Input::justPressed(BTN_NAV)) {
+    if (navStop()) {
         if (player->state() == MidiPlayer::STATE_PLAYING ||
             player->state() == MidiPlayer::STATE_PAUSED ||
             player->state() == MidiPlayer::STATE_DONE) {
@@ -1808,7 +1930,7 @@ void handlePlayInput() {
     // that combo doesn't ALSO cycle the output target for the same
     // physical press.
     if (Input::justPressed(BTN_ALT)) {
-        altUsedAsModifier = false;
+        altUsedAsModifier = Input::isDown(BTN_NAV); // ALT+NAV is the keylock
     } else if (Input::justReleased(BTN_ALT)) {
         if (!altUsedAsModifier) {
             cycleOutputTarget();
@@ -1980,6 +2102,7 @@ void handleFileEnd() {
     quickEnds = now - lastAutoEndMs < 50 ? quickEnds + 1 : 0;
     lastAutoEndMs = now;
     if (quickEnds >= limit) return;
+    dismissLockCard();
     if (playMode == PLAY_REPEAT) repeatOpenFile();
     else playNextInFolder();
 }
@@ -2573,6 +2696,11 @@ void enter() {
     // the time (needsRebuild() only true right after that reclaim).
     if (browser.needsRebuild()) browser.refresh();
 
+    keyLocked = false;
+    lockHolding = false;
+    lockCardUntilMs = 0;
+    UiPlayer::setLocked(false);
+
     appState = APP_BROWSE;
     needsRedraw = true;
 }
@@ -2606,14 +2734,14 @@ bool update() {
             // player->update() already ticked above.
             // Once the file finishes, keep showing the final "Finished"
             // screen until the user presses a button to go back.
-            handlePlayInput();
+            if (!handleKeylock()) handlePlayInput();
             static bool midiWasPlaying = false;
             if (appState != APP_PLAY) { midiWasPlaying = false; break; }
 
             // A meter skipped on the last tick before a pause or stop would
             // stay stale, so draw everything once on the change.
             bool midiPlaying = player->state() == MidiPlayer::STATE_PLAYING;
-            if (midiWasPlaying && !midiPlaying && player->state() != MidiPlayer::STATE_ERROR) {
+            if (midiWasPlaying && !midiPlaying && player->state() != MidiPlayer::STATE_ERROR && !lockCardUp()) {
                 Ui::sliceForceMeters(true);
                 Ui::updatePlayerLive(*player);
                 Ui::sliceForceMeters(false);
@@ -2624,7 +2752,7 @@ bool update() {
             // only what changed, see ui_player.h.
             static uint32_t lastPlayTick = 0;
             uint32_t now = millis();
-            if (player->state() == MidiPlayer::STATE_PLAYING && now - lastPlayTick >= LIVE_MS) {
+            if (player->state() == MidiPlayer::STATE_PLAYING && now - lastPlayTick >= LIVE_MS && !lockCardUp()) {
                 lastPlayTick = now;
                 Ui::setDrawPump(pumpPlayer);
                 Ui::updatePlayerLive(*player);
@@ -2694,13 +2822,13 @@ bool update() {
 
         case APP_PLAY_WAV: {
             audio->update();
-            handlePlayWavInput();
+            if (!handleKeylock()) handlePlayWavInput();
             static bool wavWasPlaying = false;
             if (appState != APP_PLAY_WAV) { wavWasPlaying = false; break; }
 
             // Same as APP_PLAY: one full meter draw on a pause, stop or end.
             bool wavPlaying = audio->state() == StreamPlayer::STATE_PLAYING;
-            if (wavWasPlaying && !wavPlaying && audio->state() != StreamPlayer::STATE_ERROR) {
+            if (wavWasPlaying && !wavPlaying && audio->state() != StreamPlayer::STATE_ERROR && !lockCardUp()) {
                 Ui::sliceForceMeters(true);
                 Ui::updateWavPlayerLive(*audio);
                 Ui::sliceForceMeters(false);
@@ -2711,7 +2839,7 @@ bool update() {
             uint32_t now = millis();
             if ((audio->state() == StreamPlayer::STATE_PLAYING ||
                  (audio->state() == StreamPlayer::STATE_DONE && !Ui::playerLiveSettled())) &&
-                now - lastWavPlayTick >= LIVE_MS) {
+                now - lastWavPlayTick >= LIVE_MS && !lockCardUp()) {
                 lastWavPlayTick = now;
                 Ui::setDrawPump(pumpPlayer);
                 Ui::updateWavPlayerLive(*audio);
@@ -2723,14 +2851,14 @@ bool update() {
 
         case APP_PLAY_MOD: {
             modPlayer->update();
-            handlePlayModInput();
+            if (!handleKeylock()) handlePlayModInput();
             if (appState != APP_PLAY_MOD) break;
 
             static uint32_t lastModPlayTick = 0;
             uint32_t now = millis();
             if ((modPlayer->state() == ModPlayer::STATE_PLAYING ||
                  (modPlayer->state() == ModPlayer::STATE_DONE && !Ui::playerLiveSettled())) &&
-                now - lastModPlayTick >= LIVE_MS) {
+                now - lastModPlayTick >= LIVE_MS && !lockCardUp()) {
                 lastModPlayTick = now;
                 Ui::setDrawPump(pumpPlayer);
                 Ui::updateTrackerPlayerLive(*modPlayer);
@@ -2742,14 +2870,14 @@ bool update() {
 
         case APP_PLAY_S3M: {
             s3mPlayer->update();
-            handlePlayS3mInput();
+            if (!handleKeylock()) handlePlayS3mInput();
             if (appState != APP_PLAY_S3M) break;
 
             static uint32_t lastS3mPlayTick = 0;
             uint32_t now = millis();
             if ((s3mPlayer->state() == S3mPlayer::STATE_PLAYING ||
                  (s3mPlayer->state() == S3mPlayer::STATE_DONE && !Ui::playerLiveSettled())) &&
-                now - lastS3mPlayTick >= LIVE_MS) {
+                now - lastS3mPlayTick >= LIVE_MS && !lockCardUp()) {
                 lastS3mPlayTick = now;
                 Ui::setDrawPump(pumpPlayer);
                 Ui::updateTrackerPlayerLive(*s3mPlayer);
@@ -2761,14 +2889,14 @@ bool update() {
 
         case APP_PLAY_XM: {
             xmPlayer->update();
-            handlePlayXmInput();
+            if (!handleKeylock()) handlePlayXmInput();
             if (appState != APP_PLAY_XM) break;
 
             static uint32_t lastXmPlayTick = 0;
             uint32_t now = millis();
             if ((xmPlayer->state() == XmPlayer::STATE_PLAYING ||
                  (xmPlayer->state() == XmPlayer::STATE_DONE && !Ui::playerLiveSettled())) &&
-                now - lastXmPlayTick >= LIVE_MS) {
+                now - lastXmPlayTick >= LIVE_MS && !lockCardUp()) {
                 lastXmPlayTick = now;
                 Ui::setDrawPump(pumpPlayer);
                 Ui::updateTrackerPlayerLive(*xmPlayer);
@@ -2780,13 +2908,13 @@ bool update() {
 
         case APP_PLAY_IT: {
             itPlayer->update();
-            handlePlayItInput();
+            if (!handleKeylock()) handlePlayItInput();
             if (appState != APP_PLAY_IT) break;
             static uint32_t lastItPlayTick = 0;
             uint32_t now = millis();
             if ((itPlayer->state() == ItPlayer::STATE_PLAYING ||
                  (itPlayer->state() == ItPlayer::STATE_DONE && !Ui::playerLiveSettled())) &&
-                now - lastItPlayTick >= LIVE_MS) {
+                now - lastItPlayTick >= LIVE_MS && !lockCardUp()) {
                 lastItPlayTick = now;
                 Ui::setDrawPump(pumpPlayer);
                 Ui::updateTrackerPlayerLive(*itPlayer);
@@ -2937,6 +3065,8 @@ bool update() {
             break;
     }
 
+    keylockTick();
+
     if (exitRequested) {
         Synth::resetControllers(); // nothing from a file carries into the next mode
         return true;
@@ -2944,6 +3074,7 @@ bool update() {
 
     if (needsRedraw) {
         needsRedraw = false;
+        lockCardUntilMs = 0; // any full draw covers the lock card
         switch (appState) {
             case APP_BROWSE:
                 Ui::transitionDraw([] { Ui::drawBrowser(browser, selectedIndex, scrollOffset); });

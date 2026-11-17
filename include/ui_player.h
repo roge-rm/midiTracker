@@ -81,6 +81,16 @@ void setVolume(int volume);
 // while that screen is up. nullptr shows none.
 void setPlayMode(const char* tag, bool lit, bool redraw = false);
 
+// The keylock: a lock icon in the status strip and an unlock-only footer,
+// kept for the next draw*(). With redraw, also drawn now on the player
+// screen that was drawn last.
+void setLocked(bool locked, bool redraw = false);
+
+// A card over the player screen saying it's locked or unlocked. Only a full
+// draw*() takes it away, and the *Live() calls draw over it, so hold them
+// off while it's up.
+void lockCard(bool locked);
+
 // The .mid screen's keybed somewhere else (pariSynth): y and h take in its
 // two rule lines. keybedDraw() puts it up with the notes down now, and
 // keybedUpdate() repaints only the keys that changed since. Drawing a
